@@ -47,13 +47,11 @@ def _find_metalir_dylib():
         return os.environ['METALIR_DYLIB_PATH']
 
     # 2. Sibling directory (../../metal-ir-pipeline/build/)
-    for rel in [
-        os.path.join('..', 'metal-ir-pipeline'),
-        os.path.join('..', '..', '..', '..', 'metal-ir-pipeline'),
-    ]:
-        d = os.path.join(os.path.dirname(__file__), rel, 'build', 'lib', 'Bridge', 'libMetalIRBridge.dylib')
-        if os.path.exists(os.path.abspath(d)):
-            return os.path.abspath(d)
+    # 2. Submodule: backend/AppleGPU/metal-ir-pipeline/build/
+    submodule = os.path.join(os.path.dirname(__file__), '..', '..', 'metal-ir-pipeline',
+                             'build', 'lib', 'Bridge', 'libMetalIRBridge.dylib')
+    if os.path.exists(submodule):
+        return os.path.abspath(submodule)
 
     return None
 

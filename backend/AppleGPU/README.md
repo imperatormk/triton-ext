@@ -5,14 +5,14 @@ Out-of-tree Apple GPU (Metal) backend for the Triton compiler, built as a triton
 ## Architecture
 
 ```
-triton (vanilla, pip install)
-  │── TRITON_PASS_PLUGIN_PATH ──→ libTritonAppleGPUBackend.dylib (this plugin)
-  │                                 MLIR dialect + passes for Apple GPU
-  │── entry_points ──→ triton-apple (pip package)
-  │                      compiler.py, driver.py, metal_utils.m
-  │                        │
-  │                        └── METALIR_DYLIB_PATH ──→ metal-ir-pipeline
-  │                                                    LLVM IR → Metal AIR → metallib
+triton-ext/backend/AppleGPU/
+  ├── CMakeLists.txt + lib/       C++ MLIR passes (plugin loaded via TRITON_PASS_PLUGIN_PATH)
+  ├── python/                     Python backend (pip installable, entry_points discovery)
+  │     └── triton_apple_backend/
+  │           ├── compiler.py     TTIR → TTGIR → LLVM IR → metallib
+  │           ├── driver.py       MPS GPU dispatch, buffer binding, scalar packing
+  │           └── metal_utils.m   ObjC++ Metal bridge (compiled at install time)
+  └── metal-ir-pipeline/         LLVM IR → Metal AIR → metallib compiler (git submodule)
 ```
 
 ## Prerequisites
@@ -37,45 +37,47 @@ pip install -e . --no-build-isolation
 cmake --install build/cmake.* --prefix build/install
 ```
 
-### 2. Build metal-ir-pipeline
+### 2. Clone triton-ext with submodules
 
 ```bash
-git clone https://github.com/imperatormk/metal-ir-pipeline.git
-cd metal-ir-pipeline
-# Point LLVM_DIR to the LLVM that Triton downloaded (under ~/.triton/llvm/)
-cmake -B build -DLLVM_DIR=$(ls -d ~/.triton/llvm/llvm-*/lib/cmake/llvm | head -1)
-cmake --build build
+git clone --recurse-submodules https://github.com/imperatormk/triton-ext.git
+cd triton-ext
 ```
 
-### 3. Build this plugin (triton-ext)
+### 3. Build metal-ir-pipeline (submodule)
 
 ```bash
-# From the triton-ext root
+cd backend/AppleGPU/metal-ir-pipeline
+cmake -B build -DLLVM_DIR=$(ls -d ~/.triton/llvm/llvm-*/lib/cmake/llvm | head -1)
+cmake --build build
+cd ../../..
+```
+
+### 4. Build the MLIR pass plugin
+
+```bash
 LLVM_INSTALL_DIR=/path/to/llvm/install \
 TRITON_INSTALL_DIR=/path/to/triton/build/install \
 cmake -S . -B build -G Ninja
 cmake --build build -- TritonAppleGPUBackend
 
-# Fix rpath for macOS
 install_name_tool -add_rpath /path/to/triton/python/triton/_C \
   build/lib/libTritonAppleGPUBackend.dylib
 ```
 
-### 4. Install triton-apple Python package
+### 5. Install the Python backend
 
 ```bash
-git clone https://github.com/imperatormk/triton-apple.git
-cd triton-apple
+cd backend/AppleGPU/python
 pip install -e . --no-build-isolation
 ```
 
-### 5. Run
+### 6. Run
 
 ```bash
 export TRITON_PASS_PLUGIN_PATH=/path/to/triton-ext/build/lib/libTritonAppleGPUBackend.dylib
-export METALIR_DYLIB_PATH=/path/to/metal-ir-pipeline/build/lib/Bridge/libMetalIRBridge.dylib
 
-python your_triton_script.py
+python your_triton_script.py  # kernels run on MPS
 ```
 
 ## What's included

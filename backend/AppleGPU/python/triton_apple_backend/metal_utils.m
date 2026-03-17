@@ -97,36 +97,43 @@ static PyObject *MetalKernel_call(MetalKernelObject *self,
         }
     }
 
-    // Use PyTorch's MPS stream directly. Synchronize first to ensure
-    // any pending MPS graph operations are flushed before we encode.
+    // Use PyTorch's MPS stream directly — encode on the same command buffer
+    // so ordering with other MPS ops is guaranteed.
+    // CRITICAL: Must dispatch on stream->queue() (the serial queue) to
+    // synchronize with other MPS operations (MPSGraph, blit copies, etc.)
+    // that also use this queue. Without this, commandEncoder/endKernelCoalescing
+    // race with concurrent MPS graph executions causing nondeterministic results.
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
 
-        id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
-        [enc setComputePipelineState:self->pso];
+        dispatch_sync(stream->queue(), ^() {
+            @autoreleasepool {
+                id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
+                [enc setComputePipelineState:self->pso];
 
-        for (Py_ssize_t i = 0; i < nargs; i++) {
-            auto &info = argInfos[i];
-            switch (info.kind) {
-                case ArgInfo::TENSOR:
-                    [enc setBuffer:info.buf offset:info.offset atIndex:i];
-                    break;
-                case ArgInfo::INT:
-                    [enc setBytes:&info.intVal length:sizeof(int64_t) atIndex:i];
-                    break;
-                case ArgInfo::FLOAT:
-                    [enc setBytes:&info.floatVal length:sizeof(float) atIndex:i];
-                    break;
+                for (Py_ssize_t i = 0; i < nargs; i++) {
+                    auto &info = argInfos[i];
+                    switch (info.kind) {
+                        case ArgInfo::TENSOR:
+                            [enc setBuffer:info.buf offset:info.offset atIndex:i];
+                            break;
+                        case ArgInfo::INT:
+                            [enc setBytes:&info.intVal length:sizeof(int64_t) atIndex:i];
+                            break;
+                        case ArgInfo::FLOAT:
+                            [enc setBytes:&info.floatVal length:sizeof(float) atIndex:i];
+                            break;
+                    }
+                }
+
+                MTLSize threadgroups = MTLSizeMake(tx / gx, ty / gy, tz / gz);
+                MTLSize threadsPerGroup = MTLSizeMake(gx, gy, gz);
+                [enc dispatchThreadgroups:threadgroups
+                    threadsPerThreadgroup:threadsPerGroup];
+
+                stream->endKernelCoalescing();
             }
-        }
-
-        MTLSize threadgroups = MTLSizeMake(tx / gx, ty / gy, tz / gz);
-        MTLSize threadsPerGroup = MTLSizeMake(gx, gy, gz);
-        [enc dispatchThreadgroups:threadgroups
-            threadsPerThreadgroup:threadsPerGroup];
-
-        stream->endKernelCoalescing();
+        });
     }
 
     Py_RETURN_NONE;

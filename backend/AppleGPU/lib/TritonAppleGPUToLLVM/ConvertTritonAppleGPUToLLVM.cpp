@@ -1793,6 +1793,7 @@ struct ConvertTritonAppleGPUToLLVMPass
         POPULATE_FLOAT_OP(arith::MulFOp,   LLVM::FMulOp);
         POPULATE_FLOAT_OP(arith::DivFOp,   LLVM::FDivOp);
         POPULATE_FLOAT_OP(triton::PreciseDivFOp, LLVM::FDivOp);
+        POPULATE_FLOAT_OP(triton::PreciseSqrtOp, LLVM::SqrtOp);
         POPULATE_FLOAT_OP(arith::ExtFOp,   LLVM::FPExtOp);
         POPULATE_FLOAT_OP(arith::TruncFOp, LLVM::FPTruncOp);
         POPULATE_FLOAT_OP(arith::SIToFPOp, LLVM::SIToFPOp);

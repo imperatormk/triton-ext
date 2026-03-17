@@ -65,7 +65,13 @@ def _load_metalir():
     return compile_ir
 
 
-_metalir_compile = _load_metalir()
+_metalir_compile = None
+
+def _get_metalir_compile():
+    global _metalir_compile
+    if _metalir_compile is None:
+        _metalir_compile = _load_metalir()
+    return _metalir_compile
 
 
 @dataclass(frozen=True)
@@ -226,7 +232,7 @@ class MPSBackend(BaseBackend):
             open(f'/tmp/dot_kernel_{kname}.ll', 'w').write(llvm_ir)
 
         # MetalIR C++ pipeline: LLVM IR → AIR transforms → v1 bitcode → metallib
-        result = _metalir_compile(llvm_ir)
+        result = _get_metalir_compile()(llvm_ir)
         if debug:
             open(f'/tmp/dot_kernel_{kname}.metallib', 'wb').write(result)
         return result

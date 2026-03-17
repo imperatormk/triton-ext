@@ -1562,6 +1562,18 @@ struct AppleFuncOpConversion
     }
 };
 
+struct AppleReturnOpConversion
+    : public ConvertOpToLLVMPattern<triton::ReturnOp> {
+    using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+    LogicalResult matchAndRewrite(triton::ReturnOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter) const override {
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), adaptor.getOperands());
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
 // Lower triton::PrintOp → no-op (Metal has no printf).
 // Erase the op so it doesn't block legalization.
 struct ApplePrintOpConversion
@@ -1704,11 +1716,13 @@ struct ConvertTritonAppleGPUToLLVMPass
         // Apple call lowering: no shared memory stack pointer appending.
         patterns.add<AppleCallOpConversion>(
             typeConverter, PatternBenefit(patternBenefitDefault + 20));
+        patterns.add<AppleReturnOpConversion>(
+            typeConverter, PatternBenefit(patternBenefitDefault + 20));
 
         // Shared Triton → LLVM patterns (handles device functions, non-kernel)
-        mlir::triton::populateFuncOpConversionPattern(
-            typeConverter, patterns, targetInfo, patternBenefitDefault);
         mlir::triton::populateSPMDOpToLLVMPattern(
+            typeConverter, patterns, targetInfo, patternBenefitDefault);
+        mlir::triton::populateFuncOpConversionPattern(
             typeConverter, patterns, targetInfo, patternBenefitDefault);
         mlir::triton::populateMemoryOpToLLVMPatterns(
             typeConverter, targetInfo, patterns, patternBenefitDefault);
@@ -1806,6 +1820,7 @@ struct ConvertTritonAppleGPUToLLVMPass
         // gpu.thread_id is emitted by shared make_range/SPMD patterns;
         // it will be lowered to air intrinsics by a subsequent pass.
         target.addLegalOp<mlir::gpu::ThreadIdOp>();
+        target.addLegalOp<mlir::gpu::BlockDimOp>();
         target.addLegalOp<mlir::gpu::BarrierOp>();
         target.addLegalOp<mlir::UnrealizedConversionCastOp>();
 

@@ -64,7 +64,8 @@ set_target_properties(TritonAppleGPUBackend PROPERTIES
     "${TRITON_EXT_LIBRARY_DIR}"
     CXX_STANDARD 17)
 
-# No special macOS link flags needed — triton must be built with
-# -fvisibility=default for plugin TypeID resolution to work.
-# Use: TRITON_APPEND_CMAKE_ARGS="-C /path/to/visibility_fix.cmake"
-# See SETUP.md for details.
+# On macOS with shared LLVM, use flat namespace so the plugin can resolve
+# LLVM symbols from any loaded dylib (not just the one it was linked against).
+if(APPLE)
+    target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-flat_namespace)
+endif()

@@ -58,7 +58,7 @@ def _is_pointer_type(ty):
 
 
 def _compute_scalar_layout(scalar_types):
-    """Compute packed buffer layout matching MetalASM Pass 5b.
+    """Compute packed buffer layout for scalar parameters.
 
     Returns (total_size, field_offsets) where field_offsets[i] is the byte
     offset for scalar i in the packed buffer.
@@ -78,7 +78,7 @@ def _compute_scalar_layout(scalar_types):
 
 
 def _pack_scalars(scalar_types, scalar_values, total_size, offsets):
-    """Pack scalar values into a bytes buffer matching MetalASM struct layout."""
+    """Pack scalar values into a bytes buffer with natural alignment."""
     buf = bytearray(total_size)
     for ty, val, offset in zip(scalar_types, scalar_values, offsets):
         fmt, size, _ = _SCALAR_PACK_INFO[ty]
@@ -168,7 +168,7 @@ class MPSLauncher:
         expanded = expand_signature(non_constexpr_sig, None, None)
 
         # Classify each expanded arg as pointer or scalar.
-        # MetalASM Pass 5b packs all scalars into ONE device buffer,
+        # All scalars are packed into ONE device buffer,
         # so the IR param order is: [pointers..., packed_scalar_buf, system_values].
         # We need to separate pointers from scalars at launch time.
         #

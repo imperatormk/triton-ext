@@ -1,34 +1,12 @@
-"""
-Apple MPS Triton backend.
+"""Apple MPS Triton backend.
 
-Pipeline:
-  Triton Python (@triton.jit kernel)
-    → make_ttir   (shared Triton passes)
-    → make_ttgir  (Apple MMA tiling via AccelerateAppleMatmul)
-    → make_llir   (LLVM IR with simdgroup intrinsics)
-    → make_metallib (xcrun metal-as + metallib OR MetalASM in-process)
-    → dispatch via MTLComputeCommandEncoder
-
-Status:
-  [x] LinearLayout verified + implemented
-  [x] AppleMmaEncodingAttr defined
-  [x] AccelerateAppleMatmul pass written
-  [x] DotOpToLLVM skeleton
-  [x] Python bindings skeleton
-  [x] Build + fix compile errors
-  [x] Metal IR emission (simdgroup intrinsic → .ll)
-  [x] metal-as + metallib integration
-  [x] MetalASM integration for in-process metallib
-  [x] driver.py (MTLDevice dispatch)
+Compiles Triton kernels through TTIR → TTGIR → LLVM IR → metallib,
+then dispatches via MTLComputeCommandEncoder.
 """
 
 from dataclasses import dataclass
-from typing import Any
 import ctypes
-import functools
 import hashlib
-import subprocess
-import tempfile
 import os
 
 from triton.backends.compiler import BaseBackend, GPUTarget
@@ -46,7 +24,6 @@ def _find_metalir_dylib():
     if os.environ.get('METALIR_DYLIB_PATH'):
         return os.environ['METALIR_DYLIB_PATH']
 
-    # 2. Sibling directory (../../metal-ir-pipeline/build/)
     # 2. Submodule: backend/AppleGPU/metal-ir-pipeline/build/
     submodule = os.path.join(os.path.dirname(__file__), '..', '..', 'metal-ir-pipeline',
                              'build', 'lib', 'Bridge', 'libMetalIRBridge.dylib')
@@ -254,25 +231,6 @@ class MPSBackend(BaseBackend):
             open(f'/tmp/dot_kernel_{kname}.metallib', 'wb').write(result)
         return result
 
-        # Dead code — xcrun fallback removed, MetalIR is the only path.
-        if False:  # noqa
-            with tempfile.TemporaryDirectory() as tmp:
-                ll_path  = os.path.join(tmp, "kernel.ll")
-                air_path = os.path.join(tmp, "kernel.air")
-                lib_path = os.path.join(tmp, "kernel.metallib")
-
-                with open(ll_path, "w") as f:
-                    f.write(llvm_ir)
-
-                subprocess.run(
-                    ["xcrun", "-sdk", "macosx", "metal-as", ll_path, "-o", air_path],
-                    check=True)
-                subprocess.run(
-                    ["xcrun", "-sdk", "macosx", "metallib", air_path, "-o", lib_path],
-                check=True)
-
-            with open(lib_path, "rb") as f:
-                return f.read()
     def add_stages(self, stages, options, language):
         stages["ttir"]     = lambda src, meta: self.make_ttir(src, meta, options)
         stages["ttgir"]    = lambda src, meta: self.make_ttgir(src, meta, options)

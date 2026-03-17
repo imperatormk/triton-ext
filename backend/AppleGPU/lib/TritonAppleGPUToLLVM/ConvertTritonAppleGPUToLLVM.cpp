@@ -1674,7 +1674,7 @@ struct ConvertTritonAppleGPUToLLVMPass
 
         // Pre-compute MMA threadgroup memory usage from tt.dot ops.
         // Each dot creates a __tg_dot_ab TG buffer of (8*max(K,N)+1) floats.
-        // MetalASM coalesces all dot TG globals into one (taking the max),
+        // The IR pipeline coalesces all dot TG globals into one (taking the max),
         // so total MMA TG cost = max over all dots.
         // Set as module attribute so ConvertLayoutOp can account for it in
         // the 32KB TG budget when sizing its own TG buffers.

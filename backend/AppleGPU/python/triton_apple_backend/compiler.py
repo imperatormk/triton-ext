@@ -79,6 +79,8 @@ def _load_metalir():
         ctypes.c_int,
     ]
     lib.metalir_free.argtypes = [ctypes.c_void_p]
+    lib.metalir_tg_memory_bytes.restype  = ctypes.c_uint64
+    lib.metalir_tg_memory_bytes.argtypes = [ctypes.c_char_p]
 
     def compile_ir(llvm_ir: str) -> bytes:
         out_len = ctypes.c_uint64(0)
@@ -91,6 +93,7 @@ def _load_metalir():
             return data
         raise RuntimeError(f"MetalIR compile failed: {errbuf.value.decode()}")
 
+    compile_ir.tg_memory_bytes = lambda ir: lib.metalir_tg_memory_bytes(ir.encode())
     return compile_ir
 
 
@@ -212,7 +215,14 @@ class MPSBackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
 
+        # Fuse nested loops marked with tt.flatten (tl.range(flatten=True))
+        passes.ttgpuir.add_fuse_nested_loops(pm)
+        passes.common.add_canonicalizer(pm)
+
         pm.run(mod, 'make_ttgir')
+        # Preliminary shared memory estimate (reduction scratchpad only).
+        # Overwritten in make_llir with the real total after convert_layout
+        # adds __tg_cvt_* threadgroup globals.
         metadata["shared"] = mod.get_int_attr("ttg.shared") or 0
         return mod
 
@@ -242,6 +252,14 @@ class MPSBackend(BaseBackend):
         llvm_mod = llvm.to_module(mod, context)
         if os.environ.get('TRITON_MPS_DEBUG'):
             open('/tmp/raw_pre.ll', 'w').write(str(llvm_mod))
+
+        # Recompute shared memory: Triton's ttg.shared only counts the
+        # reduction scratchpad (global_smem). The Apple GPU convert_layout
+        # lowering adds __tg_cvt_* threadgroup globals whose sizes depend
+        # on the tile configuration. Compute the real total from the LLVM IR
+        # so the autotuner can reject configs that exceed the 32 KB limit.
+        metadata["shared"] = _get_metalir_compile().tg_memory_bytes(str(llvm_mod))
+
         return llvm_mod
 
     # ── Stage 4: LLVM IR → metallib ───────────────────────────────────────

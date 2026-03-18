@@ -1087,9 +1087,40 @@ struct AtomicRMWOpAppleConversion
         }
 
         if (!tensorTy) {
-            // Scalar atomic
+            // Scalar atomic: only thread 0 executes, broadcast result via TG.
+            // Without this, all threads execute the atomic independently,
+            // which corrupts spin-lock patterns (e.g. all threads doing
+            // xchg(Lock, 0) allows another group to acquire between threads).
+            auto i32Ty = IntegerType::get(ctx, 32);
+
+            // Get thread_position_in_threadgroup[0]
+            auto arrI32x3Ty = LLVMArrayType::get(i32Ty, 3);
+            auto tidFnTy = LLVMFunctionType::get(arrI32x3Ty, {}, false);
+            {
+                OpBuilder::InsertionGuard guard(rewriter);
+                rewriter.setInsertionPointToStart(mod.getBody());
+                if (!mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup"))
+                    LLVMFuncOp::create(rewriter, mod.getLoc(),
+                        "air.thread_position_in_threadgroup", tidFnTy, Linkage::External);
+            }
+            auto tidFn = mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup");
+
+            Value tidStruct = LLVM::CallOp::create(rewriter, loc, tidFn, ValueRange{}).getResult();
+            Value tid0 = LLVM::ExtractValueOp::create(rewriter, loc, i32Ty,
+                              tidStruct, ArrayRef<int64_t>{0});
+            Value zero = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+            Value isThread0 = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, tid0, zero);
+
+            // Combine thread-0 predicate with the op's own mask (e.g. sign-based
+            // masks from float atomic_max/min decomposition).
+            Value combinedMask = isThread0;
+            if (llMask) {
+                combinedMask = LLVM::AndOp::create(rewriter, loc, isThread0, llMask);
+            }
+
+            // Thread 0 (with mask) executes the atomic; others get a default value
             Value result = emitOneAtomic(rewriter, loc, mod, llPtr, llVal,
-                                         llMask, valueElemTy, rmwOp, airName, needsCAS);
+                                         combinedMask, valueElemTy, rmwOp, airName, needsCAS);
             rewriter.replaceOp(op, result);
             return success();
         }
@@ -1341,9 +1372,105 @@ struct AtomicCASOpAppleConversion
             return failure();
 
         if (!tensorTy) {
-            // Scalar CAS
-            Value result = emitOneCAS(rewriter, loc, mod, llPtr, llCmp, llVal, valueTy);
-            rewriter.replaceOp(op, result);
+            // Scalar CAS: only thread 0 executes, broadcast result to all threads.
+            // Without this, a spin-lock pattern (while CAS == 1) deadlocks:
+            // all threads spin independently but only one succeeds, and subsequent
+            // barriers can never be reached by the blocked threads.
+            auto *ctx = rewriter.getContext();
+            auto i32Ty = IntegerType::get(ctx, 32);
+
+            // Get thread_position_in_threadgroup[0] to identify thread 0
+            auto arrI32x3Ty = LLVMArrayType::get(i32Ty, 3);
+            auto tidFnTy = LLVMFunctionType::get(arrI32x3Ty, {}, false);
+            {
+                OpBuilder::InsertionGuard guard(rewriter);
+                rewriter.setInsertionPointToStart(mod.getBody());
+                if (!mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup"))
+                    LLVMFuncOp::create(rewriter, mod.getLoc(),
+                        "air.thread_position_in_threadgroup", tidFnTy, Linkage::External);
+            }
+            auto tidFn = mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup");
+
+            // Declare barrier
+            auto voidTy = LLVMVoidType::get(ctx);
+            auto barrFnTy = LLVMFunctionType::get(voidTy, {i32Ty, i32Ty}, false);
+            {
+                OpBuilder::InsertionGuard guard(rewriter);
+                rewriter.setInsertionPointToStart(mod.getBody());
+                if (!mod.lookupSymbol<LLVMFuncOp>("air.wg.barrier"))
+                    LLVMFuncOp::create(rewriter, mod.getLoc(),
+                        "air.wg.barrier", barrFnTy, Linkage::External);
+            }
+            auto barrFn = mod.lookupSymbol<LLVMFuncOp>("air.wg.barrier");
+
+            // Create TG global to broadcast the CAS result
+            Type tgElemTy = valueTy.isF32() ? (Type)i32Ty :
+                            valueTy.isF64() ? (Type)IntegerType::get(ctx, 64) : valueTy;
+            std::string tgName = "__tg_cas_bcast";
+            auto tgPtrTy = LLVMPointerType::get(ctx, 3);
+            {
+                OpBuilder::InsertionGuard guard(rewriter);
+                rewriter.setInsertionPointToStart(mod.getBody());
+                if (!mod.lookupSymbol<LLVM::GlobalOp>(tgName)) {
+                    auto arrTy = LLVMArrayType::get(tgElemTy, 1);
+                    LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy, false,
+                        Linkage::Internal, tgName, Attribute(), 4, 3u);
+                }
+            }
+            auto tgGlobal = mod.lookupSymbol<LLVM::GlobalOp>(tgName);
+            Value tgPtr = LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy, tgGlobal.getName());
+
+            // Get tid and check if tid == 0
+            Value tidStruct = LLVM::CallOp::create(rewriter, loc, tidFn, ValueRange{}).getResult();
+            Value tid0 = LLVM::ExtractValueOp::create(rewriter, loc, i32Ty,
+                              tidStruct, ArrayRef<int64_t>{0});
+            Value zero = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+            Value isThread0 = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, tid0, zero);
+
+            // Create blocks: thread0 does CAS and stores to TG; others skip to barrier
+            auto *currentBlock = rewriter.getInsertionBlock();
+            auto *afterBlock = rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+            auto *casBlock = rewriter.createBlock(afterBlock);
+            auto *mergeBlock = rewriter.createBlock(afterBlock);
+
+            // Branch: thread 0 → casBlock, others → mergeBlock
+            rewriter.setInsertionPointToEnd(currentBlock);
+            LLVM::CondBrOp::create(rewriter, loc, isThread0, casBlock, mergeBlock);
+
+            // casBlock: execute CAS, store result to TG
+            rewriter.setInsertionPointToStart(casBlock);
+            Value casResult = emitOneCAS(rewriter, loc, mod, llPtr, llCmp, llVal, valueTy);
+            Value resultToStore = casResult;
+            if (valueTy.isF32())
+                resultToStore = LLVM::BitcastOp::create(rewriter, loc, i32Ty, casResult);
+            else if (valueTy.isF64())
+                resultToStore = LLVM::BitcastOp::create(rewriter, loc, IntegerType::get(ctx, 64), casResult);
+            LLVM::StoreOp::create(rewriter, loc, resultToStore, tgPtr);
+            LLVM::BrOp::create(rewriter, loc, mergeBlock);
+
+            // mergeBlock: barrier then load from TG
+            rewriter.setInsertionPointToStart(mergeBlock);
+            // device memory fence (flag=1) to ensure the CAS side-effects are visible
+            Value flagDev = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+            Value scope1  = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+            LLVM::CallOp::create(rewriter, loc, barrFn, ValueRange{flagDev, scope1});
+            // TG memory fence (flag=2) to ensure the TG store is visible
+            Value flagTG  = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+            LLVM::CallOp::create(rewriter, loc, barrFn, ValueRange{flagTG, scope1});
+            Value loaded = LLVM::LoadOp::create(rewriter, loc, tgElemTy, tgPtr).getResult();
+            if (valueTy.isF32())
+                loaded = LLVM::BitcastOp::create(rewriter, loc, valueTy, loaded);
+            else if (valueTy.isF64())
+                loaded = LLVM::BitcastOp::create(rewriter, loc, valueTy, loaded);
+
+            // Move remaining ops after the load
+            rewriter.setInsertionPointAfter(loaded.getDefiningOp());
+            // Splice afterBlock's contents into mergeBlock
+            mergeBlock->getOperations().splice(mergeBlock->end(),
+                                                afterBlock->getOperations());
+            afterBlock->erase();
+
+            rewriter.replaceOp(op, loaded);
             return success();
         }
 
@@ -1757,6 +1884,18 @@ struct ApplePrintOpConversion
     }
 };
 
+// Lower triton::AssertOp → no-op (Metal has no device-side assert).
+struct AppleAssertOpConversion
+    : public ConvertOpToLLVMPattern<triton::AssertOp> {
+    using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+    LogicalResult matchAndRewrite(triton::AssertOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter) const override {
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
 // Lower triton::CallOp → LLVM::CallOp for Apple device function calls.
 // Unlike CUDA, we don't append shared memory stack pointers.
 struct AppleCallOpConversion
@@ -2057,6 +2196,9 @@ struct ConvertTritonAppleGPUToLLVMPass
 
         // PrintOp → no-op (Metal has no printf)
         patterns.add<ApplePrintOpConversion>(typeConverter, patternBenefitDefault + 10);
+
+        // AssertOp → no-op (Metal has no device-side assert)
+        patterns.add<AppleAssertOpConversion>(typeConverter, patternBenefitDefault + 10);
 
         // GetNumProgramsOp → air.threadgroups_per_grid
         patterns.add<GetNumProgramsOpAppleConversion>(typeConverter,

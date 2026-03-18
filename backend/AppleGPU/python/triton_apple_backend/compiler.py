@@ -12,6 +12,35 @@ import os
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm
 
+# Patch libdevice stubs to use tl.* intrinsics (no CUDA libdevice on MPS).
+# Deferred to avoid circular imports — runs on first kernel compilation.
+_libdevice_patched = False
+def _patch_libdevice():
+    global _libdevice_patched
+    if _libdevice_patched:
+        return
+    _libdevice_patched = True
+
+    import triton.language as tl
+    from triton.language.extra import libdevice
+
+    # Direct tl.* mappings
+    _map = {
+        'exp': tl.exp, 'exp2': tl.exp2, 'log': tl.log, 'log2': tl.log2,
+        'sin': tl.sin, 'cos': tl.cos, 'sqrt': tl.sqrt, 'abs': tl.abs,
+        'fabs': tl.abs,
+    }
+    # tl.math.* mappings (check existence)
+    for name in ['floor', 'ceil', 'trunc', 'nearbyint', 'isinf', 'isnan',
+                 'rsqrt', 'erf', 'tanh']:
+        fn = getattr(tl.math, name, None) if hasattr(tl, 'math') else None
+        if fn is not None:
+            _map[name] = fn
+
+    for name, fn in _map.items():
+        if hasattr(libdevice, name):
+            setattr(libdevice, name, fn)
+
 # Apple MLIR passes loaded via TRITON_PASS_PLUGIN_PATH plugin dylib.
 # The plugin registers passes as passes.plugin.<name>(pm) and
 # the TritonAppleGPU dialect automatically on dlopen.
@@ -109,6 +138,7 @@ class MPSBackend(BaseBackend):
 
     def __init__(self, target: GPUTarget):
         super().__init__(target)
+        _patch_libdevice()
         self.target = target
         self.binary_ext = "metallib"
         if not _plugin:

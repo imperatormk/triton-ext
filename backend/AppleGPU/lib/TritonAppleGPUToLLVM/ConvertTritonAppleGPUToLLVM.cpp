@@ -1642,6 +1642,129 @@ struct AppleCallOpConversion
     }
 };
 
+// Lower ExternElementwiseOp (libdevice calls) to LLVM intrinsics.
+// Maps __nv_exp → llvm.exp.f32, __nv_sin → llvm.sin.f32, etc.
+struct ExternElementwiseOpAppleConversion
+    : public mlir::triton::gpu::ElementwiseOpConversionBase<
+          triton::ExternElementwiseOp,
+          ExternElementwiseOpAppleConversion> {
+    using Base = mlir::triton::gpu::ElementwiseOpConversionBase<
+        triton::ExternElementwiseOp,
+        ExternElementwiseOpAppleConversion>;
+    using Base::Base;
+
+    SmallVector<Value> createDestOps(
+        triton::ExternElementwiseOp op, OpAdaptor adaptor,
+        ConversionPatternRewriter &rewriter, Type elemTy,
+        gpu::MultipleOperandsRange operands, Location loc) const {
+
+        StringRef symbol = op.getSymbol();
+
+        // Map libdevice symbols to LLVM intrinsic names
+        // __nv_exp → llvm.exp, __nv_sin → llvm.sin, etc.
+        static const llvm::StringMap<StringRef> unaryMap = {
+            {"__nv_exp",      "llvm.exp"},
+            {"__nv_exp2",     "llvm.exp2"},
+            {"__nv_log",      "llvm.log"},
+            {"__nv_log2",     "llvm.log2"},
+            {"__nv_log10",    "llvm.log10"},
+            {"__nv_sin",      "llvm.sin"},
+            {"__nv_cos",      "llvm.cos"},
+            {"__nv_sqrt",     "llvm.sqrt"},
+            {"__nv_rsqrt",    "llvm.sqrt"},  // will invert
+            {"__nv_fabs",     "llvm.fabs"},
+            {"__nv_fabsf",    "llvm.fabs"},
+            {"__nv_floor",    "llvm.floor"},
+            {"__nv_floorf",   "llvm.floor"},
+            {"__nv_ceil",     "llvm.ceil"},
+            {"__nv_ceilf",    "llvm.ceil"},
+            {"__nv_trunc",    "llvm.trunc"},
+            {"__nv_truncf",   "llvm.trunc"},
+            {"__nv_nearbyint","llvm.nearbyint"},
+            {"__nv_rint",     "llvm.rint"},
+            {"__nv_llrint",   "llvm.lrint"},
+            {"__nv_expm1",    "llvm.exp"},   // approx: will subtract 1
+        };
+        static const llvm::StringMap<StringRef> binaryMap = {
+            {"__nv_copysign",  "llvm.copysign"},
+            {"__nv_copysignf", "llvm.copysign"},
+            {"__nv_fmax",      "llvm.maxnum"},
+            {"__nv_fmaxf",     "llvm.maxnum"},
+            {"__nv_fmin",      "llvm.minnum"},
+            {"__nv_fminf",     "llvm.minnum"},
+            {"__nv_pow",       "llvm.pow"},
+            {"__nv_powf",      "llvm.pow"},
+            {"__nv_atan2",     ""},  // no direct intrinsic
+            {"__nv_atan2f",    ""},
+            {"__nv_fmod",      ""},
+            {"__nv_fmodf",     ""},
+        };
+
+        // Unary intrinsics
+        auto uit = unaryMap.find(symbol);
+        if (uit != unaryMap.end() && !uit->second.empty()) {
+            StringRef intrName = uit->second;
+            // Build type-suffixed name: llvm.exp → llvm.exp.f32
+            std::string fullName = (intrName + "." +
+                (elemTy.isF32() ? "f32" : elemTy.isF64() ? "f64" : "f16")).str();
+
+            auto funcTy = LLVM::LLVMFunctionType::get(elemTy, {elemTy});
+            auto funcOp = mlir::triton::gpu::appendOrGetExternFuncOp(
+                rewriter, op, fullName, funcTy);
+            Value result = LLVM::createLLVMCallOp(
+                rewriter, loc, funcOp, operands[0]).getResult();
+
+            // rsqrt = 1.0 / sqrt
+            if (symbol.contains("rsqrt")) {
+                Value one = LLVM::ConstantOp::create(rewriter, loc, elemTy,
+                    rewriter.getFloatAttr(elemTy, 1.0));
+                result = LLVM::FDivOp::create(rewriter, loc, one, result);
+            }
+            // expm1 = exp(x) - 1
+            if (symbol.contains("expm1")) {
+                Value one = LLVM::ConstantOp::create(rewriter, loc, elemTy,
+                    rewriter.getFloatAttr(elemTy, 1.0));
+                result = LLVM::FSubOp::create(rewriter, loc, result, one);
+            }
+            return {result};
+        }
+
+        // Binary intrinsics
+        auto bit = binaryMap.find(symbol);
+        if (bit != binaryMap.end() && !bit->second.empty()) {
+            StringRef intrName = bit->second;
+            std::string fullName = (intrName + "." +
+                (elemTy.isF32() ? "f32" : elemTy.isF64() ? "f64" : "f16")).str();
+            auto funcTy = LLVM::LLVMFunctionType::get(elemTy, {elemTy, elemTy});
+            auto funcOp = mlir::triton::gpu::appendOrGetExternFuncOp(
+                rewriter, op, fullName, funcTy);
+            SmallVector<Value> args = {operands[0][0], operands[0][1]};
+            return {LLVM::createLLVMCallOp(
+                rewriter, loc, funcOp, args).getResult()};
+        }
+
+        // fmod → LLVM::FRemOp
+        if (symbol.contains("fmod")) {
+            return {LLVM::FRemOp::create(rewriter, loc, elemTy,
+                operands[0][0], operands[0][1])};
+        }
+
+        // Trig functions not in LLVM intrinsics — use math lib calls
+        // tan, asin, acos, atan, atan2, sinh, cosh, tanh, asinh, acosh, atanh
+        // For now, emit as external function calls (the metal-ir-pipeline
+        // LLVMToAIRIntrinsics pass will map them to air.* builtins)
+        {
+            auto funcTy = operands[0].size() == 1
+                ? LLVM::LLVMFunctionType::get(elemTy, {elemTy})
+                : LLVM::LLVMFunctionType::get(elemTy, {elemTy, elemTy});
+            auto funcOp = mlir::triton::gpu::appendOrGetExternFuncOp(
+                rewriter, op, symbol, funcTy);
+            return {LLVM::createLLVMCallOp(
+                rewriter, loc, funcOp, operands[0]).getResult()};
+        }
+    }
+};
+
 struct ConvertTritonAppleGPUToLLVMPass
     : public PassWrapper<ConvertTritonAppleGPUToLLVMPass,
                          OperationPass<ModuleOp>> {
@@ -1799,6 +1922,13 @@ struct ConvertTritonAppleGPUToLLVMPass
         POPULATE_FLOAT_OP(arith::SIToFPOp, LLVM::SIToFPOp);
         POPULATE_FLOAT_OP(arith::FPToSIOp, LLVM::FPToSIOp);
 #undef POPULATE_FLOAT_OP
+
+        // ExternElementwiseOp: lower libdevice calls to LLVM intrinsics.
+        // Inductor emits libdevice.exp, libdevice.sin, etc. which on CUDA
+        // link to __nv_* functions. On MPS, map to llvm.* intrinsics.
+        patterns.add<ExternElementwiseOpAppleConversion>(
+            typeConverter, axisInfoAnalysis, patternBenefitDefault + 10);
+
         mlir::triton::populateViewOpToLLVMPatterns(
             typeConverter, patterns, patternBenefitDefault + 1);
         // Expand math::ErfOp to polynomial approximation before MathToLLVM

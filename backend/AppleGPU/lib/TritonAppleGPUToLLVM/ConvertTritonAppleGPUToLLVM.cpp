@@ -1400,6 +1400,176 @@ struct AtomicCASOpAppleConversion
     }
 };
 
+// Safe tt.store lowering: use conditional branch instead of read-modify-write.
+//
+// The LoadStoreToLLVM.cpp StoreOpConversion uses a read-modify-write pattern
+// for masked stores: load(ptr); select(mask, val, loaded); store(ptr).
+// This is broken when masked-out pointers alias with other threads' valid
+// addresses (e.g., when M < RBLOCK and row strides cause overlap), creating
+// race conditions and data corruption.
+//
+// This pattern uses a conditional branch: if (mask) store(val, ptr), which
+// is safe regardless of the pointer value when the mask is false.
+struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
+    using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+    static SmallVector<Value> unpackElems(Value v, OpBuilder &b, Location loc) {
+        if (!v) return {};
+        if (auto sTy = dyn_cast<LLVMStructType>(v.getType())) {
+            SmallVector<Value> elems(sTy.getBody().size());
+            for (size_t i = 0; i < elems.size(); ++i)
+                elems[i] = ExtractValueOp::create(b, loc, sTy.getBody()[i], v,
+                                                   ArrayRef<int64_t>{(int64_t)i});
+            return elems;
+        }
+        return {v};
+    }
+
+    LogicalResult matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        Value ptr = adaptor.getPtr();
+        Value val = adaptor.getValue();
+
+        auto ptrs = unpackElems(ptr, rewriter, loc);
+        auto vals = unpackElems(val, rewriter, loc);
+
+        if (ptrs.size() != vals.size())
+            return failure();
+
+        Value maskOperand = adaptor.getMask();
+        auto masks = maskOperand ? unpackElems(maskOperand, rewriter, loc)
+                                 : SmallVector<Value>{};
+
+        for (size_t i = 0; i < ptrs.size(); ++i) {
+            if (!masks.empty() && masks[i]) {
+                // Use conditional branch: if (mask) store(val, ptr)
+                // This avoids the read-modify-write of LoadStoreToLLVM which
+                // causes data corruption when masked-out pointers alias valid data.
+                auto *curBlock = rewriter.getInsertionBlock();
+                auto curPoint = rewriter.getInsertionPoint();
+                auto *endBlock = curBlock->splitBlock(curPoint);
+                auto *thenBlock = rewriter.createBlock(endBlock);
+                rewriter.setInsertionPointToEnd(curBlock);
+                LLVM::CondBrOp::create(rewriter, loc, masks[i],
+                    thenBlock, endBlock);
+                rewriter.setInsertionPointToEnd(thenBlock);
+                LLVM::StoreOp::create(rewriter, loc, vals[i], ptrs[i]);
+                LLVM::BrOp::create(rewriter, loc, endBlock);
+                rewriter.setInsertionPointToStart(endBlock);
+            } else {
+                LLVM::StoreOp::create(rewriter, loc, vals[i], ptrs[i]);
+            }
+        }
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// Safe tt.load lowering: use conditional branch for masked loads.
+//
+// Similar to SafeStoreOpConversion, the LoadStoreToLLVM.cpp LoadOpConversion
+// unconditionally loads from the pointer (even when masked out), then selects
+// the result. Loading from out-of-bounds pointers is undefined behavior on
+// Metal. This pattern uses a conditional branch to avoid the invalid load.
+struct SafeLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
+    using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+    static SmallVector<Value> unpackElems(Value v, OpBuilder &b, Location loc) {
+        if (!v) return {};
+        if (auto sTy = dyn_cast<LLVMStructType>(v.getType())) {
+            SmallVector<Value> elems(sTy.getBody().size());
+            for (size_t i = 0; i < elems.size(); ++i)
+                elems[i] = ExtractValueOp::create(b, loc, sTy.getBody()[i], v,
+                                                   ArrayRef<int64_t>{(int64_t)i});
+            return elems;
+        }
+        return {v};
+    }
+
+    static Value packElems(ArrayRef<Value> elems, OpBuilder &b, Location loc) {
+        SmallVector<Type> tys;
+        for (auto v : elems) tys.push_back(v.getType());
+        auto sTy = LLVMStructType::getLiteral(b.getContext(), tys);
+        Value result = UndefOp::create(b, loc, sTy);
+        for (size_t i = 0; i < elems.size(); ++i)
+            result = InsertValueOp::create(b, loc, sTy, result, elems[i],
+                                            ArrayRef<int64_t>{(int64_t)i});
+        return result;
+    }
+
+    LogicalResult matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        Value ptr = adaptor.getPtr();
+        Type resultTy = getTypeConverter()->convertType(op.getType());
+        if (!resultTy) return failure();
+
+        // Scalar load: bare pointer
+        if (!isa<LLVMStructType>(ptr.getType())) {
+            Value maskOperand = adaptor.getMask();
+            Value otherOperand = adaptor.getOther();
+            if (maskOperand) {
+                Value other = otherOperand
+                    ? otherOperand
+                    : LLVM::ZeroOp::create(rewriter, loc, resultTy);
+                // Load unconditionally, select result.
+                // For scalar loads the pointer is always valid.
+                Value val = LLVM::LoadOp::create(rewriter, loc, resultTy, ptr);
+                val = LLVM::SelectOp::create(rewriter, loc, maskOperand, val, other);
+                rewriter.replaceOp(op, val);
+            } else {
+                Value val = LLVM::LoadOp::create(rewriter, loc, resultTy, ptr);
+                rewriter.replaceOp(op, val);
+            }
+            return success();
+        }
+
+        // Tensor load: struct of pointers
+        auto ptrs = unpackElems(ptr, rewriter, loc);
+        auto sTy = dyn_cast<LLVMStructType>(resultTy);
+        if (!sTy || sTy.getBody().size() != ptrs.size())
+            return failure();
+
+        Value maskOperand = adaptor.getMask();
+        Value otherOperand = adaptor.getOther();
+        auto masks = maskOperand ? unpackElems(maskOperand, rewriter, loc)
+                                  : SmallVector<Value>{};
+        auto others = otherOperand ? unpackElems(otherOperand, rewriter, loc)
+                                    : SmallVector<Value>{};
+
+        SmallVector<Value> loaded;
+        for (size_t i = 0; i < ptrs.size(); ++i) {
+            if (!masks.empty()) {
+                Value other = others.empty()
+                    ? LLVM::ZeroOp::create(rewriter, loc, sTy.getBody()[i])
+                    : others[i];
+                // Conditional load via branch to avoid accessing invalid pointers
+                // when the mask is false (e.g., rindex >= M with M < RBLOCK).
+                auto *curBlock = rewriter.getInsertionBlock();
+                auto curPoint = rewriter.getInsertionPoint();
+                auto *endBlock = curBlock->splitBlock(curPoint);
+                auto *thenBlock = rewriter.createBlock(endBlock);
+                endBlock->addArgument(sTy.getBody()[i], loc);
+                rewriter.setInsertionPointToEnd(curBlock);
+                LLVM::CondBrOp::create(rewriter, loc, masks[i],
+                    thenBlock, ValueRange{},
+                    endBlock, ValueRange{other});
+                rewriter.setInsertionPointToEnd(thenBlock);
+                Value val = LLVM::LoadOp::create(rewriter, loc, sTy.getBody()[i], ptrs[i]);
+                LLVM::BrOp::create(rewriter, loc, ValueRange{val}, endBlock);
+                rewriter.setInsertionPointToStart(endBlock);
+                loaded.push_back(endBlock->getArgument(0));
+            } else {
+                loaded.push_back(
+                    LLVM::LoadOp::create(rewriter, loc, sTy.getBody()[i], ptrs[i]));
+            }
+        }
+        rewriter.replaceOp(op, packElems(loaded, rewriter, loc));
+        return success();
+    }
+};
+
 // Lower ttg::WarpIdOp → air.dispatch_thread_id[0] / threadsPerWarp.
 struct WarpIdOpConversion
     : public mlir::ConvertOpToLLVMPattern<triton::gpu::WarpIdOp> {
@@ -1873,6 +2043,13 @@ struct ConvertTritonAppleGPUToLLVMPass
                                      patternBenefitDefault);
         populateLoadStoreToLLVMPatterns(typeConverter, patterns,
                                          patternBenefitDefault);
+
+        // Safe masked load/store: use conditional branches instead of
+        // read-modify-write. Higher priority than LoadStoreToLLVM patterns.
+        patterns.add<SafeStoreOpConversion>(
+            typeConverter, PatternBenefit(patternBenefitDefault + 10));
+        patterns.add<SafeLoadOpConversion>(
+            typeConverter, PatternBenefit(patternBenefitDefault + 10));
 
 
         // WarpIdOp → tid / 32 (needed by shared range/layout helpers)

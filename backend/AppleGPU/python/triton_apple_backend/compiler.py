@@ -21,6 +21,7 @@ def _patch_libdevice():
         return
     _libdevice_patched = True
 
+    import triton
     import triton.language as tl
     from triton.language.extra import libdevice
 
@@ -38,6 +39,20 @@ def _patch_libdevice():
             _map[name] = fn
 
     for name, fn in _map.items():
+        if hasattr(libdevice, name):
+            setattr(libdevice, name, fn)
+
+    # Composite stubs: functions that need tl.* composition.
+    # These use @triton.jit so they work inside JIT kernels.
+    @triton.jit
+    def _log1p(x):
+        return tl.log(1.0 + x)
+
+    @triton.jit
+    def _cbrt(x):
+        return tl.math.pow(x, 1.0 / 3.0) if hasattr(tl.math, 'pow') else x
+
+    for name, fn in [('log1p', _log1p), ('cbrt', _cbrt)]:
         if hasattr(libdevice, name):
             setattr(libdevice, name, fn)
 

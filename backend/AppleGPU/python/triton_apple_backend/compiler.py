@@ -124,9 +124,9 @@ def _get_metalir_compile():
 @dataclass(frozen=True)
 class MPSOptions:
     num_warps: int = 4
-    num_stages: int = 2
+    num_stages: int = 1
     num_ctas: int = 1
-    arch: str = "apple_m1"
+    arch: str = "apple_m"
     backend_name: str = "mps"
 
     # simdgroup tile — fixed by hardware

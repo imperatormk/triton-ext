@@ -2585,8 +2585,9 @@ struct ConvertTritonAppleGPUToLLVMPass
             mod.walk([&](mlir::triton::DotOp dot) {
                 auto aType = cast<RankedTensorType>(dot.getA().getType());
                 auto cType = cast<RankedTensorType>(dot.getC().getType());
-                int64_t K = aType.getShape()[1];
-                int64_t N = cType.getShape()[1];
+                unsigned dotRank = cType.getRank();
+                int64_t K = aType.getShape()[dotRank - 1];
+                int64_t N = cType.getShape()[dotRank - 1];
                 int64_t tgFloats = 8 * std::max(K, N) + 1;
                 int64_t tgBytes = tgFloats * 4;  // f32
                 maxMmaBytes = std::max(maxMmaBytes, tgBytes);

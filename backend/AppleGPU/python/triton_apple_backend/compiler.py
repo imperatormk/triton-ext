@@ -219,6 +219,14 @@ class MPSBackend(BaseBackend):
         passes.ttgpuir.add_fuse_nested_loops(pm)
         passes.common.add_canonicalizer(pm)
 
+        # Software pipeliner: multi-buffer loads across loop iterations.
+        # Generates ttg.async_copy_global_to_local + async_commit + async_wait
+        # which we lower to air.simdgroup_async_copy_2d (hardware DMA).
+        if options.num_stages > 1:
+            passes.ttgpuir.add_assign_latencies(pm, options.num_stages)
+            passes.ttgpuir.add_schedule_loops(pm)
+            passes.ttgpuir.add_pipeline(pm, options.num_stages, False)
+
         pm.run(mod, 'make_ttgir')
         # Preliminary shared memory estimate (reduction scratchpad only).
         # Overwritten in make_llir with the real total after convert_layout

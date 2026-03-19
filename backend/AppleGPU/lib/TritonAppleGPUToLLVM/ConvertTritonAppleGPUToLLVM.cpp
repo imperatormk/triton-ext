@@ -2074,6 +2074,464 @@ struct ExternElementwiseOpAppleConversion
     }
 };
 
+// ── Pipeliner async copy lowering ────────────────────────────────────────
+//
+// Lower ttg.async_copy_global_to_local → synchronous per-element copy
+// Lower ttg.async_commit_group → no-op (token = 0)
+// Lower ttg.async_wait → threadgroup barrier
+//
+// The Triton software pipeliner generates these ops for multi-buffered
+// load-compute overlap. On NVIDIA, async_copy lowers to cp.async (hw DMA).
+// On Apple GPU, we lower to per-element loads + shared memory stores
+// using Triton's lowerLocalLdSt for correct layout mapping.
+//
+// The pipeliner's multi-buffering still provides benefit by structuring
+// the code for compute/copy overlap across loop iterations.
+//
+// When possible, we emit true async DMA via air.simdgroup_async_copy_2d.
+// This requires: (1) extractable row stride from the MLIR def chain,
+// (2) no mask (unmasked copy), (3) 2D tile.
+// Otherwise we fall back to sync per-element copy via lowerLocalLdSt.
+
+// Helper: get or create an external function declaration in the module
+static LLVMFuncOp getOrCreateFn(ModuleOp mod, RewriterBase &rewriter,
+                                 StringRef name, Type retTy,
+                                 ArrayRef<Type> argTys) {
+    if (auto fn = mod.lookupSymbol<LLVMFuncOp>(name))
+        return fn;
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(mod.getBody());
+    auto fnTy = LLVMFunctionType::get(retTy, argTys, false);
+    return LLVMFuncOp::create(rewriter, mod.getLoc(), name, fnTy,
+                               Linkage::External);
+}
+
+// Get or create a thread-local alloca for async copy event storage.
+// Returns a ptr (addrspace 0) pointing to a single ptr addrspace(3) slot.
+// The alloca is placed in the function's entry block so it's visible to both
+// async copy and wait patterns.
+//
+// IMPORTANT: Metal's air.wait_simdgroup_events expects a thread-local
+// (addrspace 0) pointer-to-pointer, NOT a threadgroup (addrspace 3) pointer.
+// Using a TG global crashes the GPU compiler.
+//
+// The alloca type is `ptr addrspace(3)` (a single event pointer), matching
+// the reference pattern: `%ev = alloca %event_t addrspace(3)*, align 8`.
+// Metal v1 bitcode doesn't handle arrays of typed pointers well.
+static Value getOrCreateEventAlloca(Operation *op, RewriterBase &rewriter) {
+    auto *ctx = op->getContext();
+    auto ptrTy3 = LLVMPointerType::get(ctx, 3);
+    auto ptrTy0 = LLVMPointerType::get(ctx, 0);
+
+    // Find the enclosing function
+    auto funcOp = op->getParentOfType<LLVM::LLVMFuncOp>();
+
+    // Look for existing alloca with our event pointer type in the entry block
+    if (funcOp) {
+        auto &entryBlock = funcOp.getBody().front();
+        for (auto &existingOp : entryBlock) {
+            if (auto alloca = dyn_cast<LLVM::AllocaOp>(existingOp)) {
+                if (alloca.getElemType() == ptrTy3) {
+                    return alloca.getResult();
+                }
+            }
+        }
+    }
+
+    // Create new alloca at function entry
+    OpBuilder::InsertionGuard guard(rewriter);
+    if (funcOp) {
+        auto &entryBlock = funcOp.getBody().front();
+        rewriter.setInsertionPointToStart(&entryBlock);
+    }
+
+    auto i64Ty = IntegerType::get(ctx, 64);
+    Value one = LLVM::ConstantOp::create(rewriter, op->getLoc(), i64Ty,
+        rewriter.getI64IntegerAttr(1));
+    auto alloca = LLVM::AllocaOp::create(rewriter, op->getLoc(), ptrTy0,
+        ptrTy3, one, /*alignment=*/8);
+    return alloca.getResult();
+}
+
+// Extract the row stride scalar from a pointer tensor's MLIR def chain.
+//
+// Pattern: async_copy src = tt.addptr(broadcast(addptr(splat(base),
+//                          muli(expand_dims(row_offs), splat(STRIDE)))),
+//                          broadcast(col_offs))
+//
+// Returns the MLIR Value for the stride scalar, or nullptr if not found.
+// The stride is in ELEMENTS (not bytes) — caller multiplies by elemBytes.
+static Value extractRowStrideFromMLIR(Value ptrTensor) {
+    // Walk: ptrTensor → addptr → broadcast → addptr → muli → splat(stride)
+    auto *addptrOp = ptrTensor.getDefiningOp();
+    if (!addptrOp || !isa<triton::AddPtrOp>(addptrOp)) return nullptr;
+
+    // The first operand of the outer addptr is broadcast(inner_addptr)
+    Value broadcastedBase = addptrOp->getOperand(0);
+    auto *broadcastOp = broadcastedBase.getDefiningOp();
+    if (!broadcastOp || !isa<triton::BroadcastOp>(broadcastOp)) return nullptr;
+
+    Value innerAddptr = broadcastOp->getOperand(0);
+    auto *innerOp = innerAddptr.getDefiningOp();
+    if (!innerOp || !isa<triton::AddPtrOp>(innerOp)) return nullptr;
+
+    // The second operand of innerAddptr is the row offset:
+    // muli(expand_dims(row_range), splat(stride))
+    Value rowOffset = innerOp->getOperand(1);
+    auto *muliOp = rowOffset.getDefiningOp();
+    if (!muliOp || !isa<arith::MulIOp>(muliOp)) return nullptr;
+
+    // One operand of muli is expand_dims(range), the other is splat(stride)
+    for (unsigned i = 0; i < 2; i++) {
+        auto *splatOp = muliOp->getOperand(i).getDefiningOp();
+        if (splatOp && isa<triton::SplatOp>(splatOp)) {
+            // Found splat — its scalar operand is the stride
+            return splatOp->getOperand(0);
+        }
+    }
+    return nullptr;
+}
+
+struct AsyncCopyGlobalToLocalOpAppleConversion
+    : public ConvertOpToLLVMPattern<ttg::AsyncCopyGlobalToLocalOp> {
+    using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+    // Sync fallback: per-element load from device + store to shared memory
+    LogicalResult lowerSyncCopy(
+        ttg::AsyncCopyGlobalToLocalOp op, OpAdaptor adaptor,
+        ConversionPatternRewriter &rewriter) const {
+        auto loc = op.getLoc();
+        auto *ctx = op.getContext();
+
+        auto srcTy = op.getSrc().getType();
+        auto dstTy = op.getResult().getType();
+        auto elemTy = getTypeConverter()->convertType(dstTy.getElementType());
+
+        Value llSrc = adaptor.getSrc();
+        Value llDst = adaptor.getResult();
+        Value llMask = adaptor.getMask();
+
+        auto srcElems = unpackLLElements(loc, llSrc, rewriter);
+        if (srcElems.empty()) return failure();
+
+        SmallVector<Value> maskElems;
+        if (llMask)
+            maskElems = unpackLLElements(loc, llMask, rewriter);
+
+        auto i32Ty = IntegerType::get(ctx, 32);
+
+        SmallVector<Value> loadedVals;
+        unsigned numElems = srcElems.size();
+        for (unsigned i = 0; i < numElems; i++) {
+            Value loaded;
+            if (maskElems.empty()) {
+                loaded = LLVM::LoadOp::create(rewriter, loc, elemTy,
+                                               srcElems[i]);
+            } else {
+                Value mask = maskElems[i];
+                Value zero;
+                if (elemTy.isIntOrIndex())
+                    zero = LLVM::ConstantOp::create(rewriter, loc, elemTy,
+                        rewriter.getIntegerAttr(elemTy, 0));
+                else
+                    zero = LLVM::ConstantOp::create(rewriter, loc, elemTy,
+                        rewriter.getFloatAttr(elemTy, 0.0));
+                Value val = LLVM::LoadOp::create(rewriter, loc, elemTy,
+                                                  srcElems[i]);
+                loaded = LLVM::SelectOp::create(rewriter, loc, mask, val, zero);
+            }
+            loadedVals.push_back(loaded);
+        }
+
+        auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+            loc, llDst, elemTy, rewriter);
+
+        auto regLayout = ttg::toLinearLayout(srcTy);
+        auto sharedLayout = ttg::toLinearLayout(dstTy);
+        auto cvt = regLayout.invertAndCompose(sharedLayout);
+
+        TargetInfo targetInfo;
+        lowerLocalLdSt(loc, ctx, cvt, loadedVals, elemTy, dstTy, smemObj,
+                       rewriter, targetInfo);
+
+        Value zeroToken = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(0));
+        rewriter.replaceOp(op, zeroToken);
+        return success();
+    }
+
+    // Check if the MLIR mask is a tt.splat of a scalar i1.
+    // The pipeliner generates: %mask_scalar = arith.cmpi ... ; %mask = tt.splat %mask_scalar
+    // When this pattern holds, the mask is uniform (all-true or all-false),
+    // so we can gate the async DMA on the scalar boolean.
+    // Returns the scalar MLIR Value, or nullptr if not a splat.
+    static Value extractScalarMask(Value mask) {
+        if (!mask) return nullptr;
+        auto *defOp = mask.getDefiningOp();
+        if (!defOp || !isa<triton::SplatOp>(defOp)) return nullptr;
+        Value scalar = defOp->getOperand(0);
+        if (!scalar.getType().isInteger(1)) return nullptr;
+        return scalar;
+    }
+
+    LogicalResult matchAndRewrite(
+        ttg::AsyncCopyGlobalToLocalOp op, OpAdaptor adaptor,
+        ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        auto *ctx = op.getContext();
+        auto mod = op->getParentOfType<ModuleOp>();
+
+        auto srcTy = op.getSrc().getType();
+        auto dstTy = op.getResult().getType();
+        auto elemTy = getTypeConverter()->convertType(dstTy.getElementType());
+
+        Value llMask = adaptor.getMask();
+
+        // Try async DMA path: requires 2D and extractable stride.
+        // Mask must be absent or a uniform splat (scalar boolean).
+        auto shape = srcTy.getShape();
+        bool canAsyncDMA = (shape.size() == 2);
+
+        // Check mask: either absent, or a splat of scalar i1
+        Value mlirMaskScalar;
+        Value llvmMaskScalar;
+        if (canAsyncDMA && llMask) {
+            mlirMaskScalar = extractScalarMask(op.getMask());
+            if (mlirMaskScalar) {
+                llvmMaskScalar = rewriter.getRemappedValue(mlirMaskScalar);
+                if (!llvmMaskScalar)
+                    canAsyncDMA = false;  // can't get LLVM value for mask
+            } else {
+                canAsyncDMA = false;  // non-uniform mask, can't use DMA
+            }
+        }
+
+        Value mlirStride;
+        Value llvmStride;
+        if (canAsyncDMA) {
+            mlirStride = extractRowStrideFromMLIR(op.getSrc());
+            if (mlirStride) {
+                llvmStride = rewriter.getRemappedValue(mlirStride);
+                if (!llvmStride)
+                    canAsyncDMA = false;
+            } else {
+                canAsyncDMA = false;
+            }
+        }
+
+        if (!canAsyncDMA)
+            return lowerSyncCopy(op, adaptor, rewriter);
+
+        // ── Async DMA path via air.simdgroup_async_copy_2d ──
+
+        auto i32Ty = IntegerType::get(ctx, 32);
+        auto i64Ty = IntegerType::get(ctx, 64);
+        auto ptrTy1 = LLVMPointerType::get(ctx, 1);  // device
+        auto ptrTy3 = LLVMPointerType::get(ctx, 3);  // threadgroup
+        auto vec2i64Ty = VectorType::get({2}, i64Ty);
+
+        // Element size in bytes
+        unsigned elemBits = elemTy.getIntOrFloatBitWidth();
+        unsigned elemBytes = elemBits / 8;
+
+        // Tile geometry
+        int64_t tileRows = shape[0];
+        int64_t tileCols = shape[1];
+        int64_t tileWidthBytes = tileCols * elemBytes;
+
+        // Source stride in bytes: llvmStride (elements) * elemBytes
+        // llvmStride may be i32 — extend to i64
+        Value strideI64 = llvmStride;
+        if (llvmStride.getType() != i64Ty) {
+            strideI64 = LLVM::SExtOp::create(rewriter, loc, i64Ty, llvmStride);
+        }
+        Value elemBytesVal = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+            rewriter.getI64IntegerAttr(elemBytes));
+        Value srcStrideBytes = LLVM::MulOp::create(rewriter, loc, i64Ty,
+            strideI64, elemBytesVal);
+
+        // Destination stride in bytes (TG is packed, no padding)
+        Value dstStrideBytes = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+            rewriter.getI64IntegerAttr(tileWidthBytes));
+
+        // Source base pointer: first element from per-thread pointers (srcElems[0])
+        // For thread 0, this is the tile's top-left corner in device memory.
+        Value llSrc = adaptor.getSrc();
+        auto srcElems = unpackLLElements(loc, llSrc, rewriter);
+        if (srcElems.empty()) return failure();
+        Value srcBase = srcElems[0];
+
+        // Destination base pointer: shared memory object base
+        Value llDst = adaptor.getResult();
+        auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+            loc, llDst, elemTy, rewriter);
+        Value dstBase = smemObj.getBase();
+
+        // Build tile size vectors: <width_bytes, height_rows>
+        Value widthVal = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+            rewriter.getI64IntegerAttr(tileWidthBytes));
+        Value heightVal = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+            rewriter.getI64IntegerAttr(tileRows));
+
+        // Source tile = <tileWidthBytes, tileRows>
+        Value tileVec = LLVM::UndefOp::create(rewriter, loc, vec2i64Ty);
+        Value idx0 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(0));
+        Value idx1 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(1));
+        tileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
+            tileVec, widthVal, idx0);
+        tileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
+            tileVec, heightVal, idx1);
+
+        // Offset = <0, 0>
+        Value zeroI64 = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+            rewriter.getI64IntegerAttr(0));
+        Value offsetVec = LLVM::UndefOp::create(rewriter, loc, vec2i64Ty);
+        offsetVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
+            offsetVec, zeroI64, idx0);
+        offsetVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
+            offsetVec, zeroI64, idx1);
+
+        // sizeof=1, alignof=1 (byte-granularity copy)
+        Value one64 = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+            rewriter.getI64IntegerAttr(1));
+
+        // clamp = 0
+        Value clamp = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(0));
+
+        // Declare air.simdgroup_async_copy_2d.p3i8.p1i8
+        // Returns ptr addrspace(3) (event pointer)
+        auto asyncCopyFn = getOrCreateFn(mod, rewriter,
+            "air.simdgroup_async_copy_2d.p3i8.p1i8", ptrTy3,
+            {i64Ty, i64Ty,                              // sizeof, alignof
+             ptrTy3, i64Ty, i64Ty, vec2i64Ty,           // dst, dstStride, dstElemStride, dstTile
+             ptrTy1, i64Ty, i64Ty, vec2i64Ty,           // src, srcStride, srcElemStride, srcTile
+             vec2i64Ty, i32Ty});                         // offset, clamp
+
+        // Get event alloca (created once per function)
+        Value evAlloca = getOrCreateEventAlloca(op, rewriter);
+
+        if (llvmMaskScalar) {
+            // Masked path: gate the async DMA on the scalar boolean.
+            // When mask is false (boundary), skip the DMA entirely.
+            // Use if/then/else: if (mask) { async_copy; store event } else { skip }
+            auto *parentBlock = rewriter.getInsertionBlock();
+            auto insertPt = rewriter.getInsertionPoint();
+
+            auto *thenBlock = rewriter.createBlock(parentBlock->getParent(),
+                std::next(Region::iterator(parentBlock)));
+            auto *afterBlock = rewriter.createBlock(parentBlock->getParent(),
+                std::next(Region::iterator(thenBlock)));
+
+            // Move everything after the current insertion point to afterBlock
+            afterBlock->getOperations().splice(afterBlock->begin(),
+                parentBlock->getOperations(), insertPt, parentBlock->end());
+
+            // Conditional branch: if mask_scalar → thenBlock, else → afterBlock
+            rewriter.setInsertionPointToEnd(parentBlock);
+            LLVM::CondBrOp::create(rewriter, loc, llvmMaskScalar,
+                                    thenBlock, afterBlock);
+
+            // thenBlock: emit async copy + store event + branch to afterBlock
+            rewriter.setInsertionPointToStart(thenBlock);
+            Value event = LLVM::CallOp::create(rewriter, loc, asyncCopyFn,
+                ValueRange{one64, one64,
+                           dstBase, dstStrideBytes, one64, tileVec,
+                           srcBase, srcStrideBytes, one64, tileVec,
+                           offsetVec, clamp}).getResult();
+            LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
+            LLVM::BrOp::create(rewriter, loc, ValueRange{}, afterBlock);
+
+            // Continue in afterBlock
+            rewriter.setInsertionPointToStart(afterBlock);
+        } else {
+            // Unmasked: always emit async DMA
+            Value event = LLVM::CallOp::create(rewriter, loc, asyncCopyFn,
+                ValueRange{one64, one64,
+                           dstBase, dstStrideBytes, one64, tileVec,
+                           srcBase, srcStrideBytes, one64, tileVec,
+                           offsetVec, clamp}).getResult();
+            LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
+        }
+
+        // Return token = 0
+        Value zeroToken = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(0));
+        rewriter.replaceOp(op, zeroToken);
+        return success();
+    }
+};
+
+struct AsyncCommitGroupOpAppleConversion
+    : public ConvertOpToLLVMPattern<ttg::AsyncCommitGroupOp> {
+    using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+    LogicalResult matchAndRewrite(
+        ttg::AsyncCommitGroupOp op, OpAdaptor adaptor,
+        ConversionPatternRewriter &rewriter) const override {
+        // No-op: Metal events are per-copy, no grouping needed.
+        Value zero = LLVM::ConstantOp::create(rewriter, op.getLoc(),
+            IntegerType::get(op.getContext(), 32),
+            rewriter.getI32IntegerAttr(0));
+        rewriter.replaceOp(op, zero);
+        return success();
+    }
+};
+
+struct AsyncWaitOpAppleConversion
+    : public ConvertOpToLLVMPattern<ttg::AsyncWaitOp> {
+    using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+    LogicalResult matchAndRewrite(
+        ttg::AsyncWaitOp op, OpAdaptor adaptor,
+        ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        auto *ctx = op.getContext();
+        auto mod = op->getParentOfType<ModuleOp>();
+        auto i32Ty = IntegerType::get(ctx, 32);
+        auto voidTy = LLVMVoidType::get(ctx);
+        auto ptrTy0 = LLVMPointerType::get(ctx, 0);
+
+        // Check if any async copy was emitted by looking for the
+        // air.simdgroup_async_copy_2d declaration in the module.
+        bool hasAsyncDMA = mod.lookupSymbol<LLVMFuncOp>(
+            "air.simdgroup_async_copy_2d.p3i8.p1i8") != nullptr;
+
+        if (hasAsyncDMA) {
+            // True async wait: wait on the event stored in the alloca,
+            // then barrier to synchronize all threads.
+            Value evAlloca = getOrCreateEventAlloca(op, rewriter);
+
+            // call void @air.wait_simdgroup_events(i32 1, ptr %ev_alloca)
+            auto waitFn = getOrCreateFn(mod, rewriter,
+                "air.wait_simdgroup_events", voidTy, {i32Ty, ptrTy0});
+            Value oneI32 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                rewriter.getI32IntegerAttr(1));
+            LLVM::CallOp::create(rewriter, loc, waitFn,
+                                  ValueRange{oneI32, evAlloca});
+        }
+
+        // Always emit TG barrier (needed for both sync and async paths
+        // to ensure shared memory visibility across all threads)
+        auto barrFn = getOrCreateFn(mod, rewriter,
+            "air.wg.barrier", voidTy, {i32Ty, i32Ty});
+        Value barrFlag = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(2));
+        Value barrScope = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(1));
+        LLVM::CallOp::create(rewriter, loc, barrFn,
+                              ValueRange{barrFlag, barrScope});
+
+        // Return token = 0
+        Value zeroToken = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(0));
+        rewriter.replaceOp(op, zeroToken);
+        return success();
+    }
+};
+
 struct ConvertTritonAppleGPUToLLVMPass
     : public PassWrapper<ConvertTritonAppleGPUToLLVMPass,
                          OperationPass<ModuleOp>> {
@@ -2213,6 +2671,15 @@ struct ConvertTritonAppleGPUToLLVMPass
         // Identity convert_layout for DotOperandEncoding (higher priority than
         // shared upstream convert_layout patterns which are NVIDIA-specific).
         patterns.add<ConvertLayoutOpAppleConversion>(
+            typeConverter, PatternBenefit(patternBenefitDefault + 10));
+
+        // Async copy ops → synchronous per-element copy + TG barrier.
+        // The pipeliner's multi-buffering still provides structural benefits.
+        patterns.add<AsyncCopyGlobalToLocalOpAppleConversion>(
+            typeConverter, PatternBenefit(patternBenefitDefault + 10));
+        patterns.add<AsyncCommitGroupOpAppleConversion>(
+            typeConverter, PatternBenefit(patternBenefitDefault + 10));
+        patterns.add<AsyncWaitOpAppleConversion>(
             typeConverter, PatternBenefit(patternBenefitDefault + 10));
 
         // Standard dialect lowerings — arith first, then Triton view patterns

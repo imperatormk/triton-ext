@@ -59,10 +59,14 @@ struct ConvertLayoutOpAppleConversion
         auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
         auto dstTy = cast<RankedTensorType>(op.getResult().getType());
 
-        // DotOperandEncoding target — identity pass-through.
-        // Our dot lowering looks through convert_layout to get source
-        // blocked values and uses blocked encoding for scatter/gather.
-        if (isa<ttg::DotOperandEncodingAttr>(dstTy.getEncoding())) {
+        // DotOperandEncoding target — identity pass-through when source is
+        // blocked encoding.  Our dot lowering looks through convert_layout to
+        // get source blocked values and uses blocked encoding for scatter/gather.
+        // When the source is MMA encoding, the element count per thread differs
+        // from the DotOperandEncoding count, so we must NOT pass through
+        // (the shared LinearLayout-based convert_layout handles that case).
+        if (isa<ttg::DotOperandEncodingAttr>(dstTy.getEncoding()) &&
+            isa<ttg::BlockedEncodingAttr>(srcTy.getEncoding())) {
             rewriter.replaceOp(op, adaptor.getSrc());
             return success();
         }
@@ -2562,6 +2566,12 @@ struct ConvertTritonAppleGPUToLLVMPass
             // Always create global_smem — some ops (histogram) need it
             // even if allocate-shared-memory didn't set ttg.shared.
             if (smemSize == 0) smemSize = 8;  // minimum
+            // Update module attribute so ConvertLayoutOp budget accounts
+            // for the actual global_smem size (including alignment padding).
+            // global_smem uses align 16, so round up to match Metal runtime.
+            int64_t smemAligned = (smemSize + 15) & ~15;
+            mod->setAttr("ttg.shared",
+                IntegerAttr::get(IntegerType::get(ctx, 64), smemAligned));
             {
                 OpBuilder b(mod.getBodyRegion());
                 auto loc = mod.getLoc();

@@ -91,6 +91,77 @@ static LLVM::GlobalOp getOrCreateTGGlobal(ConversionPatternRewriter &rewriter,
                                    /*addrspace=*/3u);
 }
 
+// Create a TG global with the specified element type.
+// For bf16/f16, the array has 2x as many elements as f32 (same byte footprint
+// since f32 is 4 bytes and bf16/f16 are 2 bytes).
+static LLVM::GlobalOp getOrCreateTypedTGGlobal(ConversionPatternRewriter &rewriter,
+                                                ModuleOp mod,
+                                                StringRef name, int64_t numElements,
+                                                Type elemTy) {
+    if (auto g = mod.lookupSymbol<LLVM::GlobalOp>(name))
+        return g;
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(mod.getBody());
+    auto arrTy = LLVMArrayType::get(elemTy, numElements);
+    unsigned alignment = isa<Float32Type>(elemTy) ? 4 : 2;
+    return LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy,
+                                   /*isConstant=*/false,
+                                   LLVM::Linkage::Internal,
+                                   name,
+                                   /*value=*/Attribute(),
+                                   /*alignment=*/alignment,
+                                   /*addrspace=*/3u);
+}
+
+// Get the TG MMA load intrinsic and MMA multiply intrinsic for a given input
+// element type. Returns: (loadIntrinsicName, mmaIntrinsicName, mmaMatVecType).
+// The accumulator is always f32.
+struct MMAIntrinsicInfo {
+    const char *tgLoadName;
+    const char *mmaName;
+    Type matVecTy;  // <64 x elemTy> for load, <64 x f32> for accumulator
+};
+
+static MMAIntrinsicInfo getMMAIntrinsicInfo(MLIRContext *ctx, Type elemTy) {
+    MMAIntrinsicInfo info;
+    if (elemTy.isBF16()) {
+        info.tgLoadName = "air.simdgroup_matrix_8x8_load.v64bf16.p3bf16";
+        info.mmaName = "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64bf16.v64bf16.v64f32";
+        info.matVecTy = LLVM::getVectorType(BFloat16Type::get(ctx), 64);
+    } else if (elemTy.isF16()) {
+        info.tgLoadName = "air.simdgroup_matrix_8x8_load.v64f16.p3f16";
+        info.mmaName = "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16.v64f16.v64f32";
+        info.matVecTy = LLVM::getVectorType(Float16Type::get(ctx), 64);
+    } else {
+        info.tgLoadName = "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
+        info.mmaName = "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32";
+        info.matVecTy = LLVM::getVectorType(Float32Type::get(ctx), 64);
+    }
+    return info;
+}
+
+// Convert a value to the target MMA input type.
+// For bf16/f16: truncate from f32 or leave as-is.
+// For f32: extend from bf16/f16 or leave as-is.
+static Value toMmaInputType(OpBuilder &rewriter, Location loc, Value val, Type targetTy) {
+    auto valTy = val.getType();
+    if (valTy == targetTy)
+        return val;
+    if (isa<FloatType>(valTy) && isa<FloatType>(targetTy)) {
+        unsigned srcBits = cast<FloatType>(valTy).getWidth();
+        unsigned dstBits = cast<FloatType>(targetTy).getWidth();
+        if (srcBits < dstBits)
+            return arith::ExtFOp::create(rewriter, loc, targetTy, val);
+        else
+            return arith::TruncFOp::create(rewriter, loc, targetTy, val);
+    }
+    // Integer type path: convert to f32 first, then truncate if needed
+    auto f32Ty = Float32Type::get(rewriter.getContext());
+    Value f32Val = arith::SIToFPOp::create(rewriter, loc, f32Ty, val);
+    if (targetTy == f32Ty) return f32Val;
+    return arith::TruncFOp::create(rewriter, loc, targetTy, f32Val);
+}
+
 // Convert a value to f32. Handles both float and integer element types.
 static Value toF32(OpBuilder &rewriter, Location loc, Value val, Type f32Ty) {
     auto valTy = val.getType();
@@ -176,15 +247,31 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             "air.simdgroup.barrier", barrTy);
 
         auto vec2i64Ty = LLVM::getVectorType(IntegerType::get(ctx, 64), 2);
+        // f32 TG load/store/MMA (always needed for C accumulator)
         auto loadFn = getOrInsertIntrinsic(rewriter, mod,
             "air.simdgroup_matrix_8x8_load.v64f32.p3f32",
             LLVMFunctionType::get(matTy, {tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty}, false));
-        auto mmaFn = getOrInsertIntrinsic(rewriter, mod,
-            "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32",
-            LLVMFunctionType::get(matTy, {matTy, matTy, matTy}, false));
         auto storeFn = getOrInsertIntrinsic(rewriter, mod,
             "air.simdgroup_matrix_8x8_store.v64f32.p3f32",
             LLVMFunctionType::get(voidTy, {matTy, tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty}, false));
+
+        // Type-specific A/B MMA intrinsics (bf16/f16 use native MMA).
+        // For batchSize > 1, fall back to f32 to avoid batch offset mismatch
+        // between scatter (element-indexed) and MMA load (byte-addressed).
+        auto aElemTy = aType.getElementType();
+        bool useNativeABType = (batchSize == 1) &&
+            (aElemTy.isF16() || aElemTy.isBF16());
+        auto abMmaInfo = useNativeABType
+            ? getMMAIntrinsicInfo(ctx, aElemTy)
+            : getMMAIntrinsicInfo(ctx, f32Ty);
+        auto abLoadFn = getOrInsertIntrinsic(rewriter, mod,
+            abMmaInfo.tgLoadName,
+            LLVMFunctionType::get(abMmaInfo.matVecTy, {tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty}, false));
+        auto abMmaFn = getOrInsertIntrinsic(rewriter, mod,
+            abMmaInfo.mmaName,
+            LLVMFunctionType::get(matTy, {abMmaInfo.matVecTy, abMmaInfo.matVecTy, matTy}, false));
+        // Determine TG element type for A/B scatter.
+        Type abTgElemTy = useNativeABType ? aElemTy : f32Ty;
 
         // ── Constants ────────────────────────────────────────────────────
 
@@ -556,6 +643,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         };
 
         // Helper: scatter elements into TG for an 8-row strip.
+        // scatterTy: element type to scatter as (f32 for C, native type for A/B).
         // In sequential batch mode (curBatchRound >= 0), only scatter elements
         // matching the current batch. Data goes to TG base (no per-batch regions).
         // For operands without batch warps: compile-time filter by elemBatchIndex.
@@ -568,7 +656,8 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                 int64_t stride, int64_t rowStart,
                                 bool mixed, int64_t curBatchRound,
                                 Value operandBatchWarpIdx,
-                                bool opHasBatchWarps) {
+                                bool opHasBatchWarps,
+                                Type scatterTy) {
             for (size_t i = 0; i < elems.size(); ++i) {
                 int64_t eb = (rowDim > 0) ? elemBatchIndex(offsets, i) : 0;
 
@@ -602,21 +691,23 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 }
 
                 Value idx = stripFlatIdx(baseRow, baseCol, rowOff, colOff, stride, rowStart);
+                // Convert element to scatter type
+                Value val = (scatterTy == f32Ty)
+                    ? toF32(rewriter, loc, elems[i], f32Ty)
+                    : toMmaInputType(rewriter, loc, elems[i], scatterTy);
                 if (curBatchRound >= 0) {
                     // Sequential mode: all data goes to TG base.
                     Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
-                    Value val = toF32(rewriter, loc, elems[i], f32Ty);
                     Value gep = LLVM::GEPOp::create(rewriter, loc,
-                        tgPtrTy, f32Ty, ptrTG, ArrayRef<LLVM::GEPArg>{safeIdx});
+                        tgPtrTy, scatterTy, ptrTG, ArrayRef<LLVM::GEPArg>{safeIdx});
                     LLVM::StoreOp::create(rewriter, loc, val, gep);
                 } else {
                     // Warp-distributed mode: add per-element batch TG offset.
                     Value batchOff = elemBatchTGOffset(offsets, i, mixed);
                     Value batchIdx = arith::AddIOp::create(rewriter, loc, idx, batchOff);
                     Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, batchIdx, garbageIdx);
-                    Value val = toF32(rewriter, loc, elems[i], f32Ty);
                     Value gep = LLVM::GEPOp::create(rewriter, loc,
-                        tgPtrTy, f32Ty, ptrTG, ArrayRef<LLVM::GEPArg>{safeIdx});
+                        tgPtrTy, scatterTy, ptrTG, ArrayRef<LLVM::GEPArg>{safeIdx});
                     LLVM::StoreOp::create(rewriter, loc, val, gep);
                 }
             }
@@ -659,20 +750,20 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 scatterBatchRound = batchRound;
             }
 
-            // Phase 1: Load A tiles (8-row strips)
+            // Phase 1: Load A tiles (8-row strips) — native type MMA
             SmallVector<SmallVector<Value>> matA_tiles(tilesM);
             for (int64_t tm = 0; tm < tilesM; ++tm) {
                 matA_tiles[tm].resize(tilesK);
                 int64_t rowStart = tm * 8;
 
-                stripScatter(aBaseRow, aBaseCol, elemsA, aOffsets, K, rowStart, aMixed, scatterBatchRound, aBatchWarpIdx, aHasBatchWarps);
+                stripScatter(aBaseRow, aBaseCol, elemsA, aOffsets, K, rowStart, aMixed, scatterBatchRound, aBatchWarpIdx, aHasBatchWarps, abTgElemTy);
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                 for (int64_t tk = 0; tk < tilesK; ++tk) {
                     Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
                     Value aStride = makeI64Vec2(rewriter, loc, 1, K);
                     Value aShape  = makeI64Vec2(rewriter, loc, K, 8);
-                    matA_tiles[tm][tk] = LLVM::CallOp::create(rewriter, loc, loadFn,
+                    matA_tiles[tm][tk] = LLVM::CallOp::create(rewriter, loc, abLoadFn,
                         ValueRange{curPtrTGBatch, aShape, aStride, aOff}).getResult();
                 }
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
@@ -684,7 +775,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 matC_tiles[tm].resize(tilesN);
                 int64_t rowStart = tm * 8;
 
-                stripScatter(cBaseRow, cBaseCol, elemsC, cOffsets, N, rowStart, cMixed, scatterBatchRound, cBatchWarpIdx, cHasBatchWarps);
+                stripScatter(cBaseRow, cBaseCol, elemsC, cOffsets, N, rowStart, cMixed, scatterBatchRound, cBatchWarpIdx, cHasBatchWarps, f32Ty);
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                 Value cStride = makeI64Vec2(rewriter, loc, 1, N);
@@ -697,22 +788,22 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
             }
 
-            // Phase 3: B strips + MMA
+            // Phase 3: B strips + MMA — native type MMA
             for (int64_t tk = 0; tk < tilesK; ++tk) {
                 int64_t rowStart = tk * 8;
 
-                stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, N, rowStart, bMixed, scatterBatchRound, bBatchWarpIdx, bHasBatchWarps);
+                stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, N, rowStart, bMixed, scatterBatchRound, bBatchWarpIdx, bHasBatchWarps, abTgElemTy);
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                 Value bStride = makeI64Vec2(rewriter, loc, 1, N);
                 Value bShape  = makeI64Vec2(rewriter, loc, N, 8);
                 for (int64_t tn = 0; tn < tilesN; ++tn) {
                     Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-                    Value matB = LLVM::CallOp::create(rewriter, loc, loadFn,
+                    Value matB = LLVM::CallOp::create(rewriter, loc, abLoadFn,
                         ValueRange{curPtrTGBatch, bShape, bStride, bOff}).getResult();
 
                     for (int64_t tm = 0; tm < tilesM; ++tm) {
-                        matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, mmaFn,
+                        matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, abMmaFn,
                             ValueRange{matA_tiles[tm][tk], matB, matC_tiles[tm][tn]}).getResult();
                     }
                 }
@@ -864,15 +955,26 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             "air.simdgroup.barrier", barrTy);
 
         auto vec2i64Ty = LLVM::getVectorType(IntegerType::get(ctx, 64), 2);
+        // f32 TG load/store (C accumulator always f32)
         auto loadFn = getOrInsertIntrinsic(rewriter, mod,
             "air.simdgroup_matrix_8x8_load.v64f32.p3f32",
             LLVMFunctionType::get(matTy, {tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty}, false));
-        auto mmaFn = getOrInsertIntrinsic(rewriter, mod,
-            "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32",
-            LLVMFunctionType::get(matTy, {matTy, matTy, matTy}, false));
         auto storeFn = getOrInsertIntrinsic(rewriter, mod,
             "air.simdgroup_matrix_8x8_store.v64f32.p3f32",
             LLVMFunctionType::get(voidTy, {matTy, tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty}, false));
+
+        // Type-specific TG MMA load/multiply for A/B (bf16/f16 use native MMA)
+        auto abTgMmaInfo = getMMAIntrinsicInfo(ctx, aType.getElementType());
+        auto abTgLoadFn = getOrInsertIntrinsic(rewriter, mod,
+            abTgMmaInfo.tgLoadName,
+            LLVMFunctionType::get(abTgMmaInfo.matVecTy, {tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty}, false));
+        auto abTgMmaFn = getOrInsertIntrinsic(rewriter, mod,
+            abTgMmaInfo.mmaName,
+            LLVMFunctionType::get(matTy, {abTgMmaInfo.matVecTy, abTgMmaInfo.matVecTy, matTy}, false));
+        // TG element type for A/B in TG fallback path
+        Type abTgScatterTy = f32Ty;
+        if (aType.getElementType().isF16()) abTgScatterTy = Float16Type::get(ctx);
+        else if (aType.getElementType().isBF16()) abTgScatterTy = BFloat16Type::get(ctx);
 
         // ── Device memory MMA intrinsics (type-specific) ─────────────────
         // For f16/bf16 data: load returns <64 x half/bfloat>, MMA takes
@@ -1446,12 +1548,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // But we need cBaseRow/cBaseCol from makeBaseMma (already computed).
 
         // filteredScatter needs baseRow/baseCol. For C, use MMA-derived base.
+        // scatterTy: element type to scatter as (f32 for C, native type for A/B).
         auto filteredScatter = [&](Value ptr, Value garbIdx,
                                    Value baseRow, Value baseCol,
                                    SmallVector<Value> &elems,
                                    SmallVector<SmallVector<unsigned>> &offsets,
                                    SmallVector<size_t> &bucket,
-                                   int64_t stride, int64_t rowStart) {
+                                   int64_t stride, int64_t rowStart,
+                                   Type scatterTy) {
             for (size_t idx : bucket) {
                 int64_t rowOff = offsets[idx][0];
                 int64_t colOff = offsets[idx][1];
@@ -1465,10 +1569,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 Value sIdx = stripFlatIdx(baseRow, baseCol, rowOff, colOff, stride, rowStart);
                 Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, sIdx, garbIdx);
                 Value val = elems[idx];
-                if (val.getType() != f32Ty)
-                    val = toF32(rewriter, loc, val, f32Ty);
+                if (scatterTy == f32Ty) {
+                    if (val.getType() != f32Ty)
+                        val = toF32(rewriter, loc, val, f32Ty);
+                } else {
+                    val = toMmaInputType(rewriter, loc, val, scatterTy);
+                }
                 Value gep = LLVM::GEPOp::create(rewriter, loc,
-                    tgPtrTy, f32Ty, ptr, ArrayRef<LLVM::GEPArg>{safeIdx});
+                    tgPtrTy, scatterTy, ptr, ArrayRef<LLVM::GEPArg>{safeIdx});
                 LLVM::StoreOp::create(rewriter, loc, val, gep);
             }
         };
@@ -1479,7 +1587,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             int64_t rowStart = tm * 8;
 
             filteredScatter(ptrTG, garbageIdx, cBaseRow, cBaseCol,
-                            elemsC, cOffsets, cBuckets[tm], N, rowStart);
+                            elemsC, cOffsets, cBuckets[tm], N, rowStart, f32Ty);
             LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
             Value cStride = makeI64Vec2(rewriter, loc, 1, N);
@@ -1543,13 +1651,13 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                     for (int64_t tm = 0; tm < tilesM; ++tm) {
                         int64_t rowStart = tm * 8;
                         filteredScatter(ptrTG, garbageIdx, aBaseRow, aBaseCol,
-                                        elemsA, aOffsets, aBuckets[tm], K, rowStart);
+                                        elemsA, aOffsets, aBuckets[tm], K, rowStart, abTgScatterTy);
                         LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                         Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
                         Value aStride = makeI64Vec2(rewriter, loc, 1, K);
                         Value aShape  = makeI64Vec2(rewriter, loc, K, 8);
-                        matA_strip[tm] = LLVM::CallOp::create(rewriter, loc, loadFn,
+                        matA_strip[tm] = LLVM::CallOp::create(rewriter, loc, abTgLoadFn,
                             ValueRange{ptrTG, aShape, aStride, aOff}).getResult();
                         LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
                     }
@@ -1558,18 +1666,18 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 {
                     int64_t rowStart = tk * 8;
                     filteredScatter(ptrTG, garbageIdx, bBaseRow, bBaseCol,
-                                    elemsB, bOffsets, bBuckets[tk], N, rowStart);
+                                    elemsB, bOffsets, bBuckets[tk], N, rowStart, abTgScatterTy);
                     LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                     Value bStride = makeI64Vec2(rewriter, loc, 1, N);
                     Value bShape  = makeI64Vec2(rewriter, loc, N, 8);
                     for (int64_t tn = 0; tn < tilesN; ++tn) {
                         Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-                        Value matB = LLVM::CallOp::create(rewriter, loc, loadFn,
+                        Value matB = LLVM::CallOp::create(rewriter, loc, abTgLoadFn,
                             ValueRange{ptrTG, bShape, bStride, bOff}).getResult();
 
                         for (int64_t tm = 0; tm < tilesM; ++tm) {
-                            matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, mmaFn,
+                            matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, abTgMmaFn,
                                 ValueRange{matA_strip[tm], matB, matC_tiles[tm][tn]}).getResult();
                         }
                     }

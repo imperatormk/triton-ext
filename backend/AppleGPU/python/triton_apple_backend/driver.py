@@ -13,15 +13,13 @@ import struct as _struct
 import torch
 from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
 from triton.runtime.errors import OutOfResources
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 def _load_metal_utils():
     """Load the prebuilt metal_utils extension (compiled at pip install time)."""
     from triton_apple_backend import metal_utils
     return metal_utils
-
-
-from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 def ty_to_cpp(ty):

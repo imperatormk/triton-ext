@@ -14,6 +14,8 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Analysis/Allocation.h"
+#include "triton/Analysis/Membar.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
@@ -2536,6 +2538,54 @@ struct AsyncWaitOpAppleConversion
     }
 };
 
+// ttg.barrier → air.wg.barrier with proper addrSpace→flag mapping.
+struct AppleBarrierOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::BarrierOp> {
+    using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+    LogicalResult
+    matchAndRewrite(triton::gpu::BarrierOp op,
+                    triton::gpu::BarrierOp::Adaptor adaptor,
+                    ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        auto *ctx = rewriter.getContext();
+        auto mod = op->getParentOfType<ModuleOp>();
+        auto i32Ty = IntegerType::get(ctx, 32);
+        auto voidTy = LLVMVoidType::get(ctx);
+        auto barrFnTy = LLVMFunctionType::get(voidTy, {i32Ty, i32Ty}, false);
+
+        LLVMFuncOp barrFn;
+        if (auto existing = mod.lookupSymbol<LLVMFuncOp>("air.wg.barrier"))
+            barrFn = existing;
+        else {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(mod.getBody());
+            barrFn = LLVMFuncOp::create(rewriter, mod.getLoc(),
+                "air.wg.barrier", barrFnTy, Linkage::External);
+        }
+
+        // AIR flag 1 = device, flag 2 = TG, flag 3 = both
+        auto addrSpace = op.getAddrSpace();
+        bool needsDevice = static_cast<uint32_t>(addrSpace) &
+            (static_cast<uint32_t>(triton::gpu::AddrSpace::GlobalRead) |
+             static_cast<uint32_t>(triton::gpu::AddrSpace::GlobalWrite));
+        bool needsTG = static_cast<uint32_t>(addrSpace) &
+            static_cast<uint32_t>(triton::gpu::AddrSpace::Local);
+        int flag = 0;
+        if (needsDevice) flag |= 1;
+        if (needsTG) flag |= 2;
+        if (flag == 0) flag = 2;
+
+        Value flags = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(flag));
+        Value scope = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(1));
+        LLVM::CallOp::create(rewriter, loc, barrFn, ValueRange{flags, scope});
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
 struct ConvertTritonAppleGPUToLLVMPass
     : public PassWrapper<ConvertTritonAppleGPUToLLVMPass,
                          OperationPass<ModuleOp>> {
@@ -2557,18 +2607,18 @@ struct ConvertTritonAppleGPUToLLVMPass
         TargetInfo targetInfo;
         TritonGPUToLLVMTypeConverter typeConverter(ctx, targetInfo);
 
-        // Create global_smem for shared memory (threadgroup addrspace 3).
-        // Size comes from ttg.shared attribute set by allocate-shared-memory pass.
+        // Membar analysis: insert barriers between conflicting TG memory accesses.
+        {
+            ModuleAllocation allocation(mod);
+            ModuleMembarAnalysis membarAnalysis(&allocation);
+            membarAnalysis.run();
+        }
+
         {
             int64_t smemSize = 0;
             if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.shared"))
                 smemSize = attr.getValue().getZExtValue();
-            // Always create global_smem — some ops (histogram) need it
-            // even if allocate-shared-memory didn't set ttg.shared.
-            if (smemSize == 0) smemSize = 8;  // minimum
-            // Update module attribute so ConvertLayoutOp budget accounts
-            // for the actual global_smem size (including alignment padding).
-            // global_smem uses align 16, so round up to match Metal runtime.
+            if (smemSize == 0) smemSize = 8;
             int64_t smemAligned = (smemSize + 15) & ~15;
             mod->setAttr("ttg.shared",
                 IntegerAttr::get(IntegerType::get(ctx, 64), smemAligned));
@@ -2638,54 +2688,35 @@ struct ConvertTritonAppleGPUToLLVMPass
         mlir::triton::populateScanOpToLLVMPatterns(
             typeConverter, patterns, targetInfo, patternBenefitDefault);
 
-        // Gather → shared memory scatter/gather
         mlir::triton::populateGatherOpToLLVMPatterns(
             typeConverter, patterns, targetInfo, patternBenefitDefault);
 
-        // Histogram → shared memory atomics + barrier
         mlir::triton::populateHistogramOpToLLVMPatterns(
             typeConverter, patterns, targetInfo, patternBenefitDefault);
 
-        // Apple-specific patterns
         populateDotOpToLLVMPatterns(typeConverter, patterns,
                                      patternBenefitDefault);
         populateLoadStoreToLLVMPatterns(typeConverter, patterns,
                                          patternBenefitDefault);
 
-        // Safe masked load/store: use conditional branches instead of
-        // read-modify-write. Higher priority than LoadStoreToLLVM patterns.
+        patterns.add<AppleBarrierOpConversion>(
+            typeConverter, PatternBenefit(patternBenefitDefault + 10));
+
         patterns.add<SafeStoreOpConversion>(
             typeConverter, PatternBenefit(patternBenefitDefault + 10));
         patterns.add<SafeLoadOpConversion>(
             typeConverter, PatternBenefit(patternBenefitDefault + 10));
 
 
-        // WarpIdOp → tid / 32 (needed by shared range/layout helpers)
         patterns.add<WarpIdOpConversion>(typeConverter, patternBenefitDefault);
-
-        // PrintOp → no-op (Metal has no printf)
         patterns.add<ApplePrintOpConversion>(typeConverter, patternBenefitDefault + 10);
-
-        // AssertOp → no-op (Metal has no device-side assert)
         patterns.add<AppleAssertOpConversion>(typeConverter, patternBenefitDefault + 10);
-
-        // GetNumProgramsOp → air.threadgroups_per_grid
         patterns.add<GetNumProgramsOpAppleConversion>(typeConverter,
             PatternBenefit(patternBenefitDefault + 10));
-
-        // AtomicRMWOp → air.atomic.global.{add,max,min}.{f32,s.i32}
         patterns.add<AtomicRMWOpAppleConversion>(typeConverter, patternBenefitDefault + 10);
-
-        // AtomicCASOp → air.atomic.global.cmpxchg.weak.{i32,i64}
         patterns.add<AtomicCASOpAppleConversion>(typeConverter, patternBenefitDefault + 10);
-
-        // Identity convert_layout for DotOperandEncoding (higher priority than
-        // shared upstream convert_layout patterns which are NVIDIA-specific).
         patterns.add<ConvertLayoutOpAppleConversion>(
             typeConverter, PatternBenefit(patternBenefitDefault + 10));
-
-        // Async copy ops → synchronous per-element copy + TG barrier.
-        // The pipeliner's multi-buffering still provides structural benefits.
         patterns.add<AsyncCopyGlobalToLocalOpAppleConversion>(
             typeConverter, PatternBenefit(patternBenefitDefault + 10));
         patterns.add<AsyncCommitGroupOpAppleConversion>(
@@ -2693,8 +2724,6 @@ struct ConvertTritonAppleGPUToLLVMPass
         patterns.add<AsyncWaitOpAppleConversion>(
             typeConverter, PatternBenefit(patternBenefitDefault + 10));
 
-        // Standard dialect lowerings — arith first, then Triton view patterns
-        // override arith::ConstantOp for tensor splats (higher benefit).
         mlir::arith::populateArithToLLVMConversionPatterns(typeConverter,
                                                             patterns);
         // Triton elementwise + view patterns override arith scalar patterns
@@ -2861,7 +2890,6 @@ struct LowerGPUToAirPass
             }
 
             if (isa<mlir::gpu::BarrierOp>(op)) {
-                // gpu.barrier → call @air.wg.barrier(i32 1, i32 1)
                 auto voidTy = LLVMVoidType::get(ctx);
                 auto barrFnTy = LLVMFunctionType::get(voidTy, {i32Ty, i32Ty}, false);
                 LLVMFuncOp barrFn;
@@ -2874,7 +2902,7 @@ struct LowerGPUToAirPass
                         "air.wg.barrier", barrFnTy, Linkage::External);
                 }
                 Value flags = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                    rewriter.getI32IntegerAttr(1));
+                    rewriter.getI32IntegerAttr(2));
                 Value scope = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
                     rewriter.getI32IntegerAttr(1));
                 LLVM::CallOp::create(rewriter, loc, barrFn, ValueRange{flags, scope});

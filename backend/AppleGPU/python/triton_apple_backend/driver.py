@@ -111,8 +111,9 @@ class MPSUtils:
         try:
             module = self._metal.load_metallib(bytes(metallib_bytes))
             function = module.get_function(name)
-            max_threads = function.max_total_threads_per_threadgroup
-            return module, function, 0, 0, max_threads
+            # Report 1024 to Triton so it doesn't reject configs early.
+            # Actual capping happens at dispatch via PSO's max_total_threads.
+            return module, function, 0, 0, 1024
         except RuntimeError as e:
             msg = str(e)
             m = _re.search(r'Threadgroup (?:memory )?size \((\d+)\) exceeds the maximum .+ \((\d+)\)', msg)
@@ -221,15 +222,18 @@ class MPSLauncher:
             self.total_size = 0
             self.field_offsets = []
 
-        # Threadgroup size: num_warps * 32 threads, capped at 1024
         warp_size = 32
-        self.lx = min(getattr(metadata, "num_warps", 4) * warp_size, 1024)
+        self._requested_threads = getattr(metadata, "num_warps", 4) * warp_size
         self.ly = 1
         self.lz = 1
 
     def __call__(self, gridX, gridY, gridZ, stream, function,
                  kernel_metadata, launch_metadata,
                  launch_enter_hook, launch_exit_hook, *args):
+
+        # Cap threadgroup size to PSO's max (varies per kernel based on register pressure)
+        max_threads = getattr(function, 'max_total_threads_per_threadgroup', 1024)
+        self.lx = min(self._requested_threads, max_threads)
 
         if launch_enter_hook:
             launch_enter_hook(launch_metadata)

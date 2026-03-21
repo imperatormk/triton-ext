@@ -12,27 +12,8 @@ import os
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm
 
-# Patch libdevice/tl.math with Metal-compatible stubs.
-_libdevice_patched = False
-def _patch_libdevice():
-    global _libdevice_patched
-    if _libdevice_patched:
-        return
-    _libdevice_patched = True
 
-    import triton.language as tl
-    from triton.language.extra import libdevice
-    from triton_apple_backend.libdevice_stubs import ALL_STUBS
-
-    for name, fn in ALL_STUBS.items():
-        if hasattr(libdevice, name):
-            setattr(libdevice, name, fn)
-        if not hasattr(tl.math, name):
-            setattr(tl.math, name, fn)
-
-# Apple MLIR passes loaded via TRITON_PASS_PLUGIN_PATH plugin dylib.
-# The plugin registers passes as passes.plugin.<name>(pm) and
-# the TritonAppleGPU dialect automatically on dlopen.
+# Libdevice patching: see _LibdevicePatchFinder in __init__.py
 _plugin = getattr(passes, 'plugin', None)
 
 
@@ -126,9 +107,6 @@ class MPSBackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
-        # TODO: find a better place to call this — needs triton.language fully loaded,
-        # which rules out module-level and driver.py (circular import during discovery)
-        _patch_libdevice()
         return target.backend == "mps"
 
     def __init__(self, target: GPUTarget):

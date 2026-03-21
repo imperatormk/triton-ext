@@ -12,8 +12,7 @@ import os
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm
 
-# Patch libdevice stubs to use tl.* intrinsics (no CUDA libdevice on MPS).
-# Deferred to avoid circular imports — runs on first kernel compilation.
+# Patch libdevice/tl.math with Metal-compatible stubs.
 _libdevice_patched = False
 def _patch_libdevice():
     global _libdevice_patched
@@ -21,40 +20,15 @@ def _patch_libdevice():
         return
     _libdevice_patched = True
 
-    import triton
     import triton.language as tl
     from triton.language.extra import libdevice
+    from triton_apple_backend.libdevice_stubs import ALL_STUBS
 
-    # Direct tl.* mappings
-    _map = {
-        'exp': tl.exp, 'exp2': tl.exp2, 'log': tl.log, 'log2': tl.log2,
-        'sin': tl.sin, 'cos': tl.cos, 'sqrt': tl.sqrt, 'abs': tl.abs,
-        'fabs': tl.abs,
-    }
-    # tl.math.* mappings (check existence)
-    for name in ['floor', 'ceil', 'trunc', 'nearbyint', 'isinf', 'isnan',
-                 'rsqrt', 'erf', 'tanh']:
-        fn = getattr(tl.math, name, None) if hasattr(tl, 'math') else None
-        if fn is not None:
-            _map[name] = fn
-
-    for name, fn in _map.items():
+    for name, fn in ALL_STUBS.items():
         if hasattr(libdevice, name):
             setattr(libdevice, name, fn)
-
-    # Composite stubs: functions that need tl.* composition.
-    # These use @triton.jit so they work inside JIT kernels.
-    @triton.jit
-    def _log1p(x):
-        return tl.log(1.0 + x)
-
-    @triton.jit
-    def _cbrt(x):
-        return tl.math.pow(x, 1.0 / 3.0) if hasattr(tl.math, 'pow') else x
-
-    for name, fn in [('log1p', _log1p), ('cbrt', _cbrt)]:
-        if hasattr(libdevice, name):
-            setattr(libdevice, name, fn)
+        if not hasattr(tl.math, name):
+            setattr(tl.math, name, fn)
 
 # Apple MLIR passes loaded via TRITON_PASS_PLUGIN_PATH plugin dylib.
 # The plugin registers passes as passes.plugin.<name>(pm) and

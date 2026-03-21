@@ -246,6 +246,8 @@ class MPSLauncher:
             """Recursively flatten an arg value, expanding tuples to leaves."""
             if isinstance(a, TensorWrapper):
                 out.append(a.base)
+            elif hasattr(a, '_base') and isinstance(getattr(a, '_base', None), torch.Tensor):
+                out.append(a._base)
             elif isinstance(a, TensorDescriptor):
                 out.extend(decompose_descriptor(a))
             elif isinstance(a, tuple):

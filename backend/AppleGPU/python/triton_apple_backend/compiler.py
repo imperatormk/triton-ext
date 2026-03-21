@@ -152,11 +152,13 @@ class MPSBackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
+        # TODO: find a better place to call this — needs triton.language fully loaded,
+        # which rules out module-level and driver.py (circular import during discovery)
+        _patch_libdevice()
         return target.backend == "mps"
 
     def __init__(self, target: GPUTarget):
         super().__init__(target)
-        _patch_libdevice()
         self.target = target
         self.binary_ext = "metallib"
         if not _plugin:

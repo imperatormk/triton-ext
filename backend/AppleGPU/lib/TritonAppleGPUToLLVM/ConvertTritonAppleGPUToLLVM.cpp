@@ -2635,7 +2635,9 @@ struct ConvertTritonAppleGPUToLLVMPass
         }
 
         // Pre-compute MMA threadgroup memory usage from tt.dot ops.
-        // Each dot creates a __tg_dot_ab TG buffer of (8*max(K,N)+1) floats.
+        // Each dot creates a __tg_dot_ab TG buffer with potential bank-conflict
+        // padding (TG_PAD extra elements per row). Must account for the padded
+        // size so ConvertLayoutOp can correctly budget the 32KB TG limit.
         // The IR pipeline coalesces all dot TG globals into one (taking the max),
         // so total MMA TG cost = max over all dots.
         // Set as module attribute so ConvertLayoutOp can account for it in
@@ -2648,7 +2650,16 @@ struct ConvertTritonAppleGPUToLLVMPass
                 unsigned dotRank = cType.getRank();
                 int64_t K = aType.getShape()[dotRank - 1];
                 int64_t N = cType.getShape()[dotRank - 1];
-                int64_t tgFloats = 8 * std::max(K, N) + 1;
+                int64_t maxStride = std::max(K, N);
+                // Match the padding logic in DotOpToLLVM: pad when stride % 8 == 0
+                // and padded buffer fits in 16KB budget.
+                int64_t paddedMaxStride = maxStride;
+                if (maxStride % 8 == 0) {
+                    int64_t candidateStride = maxStride + 4; // TG_PAD = 4
+                    if ((8 * candidateStride + 1) * 4 <= 16384)
+                        paddedMaxStride = candidateStride;
+                }
+                int64_t tgFloats = 8 * paddedMaxStride + 1;
                 int64_t tgBytes = tgFloats * 4;  // f32
                 maxMmaBytes = std::max(maxMmaBytes, tgBytes);
             });

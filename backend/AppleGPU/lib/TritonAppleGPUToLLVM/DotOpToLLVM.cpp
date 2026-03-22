@@ -46,6 +46,127 @@ using namespace mlir::triton::applegpu;
 
 namespace {
 
+// Strength reduction: replace div/rem by constant with shift/mask when power-of-2.
+static bool isPowerOf2(int64_t v) { return v > 0 && (v & (v - 1)) == 0; }
+static unsigned log2(int64_t v) { unsigned r = 0; while ((1LL << r) < v) ++r; return r; }
+
+// Morton (Z-order) deinterleaving: extract even/odd bits from an integer.
+// For warp grid mapping: even bits → row index, odd bits → column index.
+// This gives cache-local (Z-curve) traversal of the output tile grid.
+// mortonDeinterleaveEven: extract bits 0, 2, 4, ... → compact them to 0, 1, 2, ...
+// mortonDeinterleaveOdd:  extract bits 1, 3, 5, ... → compact them to 0, 1, 2, ...
+static Value mortonDeinterleaveEven(OpBuilder &b, Location loc, Value id,
+                                     unsigned numBits) {
+    // result = bit0 | (bit2 << 1) | (bit4 << 2) | ...
+    Value result = arith::ConstantIntOp::create(b, loc, 0, 32);
+    for (unsigned i = 0; i < numBits; ++i) {
+        unsigned srcBit = i * 2;  // even bits: 0, 2, 4, ...
+        // Extract bit: (id >> srcBit) & 1
+        Value shifted = (srcBit > 0)
+            ? arith::ShRUIOp::create(b, loc, id,
+                  arith::ConstantIntOp::create(b, loc, srcBit, 32))
+            : id;
+        Value bit = arith::AndIOp::create(b, loc, shifted,
+            arith::ConstantIntOp::create(b, loc, 1, 32));
+        // Place at destination position i
+        if (i > 0)
+            bit = arith::ShLIOp::create(b, loc, bit,
+                arith::ConstantIntOp::create(b, loc, i, 32));
+        result = arith::OrIOp::create(b, loc, result, bit);
+    }
+    return result;
+}
+
+static Value mortonDeinterleaveOdd(OpBuilder &b, Location loc, Value id,
+                                    unsigned numBits) {
+    // result = bit1 | (bit3 << 1) | (bit5 << 2) | ...
+    Value result = arith::ConstantIntOp::create(b, loc, 0, 32);
+    for (unsigned i = 0; i < numBits; ++i) {
+        unsigned srcBit = i * 2 + 1;  // odd bits: 1, 3, 5, ...
+        Value shifted = arith::ShRUIOp::create(b, loc, id,
+            arith::ConstantIntOp::create(b, loc, srcBit, 32));
+        Value bit = arith::AndIOp::create(b, loc, shifted,
+            arith::ConstantIntOp::create(b, loc, 1, 32));
+        if (i > 0)
+            bit = arith::ShLIOp::create(b, loc, bit,
+                arith::ConstantIntOp::create(b, loc, i, 32));
+        result = arith::OrIOp::create(b, loc, result, bit);
+    }
+    return result;
+}
+
+// Check if Morton order is applicable: both dimensions must be equal powers of 2
+// (square warp grid). For non-square grids, Morton deinterleaving doesn't produce
+// a valid bijection — e.g., for 1x4, Morton yields only 2 distinct column values
+// instead of 4, causing warp collisions.
+// Returns the number of bits per dimension (log2 of dimension size).
+// Returns 0 if Morton is not applicable.
+static unsigned mortonBitsPerDim(int64_t wM, int64_t wN) {
+    if (wM != wN) return 0;  // non-square: can't use Morton
+    if (!isPowerOf2(wM)) return 0;
+    if (wM <= 1) return 0;  // single warp: nothing to reorder
+    return log2(wM);
+}
+
+// divByConst: v / c  →  v >> log2(c) when c is power-of-2, else DivUIOp.
+static Value divByConst(OpBuilder &b, Location loc, Value v, int64_t c) {
+    if (isPowerOf2(c)) {
+        unsigned shift = log2(c);
+        if (shift == 0) return v;
+        Value shAmt = arith::ConstantIntOp::create(b, loc, shift, 32);
+        return arith::ShRUIOp::create(b, loc, v, shAmt);
+    }
+    Value cv = arith::ConstantIntOp::create(b, loc, c, 32);
+    return arith::DivUIOp::create(b, loc, v, cv);
+}
+
+// remByConst: v % c  →  v & (c-1) when c is power-of-2, else RemUIOp.
+static Value remByConst(OpBuilder &b, Location loc, Value v, int64_t c) {
+    if (isPowerOf2(c)) {
+        Value mask = arith::ConstantIntOp::create(b, loc, c - 1, 32);
+        return arith::AndIOp::create(b, loc, v, mask);
+    }
+    Value cv = arith::ConstantIntOp::create(b, loc, c, 32);
+    return arith::RemUIOp::create(b, loc, v, cv);
+}
+
+// Bank conflict padding: add PAD elements per row in TG buffers.
+// Apple GPU has 32 banks of 4 bytes each (128-byte bank period).
+// For stride = N (e.g. 64), all threads in the same column hit the same bank.
+// Adding PAD elements (16 bytes) shifts successive rows by PAD banks,
+// eliminating most bank conflicts for 8-row strips.
+// Only applied when the padded buffer fits within 32KB TG limit.
+//
+// The pad amount must be 16 bytes regardless of element type:
+//   float32 (4B) -> 4 elements, float16/bf16 (2B) -> 8, int8 (1B) -> 16.
+// For integer types we skip padding entirely: int8 dots go through TG as f32
+// (scatter converts i8->f32), but async copy writes raw bytes with a stride
+// mismatch against the f32 MMA load.  Disabling padding avoids corrupting
+// the stride arithmetic for these types.
+static constexpr int64_t TG_PAD = 4;
+
+// Compute element-type-aware pad amount.  Returns 0 for integer element types
+// (padding disabled), otherwise 16 / elemBytes so the pad is always 16 bytes.
+static int64_t tgPadForType(Type elemTy) {
+    if (isa<IntegerType>(elemTy))
+        return 0;                       // no padding for int8/int16/int32
+    unsigned elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
+    if (elemBytes == 0) return TG_PAD;  // fallback
+    return 16 / elemBytes;              // 4 for f32, 8 for f16/bf16
+}
+
+// Compute padded stride: only pad when stride is a multiple of 8 (likely
+// bank-conflicting) AND total buffer size stays within 32KB TG budget.
+// budget_bytes: estimated remaining TG budget for this buffer.
+static int64_t paddedStride(int64_t stride, int64_t budget_bytes, int64_t pad = TG_PAD) {
+    if (pad == 0) return stride;
+    if (stride % 8 != 0) return stride;  // odd strides don't bank-conflict
+    int64_t padded = stride + pad;
+    // 8 rows * padded * 4 bytes/f32 must fit in budget
+    if (8 * padded * 4 > budget_bytes) return stride;
+    return padded;
+}
+
 static Type getSimdgroupMatrixType(MLIRContext *ctx) {
     return LLVM::getVectorType(Float32Type::get(ctx), 64);
 }
@@ -291,8 +412,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                                 ValueRange{}).getResult();
         Value tid32 = LLVM::ExtractValueOp::create(rewriter, loc, i32Ty,
                           tidStruct, ArrayRef<int64_t>{0});
-        Value c32    = arith::ConstantIntOp::create(rewriter, loc, 32, 32);
-        Value warpId = arith::DivUIOp::create(rewriter, loc, tid32, c32);
+        Value warpId = divByConst(rewriter, loc, tid32, 32); // tid / 32
 
         // ── Get blocked encoding params for A, B, C ───────────────────────
 
@@ -361,6 +481,213 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             (int64_t)elemsC.size() != (int64_t)cOffsets.size())
             return failure();
 
+        // ── Try to resolve device pointers for async copy ──────────────
+        auto resolveDevicePointers = [&](Value tritonVal)
+            -> SmallVector<Value> {
+            Value src = tritonVal;
+            if (auto cvt = tritonVal.getDefiningOp<ttg::ConvertLayoutOp>())
+                src = cvt.getSrc();
+            auto loadOp = src.getDefiningOp<tt::LoadOp>();
+            if (!loadOp)
+                return {};
+            Value ptrTensor = loadOp.getPtr();
+            Value mappedPtrs = rewriter.getRemappedValue(ptrTensor);
+            if (!mappedPtrs)
+                return {};
+            return unpack(mappedPtrs);
+        };
+
+        // ── Resolve device pointers for async copy (A and B) ──────────────
+        auto aPtrs = resolveDevicePointers(op.getA());
+        auto bPtrs = resolveDevicePointers(op.getB());
+
+        // Compute row stride from pointer differences for async copy.
+        // This uses the same shuffle-based approach as the MMA conversion.
+        auto computeRowStrideBlocked = [&](SmallVector<Value> &ptrs,
+                                           SmallVector<SmallVector<unsigned>> &offsets,
+                                           Type elemTy,
+                                           ttg::BlockedEncodingAttr enc) -> Value {
+            unsigned elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
+            // Strategy 1: same-thread pair with same col, different row
+            for (size_t i = 0; i < offsets.size(); ++i) {
+                for (size_t j = i + 1; j < offsets.size(); ++j) {
+                    if (offsets[i][colDim] == offsets[j][colDim] &&
+                        offsets[i][rowDim] != offsets[j][rowDim]) {
+                        int64_t rowDiff = (int64_t)offsets[j][rowDim] - (int64_t)offsets[i][rowDim];
+                        Value ptrI64_i = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, ptrs[i]);
+                        Value ptrI64_j = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, ptrs[j]);
+                        Value byteDiff = arith::SubIOp::create(rewriter, loc, ptrI64_j, ptrI64_i);
+                        Value elemSize = arith::ConstantIntOp::create(rewriter, loc, (int64_t)elemBytes, 64);
+                        Value elemDiff = arith::DivSIOp::create(rewriter, loc, byteDiff, elemSize);
+                        Value rowDiffVal = arith::ConstantIntOp::create(rewriter, loc, rowDiff, 64);
+                        return arith::DivSIOp::create(rewriter, loc, elemDiff, rowDiffVal);
+                    }
+                }
+            }
+            // Strategy 2: simd_shuffle_xor
+            auto order = enc.getOrder();
+            auto tpw = enc.getThreadsPerWarp();
+            auto spt = enc.getSizePerThread();
+            unsigned encRank = spt.size();
+            unsigned encColDim = encRank - 1;
+            unsigned encRowDim = encRank - 2;
+            bool colFastest = (order[0] == (unsigned)encColDim);
+            int64_t xorMask = colFastest ? tpw[encColDim] : 1;
+            int64_t rowDiff = spt[encRowDim];
+
+            Value ptrI64 = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, ptrs[0]);
+            auto i16Ty = IntegerType::get(ctx, 16);
+            Value xorVal = arith::ConstantIntOp::create(rewriter, loc, xorMask, 16);
+            Value lo = arith::TruncIOp::create(rewriter, loc, i32Ty, ptrI64);
+            Value hi = arith::TruncIOp::create(rewriter, loc, i32Ty,
+                arith::ShRUIOp::create(rewriter, loc, ptrI64,
+                    arith::ConstantIntOp::create(rewriter, loc, 32, 64)));
+            auto shuffleFn32 = getOrInsertIntrinsic(rewriter, mod,
+                "air.simd_shuffle_xor.s.i32",
+                LLVMFunctionType::get(i32Ty, {i32Ty, i16Ty}, false));
+            Value shufLo = LLVM::CallOp::create(rewriter, loc, shuffleFn32,
+                ValueRange{lo, xorVal}).getResult();
+            Value shufHi = LLVM::CallOp::create(rewriter, loc, shuffleFn32,
+                ValueRange{hi, xorVal}).getResult();
+            Value loExt = arith::ExtUIOp::create(rewriter, loc, i64Ty, shufLo);
+            Value hiExt = arith::ExtUIOp::create(rewriter, loc, i64Ty, shufHi);
+            Value hiShl = arith::ShLIOp::create(rewriter, loc, hiExt,
+                arith::ConstantIntOp::create(rewriter, loc, 32, 64));
+            Value otherPtrI64 = arith::OrIOp::create(rewriter, loc, loExt, hiShl);
+            Value byteDiff = arith::SubIOp::create(rewriter, loc, otherPtrI64, ptrI64);
+            Value zero64 = arith::ConstantIntOp::create(rewriter, loc, (int64_t)0, 64);
+            Value isNeg = arith::CmpIOp::create(rewriter, loc,
+                arith::CmpIPredicate::slt, byteDiff, zero64);
+            Value negDiff = arith::SubIOp::create(rewriter, loc, zero64, byteDiff);
+            Value absDiff = arith::SelectOp::create(rewriter, loc, isNeg, negDiff, byteDiff);
+            Value elemSize = arith::ConstantIntOp::create(rewriter, loc, (int64_t)elemBytes, 64);
+            Value elemDiff = arith::DivUIOp::create(rewriter, loc, absDiff, elemSize);
+            if (rowDiff > 1) {
+                Value rowDiffVal = arith::ConstantIntOp::create(rewriter, loc, rowDiff, 64);
+                elemDiff = arith::DivUIOp::create(rewriter, loc, elemDiff, rowDiffVal);
+            }
+            return elemDiff;
+        };
+
+        // Compute column stride: distance between adjacent columns in same row.
+        auto computeColStrideBlocked = [&](SmallVector<Value> &ptrs,
+                                           SmallVector<SmallVector<unsigned>> &offsets,
+                                           Type elemTy,
+                                           ttg::BlockedEncodingAttr enc) -> Value {
+            unsigned elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
+            // Strategy 1: same-thread pair with same row, different col
+            for (size_t i = 0; i < offsets.size(); ++i) {
+                for (size_t j = i + 1; j < offsets.size(); ++j) {
+                    if (offsets[i][rowDim] == offsets[j][rowDim] &&
+                        offsets[i][colDim] != offsets[j][colDim]) {
+                        int64_t colDiff = (int64_t)offsets[j][colDim] - (int64_t)offsets[i][colDim];
+                        Value ptrI64_i = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, ptrs[i]);
+                        Value ptrI64_j = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, ptrs[j]);
+                        Value byteDiff = arith::SubIOp::create(rewriter, loc, ptrI64_j, ptrI64_i);
+                        Value elemSz = arith::ConstantIntOp::create(rewriter, loc, (int64_t)elemBytes, 64);
+                        Value elemDiff = arith::DivSIOp::create(rewriter, loc, byteDiff, elemSz);
+                        Value colDiffVal = arith::ConstantIntOp::create(rewriter, loc, colDiff, 64);
+                        return arith::DivSIOp::create(rewriter, loc, elemDiff, colDiffVal);
+                    }
+                }
+            }
+            // Strategy 2: simd_shuffle_xor to get col-adjacent thread
+            auto order = enc.getOrder();
+            auto tpw = enc.getThreadsPerWarp();
+            auto spt = enc.getSizePerThread();
+            unsigned encRank = spt.size();
+            unsigned encColDim = encRank - 1;
+            unsigned encRowDim = encRank - 2;
+            bool colFastest = (order[0] == (unsigned)encColDim);
+            int64_t xorMask = colFastest ? 1 : tpw[encRowDim];
+            int64_t colDiff = spt[encColDim];
+
+            Value ptrI64 = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, ptrs[0]);
+            auto i16Ty = IntegerType::get(ctx, 16);
+            Value xorVal = arith::ConstantIntOp::create(rewriter, loc, xorMask, 16);
+            Value lo = arith::TruncIOp::create(rewriter, loc, i32Ty, ptrI64);
+            Value hi = arith::TruncIOp::create(rewriter, loc, i32Ty,
+                arith::ShRUIOp::create(rewriter, loc, ptrI64,
+                    arith::ConstantIntOp::create(rewriter, loc, 32, 64)));
+            auto shuffleFn32 = getOrInsertIntrinsic(rewriter, mod,
+                "air.simd_shuffle_xor.s.i32",
+                LLVMFunctionType::get(i32Ty, {i32Ty, i16Ty}, false));
+            Value shufLo = LLVM::CallOp::create(rewriter, loc, shuffleFn32,
+                ValueRange{lo, xorVal}).getResult();
+            Value shufHi = LLVM::CallOp::create(rewriter, loc, shuffleFn32,
+                ValueRange{hi, xorVal}).getResult();
+            Value loExt = arith::ExtUIOp::create(rewriter, loc, i64Ty, shufLo);
+            Value hiExt = arith::ExtUIOp::create(rewriter, loc, i64Ty, shufHi);
+            Value hiShl = arith::ShLIOp::create(rewriter, loc, hiExt,
+                arith::ConstantIntOp::create(rewriter, loc, 32, 64));
+            Value otherPtrI64 = arith::OrIOp::create(rewriter, loc, loExt, hiShl);
+            Value byteDiff = arith::SubIOp::create(rewriter, loc, otherPtrI64, ptrI64);
+            Value zero64 = arith::ConstantIntOp::create(rewriter, loc, (int64_t)0, 64);
+            Value isNeg = arith::CmpIOp::create(rewriter, loc,
+                arith::CmpIPredicate::slt, byteDiff, zero64);
+            Value negDiff = arith::SubIOp::create(rewriter, loc, zero64, byteDiff);
+            Value absDiff = arith::SelectOp::create(rewriter, loc, isNeg, negDiff, byteDiff);
+            Value elemSz = arith::ConstantIntOp::create(rewriter, loc, (int64_t)elemBytes, 64);
+            Value elemDiff = arith::DivUIOp::create(rewriter, loc, absDiff, elemSz);
+            if (colDiff > 1) {
+                Value colDiffVal = arith::ConstantIntOp::create(rewriter, loc, colDiff, 64);
+                elemDiff = arith::DivUIOp::create(rewriter, loc, elemDiff, colDiffVal);
+            }
+            return elemDiff;
+        };
+
+        // Determine if async copy is usable for A/B (only for non-batched).
+        // Async copy requires row-major layout (contiguous columns) because the
+        // DMA copies contiguous bytes per row. Column-major data has non-contiguous
+        // columns, which async_copy_2d can't handle.
+        // Heuristic: if encoding's col dim is fastest-varying (order[0]==colDim),
+        // data is likely row-major.
+        auto isRowMajorEncoding = [&](ttg::BlockedEncodingAttr enc) -> bool {
+            auto order = enc.getOrder();
+            unsigned encColDim = enc.getSizePerThread().size() - 1;
+            return order[0] == (unsigned)encColDim;
+        };
+
+        // Compute matWarpsC early: number of warps assigned to the MxN tile.
+        // When matWarpsC > 1, multiple simdgroups share the same TG strip,
+        // causing concurrent async copies to race on the same TG region.
+        auto cWpcEarly = cEnc.getWarpsPerCTA();
+        int64_t matWarpsCEarly = cWpcEarly[rowDim] * cWpcEarly[colDim];
+
+        // Env var to disable async copy for debugging
+        bool asyncCopyEnabled = true;
+        {
+            const char *envVar = std::getenv("TRITON_ASYNC_COPY");
+            if (envVar && std::string(envVar) == "0")
+                asyncCopyEnabled = false;
+        }
+        // Async copy writes raw bytes to TG, but MMA loads read as f32.
+        // For integer types (int8 etc.), the byte width mismatch corrupts data.
+        if (isa<IntegerType>(aElemTy))
+            asyncCopyEnabled = false;
+        // When multiple simdgroups handle the same MxN tile (matWarpsC > 1),
+        // all issue identical async copies to the same TG region concurrently.
+        // This races on Apple GPUs and corrupts data. Fall back to scatter.
+        if (matWarpsCEarly > 1)
+            asyncCopyEnabled = false;
+
+        bool useAsyncA = false, useAsyncB = false;
+        Value aRowStride, bRowStride, aColStride, bColStride;
+        if (asyncCopyEnabled && batchSize == 1
+            && (int64_t)aPtrs.size() == (int64_t)elemsA.size()
+            && !aPtrs.empty() && isRowMajorEncoding(aSrcEnc)) {
+            aRowStride = computeRowStrideBlocked(aPtrs, aOffsets, aType.getElementType(), aSrcEnc);
+            aColStride = computeColStrideBlocked(aPtrs, aOffsets, aType.getElementType(), aSrcEnc);
+            useAsyncA = (aRowStride != nullptr && aColStride != nullptr);
+        }
+        if (asyncCopyEnabled && batchSize == 1
+            && (int64_t)bPtrs.size() == (int64_t)elemsB.size()
+            && !bPtrs.empty() && isRowMajorEncoding(bSrcEnc)) {
+            bRowStride = computeRowStrideBlocked(bPtrs, bOffsets, bType.getElementType(), bSrcEnc);
+            bColStride = computeColStrideBlocked(bPtrs, bOffsets, bType.getElementType(), bSrcEnc);
+            useAsyncB = (bRowStride != nullptr && bColStride != nullptr);
+        }
+
         // ── Compute runtime thread base position ──────────────────────────
         // For 3D+ tensors, use only the last two dims of the encoding for
         // the MMA row/col base. The batch dims are handled via compile-time
@@ -390,14 +717,9 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 batchWarps *= wpc[d];
             Value matWarpId = warpId;
             if (batchWarps > 1) {
-                Value bw = arith::ConstantIntOp::create(rewriter, loc, batchWarps, 32);
-                matWarpId = arith::RemUIOp::create(rewriter, loc, warpId, bw);
-                // Actually we need warpId within the 2D tile, not within batch.
-                // The warp decomposition maps warpId -> (batch_warp, mat_warp).
-                // mat_warp = warpId % (wM * wN), batch_warp = warpId / (wM * wN)
+                // mat_warp = warpId % (wM * wN)
                 int64_t matWarps = wM * wN;
-                Value mw = arith::ConstantIntOp::create(rewriter, loc, matWarps, 32);
-                matWarpId = arith::RemUIOp::create(rewriter, loc, warpId, mw);
+                matWarpId = remByConst(rewriter, loc, warpId, matWarps);
             }
 
             // Similarly strip batch lanes from laneId
@@ -407,8 +729,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             Value matLaneId = laneId;
             if (batchLanes > 1) {
                 int64_t matLanes = tM * tN;
-                Value ml = arith::ConstantIntOp::create(rewriter, loc, matLanes, 32);
-                matLaneId = arith::RemUIOp::create(rewriter, loc, laneId, ml);
+                matLaneId = remByConst(rewriter, loc, laneId, matLanes);
             }
 
             // For the last two dims, check if col is the fastest-varying dim.
@@ -416,32 +737,46 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             // For 3D with order=[2,1,0]: order[0]==2 means colDim is fastest.
             bool colFastest = (order[0] == (unsigned)encColDim);
 
-            Value wN_val  = arith::ConstantIntOp::create(rewriter, loc, wN, 32);
-            Value tN_val  = arith::ConstantIntOp::create(rewriter, loc, tN, 32);
             Value tMsM    = arith::ConstantIntOp::create(rewriter, loc, tM * sM, 32);
             Value sM_val  = arith::ConstantIntOp::create(rewriter, loc, sM, 32);
             Value tNsN    = arith::ConstantIntOp::create(rewriter, loc, tN * sN, 32);
             Value sN_val  = arith::ConstantIntOp::create(rewriter, loc, sN, 32);
 
-            // Warp decomposition: faster dim uses mod, slower uses div
+            // Warp decomposition: Morton order when both dims are power-of-2,
+            // otherwise linear div/mod.
             Value wR, wC;
-            if (colFastest) {
-                wR = arith::DivUIOp::create(rewriter, loc, matWarpId, wN_val);
-                wC = arith::RemUIOp::create(rewriter, loc, matWarpId, wN_val);
+            unsigned mortonBits = mortonBitsPerDim(wM, wN);
+            if (mortonBits > 0) {
+                // Morton Z-order: deinterleave even bits → row, odd bits → col
+                // For colFastest: even bits = row, odd bits = col
+                // For rowFastest: even bits = col, odd bits = row
+                if (colFastest) {
+                    wR = mortonDeinterleaveEven(rewriter, loc, matWarpId, mortonBits);
+                    wC = mortonDeinterleaveOdd(rewriter, loc, matWarpId, mortonBits);
+                } else {
+                    wC = mortonDeinterleaveEven(rewriter, loc, matWarpId, mortonBits);
+                    wR = mortonDeinterleaveOdd(rewriter, loc, matWarpId, mortonBits);
+                }
+                // Mask to valid range if grid is non-square
+                if (wM < (1LL << mortonBits))
+                    wR = remByConst(rewriter, loc, wR, wM);
+                if (wN < (1LL << mortonBits))
+                    wC = remByConst(rewriter, loc, wC, wN);
+            } else if (colFastest) {
+                wR = divByConst(rewriter, loc, matWarpId, wN);
+                wC = remByConst(rewriter, loc, matWarpId, wN);
             } else {
-                Value wM_val = arith::ConstantIntOp::create(rewriter, loc, wM, 32);
-                wR = arith::RemUIOp::create(rewriter, loc, matWarpId, wM_val);
-                wC = arith::DivUIOp::create(rewriter, loc, matWarpId, wM_val);
+                wR = remByConst(rewriter, loc, matWarpId, wM);
+                wC = divByConst(rewriter, loc, matWarpId, wM);
             }
-            // Lane decomposition: faster dim uses mod, slower uses div
+            // Lane decomposition: shift/mask when power-of-2
             Value lR, lC;
             if (colFastest) {
-                lR = arith::DivUIOp::create(rewriter, loc, matLaneId, tN_val);
-                lC = arith::RemUIOp::create(rewriter, loc, matLaneId, tN_val);
+                lR = divByConst(rewriter, loc, matLaneId, tN);
+                lC = remByConst(rewriter, loc, matLaneId, tN);
             } else {
-                Value tM_val = arith::ConstantIntOp::create(rewriter, loc, tM, 32);
-                lR = arith::RemUIOp::create(rewriter, loc, matLaneId, tM_val);
-                lC = arith::DivUIOp::create(rewriter, loc, matLaneId, tM_val);
+                lR = remByConst(rewriter, loc, matLaneId, tM);
+                lC = divByConst(rewriter, loc, matLaneId, tM);
             }
 
             Value baseRow = arith::AddIOp::create(rewriter, loc,
@@ -452,14 +787,10 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 arith::MulIOp::create(rewriter, loc, lC, sN_val));
 
             // Wrap to handle redundant threads (tileM > rows)
-            if (tileM > rows) {
-                Value modRow = arith::ConstantIntOp::create(rewriter, loc, rows, 32);
-                baseRow = arith::RemUIOp::create(rewriter, loc, baseRow, modRow);
-            }
-            if (tileN > cols) {
-                Value modCol = arith::ConstantIntOp::create(rewriter, loc, cols, 32);
-                baseCol = arith::RemUIOp::create(rewriter, loc, baseCol, modCol);
-            }
+            if (tileM > rows)
+                baseRow = remByConst(rewriter, loc, baseRow, rows);
+            if (tileN > cols)
+                baseCol = remByConst(rewriter, loc, baseCol, cols);
 
             return {baseRow, baseCol};
         };
@@ -484,7 +815,19 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
         // ── Create threadgroup global ─────────────────────────────────────
         unsigned id = getDotCounter(ctx)++;
-        int64_t tgStripSize = 8 * std::max(K, N);
+        // Padded strides for bank conflict avoidance.
+        // Only pad when the padded buffer (including batch slices) fits in 16KB,
+        // leaving headroom for other TG allocations within the 32KB hardware limit.
+        int64_t pad = tgPadForType(aElemTy);
+        int64_t maxStride = std::max(K, N);
+        int64_t unpaddedSize = 8 * maxStride * batchSize + 1;
+        int64_t paddedMaxStride = maxStride + pad;
+        int64_t paddedSize = 8 * paddedMaxStride * batchSize + 1;
+        bool canPad = (pad > 0) && (paddedSize * 4 <= 16384);  // 16KB budget
+        int64_t Kpad = canPad ? K + pad : K;
+        int64_t Npad = canPad ? N + pad : N;
+        int64_t tgStripStride = canPad ? paddedMaxStride : maxStride;
+        int64_t tgStripSize = 8 * tgStripStride;
         // Each batch slice needs its own TG region so MMA ops don't
         // cross-contaminate between warps assigned to different batches.
         int64_t tgSize = tgStripSize * batchSize + 1;  // +1 garbage slot
@@ -492,6 +835,126 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             ("__tg_dot_ab_" + llvm::Twine(id)).str(), tgSize);
 
         Value ptrTG = LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy, tgBuf.getName());
+
+        // ── Async copy intrinsics (when device pointers available) ────────
+        auto devPtrTy  = LLVMPointerType::get(ctx, 1);
+        auto ptrTy0    = LLVMPointerType::get(ctx, 0);
+        LLVMFuncOp asyncCopyFn, waitFn;
+        Value evAlloca;
+        if (useAsyncA || useAsyncB) {
+            auto asyncCopyFnTy = LLVMFunctionType::get(tgPtrTy,
+                {i64Ty, i64Ty,
+                 tgPtrTy, i64Ty, i64Ty, vec2i64Ty,
+                 devPtrTy, i64Ty, i64Ty, vec2i64Ty,
+                 vec2i64Ty, i32Ty}, false);
+            asyncCopyFn = getOrInsertIntrinsic(rewriter, mod,
+                "air.simdgroup_async_copy_2d.p3i8.p1i8", asyncCopyFnTy);
+
+            auto waitFnTy = LLVMFunctionType::get(voidTy, {i32Ty, ptrTy0}, false);
+            waitFn = getOrInsertIntrinsic(rewriter, mod,
+                "air.wait_simdgroup_events", waitFnTy);
+
+            // Event alloca: thread-local storage for async event pointer
+            auto funcOp = op->getParentOfType<LLVM::LLVMFuncOp>();
+            OpBuilder::InsertionGuard guard(rewriter);
+            if (funcOp) {
+                // Check for existing alloca
+                auto &entryBlock = funcOp.getBody().front();
+                bool found = false;
+                for (auto &existingOp : entryBlock) {
+                    if (auto alloca = dyn_cast<LLVM::AllocaOp>(existingOp)) {
+                        if (alloca.getElemType() == tgPtrTy) {
+                            evAlloca = alloca.getResult();
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    rewriter.setInsertionPointToStart(&entryBlock);
+                    Value one64 = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
+                    evAlloca = LLVM::AllocaOp::create(rewriter, loc, ptrTy0,
+                        tgPtrTy, one64, /*alignment=*/8).getResult();
+                }
+            }
+        }
+
+        // Compute device strip base pointer (uniform across all threads).
+        // For row-major: addr = base + row * rowStride + col * colStride
+        // stripBase = ptrs[0] - ((baseRow + offsets[0][rowDim] - stripRowStart) * rowStride
+        //                        + (baseCol + offsets[0][colDim]) * colStride)
+        // The baseRow/baseCol terms cancel with ptrs[0]'s offset, giving:
+        //   matrixBase + stripRowStart * rowStride (same for all threads).
+        auto computeStripDevPtr = [&](SmallVector<Value> &ptrs,
+                                      SmallVector<SmallVector<unsigned>> &offsets,
+                                      Value baseRow, Value baseCol,
+                                      Value rowStride, Value colStride,
+                                      int64_t stripRowStart,
+                                      Type elemTy) -> Value {
+            int64_t refRowOff = offsets[0][rowDim];
+            int64_t refColOff = offsets[0][colDim];
+
+            Value baseRowExt = arith::ExtUIOp::create(rewriter, loc, i64Ty, baseRow);
+            Value baseColExt = arith::ExtUIOp::create(rewriter, loc, i64Ty, baseCol);
+
+            // rowDelta = baseRow + refRowOff - stripRowStart
+            Value rowDelta = arith::AddIOp::create(rewriter, loc, baseRowExt,
+                arith::ConstantIntOp::create(rewriter, loc, refRowOff - stripRowStart, 64));
+            // colDelta = baseCol + refColOff
+            Value colDelta = arith::AddIOp::create(rewriter, loc, baseColExt,
+                arith::ConstantIntOp::create(rewriter, loc, refColOff, 64));
+            // elemOff = rowDelta * rowStride + colDelta * colStride
+            Value elemOff = arith::AddIOp::create(rewriter, loc,
+                arith::MulIOp::create(rewriter, loc, rowDelta, rowStride),
+                arith::MulIOp::create(rewriter, loc, colDelta, colStride));
+            // Negate to go back to strip base
+            Value negElemOff = arith::SubIOp::create(rewriter, loc,
+                arith::ConstantIntOp::create(rewriter, loc, (int64_t)0, 64), elemOff);
+            return LLVM::GEPOp::create(rewriter, loc, devPtrTy,
+                elemTy, ptrs[0], ArrayRef<LLVM::GEPArg>{negElemOff});
+        };
+
+        // Emit async copy from device to TG for one 8-row strip.
+        // tgPadStride: the padded stride used in TG (stripCols + padding).
+        auto emitAsyncCopy = [&](Value stripDevPtr, Value rowStrideElems,
+                                 Value tgDst, int64_t stripCols,
+                                 int64_t tgPadStride,
+                                 Type elemTy) {
+            unsigned elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
+            int64_t tileWidthBytes = stripCols * elemBytes;
+
+            Value sizeOf = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
+            Value alignOf = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
+
+            // Destination (TG): packed with padding
+            Value dstStrideBytes = arith::ConstantIntOp::create(rewriter, loc,
+                tgPadStride * elemBytes, 64);
+            Value dstElemStride = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
+            Value widthVal = arith::ConstantIntOp::create(rewriter, loc, tileWidthBytes, 64);
+            Value heightVal = arith::ConstantIntOp::create(rewriter, loc, 8, 64);
+            Value dstTile = makeI64Vec2(rewriter, loc, tileWidthBytes, 8);
+
+            // Source (device): stride in bytes
+            Value elemBytesVal = arith::ConstantIntOp::create(rewriter, loc, (int64_t)elemBytes, 64);
+            Value srcStrideBytes = arith::MulIOp::create(rewriter, loc, rowStrideElems, elemBytesVal);
+            Value srcElemStride = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
+            Value srcTile = makeI64Vec2(rewriter, loc, tileWidthBytes, 8);
+
+            Value offsetVec = makeI64Vec2(rewriter, loc, 0, 0);
+            Value clamp = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+
+            Value evPtr = LLVM::CallOp::create(rewriter, loc, asyncCopyFn,
+                ValueRange{sizeOf, alignOf,
+                    tgDst, dstStrideBytes, dstElemStride, dstTile,
+                    stripDevPtr, srcStrideBytes, srcElemStride, srcTile,
+                    offsetVec, clamp}).getResult();
+
+            // Store event and wait
+            LLVM::StoreOp::create(rewriter, loc, evPtr, evAlloca);
+            Value oneI32 = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+            LLVM::CallOp::create(rewriter, loc, waitFn,
+                ValueRange{oneI32, evAlloca});
+        };
 
         // Compute runtime batch-offset pointer for SIMD matrix load/store.
         // Each batch slice gets its own tgStripSize region in TG memory so
@@ -520,8 +983,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             for (unsigned d = 0; d < encRowDim; ++d) batchW *= wpc[d];
             if (batchW <= 1)
                 return arith::ConstantIntOp::create(rewriter, loc, 0, 32);
-            Value mw = arith::ConstantIntOp::create(rewriter, loc, matW, 32);
-            return arith::DivUIOp::create(rewriter, loc, warpId, mw);
+            return divByConst(rewriter, loc, warpId, matW);
         };
 
         Value cBatchWarpIdx = makeBatchWarpIdx(cEnc);
@@ -756,13 +1218,22 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 matA_tiles[tm].resize(tilesK);
                 int64_t rowStart = tm * 8;
 
-                stripScatter(aBaseRow, aBaseCol, elemsA, aOffsets, K, rowStart, aMixed, scatterBatchRound, aBatchWarpIdx, aHasBatchWarps, abTgElemTy);
+                if (useAsyncA) {
+                    // Async copy: DMA from device to TG
+                    Value stripPtr = computeStripDevPtr(aPtrs, aOffsets,
+                        aBaseRow, aBaseCol, aRowStride, aColStride, rowStart,
+                        aType.getElementType());
+                    emitAsyncCopy(stripPtr, aRowStride, curPtrTGBatch, K, Kpad,
+                        aType.getElementType());
+                } else {
+                    stripScatter(aBaseRow, aBaseCol, elemsA, aOffsets, Kpad, rowStart, aMixed, scatterBatchRound, aBatchWarpIdx, aHasBatchWarps, abTgElemTy);
+                }
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                 for (int64_t tk = 0; tk < tilesK; ++tk) {
                     Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
-                    Value aStride = makeI64Vec2(rewriter, loc, 1, K);
-                    Value aShape  = makeI64Vec2(rewriter, loc, K, 8);
+                    Value aStride = makeI64Vec2(rewriter, loc, 1, Kpad);
+                    Value aShape  = makeI64Vec2(rewriter, loc, Kpad, 8);
                     matA_tiles[tm][tk] = LLVM::CallOp::create(rewriter, loc, abLoadFn,
                         ValueRange{curPtrTGBatch, aShape, aStride, aOff}).getResult();
                 }
@@ -775,11 +1246,11 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 matC_tiles[tm].resize(tilesN);
                 int64_t rowStart = tm * 8;
 
-                stripScatter(cBaseRow, cBaseCol, elemsC, cOffsets, N, rowStart, cMixed, scatterBatchRound, cBatchWarpIdx, cHasBatchWarps, f32Ty);
+                stripScatter(cBaseRow, cBaseCol, elemsC, cOffsets, Npad, rowStart, cMixed, scatterBatchRound, cBatchWarpIdx, cHasBatchWarps, f32Ty);
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-                Value cStride = makeI64Vec2(rewriter, loc, 1, N);
-                Value cShape  = makeI64Vec2(rewriter, loc, N, 8);
+                Value cStride = makeI64Vec2(rewriter, loc, 1, Npad);
+                Value cShape  = makeI64Vec2(rewriter, loc, Npad, 8);
                 for (int64_t tn = 0; tn < tilesN; ++tn) {
                     Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
                     matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, loadFn,
@@ -792,11 +1263,19 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             for (int64_t tk = 0; tk < tilesK; ++tk) {
                 int64_t rowStart = tk * 8;
 
-                stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, N, rowStart, bMixed, scatterBatchRound, bBatchWarpIdx, bHasBatchWarps, abTgElemTy);
+                if (useAsyncB) {
+                    Value stripPtr = computeStripDevPtr(bPtrs, bOffsets,
+                        bBaseRow, bBaseCol, bRowStride, bColStride, rowStart,
+                        bType.getElementType());
+                    emitAsyncCopy(stripPtr, bRowStride, curPtrTGBatch, N, Npad,
+                        bType.getElementType());
+                } else {
+                    stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, Npad, rowStart, bMixed, scatterBatchRound, bBatchWarpIdx, bHasBatchWarps, abTgElemTy);
+                }
                 LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-                Value bStride = makeI64Vec2(rewriter, loc, 1, N);
-                Value bShape  = makeI64Vec2(rewriter, loc, N, 8);
+                Value bStride = makeI64Vec2(rewriter, loc, 1, Npad);
+                Value bShape  = makeI64Vec2(rewriter, loc, Npad, 8);
                 for (int64_t tn = 0; tn < tilesN; ++tn) {
                     Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
                     Value matB = LLVM::CallOp::create(rewriter, loc, abLoadFn,
@@ -814,8 +1293,8 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             for (int64_t tm = 0; tm < tilesM; ++tm) {
                 int64_t rowStart = tm * 8;
 
-                Value cStoreStride = makeI64Vec2(rewriter, loc, 1, N);
-                Value cStoreShape  = makeI64Vec2(rewriter, loc, N, 8);
+                Value cStoreStride = makeI64Vec2(rewriter, loc, 1, Npad);
+                Value cStoreShape  = makeI64Vec2(rewriter, loc, Npad, 8);
                 for (int64_t tn = 0; tn < tilesN; ++tn) {
                     Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
                     LLVM::CallOp::create(rewriter, loc, storeFn,
@@ -852,7 +1331,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                         inStrip = arith::AndIOp::create(rewriter, loc, inStrip, batchMatch);
                     }
 
-                    Value idx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, N, rowStart);
+                    Value idx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, Npad, rowStart);
                     if (batchRounds > 1) {
                         // Sequential mode: data is at TG base.
                         Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
@@ -1028,8 +1507,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                                 ValueRange{}).getResult();
         Value tid32 = LLVM::ExtractValueOp::create(rewriter, loc, i32Ty,
                           tidStruct, ArrayRef<int64_t>{0});
-        Value c32    = arith::ConstantIntOp::create(rewriter, loc, 32, 32);
-        Value warpId = arith::DivUIOp::create(rewriter, loc, tid32, c32);
+        Value warpId = divByConst(rewriter, loc, tid32, 32); // tid / 32
 
         // ── Get blocked encoding params for A, B ────────────────────────
 
@@ -1123,6 +1601,15 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 useDeviceA = false;
                 useDeviceB = false;
             }
+        }
+
+        // Device MMA loads only support float types (f32, f16, bf16).
+        // For integer element types (e.g. int8), the MMA intrinsic reads f32
+        // from device memory but the actual data is packed at 1 byte/element,
+        // causing a 4x stride mismatch. Force TG scatter path for integers.
+        if (isa<IntegerType>(aElemTy)) {
+            useDeviceA = false;
+            useDeviceB = false;
         }
 
         // ── Compute row stride from pointer differences ──────────────────
@@ -1392,30 +1879,42 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
             bool colFastest = (order[0] == (unsigned)encColDim);
 
-            Value wN_val  = arith::ConstantIntOp::create(rewriter, loc, wN, 32);
-            Value tN_val  = arith::ConstantIntOp::create(rewriter, loc, tN, 32);
             Value tMsM    = arith::ConstantIntOp::create(rewriter, loc, tM * sM, 32);
             Value sM_val  = arith::ConstantIntOp::create(rewriter, loc, sM, 32);
             Value tNsN    = arith::ConstantIntOp::create(rewriter, loc, tN * sN, 32);
             Value sN_val  = arith::ConstantIntOp::create(rewriter, loc, sN, 32);
 
+            // Warp decomposition: Morton order when both dims are power-of-2,
+            // otherwise linear div/mod.
             Value wR, wC;
-            if (colFastest) {
-                wR = arith::DivUIOp::create(rewriter, loc, warpId, wN_val);
-                wC = arith::RemUIOp::create(rewriter, loc, warpId, wN_val);
+            unsigned mortonBits = mortonBitsPerDim(wM, wN);
+            if (mortonBits > 0) {
+                if (colFastest) {
+                    wR = mortonDeinterleaveEven(rewriter, loc, warpId, mortonBits);
+                    wC = mortonDeinterleaveOdd(rewriter, loc, warpId, mortonBits);
+                } else {
+                    wC = mortonDeinterleaveEven(rewriter, loc, warpId, mortonBits);
+                    wR = mortonDeinterleaveOdd(rewriter, loc, warpId, mortonBits);
+                }
+                if (wM < (1LL << mortonBits))
+                    wR = remByConst(rewriter, loc, wR, wM);
+                if (wN < (1LL << mortonBits))
+                    wC = remByConst(rewriter, loc, wC, wN);
+            } else if (colFastest) {
+                wR = divByConst(rewriter, loc, warpId, wN);
+                wC = remByConst(rewriter, loc, warpId, wN);
             } else {
-                Value wM_val = arith::ConstantIntOp::create(rewriter, loc, wM, 32);
-                wR = arith::RemUIOp::create(rewriter, loc, warpId, wM_val);
-                wC = arith::DivUIOp::create(rewriter, loc, warpId, wM_val);
+                wR = remByConst(rewriter, loc, warpId, wM);
+                wC = divByConst(rewriter, loc, warpId, wM);
             }
+            // Lane decomposition: shift/mask when power-of-2
             Value lR, lC;
             if (colFastest) {
-                lR = arith::DivUIOp::create(rewriter, loc, laneId, tN_val);
-                lC = arith::RemUIOp::create(rewriter, loc, laneId, tN_val);
+                lR = divByConst(rewriter, loc, laneId, tN);
+                lC = remByConst(rewriter, loc, laneId, tN);
             } else {
-                Value tM_val = arith::ConstantIntOp::create(rewriter, loc, tM, 32);
-                lR = arith::RemUIOp::create(rewriter, loc, laneId, tM_val);
-                lC = arith::DivUIOp::create(rewriter, loc, laneId, tM_val);
+                lR = remByConst(rewriter, loc, laneId, tM);
+                lC = divByConst(rewriter, loc, laneId, tM);
             }
 
             Value baseRow = arith::AddIOp::create(rewriter, loc,
@@ -1425,19 +1924,20 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 arith::MulIOp::create(rewriter, loc, wC, tNsN),
                 arith::MulIOp::create(rewriter, loc, lC, sN_val));
 
-            if (tileM > rows) {
-                Value modRow = arith::ConstantIntOp::create(rewriter, loc, rows, 32);
-                baseRow = arith::RemUIOp::create(rewriter, loc, baseRow, modRow);
-            }
-            if (tileN > cols) {
-                Value modCol = arith::ConstantIntOp::create(rewriter, loc, cols, 32);
-                baseCol = arith::RemUIOp::create(rewriter, loc, baseCol, modCol);
-            }
+            if (tileM > rows)
+                baseRow = remByConst(rewriter, loc, baseRow, rows);
+            if (tileN > cols)
+                baseCol = remByConst(rewriter, loc, baseCol, cols);
 
             return {baseRow, baseCol};
         };
 
-        // MMA base: lane->(row,col) within 8x8 tile, warp->tile position
+        // MMA base: lane->(row,col) within 8x8 tile, warp->tile position.
+        // Must use column-major warp ordering (warpId % wN → col, warpId / wN → row)
+        // to match the LinearLayout in AppleMmaEncodingAttr::toLinearLayout(),
+        // which the upstream convert_layout relies on for shared memory addressing.
+        // Do NOT use Morton order here — Morton is only safe for internal TG
+        // operations where scatter and gather are self-consistent.
         auto makeBaseMma = [&](AppleMmaEncodingAttr enc, int64_t rows, int64_t cols)
             -> std::pair<Value, Value> {
             auto wpc = enc.getWarpsPerCTA();
@@ -1448,10 +1948,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             Value laneCol = arith::AndIOp::create(rewriter, loc, laneId, c7);
             Value laneRow = arith::ShRUIOp::create(rewriter, loc, laneId, c3);
 
-            Value wN_val  = arith::ConstantIntOp::create(rewriter, loc, wN, 32);
             Value c8      = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
-            Value warpRow = arith::DivUIOp::create(rewriter, loc, warpId, wN_val);
-            Value warpCol = arith::RemUIOp::create(rewriter, loc, warpId, wN_val);
+            // Column-major warp tiling: matches toLinearLayout warpOrder={1,0}
+            Value warpRow = divByConst(rewriter, loc, warpId, wN);
+            Value warpCol = remByConst(rewriter, loc, warpId, wN);
 
             Value baseRow = arith::AddIOp::create(rewriter, loc,
                 arith::MulIOp::create(rewriter, loc, warpRow, c8), laneRow);
@@ -1468,10 +1968,17 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // ── Create threadgroup global ─────────────────────────────────────
         // TG buffer is needed for: C scatter/load (always), and A/B scatter
         // (only when device path is not available).
+        // Padded strides for bank conflict avoidance (conditional on TG budget)
         unsigned id = getDotCounter(ctx)++;
-        int64_t tgCStripSize = 8 * N;  // C always needs N-wide strips
-        int64_t tgABStripSize = 8 * std::max(K, N);
-        int64_t tgStripSize = (useDeviceA && useDeviceB) ? tgCStripSize : 8 * std::max(K, N);
+        int64_t pad = tgPadForType(aElemTy);
+        int64_t maxStrideMma = (useDeviceA && useDeviceB) ? N : std::max(K, N);
+        int64_t unpaddedSizeMma = 8 * maxStrideMma + 1;
+        bool canPadMma = (pad > 0) && ((unpaddedSizeMma + 8 * pad) * 4 <= 16384);
+        int64_t Kpad = canPadMma ? K + pad : K;
+        int64_t Npad = canPadMma ? N + pad : N;
+        int64_t tgCStripSize = 8 * Npad;
+        int64_t tgABStripSize = 8 * std::max(Kpad, Npad);
+        int64_t tgStripSize = (useDeviceA && useDeviceB) ? tgCStripSize : tgABStripSize;
         int64_t tgSize = tgStripSize + 1;
         auto tgBuf = getOrCreateTGGlobal(rewriter, mod,
             ("__tg_dot_ab_" + llvm::Twine(id)).str(), tgSize);
@@ -1587,11 +2094,11 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             int64_t rowStart = tm * 8;
 
             filteredScatter(ptrTG, garbageIdx, cBaseRow, cBaseCol,
-                            elemsC, cOffsets, cBuckets[tm], N, rowStart, f32Ty);
+                            elemsC, cOffsets, cBuckets[tm], Npad, rowStart, f32Ty);
             LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-            Value cStride = makeI64Vec2(rewriter, loc, 1, N);
-            Value cShape  = makeI64Vec2(rewriter, loc, N, 8);
+            Value cStride = makeI64Vec2(rewriter, loc, 1, Npad);
+            Value cShape  = makeI64Vec2(rewriter, loc, Npad, 8);
             for (int64_t tn = 0; tn < tilesN; ++tn) {
                 Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
                 matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, loadFn,
@@ -1651,12 +2158,12 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                     for (int64_t tm = 0; tm < tilesM; ++tm) {
                         int64_t rowStart = tm * 8;
                         filteredScatter(ptrTG, garbageIdx, aBaseRow, aBaseCol,
-                                        elemsA, aOffsets, aBuckets[tm], K, rowStart, abTgScatterTy);
+                                        elemsA, aOffsets, aBuckets[tm], Kpad, rowStart, abTgScatterTy);
                         LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
                         Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
-                        Value aStride = makeI64Vec2(rewriter, loc, 1, K);
-                        Value aShape  = makeI64Vec2(rewriter, loc, K, 8);
+                        Value aStride = makeI64Vec2(rewriter, loc, 1, Kpad);
+                        Value aShape  = makeI64Vec2(rewriter, loc, Kpad, 8);
                         matA_strip[tm] = LLVM::CallOp::create(rewriter, loc, abTgLoadFn,
                             ValueRange{ptrTG, aShape, aStride, aOff}).getResult();
                         LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
@@ -1666,11 +2173,11 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 {
                     int64_t rowStart = tk * 8;
                     filteredScatter(ptrTG, garbageIdx, bBaseRow, bBaseCol,
-                                    elemsB, bOffsets, bBuckets[tk], N, rowStart, abTgScatterTy);
+                                    elemsB, bOffsets, bBuckets[tk], Npad, rowStart, abTgScatterTy);
                     LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-                    Value bStride = makeI64Vec2(rewriter, loc, 1, N);
-                    Value bShape  = makeI64Vec2(rewriter, loc, N, 8);
+                    Value bStride = makeI64Vec2(rewriter, loc, 1, Npad);
+                    Value bShape  = makeI64Vec2(rewriter, loc, Npad, 8);
                     for (int64_t tn = 0; tn < tilesN; ++tn) {
                         Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
                         Value matB = LLVM::CallOp::create(rewriter, loc, abTgLoadFn,
@@ -1696,8 +2203,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         for (int64_t tm = 0; tm < tilesM; ++tm) {
             int64_t rowStart = tm * 8;
 
-            Value cStoreStride = makeI64Vec2(rewriter, loc, 1, N);
-            Value cStoreShape  = makeI64Vec2(rewriter, loc, N, 8);
+            Value cStoreStride = makeI64Vec2(rewriter, loc, 1, Npad);
+            Value cStoreShape  = makeI64Vec2(rewriter, loc, Npad, 8);
             for (int64_t tn = 0; tn < tilesN; ++tn) {
                 Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
                 LLVM::CallOp::create(rewriter, loc, storeFn,
@@ -1715,7 +2222,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                         actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
                     arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
                         actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart + 8, 32)));
-                Value sIdx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, N, rowStart);
+                Value sIdx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, Npad, rowStart);
                 Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, sIdx, garbageIdx);
                 Value val = gather1(ptrTG, safeIdx);
                 if (val.getType() != outElemTy)

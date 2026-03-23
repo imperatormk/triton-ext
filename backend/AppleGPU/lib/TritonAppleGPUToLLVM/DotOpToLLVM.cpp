@@ -828,9 +828,35 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         int64_t Npad = canPad ? N + pad : N;
         int64_t tgStripStride = canPad ? paddedMaxStride : maxStride;
         int64_t tgStripSize = 8 * tgStripStride;
+
+        // Double-buffering for B strips in Phase 3: overlap DMA with MMA.
+        // Only when async copy is used for B, K > 8 (multiple strips), and
+        // the doubled TG buffer fits in 16KB budget.
+        // batchSize is always 1 when async copy is enabled (checked above).
+        int64_t bStripBytes = 8 * Npad * 4;  // one B strip in bytes (f32)
+        int64_t tilesKEarly = K / 8;
+        // Also require matWarpsCEarly > 1: single-warp configs can't overlap
+        // load+compute (one simdgroup), and the doubled TG global gets trimmed
+        // by the IR pipeline's dead-GEP elimination, causing PSO crashes.
+        bool useDoubleBufB = useAsyncB && (tilesKEarly > 1)
+            && (2 * bStripBytes <= 16384)
+            && (batchSize == 1)
+            && (matWarpsCEarly > 1);
+        // Env var to disable double-buffering for debugging
+        {
+            const char *envVar = std::getenv("TRITON_DOUBLE_BUF");
+            if (envVar && std::string(envVar) == "0")
+                useDoubleBufB = false;
+        }
+
         // Each batch slice needs its own TG region so MMA ops don't
         // cross-contaminate between warps assigned to different batches.
-        int64_t tgSize = tgStripSize * batchSize + 1;  // +1 garbage slot
+        // With double-buffering, Phase 3 needs 2 B strip slots.
+        // The TG buffer must fit the max of: Phase 1 (A strip), Phase 2 (C strip),
+        // Phase 3 (1 or 2 B strips), Phase 4 (C strip).
+        int64_t phase3Strips = useDoubleBufB ? 2 : 1;
+        int64_t tgSizeNeeded = std::max(tgStripSize, phase3Strips * 8 * Npad);
+        int64_t tgSize = tgSizeNeeded * batchSize + 1;  // +1 garbage slot
         auto tgBuf = getOrCreateTGGlobal(rewriter, mod,
             ("__tg_dot_ab_" + llvm::Twine(id)).str(), tgSize);
 
@@ -914,12 +940,13 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 elemTy, ptrs[0], ArrayRef<LLVM::GEPArg>{negElemOff});
         };
 
-        // Emit async copy from device to TG for one 8-row strip.
+        // Emit async copy from device to TG for one 8-row strip (fire only).
+        // Returns without waiting -- caller must call emitAsyncCopyWait.
         // tgPadStride: the padded stride used in TG (stripCols + padding).
-        auto emitAsyncCopy = [&](Value stripDevPtr, Value rowStrideElems,
-                                 Value tgDst, int64_t stripCols,
-                                 int64_t tgPadStride,
-                                 Type elemTy) {
+        auto emitAsyncCopyFire = [&](Value stripDevPtr, Value rowStrideElems,
+                                     Value tgDst, int64_t stripCols,
+                                     int64_t tgPadStride,
+                                     Type elemTy) {
             unsigned elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
             int64_t tileWidthBytes = stripCols * elemBytes;
 
@@ -930,8 +957,6 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             Value dstStrideBytes = arith::ConstantIntOp::create(rewriter, loc,
                 tgPadStride * elemBytes, 64);
             Value dstElemStride = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
-            Value widthVal = arith::ConstantIntOp::create(rewriter, loc, tileWidthBytes, 64);
-            Value heightVal = arith::ConstantIntOp::create(rewriter, loc, 8, 64);
             Value dstTile = makeI64Vec2(rewriter, loc, tileWidthBytes, 8);
 
             // Source (device): stride in bytes
@@ -949,11 +974,25 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                     stripDevPtr, srcStrideBytes, srcElemStride, srcTile,
                     offsetVec, clamp}).getResult();
 
-            // Store event and wait
+            // Store event pointer for later wait
             LLVM::StoreOp::create(rewriter, loc, evPtr, evAlloca);
+        };
+
+        // Wait for the last fired async copy to complete.
+        auto emitAsyncCopyWait = [&]() {
             Value oneI32 = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
             LLVM::CallOp::create(rewriter, loc, waitFn,
                 ValueRange{oneI32, evAlloca});
+        };
+
+        // Emit async copy from device to TG for one 8-row strip (fire + wait).
+        auto emitAsyncCopy = [&](Value stripDevPtr, Value rowStrideElems,
+                                 Value tgDst, int64_t stripCols,
+                                 int64_t tgPadStride,
+                                 Type elemTy) {
+            emitAsyncCopyFire(stripDevPtr, rowStrideElems, tgDst, stripCols,
+                              tgPadStride, elemTy);
+            emitAsyncCopyWait();
         };
 
         // Compute runtime batch-offset pointer for SIMD matrix load/store.
@@ -1260,33 +1299,93 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             }
 
             // Phase 3: B strips + MMA — native type MMA
-            for (int64_t tk = 0; tk < tilesK; ++tk) {
-                int64_t rowStart = tk * 8;
+            // Double-buffered path: overlap DMA of B[k+1] with MMA on B[k].
+            // Two TG slots of size 8*Npad alternate: slot 0 and slot 1.
+            // Prologue loads B[0] into slot 0; each iteration fires prefetch
+            // of B[k+1] into slot[(k+1)%2] then MMA on slot[k%2], then waits.
+            // Falls back to single-buffer when double-buffering is not active.
+            if (useDoubleBufB) {
+                // Slot pointers: slot0 = curPtrTGBatch, slot1 = curPtrTGBatch + 8*Npad
+                int64_t slotOffset = 8 * Npad;  // offset in f32 elements
+                Value ptrSlot0 = curPtrTGBatch;
+                Value ptrSlot1 = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32Ty,
+                    curPtrTGBatch,
+                    ArrayRef<LLVM::GEPArg>{(int64_t)slotOffset});
 
-                if (useAsyncB) {
+                // Prologue: load B[0] into slot 0, wait, barrier
+                {
                     Value stripPtr = computeStripDevPtr(bPtrs, bOffsets,
-                        bBaseRow, bBaseCol, bRowStride, bColStride, rowStart,
+                        bBaseRow, bBaseCol, bRowStride, bColStride, 0,
                         bType.getElementType());
-                    emitAsyncCopy(stripPtr, bRowStride, curPtrTGBatch, N, Npad,
+                    emitAsyncCopy(stripPtr, bRowStride, ptrSlot0, N, Npad,
                         bType.getElementType());
-                } else {
-                    stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, Npad, rowStart, bMixed, scatterBatchRound, bBatchWarpIdx, bHasBatchWarps, abTgElemTy);
+                    LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
                 }
-                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
 
-                Value bStride = makeI64Vec2(rewriter, loc, 1, Npad);
-                Value bShape  = makeI64Vec2(rewriter, loc, Npad, 8);
-                for (int64_t tn = 0; tn < tilesN; ++tn) {
-                    Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-                    Value matB = LLVM::CallOp::create(rewriter, loc, abLoadFn,
-                        ValueRange{curPtrTGBatch, bShape, bStride, bOff}).getResult();
+                for (int64_t tk = 0; tk < tilesK; ++tk) {
+                    Value curSlotPtr = (tk % 2 == 0) ? ptrSlot0 : ptrSlot1;
+                    Value nextSlotPtr = (tk % 2 == 0) ? ptrSlot1 : ptrSlot0;
 
-                    for (int64_t tm = 0; tm < tilesM; ++tm) {
-                        matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, abMmaFn,
-                            ValueRange{matA_tiles[tm][tk], matB, matC_tiles[tm][tn]}).getResult();
+                    // Prefetch B[tk+1] into next slot (fire only, no wait)
+                    if (tk + 1 < tilesK) {
+                        int64_t nextRowStart = (tk + 1) * 8;
+                        Value stripPtr = computeStripDevPtr(bPtrs, bOffsets,
+                            bBaseRow, bBaseCol, bRowStride, bColStride, nextRowStart,
+                            bType.getElementType());
+                        emitAsyncCopyFire(stripPtr, bRowStride, nextSlotPtr, N, Npad,
+                            bType.getElementType());
+                    }
+
+                    // MMA on current slot (data ready from previous barrier)
+                    Value bStride = makeI64Vec2(rewriter, loc, 1, Npad);
+                    Value bShape  = makeI64Vec2(rewriter, loc, Npad, 8);
+                    for (int64_t tn = 0; tn < tilesN; ++tn) {
+                        Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
+                        Value matB = LLVM::CallOp::create(rewriter, loc, abLoadFn,
+                            ValueRange{curSlotPtr, bShape, bStride, bOff}).getResult();
+
+                        for (int64_t tm = 0; tm < tilesM; ++tm) {
+                            matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, abMmaFn,
+                                ValueRange{matA_tiles[tm][tk], matB, matC_tiles[tm][tn]}).getResult();
+                        }
+                    }
+
+                    // Wait for prefetch + barrier (ensures next slot is ready)
+                    if (tk + 1 < tilesK) {
+                        emitAsyncCopyWait();
+                        LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
                     }
                 }
-                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+            } else {
+                // Single-buffer path (original): scatter/async → barrier → MMA → barrier
+                for (int64_t tk = 0; tk < tilesK; ++tk) {
+                    int64_t rowStart = tk * 8;
+
+                    if (useAsyncB) {
+                        Value stripPtr = computeStripDevPtr(bPtrs, bOffsets,
+                            bBaseRow, bBaseCol, bRowStride, bColStride, rowStart,
+                            bType.getElementType());
+                        emitAsyncCopy(stripPtr, bRowStride, curPtrTGBatch, N, Npad,
+                            bType.getElementType());
+                    } else {
+                        stripScatter(bBaseRow, bBaseCol, elemsB, bOffsets, Npad, rowStart, bMixed, scatterBatchRound, bBatchWarpIdx, bHasBatchWarps, abTgElemTy);
+                    }
+                    LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+                    Value bStride = makeI64Vec2(rewriter, loc, 1, Npad);
+                    Value bShape  = makeI64Vec2(rewriter, loc, Npad, 8);
+                    for (int64_t tn = 0; tn < tilesN; ++tn) {
+                        Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
+                        Value matB = LLVM::CallOp::create(rewriter, loc, abLoadFn,
+                            ValueRange{curPtrTGBatch, bShape, bStride, bOff}).getResult();
+
+                        for (int64_t tm = 0; tm < tilesM; ++tm) {
+                            matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, abMmaFn,
+                                ValueRange{matA_tiles[tm][tk], matB, matC_tiles[tm][tn]}).getResult();
+                        }
+                    }
+                    LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+                }
             }
 
             // Phase 4: Store C tiles -> TG (8-row strips), gather

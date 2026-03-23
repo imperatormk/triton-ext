@@ -1944,6 +1944,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             return tilePtr;
         };
 
+
         // ── Make MMA stride vector for device loads ──────────────────────
         // stride = <colStride, rowStride>
         // For row-major data: colStride=1, rowStride=numCols
@@ -2065,9 +2066,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         auto [cBaseRow, cBaseCol] = makeBaseMma(cMmaEnc, M, N);
 
         // ── Create threadgroup global ─────────────────────────────────────
-        // TG buffer is needed for: C scatter/load (always), and A/B scatter
-        // (only when device path is not available).
-        // Padded strides for bank conflict avoidance (conditional on TG budget)
+        // TG buffer needed for C scatter/load (always), and A/B scatter (TG path).
         unsigned id = getDotCounter(ctx)++;
         int64_t pad = tgPadForType(aElemTy);
         int64_t maxStrideMma = (useDeviceA && useDeviceB) ? N : std::max(K, N);
@@ -2145,16 +2144,6 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
         Value garbageIdx = arith::ConstantIntOp::create(rewriter, loc, tgStripSize, 64);
 
-        // ── Phase 1: Load C tiles (filtered strip scatter — always via TG) ──
-        // C accumulator comes from the previous iteration or zero init.
-        // It uses AppleMmaEncoding, so we always go through TG scatter/load.
-
-        // For C, we still need aBaseRow/Col for scatter — but only when NOT
-        // using device path for A/B. Actually, C always uses TG regardless.
-        // But we need cBaseRow/cBaseCol from makeBaseMma (already computed).
-
-        // filteredScatter needs baseRow/baseCol. For C, use MMA-derived base.
-        // scatterTy: element type to scatter as (f32 for C, native type for A/B).
         auto filteredScatter = [&](Value ptr, Value garbIdx,
                                    Value baseRow, Value baseCol,
                                    SmallVector<Value> &elems,
@@ -2187,6 +2176,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             }
         };
 
+        // ── Phase 1: Load C tiles (filtered strip scatter via TG) ──────────
         SmallVector<SmallVector<Value>> matC_tiles(tilesM);
         for (int64_t tm = 0; tm < tilesM; ++tm) {
             matC_tiles[tm].resize(tilesN);
@@ -2209,21 +2199,32 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // ── Phase 2: A/B loads + MMA ──────────────────────────────────
         if (useDeviceA && useDeviceB) {
             // ── DEVICE PATH: Direct MMA loads from device memory ──────────
-            // No TG scatter, no barriers for A/B. Just compute tile pointers
-            // and call the p1f32 MMA load intrinsic directly.
+            // No TG scatter, no barriers for A/B.
+            // Prefetch: A tiles for tk+1 loaded before MMA of tk.
             Value aDevStride = makeDevMmaStride(aColStride, aRowStride);
             Value bDevStride = makeDevMmaStride(bColStride, bRowStride);
             Value mmaShape = makeI64Vec2(rewriter, loc, 8, 8);
             Value zeroOff = makeI64Vec2(rewriter, loc, 0, 0);
 
+            // Prologue: load A tiles for tk=0
+            SmallVector<Value> matA_cur(tilesM);
+            for (int64_t tm = 0; tm < tilesM; ++tm) {
+                Value aTilePtr = computeTileDevPtr(aPtrs, aOffsets,
+                    aRowStride, aColStride, aBaseRow, aBaseCol, tm * 8, 0);
+                matA_cur[tm] = LLVM::CallOp::create(rewriter, loc, devLoadFn,
+                    ValueRange{aTilePtr, mmaShape, aDevStride, zeroOff}).getResult();
+            }
+
             for (int64_t tk = 0; tk < tilesK; ++tk) {
-                // Load A tiles for this K strip directly from device memory
-                SmallVector<Value> matA_strip(tilesM);
-                for (int64_t tm = 0; tm < tilesM; ++tm) {
-                    Value aTilePtr = computeTileDevPtr(aPtrs, aOffsets,
-                        aRowStride, aColStride, aBaseRow, aBaseCol, tm * 8, tk * 8);
-                    matA_strip[tm] = LLVM::CallOp::create(rewriter, loc, devLoadFn,
-                        ValueRange{aTilePtr, mmaShape, aDevStride, zeroOff}).getResult();
+                // Prefetch A tiles for tk+1
+                SmallVector<Value> matA_next(tilesM);
+                if (tk + 1 < tilesK) {
+                    for (int64_t tm = 0; tm < tilesM; ++tm) {
+                        Value aTilePtr = computeTileDevPtr(aPtrs, aOffsets,
+                            aRowStride, aColStride, aBaseRow, aBaseCol, tm * 8, (tk + 1) * 8);
+                        matA_next[tm] = LLVM::CallOp::create(rewriter, loc, devLoadFn,
+                            ValueRange{aTilePtr, mmaShape, aDevStride, zeroOff}).getResult();
+                    }
                 }
 
                 // Load B tiles and accumulate
@@ -2234,18 +2235,16 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                         ValueRange{bTilePtr, mmaShape, bDevStride, zeroOff}).getResult();
 
                     for (int64_t tm = 0; tm < tilesM; ++tm) {
-                        // Use type-specific MMA: devMmaFn handles f16*f16+f32 or f32*f32+f32
                         matC_tiles[tm][tn] = LLVM::CallOp::create(rewriter, loc, devMmaFn,
-                            ValueRange{matA_strip[tm], matB, matC_tiles[tm][tn]}).getResult();
+                            ValueRange{matA_cur[tm], matB, matC_tiles[tm][tn]}).getResult();
                     }
                 }
+
+                if (tk + 1 < tilesK)
+                    matA_cur = matA_next;
             }
         } else {
             // ── TG PATH: Original scatter/load through threadgroup memory ──
-            // Used when device pointers are not available (e.g., operand is
-            // not directly from a load, or stride couldn't be computed).
-            // aBaseRow/aBaseCol/bBaseRow/bBaseCol already computed above.
-
             int64_t aMaxBase = maxBaseRow(aSrcEnc);
             int64_t bMaxBase = maxBaseRow(bSrcEnc);
             auto aBuckets = bucketElements(aOffsets, aMaxBase, tilesM, 0);
@@ -2292,44 +2291,200 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             }
         }
 
-        // ── Phase 4: Store C tiles -> TG, gather ─────────────────────────
+        // ── Phase 4: Extract C results from MMA tiles ────────────────────
         auto outElemTy = cType.getElementType();
         SmallVector<Value> resultElems(elemsC.size());
         for (size_t i = 0; i < elemsC.size(); ++i)
             resultElems[i] = arith::ConstantOp::create(rewriter, loc,
                 rewriter.getZeroAttr(outElemTy));
 
-        for (int64_t tm = 0; tm < tilesM; ++tm) {
-            int64_t rowStart = tm * 8;
+        if (useDeviceA && useDeviceB) {
+            // ── DEVICE PATH: Shuffle-based MMA extract (no TG round-trip) ───
+            //
+            // The MMA hardware register layout differs from the logical layout
+            // defined by toLinearLayout:
+            //
+            // PHYSICAL layout (extractelement indices 0, 1):
+            //   phys_row = L[1] | (L[2]<<1) | (L[4]<<2)
+            //   phys_col = (L[0]<<1) | (L[3]<<2) | R   (R = extract index 0 or 1)
+            //
+            // LOGICAL layout (toLinearLayout / cOffsets):
+            //   log_row = L[3] | (L[4]<<1)   + (logReg ? 4 : 0)
+            //   log_col = L[0] | (L[1]<<1) | (L[2]<<2)
+            //
+            // To extract the value at logical position (log_row, log_col) from
+            // the MMA tile, we need to:
+            //   1. Find source lane S that physically holds (log_row, log_col):
+            //      S = log_col[1] | (log_row[0]<<1) | (log_row[1]<<2) | (log_col[2]<<3) | (log_row[2]<<4)
+            //      In terms of lane bits:
+            //        S = L[1] | (L[3]<<1) | (L[4]<<2) | (L[2]<<3)  (+ 16 for logReg=1)
+            //   2. Physical register R = log_col[0] = L[0] = laneId & 1
+            //   3. simd_shuffle(phys_reg_R, S) gives the value
 
-            Value cStoreStride = makeI64Vec2(rewriter, loc, 1, Npad);
-            Value cStoreShape  = makeI64Vec2(rewriter, loc, Npad, 8);
-            for (int64_t tn = 0; tn < tilesN; ++tn) {
-                Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-                LLVM::CallOp::create(rewriter, loc, storeFn,
-                    ValueRange{matC_tiles[tm][tn], ptrTG, cStoreShape, cStoreStride, cOff});
-            }
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+            auto cWpc = cMmaEnc.getWarpsPerCTA();
+            unsigned wN = cWpc[1];
 
-            for (size_t idx : cBuckets[tm]) {
+            // Compute warpRow/warpCol for C tile mapping (runtime i32)
+            Value cWarpRow = divByConst(rewriter, loc, warpId, wN);
+            Value cWarpCol = remByConst(rewriter, loc, warpId, wN);
+
+            // Declare shuffle intrinsic: air.simd_shuffle.f32(float, i16) -> float
+            auto i16Ty = IntegerType::get(ctx, 16);
+            auto shuffleFn = getOrInsertIntrinsic(rewriter, mod,
+                "air.simd_shuffle.f32",
+                LLVMFunctionType::get(f32Ty, {f32Ty, i16Ty}, false));
+
+            // Compute shuffle source lane for logical reg 0:
+            // S0 = L[1] | (L[3]<<1) | (L[4]<<2) | (L[2]<<3)
+            // Bit extraction from laneId (i32):
+            auto extractBit = [&](Value v, int bit) -> Value {
+                Value shifted = (bit > 0)
+                    ? arith::ShRUIOp::create(rewriter, loc, v,
+                          arith::ConstantIntOp::create(rewriter, loc, bit, 32))
+                    : v;
+                return arith::AndIOp::create(rewriter, loc, shifted,
+                    arith::ConstantIntOp::create(rewriter, loc, 1, 32));
+            };
+
+            // S0 = L[1] | (L[3]<<1) | (L[4]<<2) | (L[2]<<3)
+            Value bit1 = extractBit(laneId, 1);
+            Value bit2 = extractBit(laneId, 2);
+            Value bit3 = extractBit(laneId, 3);
+            Value bit4 = extractBit(laneId, 4);
+
+            Value S0 = bit1;  // L[1] at position 0
+            S0 = arith::OrIOp::create(rewriter, loc, S0,
+                arith::ShLIOp::create(rewriter, loc, bit3,
+                    arith::ConstantIntOp::create(rewriter, loc, 1, 32))); // L[3] at position 1
+            S0 = arith::OrIOp::create(rewriter, loc, S0,
+                arith::ShLIOp::create(rewriter, loc, bit4,
+                    arith::ConstantIntOp::create(rewriter, loc, 2, 32))); // L[4] at position 2
+            S0 = arith::OrIOp::create(rewriter, loc, S0,
+                arith::ShLIOp::create(rewriter, loc, bit2,
+                    arith::ConstantIntOp::create(rewriter, loc, 3, 32))); // L[2] at position 3
+
+            // S1 = S0 | 16 (for logical register 1, target_row has bit 2 set)
+            Value S1 = arith::OrIOp::create(rewriter, loc, S0,
+                arith::ConstantIntOp::create(rewriter, loc, 16, 32));
+
+            Value S0_i16 = arith::TruncIOp::create(rewriter, loc, i16Ty, S0);
+            Value S1_i16 = arith::TruncIOp::create(rewriter, loc, i16Ty, S1);
+
+            // Physical register selector: R = laneId & 1
+            Value physReg = arith::AndIOp::create(rewriter, loc, laneId,
+                arith::ConstantIntOp::create(rewriter, loc, 1, 32));
+            Value isOddCol = arith::CmpIOp::create(rewriter, loc,
+                arith::CmpIPredicate::ne, physReg,
+                arith::ConstantIntOp::create(rewriter, loc, 0, 32));
+
+            // Pre-extract physical registers and shuffle for ALL tiles
+            // For each tile, compute 4 shuffled values:
+            //   shufReg0_S0, shufReg1_S0 (for logical reg 0)
+            //   shufReg0_S1, shufReg1_S1 (for logical reg 1)
+            // Then select based on isOddCol:
+            //   logReg0_val = isOddCol ? shufReg1_S0 : shufReg0_S0
+            //   logReg1_val = isOddCol ? shufReg1_S1 : shufReg0_S1
+
+            Value extractIdx0 = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+            Value extractIdx1 = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+
+            // Pre-compute shuffled logical values per tile: logReg0[flat], logReg1[flat]
+            SmallVector<Value> tileLogReg0(tilesM * tilesN);
+            SmallVector<Value> tileLogReg1(tilesM * tilesN);
+            for (int64_t tm = 0; tm < tilesM; ++tm)
+                for (int64_t tn = 0; tn < tilesN; ++tn) {
+                    int64_t flat = tm * tilesN + tn;
+                    Value pr0 = LLVM::ExtractElementOp::create(rewriter, loc,
+                        f32Ty, matC_tiles[tm][tn], extractIdx0);
+                    Value pr1 = LLVM::ExtractElementOp::create(rewriter, loc,
+                        f32Ty, matC_tiles[tm][tn], extractIdx1);
+
+                    // Shuffle for logical reg 0 (S0)
+                    Value shR0_S0 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
+                        ValueRange{pr0, S0_i16}).getResult();
+                    Value shR1_S0 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
+                        ValueRange{pr1, S0_i16}).getResult();
+                    tileLogReg0[flat] = arith::SelectOp::create(rewriter, loc,
+                        isOddCol, shR1_S0, shR0_S0);
+
+                    // Shuffle for logical reg 1 (S1)
+                    Value shR0_S1 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
+                        ValueRange{pr0, S1_i16}).getResult();
+                    Value shR1_S1 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
+                        ValueRange{pr1, S1_i16}).getResult();
+                    tileLogReg1[flat] = arith::SelectOp::create(rewriter, loc,
+                        isOddCol, shR1_S1, shR0_S1);
+                }
+
+            for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
                 int64_t rowOff = cOffsets[idx][0];
                 int64_t colOff = cOffsets[idx][1];
-                Value actualRow = arith::AddIOp::create(rewriter, loc, cBaseRow,
-                    arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
-                Value inStrip = arith::AndIOp::create(rewriter, loc,
-                    arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::uge,
-                        actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
-                    arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
-                        actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart + 8, 32)));
-                Value sIdx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, Npad, rowStart);
-                Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, sIdx, garbageIdx);
-                Value val = gather1(ptrTG, safeIdx);
+                int64_t localTm = rowOff / 8;
+                int64_t localTn = colOff / 8;
+                int64_t logRegIdx = (rowOff % 8 >= 4) ? 1 : 0;
+
+                // Absolute tile index (runtime)
+                // absoluteTm = warpRow + rowOff/8, absoluteTn = warpCol + colOff/8
+                // This works because cBaseRow = warpRow*8 + laneRow (laneRow < 4),
+                // so (cBaseRow + rowOff) / 8 = warpRow + rowOff/8 (since laneRow + rowOff%8 < 8).
+                Value absTm = arith::AddIOp::create(rewriter, loc, cWarpRow,
+                    arith::ConstantIntOp::create(rewriter, loc, localTm, 32));
+                Value absTn = arith::AddIOp::create(rewriter, loc, cWarpCol,
+                    arith::ConstantIntOp::create(rewriter, loc, localTn, 32));
+                Value flatTileIdx = arith::AddIOp::create(rewriter, loc,
+                    arith::MulIOp::create(rewriter, loc, absTm,
+                        arith::ConstantIntOp::create(rewriter, loc, tilesN, 32)),
+                    absTn);
+
+                // Select chain: pick the correct tile's shuffled value
+                auto &logRegVals = (logRegIdx == 0) ? tileLogReg0 : tileLogReg1;
+                Value val = logRegVals[0]; // default
+                for (int64_t t = (int64_t)logRegVals.size() - 1; t >= 0; --t) {
+                    Value match = arith::CmpIOp::create(rewriter, loc,
+                        arith::CmpIPredicate::eq, flatTileIdx,
+                        arith::ConstantIntOp::create(rewriter, loc, t, 32));
+                    val = arith::SelectOp::create(rewriter, loc, match,
+                        logRegVals[t], val);
+                }
+
                 if (val.getType() != outElemTy)
                     val = fromF32(rewriter, loc, val, outElemTy);
-                resultElems[idx] = arith::SelectOp::create(rewriter, loc, inStrip,
-                    val, resultElems[idx]);
+                resultElems[idx] = val;
             }
-            LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+        } else {
+            // ── TG PATH: Store C tiles -> TG, gather (original) ─────────
+            for (int64_t tm = 0; tm < tilesM; ++tm) {
+                int64_t rowStart = tm * 8;
+
+                Value cStoreStride = makeI64Vec2(rewriter, loc, 1, Npad);
+                Value cStoreShape  = makeI64Vec2(rewriter, loc, Npad, 8);
+                for (int64_t tn = 0; tn < tilesN; ++tn) {
+                    Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
+                    LLVM::CallOp::create(rewriter, loc, storeFn,
+                        ValueRange{matC_tiles[tm][tn], ptrTG, cStoreShape, cStoreStride, cOff});
+                }
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+                for (size_t idx : cBuckets[tm]) {
+                    int64_t rowOff = cOffsets[idx][0];
+                    int64_t colOff = cOffsets[idx][1];
+                    Value actualRow = arith::AddIOp::create(rewriter, loc, cBaseRow,
+                        arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
+                    Value inStrip = arith::AndIOp::create(rewriter, loc,
+                        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::uge,
+                            actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
+                        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
+                            actualRow, arith::ConstantIntOp::create(rewriter, loc, rowStart + 8, 32)));
+                    Value sIdx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, Npad, rowStart);
+                    Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, sIdx, garbageIdx);
+                    Value val = gather1(ptrTG, safeIdx);
+                    if (val.getType() != outElemTy)
+                        val = fromF32(rewriter, loc, val, outElemTy);
+                    resultElems[idx] = arith::SelectOp::create(rewriter, loc, inStrip,
+                        val, resultElems[idx]);
+                }
+                LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+            }
         }
 
         // ── Pack result ───────────────────────────────────────────────────

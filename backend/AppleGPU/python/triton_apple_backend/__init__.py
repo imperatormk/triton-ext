@@ -19,10 +19,11 @@ class _LibdevicePatchFinder(_importlib_abc.MetaPathFinder):
         orig_loader = spec.loader
 
         class _PatchingLoader:
+
             @staticmethod
             def create_module(spec):
-                return (orig_loader.create_module(spec)
-                        if hasattr(orig_loader, 'create_module') else None)
+                return (orig_loader.create_module(spec) if hasattr(
+                    orig_loader, 'create_module') else None)
 
             @staticmethod
             def exec_module(module):

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "mlir/IR/Value.h"
+#include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 
 namespace mlir::triton::applegpu {
 
@@ -46,8 +46,8 @@ public:
   Value programId(RewriterBase &rewriter, Location loc, ModuleOp moduleOp,
                   ProgramIDDim axis) const override;
 
-  bool warpReduce(RewriterBase &rewriter, Location loc,
-                  SmallVector<Value> &acc, triton::ReduceOp op,
+  bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+                  triton::ReduceOp op,
                   unsigned reduceLaneIdMask) const override;
 
   std::string getMulhiFuncName(Type resultElementTy) const override;

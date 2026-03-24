@@ -15,7 +15,8 @@ class MetalBuildExt(build_ext):
         torch_inc = os.path.join(torch_dir, "include")
 
         ext.include_dirs.append(torch_inc)
-        ext.include_dirs.append(os.path.join(torch_inc, "torch", "csrc", "api", "include"))
+        ext.include_dirs.append(
+            os.path.join(torch_inc, "torch", "csrc", "api", "include"))
         ext.library_dirs.append(torch_lib)
         ext.libraries.extend(["torch", "c10", "torch_python"])
         ext.extra_link_args.append(f"-Wl,-rpath,{torch_lib}")
@@ -28,13 +29,18 @@ metal_utils = Extension(
     sources=[os.path.join("triton_apple_backend", "metal_utils.m")],
     language="objc++",
     extra_compile_args=[
-        "-ObjC++", "-std=c++17", "-O3",
+        "-ObjC++",
+        "-std=c++17",
+        "-O3",
         "-Wno-deprecated-declarations",
     ],
     extra_link_args=[
-        "-framework", "Metal",
-        "-framework", "Foundation",
-        "-undefined", "dynamic_lookup",
+        "-framework",
+        "Metal",
+        "-framework",
+        "Foundation",
+        "-undefined",
+        "dynamic_lookup",
     ],
     include_dirs=[sysconfig.get_path("include")],
 )

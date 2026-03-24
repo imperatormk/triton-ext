@@ -12,7 +12,6 @@ import os
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm
 
-
 # Libdevice patching: see _LibdevicePatchFinder in __init__.py
 _plugin = getattr(passes, 'plugin', None)
 
@@ -24,8 +23,9 @@ def _find_metalir_dylib():
         return os.environ['METALIR_DYLIB_PATH']
 
     # 2. Submodule: backend/AppleGPU/metal-ir-pipeline/build/
-    submodule = os.path.join(os.path.dirname(__file__), '..', '..', 'metal-ir-pipeline',
-                             'build', 'lib', 'Bridge', 'libMetalIRBridge.dylib')
+    submodule = os.path.join(os.path.dirname(__file__), '..', '..',
+                             'metal-ir-pipeline', 'build', 'lib', 'Bridge',
+                             'libMetalIRBridge.dylib')
     if os.path.exists(submodule):
         return os.path.abspath(submodule)
 
@@ -41,7 +41,7 @@ def _load_metalir():
             "  cd metal-ir-pipeline && cmake -B build -DLLVM_DIR=... && cmake --build build\n"
             "Or set METALIR_DYLIB_PATH=/path/to/libMetalIRBridge.dylib")
     lib = ctypes.CDLL(dylib)
-    lib.metalir_compile.restype  = ctypes.c_void_p
+    lib.metalir_compile.restype = ctypes.c_void_p
     lib.metalir_compile.argtypes = [
         ctypes.c_char_p,
         ctypes.POINTER(ctypes.c_uint64),
@@ -49,25 +49,27 @@ def _load_metalir():
         ctypes.c_int,
     ]
     lib.metalir_free.argtypes = [ctypes.c_void_p]
-    lib.metalir_tg_memory_bytes.restype  = ctypes.c_uint64
+    lib.metalir_tg_memory_bytes.restype = ctypes.c_uint64
     lib.metalir_tg_memory_bytes.argtypes = [ctypes.c_char_p]
 
     def compile_ir(llvm_ir: str) -> bytes:
         out_len = ctypes.c_uint64(0)
-        errbuf  = ctypes.create_string_buffer(512)
-        ptr = lib.metalir_compile(
-            llvm_ir.encode(), ctypes.byref(out_len), errbuf, 512)
+        errbuf = ctypes.create_string_buffer(512)
+        ptr = lib.metalir_compile(llvm_ir.encode(), ctypes.byref(out_len),
+                                  errbuf, 512)
         if ptr:
             data = bytes((ctypes.c_ubyte * out_len.value).from_address(ptr))
             lib.metalir_free(ptr)
             return data
         raise RuntimeError(f"MetalIR compile failed: {errbuf.value.decode()}")
 
-    compile_ir.tg_memory_bytes = lambda ir: lib.metalir_tg_memory_bytes(ir.encode())
+    compile_ir.tg_memory_bytes = lambda ir: lib.metalir_tg_memory_bytes(
+        ir.encode())
     return compile_ir
 
 
 _metalir_compile = None
+
 
 def _get_metalir_compile():
     global _metalir_compile
@@ -95,12 +97,10 @@ class MPSOptions:
     launch_cooperative_grid: bool = False
     instrumentation_mode: str = "none"
     sanitize_overflow: bool = False
-    allowed_dot_input_precisions: tuple = ("ieee",)
+    allowed_dot_input_precisions: tuple = ("ieee", )
 
     def hash(self):
-        return hashlib.md5(
-            str(self.__dict__).encode()
-        ).hexdigest()
+        return hashlib.md5(str(self.__dict__).encode()).hexdigest()
 
 
 class MPSBackend(BaseBackend):
@@ -119,18 +119,24 @@ class MPSBackend(BaseBackend):
                 "the TritonAppleGPUBackend dylib built from triton-ext.")
 
     def parse_options(self, opts) -> MPSOptions:
-        args = {k: opts[k] for k in MPSOptions.__dataclass_fields__ if k in opts}
+        args = {
+            k: opts[k]
+            for k in MPSOptions.__dataclass_fields__ if k in opts
+        }
         nw = args.get("num_warps", MPSOptions.num_warps)
-        assert nw > 0 and (nw & (nw - 1)) == 0, "num_warps must be a power of 2"
+        assert nw > 0 and (nw &
+                           (nw - 1)) == 0, "num_warps must be a power of 2"
         return MPSOptions(**args)
 
     def pack_metadata(self, metadata):
         return metadata
 
     def get_codegen_implementation(self, options):
+
         def min_dot_size(lhs_type, rhs_type):
             # Apple simdgroup tile is 8×8; minimum dot operand = (1, 1, 8)
             return (1, 1, 8)
+
         return {"min_dot_size": min_dot_size}
 
     def get_module_map(self):
@@ -166,7 +172,9 @@ class MPSBackend(BaseBackend):
 
         # Convert generic TritonIR → TritonGPU IR (shared pass)
         passes.ttir.add_convert_to_ttgpuir(
-            pm, f"mps:{options.arch}", options.num_warps,
+            pm,
+            f"mps:{options.arch}",
+            options.num_warps,
             32,  # warp_size = 32 (simdgroup size)
             options.num_ctas)
 
@@ -235,7 +243,8 @@ class MPSBackend(BaseBackend):
         # lowering adds __tg_cvt_* threadgroup globals whose sizes depend
         # on the tile configuration. Compute the real total from the LLVM IR
         # so the autotuner can reject configs that exceed the 32 KB limit.
-        metadata["shared"] = _get_metalir_compile().tg_memory_bytes(str(llvm_mod))
+        metadata["shared"] = _get_metalir_compile().tg_memory_bytes(
+            str(llvm_mod))
 
         return llvm_mod
 
@@ -263,7 +272,8 @@ class MPSBackend(BaseBackend):
         return result
 
     def add_stages(self, stages, options, language):
-        stages["ttir"]     = lambda src, meta: self.make_ttir(src, meta, options)
-        stages["ttgir"]    = lambda src, meta: self.make_ttgir(src, meta, options)
-        stages["llir"]     = lambda src, meta: self.make_llir(src, meta, options)
-        stages["metallib"] = lambda src, meta: self.make_metallib(src, meta, options)
+        stages["ttir"] = lambda src, meta: self.make_ttir(src, meta, options)
+        stages["ttgir"] = lambda src, meta: self.make_ttgir(src, meta, options)
+        stages["llir"] = lambda src, meta: self.make_llir(src, meta, options)
+        stages["metallib"] = lambda src, meta: self.make_metallib(
+            src, meta, options)

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "mlir/IR/Dialect.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/LinearLayout.h"
 

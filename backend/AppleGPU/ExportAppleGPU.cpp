@@ -1,10 +1,10 @@
 /// Export Apple GPU backend passes and dialect via triton-ext plugin API.
 /// Registers 5 passes + 1 dialect in a single shared library.
 
-#include "Export.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
-#include "TritonAppleGPUTransforms/Passes.h"
+#include "Export.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
+#include "TritonAppleGPUTransforms/Passes.h"
 #include "mlir/Conversion/Passes.h"
 
 using namespace triton::ext::plugin;
@@ -58,16 +58,15 @@ static void insertAppleGPUDialect(mlir::DialectRegistry *registry) {
   registry->insert<mlir::triton::applegpu::TritonAppleGPUDialect>();
 }
 
-static auto _p1 = exportPass("add_accelerate_matmul",
-                              registerAccelerateMatmul, addAccelerateMatmul);
-static auto _p2 = exportPass("add_simplify_gather",
-                              registerSimplifyGather, addSimplifyGather);
-static auto _p3 = exportPass("add_to_llvmir",
-                              registerToLLVMIR, addToLLVMIR);
-static auto _p4 = exportPass("add_lower_gpu_to_air",
-                              registerLowerGPUToAIR, addLowerGPUToAIR);
-static auto _p5 = exportPass("add_reconcile_unrealized_casts",
-                              registerReconcileUnrealizedCasts,
-                              addReconcileUnrealizedCasts);
+static auto _p1 = exportPass("add_accelerate_matmul", registerAccelerateMatmul,
+                             addAccelerateMatmul);
+static auto _p2 = exportPass("add_simplify_gather", registerSimplifyGather,
+                             addSimplifyGather);
+static auto _p3 = exportPass("add_to_llvmir", registerToLLVMIR, addToLLVMIR);
+static auto _p4 =
+    exportPass("add_lower_gpu_to_air", registerLowerGPUToAIR, addLowerGPUToAIR);
+static auto _p5 =
+    exportPass("add_reconcile_unrealized_casts",
+               registerReconcileUnrealizedCasts, addReconcileUnrealizedCasts);
 
 static auto _d1 = exportDialect("TritonAppleGPU", insertAppleGPUDialect);

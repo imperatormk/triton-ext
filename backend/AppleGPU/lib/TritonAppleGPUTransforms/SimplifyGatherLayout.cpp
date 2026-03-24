@@ -20,8 +20,7 @@ class SimplifyGatherLayoutPass
 
       auto srcTy = op.getSrc().getType();
       auto idxTy = op.getIndices().getType();
-      auto srcEnc =
-          dyn_cast<gpu::BlockedEncodingAttr>(srcTy.getEncoding());
+      auto srcEnc = dyn_cast<gpu::BlockedEncodingAttr>(srcTy.getEncoding());
       if (!srcEnc)
         return;
 

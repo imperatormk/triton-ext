@@ -26,25 +26,33 @@ def ty_to_cpp(ty):
     if ty[0] == '*':
         return "void*"
     return {
-        "i1": "int32_t", "u1": "int32_t", "i8": "int8_t", "i16": "int16_t",
-        "i32": "int32_t", "i64": "int64_t",
-        "u32": "uint32_t", "u64": "uint64_t",
-        "fp16": "float", "bf16": "float", "fp32": "float", "fp64": "double",
+        "i1": "int32_t",
+        "u1": "int32_t",
+        "i8": "int8_t",
+        "i16": "int16_t",
+        "i32": "int32_t",
+        "i64": "int64_t",
+        "u32": "uint32_t",
+        "u64": "uint64_t",
+        "fp16": "float",
+        "bf16": "float",
+        "fp32": "float",
+        "fp64": "double",
     }[ty]
 
 
 # Scalar type → (struct.pack format char, byte size, alignment)
 _SCALAR_PACK_INFO = {
-    "i1":  ("b", 1, 1),   # i1 stored as 1 byte
-    "u1":  ("b", 1, 1),   # u1 (unsigned boolean)
-    "i8":  ("b", 1, 1),
+    "i1": ("b", 1, 1),  # i1 stored as 1 byte
+    "u1": ("b", 1, 1),  # u1 (unsigned boolean)
+    "i8": ("b", 1, 1),
     "i16": ("h", 2, 2),
     "i32": ("i", 4, 4),
     "i64": ("q", 8, 8),
     "u32": ("I", 4, 4),
     "u64": ("Q", 8, 8),
     "fp16": ("e", 2, 2),
-    "bf16": ("e", 2, 2),   # bf16 → pack as fp16 (Metal treats both as 2-byte)
+    "bf16": ("e", 2, 2),  # bf16 → pack as fp16 (Metal treats both as 2-byte)
     "fp32": ("f", 4, 4),
     "fp64": ("d", 8, 8),
 }
@@ -86,9 +94,9 @@ def _pack_scalars(scalar_types, scalar_values, total_size, offsets):
             # bf16: convert float → bf16 bits, pack as uint16
             import numpy as np
             bf16_bits = int.from_bytes(
-                np.array([val], dtype=np.float32).view(np.uint32).item().to_bytes(4, 'little')[2:4],
-                'little'
-            )
+                np.array([val],
+                         dtype=np.float32).view(np.uint32).item().to_bytes(
+                             4, 'little')[2:4], 'little')
             _struct.pack_into("H", buf, offset, bf16_bits)
             continue
         _struct.pack_into(fmt, buf, offset, val)
@@ -116,9 +124,12 @@ class MPSUtils:
             return module, function, 0, 0, 1024
         except RuntimeError as e:
             msg = str(e)
-            m = _re.search(r'Threadgroup (?:memory )?size \((\d+)\) exceeds the maximum .+ \((\d+)\)', msg)
+            m = _re.search(
+                r'Threadgroup (?:memory )?size \((\d+)\) exceeds the maximum .+ \((\d+)\)',
+                msg)
             if m:
-                raise OutOfResources(int(m.group(1)), int(m.group(2)), "Metal PSO") from e
+                raise OutOfResources(int(m.group(1)), int(m.group(2)),
+                                     "Metal PSO") from e
             raise
 
     def unload_module(self, module):
@@ -126,9 +137,12 @@ class MPSUtils:
 
     def get_device_properties(self, device):
         return {
-            "warpSize":            32,
-            "max_shared_mem":      32768,
-            "multiprocessorCount": getattr(torch._C, '_mps_get_core_count', lambda: 10)(),
+            "warpSize":
+            32,
+            "max_shared_mem":
+            32768,
+            "multiprocessorCount":
+            getattr(torch._C, '_mps_get_core_count', lambda: 10)(),
         }
 
     def get_current_device(self):
@@ -148,8 +162,8 @@ class MPSLauncher:
     """
 
     def __init__(self, src, metadata):
-        self.signature  = dict(src.signature)
-        self.constants  = getattr(src, "constants", {})
+        self.signature = dict(src.signature)
+        self.constants = getattr(src, "constants", {})
 
         # Constexpr args appear in Python *args but NOT in the compiled IR.
         # We strip them before passing to _mps_MetalKernel so Metal buffer slots
@@ -157,13 +171,14 @@ class MPSLauncher:
         # Python *args indices that are constexpr (to be stripped at launch).
         self.constexpr_py_slots = frozenset(
             i for i, (k, ty) in enumerate(self.signature.items())
-            if ty == 'constexpr'
-        )
+            if ty == 'constexpr')
 
         # Expand tensor descriptor types into flat scalar types.
         # MPS has no hardware TMA, so tensordesc_meta is always None —
         # descriptors are decomposed to (ptr, *shape, *strides, padding, tf32, *shape, *strides).
-        non_constexpr_sig = [ty for ty in self.signature.values() if ty != 'constexpr']
+        non_constexpr_sig = [
+            ty for ty in self.signature.values() if ty != 'constexpr'
+        ]
         expanded = expand_signature(non_constexpr_sig, None, None)
 
         # Classify each expanded arg as pointer or scalar.
@@ -180,9 +195,9 @@ class MPSLauncher:
         # flattening in __call__) should be forwarded to the GPU.  We need this
         # because constexpr values inside tuples ARE present in flat_args but
         # must NOT be passed to the kernel.
-        self.ptr_indices = []    # indices into the KEPT slice of flat_args
-        self.scalar_indices = [] # indices into the KEPT slice of flat_args
-        self.scalar_types = []   # type strings for scalars (for packing)
+        self.ptr_indices = []  # indices into the KEPT slice of flat_args
+        self.scalar_indices = []  # indices into the KEPT slice of flat_args
+        self.scalar_types = []  # type strings for scalars (for packing)
 
         def _flatten_types_with_mask(types):
             """Recursively flatten tuple types; return (all_types, keep_mask).
@@ -217,7 +232,8 @@ class MPSLauncher:
 
         # Pre-compute packed buffer layout
         if self.scalar_types:
-            self.total_size, self.field_offsets = _compute_scalar_layout(self.scalar_types)
+            self.total_size, self.field_offsets = _compute_scalar_layout(
+                self.scalar_types)
         else:
             self.total_size = 0
             self.field_offsets = []
@@ -227,12 +243,12 @@ class MPSLauncher:
         self.ly = 1
         self.lz = 1
 
-    def __call__(self, gridX, gridY, gridZ, stream, function,
-                 kernel_metadata, launch_metadata,
-                 launch_enter_hook, launch_exit_hook, *args):
+    def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata,
+                 launch_metadata, launch_enter_hook, launch_exit_hook, *args):
 
         # Cap threadgroup size to PSO's max (varies per kernel based on register pressure)
-        max_threads = getattr(function, 'max_total_threads_per_threadgroup', 1024)
+        max_threads = getattr(function, 'max_total_threads_per_threadgroup',
+                              1024)
         self.lx = min(self._requested_threads, max_threads)
 
         if launch_enter_hook:
@@ -250,7 +266,8 @@ class MPSLauncher:
             """Recursively flatten an arg value, expanding tuples to leaves."""
             if isinstance(a, TensorWrapper):
                 out.append(a.base)
-            elif hasattr(a, '_base') and isinstance(getattr(a, '_base', None), torch.Tensor):
+            elif hasattr(a, '_base') and isinstance(getattr(a, '_base', None),
+                                                    torch.Tensor):
                 out.append(a._base)
             elif isinstance(a, TensorDescriptor):
                 out.extend(decompose_descriptor(a))
@@ -267,7 +284,9 @@ class MPSLauncher:
             _flatten_arg(a, all_flat_args)
 
         # Apply keep mask: drop constexpr-inside-tuple positions.
-        flat_args = [v for v, keep in zip(all_flat_args, self._flat_arg_keep) if keep]
+        flat_args = [
+            v for v, keep in zip(all_flat_args, self._flat_arg_keep) if keep
+        ]
 
         # Separate pointer args from scalar args.
         # IR param order after Pass 5b: [ptr0, ptr1, ..., packed_scalar_buf]
@@ -276,12 +295,11 @@ class MPSLauncher:
 
         if scalar_values:
             # Pack all scalars into a small MPS tensor (acts as device buffer)
-            packed_bytes = _pack_scalars(
-                self.scalar_types, scalar_values,
-                self.total_size, self.field_offsets
-            )
-            scalar_buf = torch.frombuffer(bytearray(packed_bytes), dtype=torch.uint8).to('mps')
-            reordered_args = tuple(ptr_args) + (scalar_buf,)
+            packed_bytes = _pack_scalars(self.scalar_types, scalar_values,
+                                         self.total_size, self.field_offsets)
+            scalar_buf = torch.frombuffer(bytearray(packed_bytes),
+                                          dtype=torch.uint8).to('mps')
+            reordered_args = tuple(ptr_args) + (scalar_buf, )
         else:
             reordered_args = tuple(ptr_args)
 
@@ -289,15 +307,21 @@ class MPSLauncher:
         if _os.environ.get('TRITON_MPS_DEBUG'):
             _threads = [gridX * self.lx, gridY * self.ly, gridZ * self.lz]
             _gs = [self.lx, self.ly, self.lz]
-            print(f'[MPS] threads={_threads} group_size={_gs} grid=({gridX},{gridY},{gridZ})')
+            print(
+                f'[MPS] threads={_threads} group_size={_gs} grid=({gridX},{gridY},{gridZ})'
+            )
             print(f'[MPS] reordered_args={reordered_args}')
             if scalar_values:
-                print(f'[MPS] scalar_types={self.scalar_types} scalar_values={scalar_values}')
-                print(f'[MPS] packed_bytes={packed_bytes.hex()} total_size={self.total_size}')
+                print(
+                    f'[MPS] scalar_types={self.scalar_types} scalar_values={scalar_values}'
+                )
+                print(
+                    f'[MPS] packed_bytes={packed_bytes.hex()} total_size={self.total_size}'
+                )
         function(
             *reordered_args,
-            threads    =[gridX * self.lx, gridY * self.ly, gridZ * self.lz],
-            group_size =[self.lx, self.ly, self.lz],
+            threads=[gridX * self.lx, gridY * self.ly, gridZ * self.lz],
+            group_size=[self.lx, self.ly, self.lz],
         )
 
         if launch_exit_hook:
@@ -308,7 +332,7 @@ class MPSDriver(DriverBase):
 
     def __init__(self):
         super().__init__()
-        self.utils        = MPSUtils()
+        self.utils = MPSUtils()
         self.launcher_cls = MPSLauncher
 
     @staticmethod
@@ -342,7 +366,9 @@ class MPSDriver(DriverBase):
         return do_bench
 
     def get_empty_cache_for_benchmark(self):
-        return torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int32, device='mps')
+        return torch.empty(256 * 1024 * 1024 // 4,
+                           dtype=torch.int32,
+                           device='mps')
 
     def clear_cache(self, cache):
         cache.zero_()

@@ -16,6 +16,11 @@ from triton._C.libtriton import ir, passes, llvm
 _plugin = getattr(passes, 'plugin', None)
 
 
+def _pmaybe_enable_debug(pm):
+    if os.environ.get('TRITON_MPS_DEBUG'):
+        pm.enable_debug()
+
+
 def _find_metalir_dylib():
     """Find libMetalIRBridge.dylib (C++ metal-ir-pipeline)."""
     # 1. Environment variable override
@@ -152,7 +157,7 @@ class MPSBackend(BaseBackend):
     # ── Stage 1: Triton IR optimization (shared) ───────────────────────────
     def make_ttir(self, mod, metadata, options):
         pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
+        _pmaybe_enable_debug(pm)
         passes.common.add_inliner(pm)
         passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.ttir.add_combine(pm)
@@ -168,7 +173,7 @@ class MPSBackend(BaseBackend):
     # ── Stage 2: GPU tiling — THE make-or-break ────────────────────────────
     def make_ttgir(self, mod, metadata, options):
         pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
+        _pmaybe_enable_debug(pm)
 
         # Convert generic TritonIR → TritonGPU IR (shared pass)
         passes.ttir.add_convert_to_ttgpuir(
@@ -214,7 +219,7 @@ class MPSBackend(BaseBackend):
     # ── Stage 3: LLVM IR with simdgroup intrinsics ─────────────────────────
     def make_llir(self, mod, metadata, options):
         pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
+        _pmaybe_enable_debug(pm)
 
         # Standard TritonGPU → LLVM lowering prerequisites
         passes.convert.add_scf_to_cf(pm)
@@ -235,23 +240,23 @@ class MPSBackend(BaseBackend):
         llvm.init_targets()
         context = llvm.context()
         llvm_mod = llvm.to_module(mod, context)
+        llvm_ir = str(llvm_mod)
         if os.environ.get('TRITON_MPS_DEBUG'):
-            open('/tmp/raw_pre.ll', 'w').write(str(llvm_mod))
+            open('/tmp/raw_pre.ll', 'w').write(llvm_ir)
 
         # Recompute shared memory: Triton's ttg.shared only counts the
         # reduction scratchpad (global_smem). The Apple GPU convert_layout
         # lowering adds __tg_cvt_* threadgroup globals whose sizes depend
         # on the tile configuration. Compute the real total from the LLVM IR
         # so the autotuner can reject configs that exceed the 32 KB limit.
-        metadata["shared"] = _get_metalir_compile().tg_memory_bytes(
-            str(llvm_mod))
+        metadata["shared"] = _get_metalir_compile().tg_memory_bytes(llvm_ir)
+        metadata["_llvm_ir"] = llvm_ir
 
         return llvm_mod
 
     # ── Stage 4: LLVM IR → metallib ───────────────────────────────────────
     def make_metallib(self, llvm_mod, metadata, options):
-        # Emit LLVM IR text
-        llvm_ir = str(llvm_mod)
+        llvm_ir = metadata.pop("_llvm_ir", None) or str(llvm_mod)
 
         # Extract kernel name (first defined void function = kernel entry)
         for line in llvm_ir.splitlines():

@@ -128,6 +128,10 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
               dyn_cast<ttg::DotOperandEncodingAttr>(ty.getEncoding())) {
         auto parentTy = RankedTensorType::get(
             ty.getShape(), ty.getElementType(), dotEnc.getParent());
+        if (auto cvt = operand.getDefiningOp<ttg::ConvertLayoutOp>()) {
+          if (cvt.getSrc().getType() == parentTy)
+            return cvt.getSrc();
+        }
         return ttg::ConvertLayoutOp::create(rewriter, loc, parentTy, operand);
       }
       return operand;
@@ -136,19 +140,58 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     Value newB = stripDotOpEnc(dot.getB());
 
     // Convert C to MMA encoding (it's the accumulator)
-    Value newC =
-        ttg::ConvertLayoutOp::create(rewriter, loc, newCType, dot.getC());
+    Value newC = dot.getC();
+    if (auto cvt = newC.getDefiningOp<ttg::ConvertLayoutOp>()) {
+      if (cvt.getSrc().getType() == newCType)
+        newC = cvt.getSrc();
+      else
+        newC = ttg::ConvertLayoutOp::create(rewriter, loc, newCType, dot.getC());
+    } else {
+      newC = ttg::ConvertLayoutOp::create(rewriter, loc, newCType, dot.getC());
+    }
 
     // Create new dot: blocked A, blocked B, AppleMma C → AppleMma result
     auto newDot = tt::DotOp::create(rewriter, loc, newCType, newA, newB, newC,
                                     dot.getInputPrecisionAttr(),
                                     dot.getMaxNumImpreciseAccAttr());
 
-    // Convert result back to original blocked encoding for stores
+    SmallVector<OpOperand *> mmaUses;
+    SmallVector<OpOperand *> blockedUses;
+    SmallVector<ttg::ConvertLayoutOp> passthroughCasts;
+    for (OpOperand &use : dot->getUses()) {
+      auto *owner = use.getOwner();
+      if (isa<tt::DotOp>(owner) && use.getOperandNumber() == 2) {
+        mmaUses.push_back(&use);
+        continue;
+      }
+      if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(owner)) {
+        if (cvt.getType() == newCType) {
+          for (OpOperand &cvtUse : cvt->getUses())
+            mmaUses.push_back(&cvtUse);
+          passthroughCasts.push_back(cvt);
+          continue;
+        }
+      }
+      blockedUses.push_back(&use);
+    }
+
+    for (OpOperand *use : mmaUses)
+      use->set(newDot.getResult());
+    for (ttg::ConvertLayoutOp cvt : passthroughCasts)
+      if (cvt->use_empty())
+        rewriter.eraseOp(cvt);
+
+    if (blockedUses.empty()) {
+      rewriter.eraseOp(dot);
+      return success();
+    }
+
     auto result =
         ttg::ConvertLayoutOp::create(rewriter, loc, cType, newDot.getResult());
+    for (OpOperand *use : blockedUses)
+      use->set(result.getResult());
 
-    rewriter.replaceOp(dot, result.getResult());
+    rewriter.eraseOp(dot);
     return success();
   }
 };

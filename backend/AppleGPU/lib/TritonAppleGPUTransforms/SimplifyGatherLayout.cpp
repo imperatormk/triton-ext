@@ -2,6 +2,7 @@
 // generate too many instructions for the Metal GPU JIT compiler.
 
 #include "TritonAppleGPUTransforms/Passes.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
@@ -37,7 +38,10 @@ class SimplifyGatherLayoutPass
 
       unsigned idxRegs = 1;
       for (unsigned d = 0; d < rank; ++d) {
-        unsigned s = idxTy.getDimSize(d) / (tpw[d] * wpc[d]);
+        int64_t dim = idxTy.getDimSize(d);
+        if (dim == ShapedType::kDynamic)
+          return;
+        unsigned s = dim / (tpw[d] * wpc[d]);
         idxRegs *= std::max(s, 1u);
       }
 

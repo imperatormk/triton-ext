@@ -91,12 +91,9 @@ def _pack_scalars(scalar_types, scalar_values, total_size, offsets):
         if ty in ("i1", "u1"):
             val = 1 if val else 0
         elif ty == "bf16":
-            # bf16: convert float → bf16 bits, pack as uint16
-            import numpy as np
-            bf16_bits = int.from_bytes(
-                np.array([val],
-                         dtype=np.float32).view(np.uint32).item().to_bytes(
-                             4, 'little')[2:4], 'little')
+            # bf16: convert float → bf16 bits using IEEE754 layout
+            bits = _struct.unpack('<I', _struct.pack('<f', float(val)))[0]
+            bf16_bits = bits >> 16
             _struct.pack_into("H", buf, offset, bf16_bits)
             continue
         _struct.pack_into(fmt, buf, offset, val)

@@ -2315,47 +2315,124 @@ static Value getOrCreateEventAlloca(Operation *op, RewriterBase &rewriter) {
   return alloca.getResult();
 }
 
-// Extract the row stride scalar from a pointer tensor's MLIR def chain.
+// Struct to hold all components extracted from the async_copy pointer chain.
+struct AsyncCopyPtrInfo {
+  Value stride;     // Row stride scalar (MLIR, in elements)
+  Value basePtr;    // Scalar base pointer (MLIR, tt.ptr)
+  Value rowStart;   // Scalar first-row index (MLIR, i32/i64), or nullptr if 0
+  Value colStart;   // Scalar first-col index (MLIR, i32/i64), or nullptr if 0
+};
+
+// Extract the first-element scalar from a 1D index tensor.
+//
+// Patterns:
+//   addi(splat(scalar), make_range(0, N)) → scalar
+//   splat(scalar) → scalar
+//   make_range(0, N) → nullptr (first element is 0)
+//   expand_dims(inner_1d, axis) → recurse on inner_1d
+static Value extractFirstElemScalar(Value tensor) {
+  auto *defOp = tensor.getDefiningOp();
+  if (!defOp)
+    return nullptr;
+
+  // Peel through expand_dims
+  if (isa<triton::ExpandDimsOp>(defOp))
+    return extractFirstElemScalar(defOp->getOperand(0));
+
+  // addi(splat(scalar), make_range(0, N)) → first elem = scalar + 0 = scalar
+  if (isa<arith::AddIOp>(defOp)) {
+    for (unsigned i = 0; i < 2; i++) {
+      auto *op = defOp->getOperand(i).getDefiningOp();
+      if (op && isa<triton::SplatOp>(op))
+        return op->getOperand(0);
+    }
+    return nullptr;
+  }
+
+  // splat(scalar) → scalar (uniform tensor)
+  if (isa<triton::SplatOp>(defOp))
+    return defOp->getOperand(0);
+
+  // make_range(0, N) → first element is 0 (return nullptr to signal zero)
+  if (isa<triton::MakeRangeOp>(defOp))
+    return nullptr; // caller treats nullptr as zero
+
+  return nullptr;
+}
+
+// Extract all pointer components from a pointer tensor's MLIR def chain.
 //
 // Pattern: async_copy src = tt.addptr(broadcast(addptr(splat(base),
 //                          muli(expand_dims(row_offs), splat(STRIDE)))),
 //                          broadcast(col_offs))
 //
-// Returns the MLIR Value for the stride scalar, or nullptr if not found.
-// The stride is in ELEMENTS (not bytes) — caller multiplies by elemBytes.
-static Value extractRowStrideFromMLIR(Value ptrTensor) {
+// Returns true if extraction succeeded. Populates `info` with:
+//   - stride: row stride scalar (in elements)
+//   - basePtr: scalar base pointer
+//   - rowStart: first-row index scalar (or nullptr if 0)
+//   - colStart: first-col index scalar (or nullptr if 0)
+static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info) {
   // Walk: ptrTensor → addptr → broadcast → addptr → muli → splat(stride)
   auto *addptrOp = ptrTensor.getDefiningOp();
   if (!addptrOp || !isa<triton::AddPtrOp>(addptrOp))
-    return nullptr;
+    return false;
 
   // The first operand of the outer addptr is broadcast(inner_addptr)
   Value broadcastedBase = addptrOp->getOperand(0);
   auto *broadcastOp = broadcastedBase.getDefiningOp();
   if (!broadcastOp || !isa<triton::BroadcastOp>(broadcastOp))
-    return nullptr;
+    return false;
 
   Value innerAddptr = broadcastOp->getOperand(0);
   auto *innerOp = innerAddptr.getDefiningOp();
   if (!innerOp || !isa<triton::AddPtrOp>(innerOp))
-    return nullptr;
+    return false;
+
+  // Extract scalar base pointer from splat(base) — first operand of inner addptr
+  auto *baseSplatOp = innerOp->getOperand(0).getDefiningOp();
+  if (!baseSplatOp || !isa<triton::SplatOp>(baseSplatOp))
+    return false;
+  info.basePtr = baseSplatOp->getOperand(0);
 
   // The second operand of innerAddptr is the row offset:
   // muli(expand_dims(row_range), splat(stride))
   Value rowOffset = innerOp->getOperand(1);
   auto *muliOp = rowOffset.getDefiningOp();
   if (!muliOp || !isa<arith::MulIOp>(muliOp))
-    return nullptr;
+    return false;
 
   // One operand of muli is expand_dims(range), the other is splat(stride)
+  Value expandDimsVal;
+  bool foundStride = false;
   for (unsigned i = 0; i < 2; i++) {
-    auto *splatOp = muliOp->getOperand(i).getDefiningOp();
-    if (splatOp && isa<triton::SplatOp>(splatOp)) {
-      // Found splat — its scalar operand is the stride
-      return splatOp->getOperand(0);
+    auto *op = muliOp->getOperand(i).getDefiningOp();
+    if (op && isa<triton::SplatOp>(op)) {
+      info.stride = op->getOperand(0);
+      foundStride = true;
+    } else if (op && isa<triton::ExpandDimsOp>(op)) {
+      expandDimsVal = muliOp->getOperand(i);
     }
   }
-  return nullptr;
+  if (!foundStride)
+    return false;
+
+  // Extract first-row scalar from expand_dims(row_offs_1d)
+  if (expandDimsVal)
+    info.rowStart = extractFirstElemScalar(expandDimsVal);
+  // nullptr means first row = 0
+
+  // Extract col offset from outer addptr's second operand:
+  // broadcast(expand_dims(col_offs_1d)) or broadcast(col_offs)
+  Value colOffset = addptrOp->getOperand(1);
+  auto *colBroadcastOp = colOffset.getDefiningOp();
+  if (colBroadcastOp &&
+      (isa<triton::BroadcastOp>(colBroadcastOp) ||
+       isa<triton::ExpandDimsOp>(colBroadcastOp))) {
+    info.colStart = extractFirstElemScalar(colBroadcastOp->getOperand(0));
+  }
+  // nullptr means first col = 0
+
+  return true;
 }
 
 struct AsyncCopyGlobalToLocalOpAppleConversion
@@ -2474,16 +2551,35 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       }
     }
 
-    Value mlirStride;
+    AsyncCopyPtrInfo ptrInfo;
     Value llvmStride;
     if (canAsyncDMA) {
-      mlirStride = extractRowStrideFromMLIR(op.getSrc());
-      if (mlirStride) {
-        llvmStride = rewriter.getRemappedValue(mlirStride);
+      if (extractAsyncCopyPtrInfo(op.getSrc(), ptrInfo)) {
+        llvmStride = rewriter.getRemappedValue(ptrInfo.stride);
         if (!llvmStride)
           canAsyncDMA = false;
       } else {
         canAsyncDMA = false;
+      }
+    }
+
+    // Also need the LLVM base pointer and tile-origin offsets
+    Value llvmBasePtr;
+    Value llvmRowStart;
+    Value llvmColStart;
+    if (canAsyncDMA) {
+      llvmBasePtr = rewriter.getRemappedValue(ptrInfo.basePtr);
+      if (!llvmBasePtr)
+        canAsyncDMA = false;
+      if (ptrInfo.rowStart) {
+        llvmRowStart = rewriter.getRemappedValue(ptrInfo.rowStart);
+        if (!llvmRowStart)
+          canAsyncDMA = false;
+      }
+      if (ptrInfo.colStart) {
+        llvmColStart = rewriter.getRemappedValue(ptrInfo.colStart);
+        if (!llvmColStart)
+          canAsyncDMA = false;
       }
     }
 
@@ -2522,13 +2618,28 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     Value dstStrideBytes = LLVM::ConstantOp::create(
         rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileWidthBytes));
 
-    // Source base pointer: first element from per-thread pointers (srcElems[0])
-    // For thread 0, this is the tile's top-left corner in device memory.
-    Value llSrc = adaptor.getSrc();
-    auto srcElems = unpackLLElements(loc, llSrc, rewriter);
-    if (srcElems.empty())
-      return failure();
-    Value srcBase = srcElems[0];
+    // Source base pointer: compute UNIFORM tile origin from extracted scalars.
+    //
+    // air.simdgroup_async_copy_2d is a simdgroup-cooperative operation — all
+    // threads in the simdgroup must pass the SAME base pointer (the tile's
+    // top-left corner). We cannot use per-thread pointers from srcElems[0].
+    //
+    // tile_origin = basePtr + rowStart * stride + colStart
+    // where basePtr, rowStart, colStart, stride are all scalar (uniform).
+    Value srcBase = llvmBasePtr;
+    if (llvmRowStart) {
+      // GEP by rowStart * stride (in elements)
+      Value rowOff = LLVM::MulOp::create(rewriter, loc, llvmRowStart.getType(),
+                                         llvmRowStart, llvmStride);
+      srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy,
+                                    srcBase, ArrayRef<LLVM::GEPArg>{rowOff});
+    }
+    if (llvmColStart) {
+      // GEP by colStart (in elements)
+      srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy,
+                                    srcBase,
+                                    ArrayRef<LLVM::GEPArg>{llvmColStart});
+    }
 
     // Destination base pointer: shared memory object base
     Value llDst = adaptor.getResult();

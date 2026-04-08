@@ -1,7 +1,9 @@
 # Triton Extensions
 
 <a href="https://github.com/triton-lang/triton-ext/actions?query=workflow%3ACI"><img src="https://github.com/triton-lang/triton-ext/workflows/CI/badge.svg" alt="build status" /></a>
-<a href="https://triton-lang.slack.com/archives/C09U44YGR1T"><img src="https://img.shields.io/badge/slack-join_chat-blue.svg" alt="slack chat" /></a>
+<a href="https://discord.com/channels/1189498204333543425/1483539998702567587"><img src="https://img.shields.io/badge/discord-join_chat-blue.svg" alt="discord chat" /></a>
+
+
 
 A collection of out-of-tree extensions for the Triton compiler, including passes, dialects, backends, and language extensions.
 
@@ -29,6 +31,14 @@ Each subdirectory's `CMakeLists.txt` is responsible for building its respective 
 
 - **[`pass/`](./pass/)**: Contains MLIR pass extensions. Each pass extension is implemented as a shared library that can
   be loaded dynamically. Pass extensions include a `triton-ext.conf` file that specifies the extension name and status.
+
+- **[`extensions/`](./extensions/)**: Contains standalone plugin extensions that bundle dialects, passes, and language
+  bindings into self-contained shared libraries loadable by Triton at runtime.
+
+  - **[`utlx` (µTLX)](./extensions/utlx/)**: Triton Language Extensions plugin that provides most of Meta's TLX
+    functionality without modifying the Triton fork. Includes local memory operations (`local_alloc`, `local_view`,
+    `local_store`, `local_load`, `alloc_barriers`), custom passes (e.g., PingPong, PruneUnusedBarriers), the TLX
+    dialect, conversion patterns, and a Python DSL. Builds `libutlx.so`.
 
 - **[`support/`](./support/)**: Contains extension infrastructure code to automatically register extensions with Triton.
 
@@ -68,10 +78,26 @@ To build the extensions:
 
 ## Use
 
-Extensions can be loaded by Triton at runtime using the `TRITON_PASS_PLUGIN_PATH` environment variable (see [Triton
-plugins](https://github.com/triton-lang/triton/tree/main/examples/plugins)):
+Pass extensions can be loaded by Triton at runtime using the `TRITON_PASS_PLUGIN_PATH` environment variable (see
+[Triton plugins](https://github.com/triton-lang/triton/tree/main/examples/plugins)):
 
 ```bash
 export TRITON_PASS_PLUGIN_PATH=/path/to/libmy_pass.so
 python your_script.py
+```
+
+### Extension Plugins (µTLX)
+
+Extension plugins are loaded via `TRITON_PLUGIN_PATHS`. The µTLX plugin automatically registers itself as
+`triton.language.extra.tlx` when imported, so no filesystem symlinks are needed:
+
+```bash
+export TRITON_PLUGIN_PATHS=/path/to/triton-ext/build/lib/libutlx.so
+python your_script.py
+```
+
+To load multiple plugins, separate paths with `:`:
+
+```bash
+export TRITON_PLUGIN_PATHS=build/lib/libutlx.so:build/lib/libother_plugin.so
 ```

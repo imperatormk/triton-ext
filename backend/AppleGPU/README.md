@@ -6,13 +6,14 @@ Out-of-tree Apple GPU (Metal) backend for the Triton compiler, built as a triton
 
 ```
 triton-ext/backend/AppleGPU/
-  ├── CMakeLists.txt + lib/       C++ MLIR passes (plugin loaded via TRITON_PASS_PLUGIN_PATH)
-  ├── python/                     Python backend (pip installable, entry_points discovery)
+  ├── ExportAppleGPU.cpp         Plugin registration (tritonGetPluginInfo API)
+  ├── CMakeLists.txt + lib/      C++ MLIR passes
+  ├── python/                    Python backend (pip installable)
   │     └── triton_apple_backend/
-  │           ├── compiler.py     TTIR → TTGIR → LLVM IR → metallib
-  │           ├── driver.py       MPS GPU dispatch, buffer binding, scalar packing
-  │           └── metal_utils.m   ObjC++ Metal bridge (compiled at install time)
-  └── metal-ir-pipeline/         LLVM IR → Metal AIR → metallib compiler (git submodule)
+  │           ├── compiler.py    TTIR → TTGIR → LLVM IR → metallib
+  │           ├── driver.py      MPS GPU dispatch, buffer binding, scalar packing
+  │           └── metal_utils.m  ObjC++ Metal bridge (compiled at install time)
+  └── metal-ir-pipeline/        LLVM IR → Metal AIR → metallib compiler (git submodule)
 ```
 
 ## Prerequisites
@@ -23,18 +24,34 @@ triton-ext/backend/AppleGPU/
 
 ## Setup
 
-### 1. Install Triton from source
+### 1. Build Triton from source
 
 ```bash
-git clone https://github.com/triton-lang/triton.git
-cd triton
+git clone https://github.com/triton-lang/triton.git ~/projects/oss/triton-main
+cd ~/projects/oss/triton-main
 
-# Required for macOS plugin support: remove -fvisibility=hidden
-# (TypeID symbols must be exported for dlopen'd plugins to resolve them)
-sed -i '' 's/-fvisibility=hidden//' CMakeLists.txt
+# Create venv
+python3.12 -m venv pytorch25-venv
+source pytorch25-venv/bin/activate
+pip install pybind11 numpy pytest
 
-pip install -e . --no-build-isolation
-cmake --install build/cmake.* --prefix build/install
+# macOS patches needed before building:
+# - third_party/nvidia/CMakeLists.txt: skip GSan CUDA on Apple (stub gsan.ll)
+# - CMakeLists.txt: skip examples/plugins on Apple (visibility link errors)
+
+# Build LLVM (first time only, ~40 min)
+cd llvm-project
+git checkout $(cat ../cmake/llvm-hash.txt)
+cmake -B build -G Ninja llvm \
+  -DLLVM_ENABLE_PROJECTS="mlir;llvm;lld;clang" \
+  -DLLVM_TARGETS_TO_BUILD="Native;NVPTX;AMDGPU" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(sysctl -n hw.ncpu)
+cd ..
+
+# Build & install Triton
+LLVM_SYSPATH=$(pwd)/llvm-project/build TRITON_BUILD_WITH_CCACHE=true \
+  TRITON_EXT_ENABLED=1 pip install -e . --no-build-isolation
 ```
 
 ### 2. Clone triton-ext with submodules
@@ -42,27 +59,28 @@ cmake --install build/cmake.* --prefix build/install
 ```bash
 git clone --recurse-submodules https://github.com/imperatormk/triton-ext.git
 cd triton-ext
+git checkout apple-gpu
 ```
 
-### 3. Build metal-ir-pipeline (submodule)
+### 3. Build metal-ir-pipeline
 
 ```bash
 cd backend/AppleGPU/metal-ir-pipeline
-cmake -B build -DLLVM_DIR=$(ls -d ~/.triton/llvm/llvm-*/lib/cmake/llvm | head -1)
-cmake --build build
+cmake -B build -DLLVM_DIR=~/projects/oss/triton-main/llvm-project/build/lib/cmake/llvm
+cmake --build build -j$(sysctl -n hw.ncpu)
 cd ../../..
 ```
 
-### 4. Build the MLIR pass plugin
+### 4. Build the plugin
 
 ```bash
-LLVM_INSTALL_DIR=/path/to/llvm/install \
-TRITON_INSTALL_DIR=/path/to/triton/build/install \
-cmake -S . -B build -G Ninja
-cmake --build build -- TritonAppleGPUBackend
-
-install_name_tool -add_rpath /path/to/triton/python/triton/_C \
-  build/lib/libTritonAppleGPUBackend.dylib
+mkdir build && cd build
+TRITON_INSTALL_DIR=~/projects/oss/triton-main/build/install \
+cmake .. \
+  -DLLVM_DIR=~/projects/oss/triton-main/llvm-project/build/lib/cmake/llvm \
+  -DMLIR_DIR=~/projects/oss/triton-main/llvm-project/build/lib/cmake/mlir \
+  -DFILECHECK_PATH=~/projects/oss/triton-main/llvm-project/build/bin/FileCheck
+make -j$(sysctl -n hw.ncpu)
 ```
 
 ### 5. Install the Python backend
@@ -75,14 +93,14 @@ pip install -e . --no-build-isolation
 ### 6. Run
 
 ```bash
-export TRITON_PASS_PLUGIN_PATH=/path/to/triton-ext/build/lib/libTritonAppleGPUBackend.dylib
+export TRITON_PLUGIN_PATHS=~/projects/oss/triton-ext/build/lib/libTritonAppleGPUBackend.dylib
 
 python your_triton_script.py  # kernels run on MPS
 ```
 
 ## What's included
 
-### C++ MLIR Passes (loaded via TRITON_PASS_PLUGIN_PATH)
+### C++ MLIR Passes (loaded via TRITON_PLUGIN_PATHS)
 
 | Pass | Purpose |
 |------|---------|
@@ -98,9 +116,9 @@ python your_triton_script.py  # kernels run on MPS
 
 ## Test Status
 
-- 72/72 backend-specific tests passing (elementwise, dot, GEMM, reduce, atomics, softmax, layernorm, attention, fla delta rule)
-- 5735/9337 upstream test_core.py passing (remaining failures are float64, FP8, int64 atomics, NVIDIA-specific precision modes — all known MPS/Metal limitations)
-- Qwen 3.5-2B inference working via fla (flash-linear-attention) Triton kernels
+- 71/72 backend-specific tests passing (1 xfail for shared memory limit)
+- Upstream test_core.py: remaining failures are float64, FP8, int64 atomics, NVIDIA-specific tests
+- 3 backend bugs tracked: phi(undef,ptr) crash, LICM metadata, multi-return noinline
 
 ## Known Limitations
 
@@ -109,3 +127,4 @@ python your_triton_script.py  # kernels run on MPS
 - `int64` atomics — Metal doesn't support 64-bit atomic operations
 - `num_warps >= 16` — exceeds Apple GPU max threads per threadgroup (384)
 - Cross-threadgroup spinlocks — Apple GPU has no forward progress guarantee
+

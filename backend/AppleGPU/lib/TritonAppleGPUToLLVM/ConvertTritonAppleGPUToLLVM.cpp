@@ -2021,7 +2021,28 @@ struct AppleReturnOpConversion
   LogicalResult
   matchAndRewrite(triton::ReturnOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    LLVM::ReturnOp::create(rewriter, op.getLoc(), adaptor.getOperands());
+    auto operands = adaptor.getOperands();
+    if (operands.size() <= 1) {
+      // Void or single return — direct lowering
+      LLVM::ReturnOp::create(rewriter, op.getLoc(), operands);
+    } else {
+      // Multi-return: pack values into a struct (matches the struct return
+      // type created by AppleFuncOpConversion for multi-result functions).
+      auto loc = op.getLoc();
+      auto *ctx = rewriter.getContext();
+      SmallVector<Type> memberTypes;
+      for (auto v : operands)
+        memberTypes.push_back(v.getType());
+      auto structTy = LLVM::LLVMStructType::getLiteral(ctx, memberTypes);
+
+      Value packed = LLVM::UndefOp::create(rewriter, loc, structTy);
+      for (unsigned i = 0; i < operands.size(); ++i) {
+        packed = LLVM::InsertValueOp::create(
+            rewriter, loc, packed, operands[i],
+            ArrayRef<int64_t>{static_cast<int64_t>(i)});
+      }
+      LLVM::ReturnOp::create(rewriter, loc, ValueRange{packed});
+    }
     rewriter.eraseOp(op);
     return success();
   }
@@ -3078,6 +3099,34 @@ struct ConvertTritonAppleGPUToLLVMPass
 
     if (failed(applyPartialConversion(mod, target, std::move(patterns))))
       signalPassFailure();
+
+    // Fix up llvm.loop_annotation on llvm.br / llvm.cond_br ops.
+    //
+    // The ControlFlowToLLVM BranchOpLowering copies cf.br attrs via
+    // setAttrs(getAttrDictionary()), but the loop_annotation attr name
+    // in the CF dict is "llvm.loop_annotation" (discardable, dialect-
+    // prefixed), while the LLVM BrOp's inherent property is named
+    // "loop_annotation" (no prefix). setAttrs doesn't match them, so
+    // the attr stays discardable and getLoopAnnotationAttr() returns
+    // null, causing translateModuleToLLVMIR to drop the !llvm.loop
+    // metadata.
+    //
+    // Walk all branch ops and move the discardable attr to the proper
+    // inherent property.
+    mod.walk([](LLVM::BrOp brOp) {
+      if (auto attr = brOp->getAttrOfType<LLVM::LoopAnnotationAttr>(
+              "llvm.loop_annotation")) {
+        brOp.setLoopAnnotationAttr(attr);
+        brOp->removeDiscardableAttr("llvm.loop_annotation");
+      }
+    });
+    mod.walk([](LLVM::CondBrOp brOp) {
+      if (auto attr = brOp->getAttrOfType<LLVM::LoopAnnotationAttr>(
+              "llvm.loop_annotation")) {
+        brOp.setLoopAnnotationAttr(attr);
+        brOp->removeDiscardableAttr("llvm.loop_annotation");
+      }
+    });
   }
 };
 

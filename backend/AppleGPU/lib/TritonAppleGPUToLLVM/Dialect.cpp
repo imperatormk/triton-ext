@@ -96,6 +96,7 @@ struct AppleGPUInferLayoutInterface
   LogicalResult
   inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
                          ArrayRef<int64_t> dstShape, Attribute &dstEnc,
+                         bool allowReorder,
                          std::optional<Location> loc) const override {
     if (!isa<ttg::DistributedEncodingTrait>(srcEnc))
       return emitOptionalError(loc,

@@ -1,3 +1,0 @@
-[submodule "backend/AppleGPU/metal-ir-pipeline"]
-	path = backend/AppleGPU/metal-ir-pipeline
-	url = https://github.com/imperatormk/metal-ir-pipeline.git

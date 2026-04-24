@@ -1,0 +1,4 @@
+lit~=18.1
+ninja~=1.13
+pre_commit~=4.6
+requests~=2.33

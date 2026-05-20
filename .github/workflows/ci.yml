@@ -122,6 +122,9 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/${{ steps.build-triton.outputs.triton_install_dir }}/python
           TRITON_EXT_BUILD_DIR: build
         run: |
+          # libtriton.so ships in the C++ tree, not the bundled python package.
+          TRITON_DIR="${{ github.workspace }}/${{ steps.build-triton.outputs.triton_install_dir }}"
+          cp "$TRITON_DIR"/lib/libtriton.so "$TRITON_DIR"/python/triton/_C/
           python -m pip install --quiet pytest
           python -c "import triton; print('triton', triton.__version__)"
           python -m pytest testing/test_plugins.py -v

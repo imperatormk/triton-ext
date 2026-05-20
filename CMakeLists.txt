@@ -8,6 +8,25 @@ set(TRITON_EXT_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 set(TRITON_EXT_LIBRARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/lib")
 set(TRITON_EXT_SUPPORT_DIR "${TRITON_EXT_SOURCE_DIR}/support")
 
+# Extensions listed in ci/skip-extensions.txt (one name per line, '#' comments)
+# are not built. This is the durable record of extensions temporarily skipped
+# because they break against the current Triton pin; their owner re-enables
+# them by removing the line once fixed. A -DTRITON_EXT_SKIP=... on the command
+# line is merged in too.
+set(_skip_file "${TRITON_EXT_SOURCE_DIR}/ci/skip-extensions.txt")
+if(EXISTS "${_skip_file}")
+    file(STRINGS "${_skip_file}" _skip_lines)
+    foreach(_line ${_skip_lines})
+        string(STRIP "${_line}" _line)
+        if(_line AND NOT _line MATCHES "^#")
+            list(APPEND TRITON_EXT_SKIP "${_line}")
+        endif()
+    endforeach()
+endif()
+if(TRITON_EXT_SKIP)
+    message(STATUS "Extensions to skip: ${TRITON_EXT_SKIP}")
+endif()
+
 # Locate Triton: supports two modes:
 #   1. TRITON_INSTALL_DIR — path to a Triton installation (headers + lib)
 #   2. TRITON_SOURCE_DIR + TRITON_BUILD_DIR — path to Triton source + build trees

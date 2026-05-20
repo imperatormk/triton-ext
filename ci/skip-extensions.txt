@@ -1,0 +1,10 @@
+# Extensions to skip building, one name per line (matches the name in each
+# extension's triton-ext.conf). Lines starting with '#' are ignored.
+#
+# An extension is listed here when it does not build or load against the
+# current Triton pin, so the rest of the build stays green while its owner
+# updates it. Remove the line once the extension is fixed. This is process,
+# not a verdict on the extension.
+#
+# Example:
+#   utlx

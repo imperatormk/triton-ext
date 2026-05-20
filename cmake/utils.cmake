@@ -82,6 +82,18 @@ function(triton_ext_should_build_extension triton_ext_dir result_var)
                 # If TRITON_EXT_NAMES is empty, default to TRUE
                 set(${result_var} TRUE PARENT_SCOPE)
             endif()
+
+            # Honor the skip list (TRITON_EXT_SKIP, semicolon-separated). An
+            # extension on it is not built - used to temporarily skip an
+            # extension that breaks against a new Triton pin while its owner
+            # fixes it, so the rest of the build stays green.
+            if(_ext_name AND TRITON_EXT_SKIP)
+                list(FIND TRITON_EXT_SKIP "${_ext_name}" _skip_index)
+                if(NOT _skip_index EQUAL -1)
+                    message(STATUS "Skipping extension '${_ext_name}' (in TRITON_EXT_SKIP)")
+                    set(${result_var} FALSE PARENT_SCOPE)
+                endif()
+            endif()
         endif()
     endif()
 endfunction()

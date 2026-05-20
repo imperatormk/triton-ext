@@ -91,10 +91,17 @@ runs:
       shell: bash
       working-directory: ${{ steps.setup.outputs.triton_install_dir }}
       # Stripping debug symbols reduces the artifact size by an order of magnitude.
+      # Bundle the importable python/ package too (not just the C++ install tree)
+      # so CI can `import triton`; -h dereferences its backend symlinks.
       run: |
         make install
         find build/install -type f -executable | xargs strip --strip-debug
-        tar czf ../"${{ env.triton_install_dir }}.tar.gz" --transform="s|^build/install|${{ env.triton_install_dir }}|" build/install
+        find python/triton -name '*.so' -type f | xargs --no-run-if-empty strip --strip-debug
+        find python -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+        tar czhf ../"${{ env.triton_install_dir }}.tar.gz" \
+          --transform="s|^build/install|${{ env.triton_install_dir }}|" \
+          --transform="s|^python|${{ env.triton_install_dir }}/python|" \
+          build/install python
 
     - name: Upload Triton artifact
       if: steps.check-artifact.outputs.exists == 'false'

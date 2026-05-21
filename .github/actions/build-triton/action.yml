@@ -5,8 +5,8 @@ description: |
   - if the artifact does not exist, check out Triton and build it, using the given LLVM installation directory; then,
     upload it as an artifact
   - if the artifact does exist, download and extract it
-  - return the path the Triton installation directory as well as the build directory inside of it (e.g.,
-    `build/cmake.linux-x86_64-cpython-3.14`).
+  - return the path to the Triton installation directory, which contains the installable C++ tree
+    (bin, include, lib) alongside the importable Python package under `python/`.
 
   This action expects `sccache` to be set up by the caller.
 
@@ -94,7 +94,11 @@ runs:
       run: |
         make install
         find build/install -type f -executable | xargs strip --strip-debug
-        tar czf ../"${{ env.triton_install_dir }}.tar.gz" --transform="s|^build/install|${{ env.triton_install_dir }}|" build/install
+        find python -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+        tar czhf ../"${{ env.triton_install_dir }}.tar.gz" \
+          --transform="s|^build/install|${{ env.triton_install_dir }}|" \
+          --transform="s|^python|${{ env.triton_install_dir }}/python|" \
+          build/install python
 
     - name: Upload Triton artifact
       if: steps.check-artifact.outputs.exists == 'false'

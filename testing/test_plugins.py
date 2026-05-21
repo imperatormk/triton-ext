@@ -18,15 +18,19 @@ Adding a new plugin: drop a `triton-ext.conf`; both parametrized tests pick
 it up. To exempt a plugin from a parametrized test, mark it at parametrize
 time with `pytest.param(..., marks=pytest.mark.skip(...))` -- see
 `_COMPILE_PLUGINS` for an example.
+
+The kernel-compile and tlx-DSL scenarios live as standalone scripts under
+`testing/scripts/` so they can be run by hand to debug a plugin, e.g.
+`TRITON_PLUGIN_PATHS=build/lib/lib<name>.so python testing/scripts/compile_kernel.py`.
+On failure each test prints the exact command to reproduce it.
 """
 
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
-import tempfile
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -34,6 +38,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = Path(os.environ.get("TRITON_EXT_BUILD_DIR", REPO_ROOT / "build"))
 PLUGIN_LIB_DIR = BUILD_DIR / "lib"
+SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 
 
 def _discover_plugins() -> list[pytest.ParameterSet]:
@@ -61,26 +66,27 @@ def _plugin_path(name: str) -> Path:
     return PLUGIN_LIB_DIR / f"lib{name}.so"
 
 
-def _run_with_plugin(plugin_path: Path,
-                     script: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "TRITON_PLUGIN_PATHS": str(plugin_path)}
-    # Write the script to a real file rather than using `python -c`: a
-    # `@triton.jit` kernel needs `inspect.getsourcelines` to read its source,
-    # which fails ("could not get source code") for code passed via -c.
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
-                                     delete=False) as f:
-        f.write(textwrap.dedent(script))
-        script_path = f.name
-    try:
-        return subprocess.run(
-            [sys.executable, script_path],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    finally:
-        os.unlink(script_path)
+def _format_command(env_overrides: dict[str, str], args: list[str]) -> str:
+    """Render a copy-pasteable shell command for manual debugging."""
+    prefix = " ".join(f"{k}={shlex.quote(v)}"
+                      for k, v in env_overrides.items())
+    cmd = " ".join(shlex.quote(a) for a in args)
+    return f"{prefix} {cmd}".strip()
+
+
+def _run(env_overrides: dict[str, str],
+         args: list[str]) -> tuple[subprocess.CompletedProcess, str]:
+    """Run a subprocess and return it along with its debug command string."""
+    env = {**os.environ, **env_overrides}
+    command = _format_command(env_overrides, args)
+    result = subprocess.run(
+        args,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, command
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +105,10 @@ def test_plugin_loads(name: str) -> None:
     path = _plugin_path(name)
     if not path.is_file():
         pytest.skip(f"Plugin not built at {path} (extension may be disabled)")
-    result = _run_with_plugin(path, "import triton")
+    result, command = _run({"TRITON_PLUGIN_PATHS": str(path)},
+                           [sys.executable, "-c", "import triton"])
     assert result.returncode == 0, (
-        f"Loading plugin {name} from {path} failed:\n"
+        f"Loading plugin {name} failed. Reproduce with:\n  {command}\n"
         f"--- stdout ---\n{result.stdout}\n"
         f"--- stderr ---\n{result.stderr}")
 
@@ -122,32 +129,14 @@ def test_plugin_compiles_kernel(name: str) -> None:
     path = _plugin_path(name)
     if not path.is_file():
         pytest.skip(f"Plugin not built at {path} (extension may be disabled)")
-    script = """
-        import sys
-        import triton
-        import triton.language as tl
-
-        @triton.jit
-        def kernel(in_ptr, out_ptr, BLOCK: tl.constexpr):
-            offs = tl.arange(0, BLOCK)
-            tl.store(out_ptr + offs, tl.load(in_ptr + offs))
-
-        try:
-            target = triton.runtime.driver.active.get_current_target()
-        except Exception as e:
-            print(f"No target ({type(e).__name__}: {e}); skipping compile.")
-            sys.exit(0)
-        src = triton.compiler.ASTSource(
-            fn=kernel,
-            signature={"in_ptr": "*fp32", "out_ptr": "*fp32"},
-            constexprs={"BLOCK": 128},
-        )
-        triton.compile(src, target=target)
-        """
-    result = _run_with_plugin(path, script)
-    assert result.returncode == 0, (f"Plugin {name} broke kernel compile:\n"
-                                    f"--- stdout ---\n{result.stdout}\n"
-                                    f"--- stderr ---\n{result.stderr}")
+    result, command = _run(
+        {"TRITON_PLUGIN_PATHS": str(path)},
+        [sys.executable,
+         str(SCRIPTS_DIR / "compile_kernel.py")])
+    assert result.returncode == 0, (
+        f"Plugin {name} broke kernel compile. Reproduce with:\n  {command}\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}")
 
 
 # ---------------------------------------------------------------------------
@@ -166,27 +155,14 @@ def test_utlx_registers_tlx_dsl() -> None:
     """
     plugin_path = _plugin_path("utlx")
     utlx_python = REPO_ROOT / "extensions" / "utlx" / "python"
-    env = {
-        **os.environ,
-        "TRITON_PLUGIN_PATHS":
-        str(plugin_path),
-        "PYTHONPATH":
-        f"{utlx_python}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-    }
-    script = """
-        import triton  # noqa: F401
-        import utlx_plugin  # noqa: F401  (registers triton.language.extra.tlx)
-        from triton.language.extra import tlx
-        for n in ("local_alloc", "local_view", "local_store", "local_load"):
-            assert hasattr(tlx, n), f"missing tlx.{n}"
-        """
-    result = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(script)],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, (f"utlx tlx-DSL check failed:\n"
-                                    f"--- stdout ---\n{result.stdout}\n"
-                                    f"--- stderr ---\n{result.stderr}")
+    pythonpath = f"{utlx_python}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
+    result, command = _run(
+        {
+            "TRITON_PLUGIN_PATHS": str(plugin_path),
+            "PYTHONPATH": pythonpath,
+        },
+        [sys.executable, str(SCRIPTS_DIR / "load_tlx_dsl.py")])
+    assert result.returncode == 0, (
+        f"utlx tlx-DSL check failed. Reproduce with:\n  {command}\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}")

@@ -46,7 +46,4 @@ if __name__ == "__main__":
     criteria = sys.argv[1].lower()
     search_dir = os.getenv("SEARCH_DIR", ".")
     artifact_dir = run(search_dir, criteria)
-    # Triton artifacts hold the installable C++ tree under cpp/ (python/ holds the importable package).
-    if criteria.startswith("triton"):
-        artifact_dir = os.path.join(artifact_dir, "cpp")
     print(artifact_dir)

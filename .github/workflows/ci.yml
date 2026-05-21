@@ -109,22 +109,15 @@ jobs:
       - name: Build Triton extensions
         run: >
           make LLVM_INSTALL_DIR="${{ steps.build-llvm.outputs.llvm_install_dir }}"
-               TRITON_INSTALL_DIR="${{ steps.build-triton.outputs.triton_install_dir }}/cpp"
+               TRITON_INSTALL_DIR="${{ steps.build-triton.outputs.triton_install_dir }}"
                EXTRA_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
       - name: Run tests
-        run: >
-          make test LLVM_INSTALL_DIR="${{ steps.build-llvm.outputs.llvm_install_dir }}"
-                    TRITON_INSTALL_DIR="${{ steps.build-triton.outputs.triton_install_dir }}/cpp"
-
-      - name: Test that extensions load into Triton
         env:
           PYTHONPATH: ${{ github.workspace }}/${{ steps.build-triton.outputs.triton_install_dir }}/python
-          TRITON_EXT_BUILD_DIR: build
-        run: |
-          python -m pip install --quiet pytest
-          python -c "import triton; print('triton', triton.__version__)"
-          python -m pytest testing/test_plugins.py -v
+        run: >
+          make test LLVM_INSTALL_DIR="${{ steps.build-llvm.outputs.llvm_install_dir }}"
+                    TRITON_INSTALL_DIR="${{ steps.build-triton.outputs.triton_install_dir }}"
 
       - name: List files
         run: du -d 3 -h .

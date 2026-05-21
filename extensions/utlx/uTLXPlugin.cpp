@@ -15,6 +15,10 @@
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Version.h"
 
+#ifndef TRITON_EXT_VERSION
+#define TRITON_EXT_VERSION "0.0.0"
+#endif
+
 // TLX dialect headers
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
@@ -695,37 +699,37 @@ using namespace mlir::triton;
 
 TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
   static plugin::PassInfo passes[] = {
-      {"utlx_convert_triton_to_tritongpu", "0.1.0", addUTLXConversionPass,
-       registerUTLXConversionPass},
-      {"utlx_insert_and_propagate_layout", "0.1.0",
+      {"utlx_convert_triton_to_tritongpu", TRITON_EXT_VERSION,
+       addUTLXConversionPass, registerUTLXConversionPass},
+      {"utlx_insert_and_propagate_layout", TRITON_EXT_VERSION,
        addUTLXInsertAndPropagatePass, registerUTLXInsertAndPropagatePass},
-      {"utlx_fixup", "0.1.0", addTLXFixupPass, registerTLXFixupPass},
-      {"utlx_propagate_layout", "0.1.0", addPropagateLayoutPass,
+      {"utlx_fixup", TRITON_EXT_VERSION, addTLXFixupPass, registerTLXFixupPass},
+      {"utlx_propagate_layout", TRITON_EXT_VERSION, addPropagateLayoutPass,
        registerPropagateLayoutPass},
-      {"utlx_insert_require_layout", "0.1.0", addInsertRequireLayoutPass,
+      {"utlx_insert_require_layout", TRITON_EXT_VERSION,
+       addInsertRequireLayoutPass, noopRegister},
+      {"utlx_rewrite_local_alias", TRITON_EXT_VERSION, addRewriteLocalAliasPass,
        noopRegister},
-      {"utlx_rewrite_local_alias", "0.1.0", addRewriteLocalAliasPass,
-       noopRegister},
-      {"utlx_resolve_placeholder_layouts", "0.1.0",
+      {"utlx_resolve_placeholder_layouts", TRITON_EXT_VERSION,
        addResolvePlaceholderLayoutsPass, noopRegister},
-      {"utlx_print_ttgir_to_tlx", "0.1.0", addPrintTTGIRToTLXPass,
+      {"utlx_print_ttgir_to_tlx", TRITON_EXT_VERSION, addPrintTTGIRToTLXPass,
        noopRegister},
-      {"utlx_storage_alias_lowering", "0.1.0", addStorageAliasLoweringPass,
-       noopRegister},
+      {"utlx_storage_alias_lowering", TRITON_EXT_VERSION,
+       addStorageAliasLoweringPass, noopRegister},
       // Ported NVIDIA passes
-      {"utlx_prune_unused_barriers", "0.1.0", addPruneUnusedBarriersPass,
-       registerPruneUnusedBarriersPassFn},
-      {"utlx_ping_pong_prep", "0.1.0", addPingPongPrepPass,
+      {"utlx_prune_unused_barriers", TRITON_EXT_VERSION,
+       addPruneUnusedBarriersPass, registerPruneUnusedBarriersPassFn},
+      {"utlx_ping_pong_prep", TRITON_EXT_VERSION, addPingPongPrepPass,
        registerPingPongPrepPassFn},
-      {"utlx_ping_pong_sync", "0.1.0", addPingPongSyncPass,
+      {"utlx_ping_pong_sync", TRITON_EXT_VERSION, addPingPongSyncPass,
        registerPingPongSyncPassFn},
       // Ported AMD passes (disabled until patched triton is available)
-      // {"utlx_amd_lower_barrier_ops", "0.1.0",
+      // {"utlx_amd_lower_barrier_ops", TRITON_EXT_VERSION,
       //  addAMDLowerBarrierOpsPass, registerAMDLowerBarrierOpsPassFn},
   };
 
   static plugin::DialectInfo dialects[] = {
-      {"TLXDialect", "0.1.0", registerTLXDialect},
+      {"TLXDialect", TRITON_EXT_VERSION, registerTLXDialect},
   };
 
   static plugin::OpInfo ops[] = {
@@ -797,7 +801,7 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
   static plugin::PluginInfo info = {
       TRITON_PLUGIN_API_VERSION,
       "uTLXPlugin",
-      "0.1.0",
+      TRITON_EXT_VERSION,
       passes,
       12, // numPasses
       dialects,

@@ -9,7 +9,7 @@ To contribute a new extension, follow these steps:
   [`pass`](./pass), etc. If the addition spans multiple top-level directories
   but should not logically be split up, use [`extensions`](./extensions).
 - create a new directory for the addition
-- add the implementation files, CMakeLists.txt, and `triton-ext.conf`; provide
+- add the implementation files, CMakeLists.txt, and `triton-ext.toml`; provide
   tests and ensure they run in `make test`.
 - check that all pre-commit checks pass: `pre-commit run --all-files`
 - open a PR with a clear description of the extension and its functionality, and

@@ -1,5 +1,5 @@
 build
 llvm-*
 triton-*
-!triton-ext.conf
+!triton-ext.toml
 *.pyc

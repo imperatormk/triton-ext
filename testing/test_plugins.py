@@ -1,8 +1,10 @@
 """Plugin integration tests.
 
-Auto-discovers every plugin declared by a `triton-ext.conf` and exercises
+Auto-discovers every plugin declared by a `triton-ext.toml` and exercises
 its `lib<name>.so` from a fresh Python interpreter with `TRITON_PLUGIN_PATHS`
 set. Each plugin runs in its own subprocess so failures isolate cleanly.
+Extensions with `enabled = 0` in their manifest are not built, so they are
+skipped during discovery.
 
 Tests:
   - test_plugin_loads[<name>]            -- plugin static-init: `import triton`
@@ -14,7 +16,7 @@ Tests:
                                             with `@pytest.mark.skipif` on the
                                             plugin's .so existence.
 
-Adding a new plugin: drop a `triton-ext.conf`; both parametrized tests pick
+Adding a new plugin: drop a `triton-ext.toml`; both parametrized tests pick
 it up. To exempt a plugin from a parametrized test, mark it at parametrize
 time with `pytest.param(..., marks=pytest.mark.skip(...))` -- see
 `_COMPILE_PLUGINS` for an example.
@@ -40,21 +42,21 @@ BUILD_DIR = Path(os.environ.get("TRITON_EXT_BUILD_DIR", REPO_ROOT / "build"))
 PLUGIN_LIB_DIR = BUILD_DIR / "lib"
 SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 
+sys.path.insert(0, str(REPO_ROOT / "ci"))
+import extension_config  # noqa: E402  (ci/ is added to sys.path above)
+
 
 def _discover_plugins() -> list[pytest.ParameterSet]:
     plugins: list[pytest.ParameterSet] = []
-    for conf in REPO_ROOT.rglob("triton-ext.conf"):
-        rel_parts = conf.relative_to(REPO_ROOT).parts
+    for manifest in REPO_ROOT.rglob("triton-ext.toml"):
+        rel_parts = manifest.relative_to(REPO_ROOT).parts
         if rel_parts[0].startswith(("triton-", "llvm-", "build")):
             continue
-        text = conf.read_text().strip()
-        if not text:
+        cfg = extension_config.load(manifest)
+        # Disabled extensions are not built, so do not parametrize them.
+        if not cfg.enabled:
             continue
-        # Format is `name;status[;hash]` (CMake list); we only need the name.
-        name = text.split(";", 1)[0].strip()
-        if not name:
-            continue
-        plugins.append(pytest.param(name, id=name))
+        plugins.append(pytest.param(cfg.name, id=cfg.name))
     plugins.sort(key=lambda p: p.id)
     return plugins
 
@@ -96,7 +98,7 @@ def _run(env_overrides: dict[str, str],
 
 def test_plugins_discovered() -> None:
     """Guard against silently testing nothing if discovery breaks."""
-    assert PLUGINS, f"No triton-ext.conf files found under {REPO_ROOT}"
+    assert PLUGINS, f"No triton-ext.toml files found under {REPO_ROOT}"
 
 
 @pytest.mark.parametrize("name", PLUGINS)

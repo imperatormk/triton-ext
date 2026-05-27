@@ -45,8 +45,8 @@ extensions.
 
 - **[`pass/`](./pass/)**: Contains MLIR pass extensions. Each pass extension is
   implemented as a shared library that can be loaded dynamically. Pass
-  extensions include a `triton-ext.conf` file that specifies the extension name
-  and status.
+  extensions include a `triton-ext.toml` manifest that specifies the extension
+  name and status.
 
 - **[`extensions/`](./extensions/)**: Contains standalone plugin extensions that
   bundle dialects, passes, and language bindings into self-contained shared

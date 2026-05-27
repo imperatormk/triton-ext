@@ -5,9 +5,11 @@ then dispatches via MTLComputeCommandEncoder.
 """
 
 from dataclasses import dataclass
-import ctypes
 import hashlib
 import os
+import re
+import subprocess
+import tempfile
 
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm
@@ -21,55 +23,110 @@ def _pmaybe_enable_debug(pm):
         pm.enable_debug()
 
 
-def _find_metalir_dylib():
-    """Find libMetalIRBridge.dylib (C++ metal-ir-pipeline)."""
-    # 1. Environment variable override
-    if os.environ.get('METALIR_DYLIB_PATH'):
-        return os.environ['METALIR_DYLIB_PATH']
-
-    # 2. Submodule: backend/AppleGPU/metal-ir-pipeline/build/
-    submodule = os.path.join(os.path.dirname(__file__), '..', '..',
-                             'metal-ir-pipeline', 'build', 'lib', 'Bridge',
-                             'libMetalIRBridge.dylib')
-    if os.path.exists(submodule):
-        return os.path.abspath(submodule)
-
+def _find_llc():
+    """Find the in-tree `llc` built from the LLVM Metal/AIR target."""
+    if os.environ.get('METAL_LLC_PATH'):
+        return os.environ['METAL_LLC_PATH']
+    # Standard location: llvm-project/build/bin/llc, two levels above the Triton
+    # source we vendor against.
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, '..', '..', '..', '..', '..', 'triton-main',
+                     'llvm-project', 'build', 'bin', 'llc'),
+        '/Users/zimski/projects/oss/triton-main/llvm-project/build/bin/llc',
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return os.path.abspath(c)
     return None
 
 
+# Sized scalar types that may appear as the element type of an `addrspace(3)`
+# global. Vectors are handled by multiplying through.
+_LLVM_SCALAR_BYTES = {
+    'i1': 1, 'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8,
+    'half': 2, 'bfloat': 2, 'float': 4, 'double': 8,
+}
+
+
+def _llvm_type_size(ty: str) -> int:
+    """Total bytes for an LLVM IR type literal as it appears in a global decl."""
+    ty = ty.strip()
+    # Vector: <N x T>
+    m = re.fullmatch(r'<\s*(\d+)\s*x\s*(.+?)\s*>', ty)
+    if m:
+        return int(m.group(1)) * _llvm_type_size(m.group(2))
+    # Array: [N x T]
+    m = re.fullmatch(r'\[\s*(\d+)\s*x\s*(.+?)\s*\]', ty)
+    if m:
+        return int(m.group(1)) * _llvm_type_size(m.group(2))
+    # Sized scalar
+    if ty in _LLVM_SCALAR_BYTES:
+        return _LLVM_SCALAR_BYTES[ty]
+    # Generic iN
+    m = re.fullmatch(r'i(\d+)', ty)
+    if m:
+        return (int(m.group(1)) + 7) // 8
+    raise ValueError(f"unsupported LLVM type for tg-memory sizing: {ty!r}")
+
+
+def _tg_memory_bytes(llvm_ir: str) -> int:
+    """Sum bytes for `addrspace(3)` globals in the IR, with alignment padding.
+
+    Matches the C bridge's metalir_tg_memory_bytes: walks each addrspace(3)
+    global in declaration order, pads the running total up to that global's
+    align, then adds its allocation size.
+    """
+    total = 0
+    # `@name = ... addrspace(3) global <type> ..., align N`
+    pat = re.compile(
+        r'^@[\w$.]+\s*=\s*(?:[^@\n]*?\s)?addrspace\(3\)\s+(?:[\w]+\s+)?global\s+'
+        r'(.+?)(?:,\s*align\s+(\d+))?\s*$',
+        re.MULTILINE)
+    for m in pat.finditer(llvm_ir):
+        # The captured initializer-or-type group may start with the type
+        # followed by the initializer; take the leading well-formed type.
+        head = m.group(1).strip()
+        ty = re.match(r'(<[^>]+>|\[[^\]]+\]|[\w]+)', head).group(1)
+        align = int(m.group(2)) if m.group(2) else 1
+        if total % align:
+            total += align - (total % align)
+        total += _llvm_type_size(ty)
+    return total
+
+
 def _load_metalir():
-    """Load MetalIRBridge dylib and return a compile function."""
-    dylib = _find_metalir_dylib()
-    if not dylib:
+    """Return a compile function backed by the in-tree `llc -mtriple=air`."""
+    llc = _find_llc()
+    if not llc:
         raise RuntimeError(
-            "libMetalIRBridge.dylib not found. Build metal-ir-pipeline first:\n"
-            "  cd metal-ir-pipeline && cmake -B build -DLLVM_DIR=... && cmake --build build\n"
-            "Or set METALIR_DYLIB_PATH=/path/to/libMetalIRBridge.dylib")
-    lib = ctypes.CDLL(dylib)
-    lib.metalir_compile.restype = ctypes.c_void_p
-    lib.metalir_compile.argtypes = [
-        ctypes.c_char_p,
-        ctypes.POINTER(ctypes.c_uint64),
-        ctypes.c_char_p,
-        ctypes.c_int,
-    ]
-    lib.metalir_free.argtypes = [ctypes.c_void_p]
-    lib.metalir_tg_memory_bytes.restype = ctypes.c_uint64
-    lib.metalir_tg_memory_bytes.argtypes = [ctypes.c_char_p]
+            "llc not found. Build the in-tree LLVM Metal target (cmake "
+            "--build build, target llc) or set METAL_LLC_PATH=/path/to/llc.")
 
     def compile_ir(llvm_ir: str) -> bytes:
-        out_len = ctypes.c_uint64(0)
-        errbuf = ctypes.create_string_buffer(512)
-        ptr = lib.metalir_compile(llvm_ir.encode(), ctypes.byref(out_len),
-                                  errbuf, 512)
-        if ptr:
-            data = bytes((ctypes.c_ubyte * out_len.value).from_address(ptr))
-            lib.metalir_free(ptr)
-            return data
-        raise RuntimeError(f"MetalIR compile failed: {errbuf.value.decode()}")
+        with tempfile.NamedTemporaryFile(
+                suffix='.metallib', delete=False) as out_f:
+            out_path = out_f.name
+        try:
+            if os.environ.get('TRITON_MPS_DEBUG'):
+                print(f"[mps] llc: {llc} -mtriple=air -filetype=obj")
+            proc = subprocess.run(
+                [llc, '-mtriple=air', '-filetype=obj', '-o', out_path, '-'],
+                input=llvm_ir.encode(),
+                capture_output=True,
+                check=False)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"llc failed: {proc.stderr.decode(errors='replace')}")
+            with open(out_path, 'rb') as f:
+                return f.read()
+        finally:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
 
-    compile_ir.tg_memory_bytes = lambda ir: lib.metalir_tg_memory_bytes(
-        ir.encode())
+    compile_ir.tg_memory_bytes = _tg_memory_bytes
     return compile_ir
 
 

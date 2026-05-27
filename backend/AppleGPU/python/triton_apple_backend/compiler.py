@@ -24,20 +24,25 @@ def _pmaybe_enable_debug(pm):
 
 
 def _find_llc():
-    """Find the in-tree `llc` built from the LLVM Metal/AIR target."""
+    """Locate the out-of-tree `metal-llc` shipped by triton-ext.
+
+    The MPS backend compiles kernels by piping LLVM IR through a custom
+    `llc` built from the in-repo `llvm-metal-target/` project (which
+    links against Triton's pinned LLVM). The expected location is
+    `<triton-ext>/llvm-metal-target/build/bin/metal-llc`. Override with
+    `METAL_LLC_PATH` only for development; production should use the
+    shipped binary.
+    """
     if os.environ.get('METAL_LLC_PATH'):
         return os.environ['METAL_LLC_PATH']
-    # Standard location: llvm-project/build/bin/llc, two levels above the Triton
-    # source we vendor against.
+    # compiler.py is at <triton-ext>/backend/AppleGPU/python/triton_apple_backend/
+    # llvm-metal-target is at <triton-ext>/llvm-metal-target/
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(here, '..', '..', '..', '..', '..', 'triton-main',
-                     'llvm-project', 'build', 'bin', 'llc'),
-        '/Users/zimski/projects/oss/triton-main/llvm-project/build/bin/llc',
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.abspath(c)
+    triton_ext = os.path.abspath(os.path.join(here, '..', '..', '..', '..'))
+    candidate = os.path.join(
+        triton_ext, 'llvm-metal-target', 'build', 'bin', 'metal-llc')
+    if os.path.exists(candidate):
+        return candidate
     return None
 
 
@@ -96,12 +101,13 @@ def _tg_memory_bytes(llvm_ir: str) -> int:
 
 
 def _load_metalir():
-    """Return a compile function backed by the in-tree `llc -mtriple=air`."""
+    """Return a compile function backed by the out-of-tree `metal-llc`."""
     llc = _find_llc()
     if not llc:
         raise RuntimeError(
-            "llc not found. Build the in-tree LLVM Metal target (cmake "
-            "--build build, target llc) or set METAL_LLC_PATH=/path/to/llc.")
+            "metal-llc not found. Build the out-of-tree Metal target:\n"
+            "  cd <triton-ext>/llvm-metal-target && \\\n"
+            "    cmake -B build -G Ninja && cmake --build build")
 
     def compile_ir(llvm_ir: str) -> bytes:
         with tempfile.NamedTemporaryFile(

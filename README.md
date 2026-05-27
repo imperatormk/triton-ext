@@ -62,6 +62,38 @@ extensions.
 - **[`support/`](./support/)**: Contains extension infrastructure code to
   automatically register extensions with Triton.
 
+- **[`backend/AppleGPU/`](./backend/AppleGPU/)**: Apple GPU backend
+  plugin. Lowers Triton kernels through TritonGPU → LLVM IR → AIR bitcode →
+  `.metallib` and dispatches via `MTLComputeCommandEncoder`. Pairs with the
+  out-of-tree LLVM Metal target below.
+
+- **[`llvm-metal-target/`](./llvm-metal-target/)**: Out-of-tree LLVM Metal/AIR
+  target. Builds against Triton's pinned LLVM via `find_package(LLVM CONFIG)`;
+  produces a `metal-llc` binary that the AppleGPU backend uses to compile
+  Triton-emitted LLVM IR into `.metallib` containers loadable by Apple's Metal
+  runtime. No core LLVM patches required.
+
+## Apple GPU quick start
+
+```bash
+# 1. Build the out-of-tree Metal target (needs Triton's prebuilt LLVM on disk).
+cd llvm-metal-target
+cmake -B build -G Ninja
+cmake --build build
+
+# 2. Build the AppleGPU plugin (uses normal triton-ext CMake flow; see Build
+#    section below).
+
+# 3. Use it. The AppleGPU plugin auto-discovers `metal-llc` from
+#    `llvm-metal-target/build/bin/metal-llc` relative to its own install
+#    location. No environment variables needed.
+TRITON_PLUGIN_PATHS=/path/to/build/lib/libTritonAppleGPUBackend.dylib \
+    pytest python/test/unit/language/test_core.py --device mps
+```
+
+Override the metal-llc path for development with
+`METAL_LLC_PATH=/custom/metal-llc`.
+
 ## Prerequisites
 
 - C++ compiler with C++17 support

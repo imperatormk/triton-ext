@@ -1,5 +1,7 @@
 build
 llvm-*
+!llvm-metal-target/
 triton-*
 !triton-ext.conf
+*.so
 *.pyc

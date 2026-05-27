@@ -30,6 +30,19 @@ struct AppleGPUInferLayoutInterface
   using DialectInferLayoutInterface::DialectInferLayoutInterface;
 
   LogicalResult
+  verifyCatOpEncodingCompatibility(Operation *op) const override {
+    auto cat = cast<CatOp>(op);
+    int64_t operandRegs =
+        ttg::getUniqueElemsPerThread(cat.getLhs().getType()) * 2;
+    int64_t resultRegs = ttg::getUniqueElemsPerThread(cat.getType());
+    if (resultRegs != operandRegs)
+      return op->emitError("tt.cat result encoding requires ")
+             << resultRegs << " non-broadcast register values, but operands "
+             << "provide " << operandRegs;
+    return success();
+  }
+
+  LogicalResult
   inferReduceOpEncoding(Attribute operandEncoding, unsigned axis,
                         Attribute &resultEncoding,
                         std::optional<Location> loc) const override {

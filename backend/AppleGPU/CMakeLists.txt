@@ -36,9 +36,9 @@ add_public_tablegen_target(TritonAppleGPUTransformsPassesIncGen)
 
 file(GLOB TOLLVM_SRCS lib/TritonAppleGPUToLLVM/*.cpp)
 
-add_subdirectory(lib/MetalIR/Transforms)
-add_subdirectory(lib/MetalIR/Serialization)
-add_subdirectory(lib/MetalIR/Bridge)
+# The IR -> AIR -> metallib lowering pipeline now lives in the
+# out-of-tree LLVM Metal target at <triton-ext>/llvm-metal-target/.
+# The Python driver shells out to its `metal-llc` binary.
 
 # Build as a single shared library
 add_mlir_library(TritonAppleGPUBackend

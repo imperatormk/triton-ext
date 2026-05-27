@@ -1,8 +1,0 @@
-{
-  global:
-    metalir_compile;
-    metalir_free;
-    metalir_tg_memory_bytes;
-  local:
-    *;
-};

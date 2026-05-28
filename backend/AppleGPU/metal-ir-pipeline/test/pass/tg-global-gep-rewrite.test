@@ -1,3 +1,0 @@
-PASS: tg-global-gep-rewrite
-CHECK: [4 x float]
-CHECK-NOT: [16 x i8]

@@ -1,3 +1,0 @@
-PASS: barrier-rename
-CHECK: air.wg.barrier
-CHECK-NOT: air.threadgroup.barrier

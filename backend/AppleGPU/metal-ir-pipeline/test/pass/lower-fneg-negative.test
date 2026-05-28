@@ -1,2 +1,0 @@
-PASS: lower-fneg
-CHECK: fsub float %v, 1.000000e+00

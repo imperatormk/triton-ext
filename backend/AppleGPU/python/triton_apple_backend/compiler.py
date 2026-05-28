@@ -24,33 +24,44 @@ def _pmaybe_enable_debug(pm):
 
 
 def _find_llc():
-    """Locate the out-of-tree `metal-llc` shipped by triton-ext.
+    """Locate the metal-llc binary shipped by the AppleGPU backend.
 
-    The MPS backend compiles kernels by piping LLVM IR through a custom
-    `llc` built from the in-repo `llvm-metal-target/` project (which
-    links against Triton's pinned LLVM). The expected location is
-    `<triton-ext>/llvm-metal-target/build/bin/metal-llc`. Override with
-    `METAL_LLC_PATH` only for development; production should use the
-    shipped binary.
+    `metal-llc` is produced by `backend/AppleGPU/llvm-metal-target/`. Two
+    layouts are supported:
+      - Nested (default `make build`):
+          <triton-ext>/build/backend/AppleGPU/llvm-metal-target/bin/metal-llc
+      - Standalone (`cmake -S llvm-metal-target -B llvm-metal-target/build`):
+          <triton-ext>/backend/AppleGPU/llvm-metal-target/build/bin/metal-llc
+    Override with METAL_LLC_PATH for ad-hoc dev.
     """
     if os.environ.get('METAL_LLC_PATH'):
         return os.environ['METAL_LLC_PATH']
-    # compiler.py is at <triton-ext>/backend/AppleGPU/python/triton_apple_backend/
-    # llvm-metal-target is at <triton-ext>/llvm-metal-target/
     here = os.path.dirname(os.path.abspath(__file__))
-    triton_ext = os.path.abspath(os.path.join(here, '..', '..', '..', '..'))
-    candidate = os.path.join(
-        triton_ext, 'llvm-metal-target', 'build', 'bin', 'metal-llc')
-    if os.path.exists(candidate):
-        return candidate
+    apple_gpu = os.path.abspath(os.path.join(here, '..', '..'))
+    triton_ext = os.path.abspath(os.path.join(apple_gpu, '..', '..'))
+    candidates = [
+        os.path.join(triton_ext, 'build', 'bin', 'metal-llc'),
+        os.path.join(apple_gpu, 'llvm-metal-target', 'build', 'bin',
+                     'metal-llc'),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
     return None
 
 
 # Sized scalar types that may appear as the element type of an `addrspace(3)`
 # global. Vectors are handled by multiplying through.
 _LLVM_SCALAR_BYTES = {
-    'i1': 1, 'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8,
-    'half': 2, 'bfloat': 2, 'float': 4, 'double': 8,
+    'i1': 1,
+    'i8': 1,
+    'i16': 2,
+    'i32': 4,
+    'i64': 8,
+    'half': 2,
+    'bfloat': 2,
+    'float': 4,
+    'double': 8,
 }
 
 
@@ -86,13 +97,15 @@ def _tg_memory_bytes(llvm_ir: str) -> int:
     # `@name = ... addrspace(3) global <type> ..., align N`
     pat = re.compile(
         r'^@[\w$.]+\s*=\s*(?:[^@\n]*?\s)?addrspace\(3\)\s+(?:[\w]+\s+)?global\s+'
-        r'(.+?)(?:,\s*align\s+(\d+))?\s*$',
-        re.MULTILINE)
+        r'(.+?)(?:,\s*align\s+(\d+))?\s*$', re.MULTILINE)
     for m in pat.finditer(llvm_ir):
         # The captured initializer-or-type group may start with the type
         # followed by the initializer; take the leading well-formed type.
         head = m.group(1).strip()
-        ty = re.match(r'(<[^>]+>|\[[^\]]+\]|[\w]+)', head).group(1)
+        tm = re.match(r'(<[^>]+>|\[[^\]]+\]|[\w]+)', head)
+        if not tm:
+            raise ValueError(f"unrecognized addrspace(3) type head: {head!r}")
+        ty = tm.group(1)
         align = int(m.group(2)) if m.group(2) else 1
         if total % align:
             total += align - (total % align)
@@ -110,8 +123,8 @@ def _load_metalir():
             "    cmake -B build -G Ninja && cmake --build build")
 
     def compile_ir(llvm_ir: str) -> bytes:
-        with tempfile.NamedTemporaryFile(
-                suffix='.metallib', delete=False) as out_f:
+        with tempfile.NamedTemporaryFile(suffix='.metallib',
+                                         delete=False) as out_f:
             out_path = out_f.name
         try:
             if os.environ.get('TRITON_MPS_DEBUG'):

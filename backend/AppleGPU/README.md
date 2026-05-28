@@ -69,19 +69,19 @@ git checkout apple-gpu
 make build
 ```
 
-This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/` and
-the `metal-llc` binary under `build/bin/` via the nested
-`backend/AppleGPU/llvm-metal-target/` project. No separate cmake invocation
-is needed.
+This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/` and the
+`metal-llc` binary under `build/bin/` via the nested
+`backend/AppleGPU/llvm-metal-target/` project. No separate cmake invocation is
+needed.
 
-### 5. Install the Python backend
+### 4. Install the Python backend
 
 ```bash
 cd backend/AppleGPU/python
 pip install -e . --no-build-isolation
 ```
 
-### 6. Run
+### 5. Run
 
 ```bash
 export TRITON_PLUGIN_PATHS=~/projects/oss/triton-ext/build/lib/libTritonAppleGPUBackend.dylib

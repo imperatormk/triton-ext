@@ -22,8 +22,7 @@
 
 namespace llvm {
 
-class MetalAliasAnnotatePass
-    : public PassInfoMixin<MetalAliasAnnotatePass> {
+class MetalAliasAnnotatePass : public PassInfoMixin<MetalAliasAnnotatePass> {
 public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
   static bool isRequired() { return true; }

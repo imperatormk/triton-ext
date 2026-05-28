@@ -38,11 +38,9 @@ void emitConstantsBlock(BitstreamWriter &W, ValueEnumerator &E,
       // Always use INTEGER for ints (even zero) - Metal doesn't
       // accept NULL for integer types in some contexts.
       // Use ZExtValue for i1 (Metal convention), SExtValue for wider types.
-      int64_t Val = CI->getType()->isIntegerTy(1)
-                        ? (int64_t)CI->getZExtValue()
-                        : CI->getSExtValue();
-      V.push_back(Val >= 0 ? uint64_t(Val) << 1
-                           : (uint64_t(-Val) << 1) | 1);
+      int64_t Val = CI->getType()->isIntegerTy(1) ? (int64_t)CI->getZExtValue()
+                                                  : CI->getSExtValue();
+      V.push_back(Val >= 0 ? uint64_t(Val) << 1 : (uint64_t(-Val) << 1) | 1);
       W.EmitRecord(bitc::CST_CODE_INTEGER, V);
     } else if (auto *CF = dyn_cast<ConstantFP>(C)) {
       V.push_back(CF->getValueAPF().bitcastToAPInt().getZExtValue());

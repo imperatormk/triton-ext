@@ -62,10 +62,10 @@ extensions.
 - **[`support/`](./support/)**: Contains extension infrastructure code to
   automatically register extensions with Triton.
 
-- **[`backend/AppleGPU/`](./backend/AppleGPU/)**: Apple GPU backend
-  plugin. Lowers Triton kernels through TritonGPU → LLVM IR → AIR bitcode →
-  `.metallib` and dispatches via `MTLComputeCommandEncoder`. Pairs with the
-  out-of-tree LLVM Metal target below.
+- **[`backend/AppleGPU/`](./backend/AppleGPU/)**: Apple GPU backend plugin.
+  Lowers Triton kernels through TritonGPU → LLVM IR → AIR bitcode → `.metallib`
+  and dispatches via `MTLComputeCommandEncoder`. Pairs with the out-of-tree LLVM
+  Metal target below.
 
 - **[`llvm-metal-target/`](./llvm-metal-target/)**: Out-of-tree LLVM Metal/AIR
   target. Builds against Triton's pinned LLVM via `find_package(LLVM CONFIG)`;

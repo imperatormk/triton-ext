@@ -16,10 +16,10 @@
 #include "AIRWriter/MetalWriterPass.h"
 #include "Metal.h"
 #include "MetalAIRSystemValues.h"
+#include "MetalAliasAnnotate.h"
 #include "MetalAsyncEventToAlloca.h"
 #include "MetalBFloat16CastDecompose.h"
 #include "MetalBarrierRename.h"
-#include "MetalAliasAnnotate.h"
 #include "MetalDeviceLoadsVolatile.h"
 #include "MetalInlineNonKernel.h"
 #include "MetalLLVMToAIRIntrinsics.h"
@@ -35,6 +35,7 @@
 #include "MetalTGBarrierInsert.h"
 #include "MetalTGGlobalCoalesce.h"
 #include "MetalTargetTransformInfo.h"
+#include "MetalTripleCompat.h"
 #include "TargetInfo/MetalTargetInfo.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/Passes.h"
@@ -43,7 +44,6 @@
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/InitializePasses.h"
-#include "MetalTripleCompat.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/TargetRegistry.h"
@@ -92,7 +92,9 @@ public:
     // .metallib payload is emitted directly via MetalWriterPass in
     // addPassesToEmitFile -- AsmPrinter never runs, so this hook is never
     // hit in practice. Return null to make the unreachable explicit.
-    (void)GO; (void)Kind; (void)TM;
+    (void)GO;
+    (void)Kind;
+    (void)TM;
     llvm_unreachable("Metal out-of-tree: AsmPrinter path is disabled; "
                      "metallib emission goes through MetalWriterPass.");
   }
@@ -163,7 +165,7 @@ MetalTargetMachine::MetalTargetMachine(const Target &T, const Triple &TT,
 
 MetalTargetMachine::~MetalTargetMachine() {}
 
-void MetalTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB){
+void MetalTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
 #define GET_PASS_REGISTRY "MetalPassRegistry.def"
 #include "llvm/Passes/TargetPassRegistry.inc"
 }

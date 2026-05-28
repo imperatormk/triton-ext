@@ -21,7 +21,9 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/PassRegistry.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
@@ -59,8 +61,8 @@ static cl::opt<std::string> MTriple("mtriple",
 
 static cl::opt<std::string>
     FileType("filetype",
-             cl::desc("File type to emit: obj (=metallib) is the only "
-                      "supported value"),
+             cl::desc("File type to emit: 'obj' (metallib) or 'asm' (LLVM IR "
+                      "text after the Metal pre-codegen passes)"),
              cl::init("obj"));
 
 static int reportError(const Twine &Msg) {
@@ -71,6 +73,12 @@ static int reportError(const Twine &Msg) {
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
 
+  // Register codegen / IR pass option parsers so -stop-after, -stop-before,
+  // -print-after, -print-before etc. resolve before we parse the command line.
+  PassRegistry *Registry = PassRegistry::getPassRegistry();
+  initializeCore(*Registry);
+  initializeCodeGen(*Registry);
+
   cl::ParseCommandLineOptions(argc, argv, "metal-llc: AIR/metallib backend\n");
 
   // Register only the Metal target (this binary is single-target).
@@ -78,8 +86,15 @@ int main(int argc, char **argv) {
   LLVMInitializeMetalTargetMC();
   LLVMInitializeMetalTarget();
 
-  if (FileType != "obj")
-    return reportError("only -filetype=obj is supported");
+  CodeGenFileType CGFT;
+  if (FileType == "obj") {
+    CGFT = CodeGenFileType::ObjectFile;
+  } else if (FileType == "asm") {
+    CGFT = CodeGenFileType::AssemblyFile;
+  } else {
+    return reportError("unsupported -filetype: " + FileType +
+                       " (expected 'obj' or 'asm')");
+  }
 
   // Parse input IR.
   LLVMContext Ctx;
@@ -107,13 +122,16 @@ int main(int argc, char **argv) {
   if (M->getTargetTriple().empty())
     M->setTargetTriple(TT);
 
-  // Open output (binary stream).
+  // Open output. Text for asm (IR dump), binary for obj (metallib bytes).
   std::error_code EC;
+  sys::fs::OpenFlags Flags = (CGFT == CodeGenFileType::AssemblyFile)
+                                 ? sys::fs::OF_Text
+                                 : sys::fs::OF_None;
   std::unique_ptr<ToolOutputFile> Out;
   if (OutputFile == "-") {
-    Out = std::make_unique<ToolOutputFile>("-", EC, sys::fs::OF_None);
+    Out = std::make_unique<ToolOutputFile>("-", EC, Flags);
   } else {
-    Out = std::make_unique<ToolOutputFile>(OutputFile, EC, sys::fs::OF_None);
+    Out = std::make_unique<ToolOutputFile>(OutputFile, EC, Flags);
   }
   if (EC)
     return reportError("cannot open output: " + EC.message());
@@ -123,10 +141,9 @@ int main(int argc, char **argv) {
   TargetLibraryInfoImpl TLII(Triple(M->getTargetTriple()));
   PM.add(new TargetLibraryInfoWrapperPass(TLII));
 
-  if (TM->addPassesToEmitFile(PM, Out->os(), /*DwoOut=*/nullptr,
-                              CodeGenFileType::ObjectFile,
+  if (TM->addPassesToEmitFile(PM, Out->os(), /*DwoOut=*/nullptr, CGFT,
                               /*DisableVerify=*/false)) {
-    return reportError("target does not support metallib emission");
+    return reportError("target does not support the requested output");
   }
 
   PM.run(*M);

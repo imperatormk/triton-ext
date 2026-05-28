@@ -21,6 +21,8 @@ config.excludes = [
 
 # Also exclude any artifacts downloaded in the top-level directory.
 for top in os.listdir(config.test_source_root):
+    if top == "llvm-metal-target":
+        continue
     if top.startswith("llvm-") or top.startswith("triton-"):
         config.excludes.append(top)
 
@@ -40,3 +42,13 @@ config.environment["FILECHECK_OPTS"] = "--enable-var-scope"
 # libraries.
 llvm_lib_dir = os.path.join(config.llvm_install_dir, "lib")
 llvm_config.with_environment("LD_LIBRARY_PATH", llvm_lib_dir, append_path=True)
+
+# Register %metal-llc for llvm-metal-target/test/*.ll. metal-llc lives in a
+# separate build tree (llvm-metal-target/build) and is optional: if missing
+# (e.g. on CI before its build step), llvm-metal-target tests will fail
+# RUN-line resolution, which is the correct signal.
+metal_llc = os.environ.get(
+    "METAL_LLC_PATH",
+    os.path.join(config.triton_ext_source_dir, "llvm-metal-target", "build",
+                 "bin", "metal-llc"))
+config.substitutions.append(("%metal-llc", metal_llc))

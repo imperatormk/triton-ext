@@ -875,10 +875,9 @@ static bool insertPreambleGEPs(Module &M) {
             Type *SrcTy = GEP->getSourceElementType();
             auto *AT = cast<ArrayType>(GV->getValueType());
             Type *GVElem = AT->getElementType();
-            bool NeedsBitcast =
-                SrcTy->isBFloatTy() || SrcTy->isHalfTy() ||
-                (SrcTy->isFloatTy() &&
-                 (GVElem->isBFloatTy() || GVElem->isHalfTy()));
+            bool NeedsBitcast = SrcTy->isBFloatTy() || SrcTy->isHalfTy() ||
+                                (SrcTy->isFloatTy() &&
+                                 (GVElem->isBFloatTy() || GVElem->isHalfTy()));
             if (NeedsBitcast) {
               auto *BC = CastInst::Create(Instruction::BitCast, NewOp,
                                           NewOp->getType(), "", &I);

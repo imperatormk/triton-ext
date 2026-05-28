@@ -31,11 +31,13 @@ extension:
    ```
 
 1. **Extension Configuration**: Specify the extension name and status in a
-   `triton-ext.conf` file (see
-   [`triton-ext.conf`](./LoopSplit/triton-ext.conf)):
+   `triton-ext.toml` manifest (see
+   [`triton-ext.toml`](./LoopSplit/triton-ext.toml)):
 
-   ```txt
-   loop_split;experimental
+   ```toml
+   name = "loop_split"
+   status = "experimental"
+   enabled = 1
    ```
 
 1. **CMake Configuration**: Set up the build as a shared library with proper

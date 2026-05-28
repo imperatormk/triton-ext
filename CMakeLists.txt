@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(triton-ext DESCRIPTION "Extensions for the Triton compiler" LANGUAGES C CXX)
 
-# LLVM/MLIR headers require C++17 (std::is_same_v, etc.)
-set(CMAKE_CXX_STANDARD 17 CACHE STRING "")
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 
 include(cmake/utils.cmake)
 

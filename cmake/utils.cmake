@@ -45,43 +45,59 @@ function(triton_ext_check_triton_hash result_var)
     endif()
 endfunction()
 
+# triton_ext_read_manifest(<triton_ext_dir>)
+# Reads triton-ext.toml via ci/extension_config.py and sets TRITON_EXT_NAME,
+# TRITON_EXT_STATUS, TRITON_EXT_ENABLED, TRITON_EXT_VERSION in the caller's scope.
+function(triton_ext_read_manifest triton_ext_dir)
+    set(manifest "${triton_ext_dir}/triton-ext.toml")
+    if(NOT EXISTS ${manifest})
+        message(FATAL_ERROR "Extension manifest not found: ${manifest}")
+    endif()
+
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(generated "${CMAKE_CURRENT_BINARY_DIR}/triton-ext-manifest.cmake")
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/ci/extension_config.py" "${manifest}" --cmake
+        OUTPUT_FILE "${generated}"
+        RESULT_VARIABLE _manifest_rc
+    )
+    if(NOT _manifest_rc EQUAL 0)
+        message(FATAL_ERROR "Failed to parse ${manifest}")
+    endif()
+
+    include("${generated}")
+    set(TRITON_EXT_NAME "${TRITON_EXT_NAME}" PARENT_SCOPE)
+    set(TRITON_EXT_STATUS "${TRITON_EXT_STATUS}" PARENT_SCOPE)
+    set(TRITON_EXT_ENABLED "${TRITON_EXT_ENABLED}" PARENT_SCOPE)
+    set(TRITON_EXT_VERSION "${TRITON_EXT_VERSION}" PARENT_SCOPE)
+endfunction()
+
 # Function to check if a Triton extension should be built
 # Usage: triton_ext_should_build_extension(<triton_ext_dir> <result_var>)
 #   triton_ext_dir: Path to the Triton extension directory
 #   result_var: Variable to store the result
 function(triton_ext_should_build_extension triton_ext_dir result_var)
-    set(config_file "${triton_ext_dir}/triton-ext.conf")
-    # Default to FALSE
     set(${result_var} FALSE PARENT_SCOPE)
+    if(NOT EXISTS "${triton_ext_dir}/triton-ext.toml")
+        return()
+    endif()
 
-    # Try to read from config file first
-    if(EXISTS ${config_file})
-        file(READ ${config_file} _config_content)
-        string(STRIP "${_config_content}" _config_content)
-        # Parse the config file (format: name;status or just name)
-        # Config file must be in CMake list format (semicolon-separated)
-        if(_config_content)
-            set(_config_list ${_config_content})
-            list(LENGTH _config_list _num_parts)
-            if(_num_parts GREATER_EQUAL 1)
-                list(GET _config_list 0 _ext_name)
-                string(STRIP "${_ext_name}" _ext_name)
-            else()
-                set(_ext_name ${_config_content})
-                string(STRIP "${_ext_name}" _ext_name)
-            endif()
-            # Check if _ext_name is in TRITON_EXT_NAMES
-            list(LENGTH TRITON_EXT_NAMES _size)
-            if(NOT _size EQUAL 0)
-                list(FIND TRITON_EXT_NAMES "${_ext_name}" _index)
-                if(NOT _index EQUAL -1)
-                    # If _ext_name is in TRITON_EXT_NAMES, set result to TRUE
-                    set(${result_var} TRUE PARENT_SCOPE)
-                endif()
-            else()
-                # If TRITON_EXT_NAMES is empty, default to TRUE
-                set(${result_var} TRUE PARENT_SCOPE)
-            endif()
+    triton_ext_read_manifest("${triton_ext_dir}")
+
+    if(NOT TRITON_EXT_ENABLED)
+        message(STATUS "Skipping disabled extension '${TRITON_EXT_NAME}'")
+        return()
+    endif()
+
+    # When TRITON_EXT_NAMES is set, build only the names it lists.
+    list(LENGTH TRITON_EXT_NAMES _size)
+    if(_size EQUAL 0)
+        set(${result_var} TRUE PARENT_SCOPE)
+    else()
+        list(FIND TRITON_EXT_NAMES "${TRITON_EXT_NAME}" _index)
+        if(NOT _index EQUAL -1)
+            set(${result_var} TRUE PARENT_SCOPE)
         endif()
     endif()
 endfunction()
@@ -94,56 +110,21 @@ endfunction()
 # - ext_class: the extension class name (required)
 #
 # Outputs (set as CMake variables):
-# - TRITON_EXT_CONFIG_FILE: path to the extension's triton-ext.conf file
-# - TRITON_EXT_NAME: extension name (from config file)
+# - TRITON_EXT_NAME: extension name (from manifest)
 # - TRITON_EXT_CLASS: extension class (from argument)
-# - TRITON_EXT_STATUS: extension status (from config file, default "experimental")
-# - TRITON_EXT_HASH: expected Triton git hash (from config file, optional)
+# - TRITON_EXT_STATUS: extension status (from manifest, default "experimental")
+# - TRITON_EXT_VERSION: extension version (from manifest); also a compile def
 # - Adds the extension project name to the global TRITON_EXT_BUILT_TARGETS list
 macro(triton_extension ext_class)
-    # Read extension name, status, and hash from local triton-ext.conf file
-    set(TRITON_EXT_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/triton-ext.conf")
-    set(_ext_name "")
-    set(_status "experimental")
-    set(_hash "")
+    triton_ext_read_manifest("${CMAKE_CURRENT_SOURCE_DIR}")
 
-    if(EXISTS ${TRITON_EXT_CONFIG_FILE})
-        file(READ ${TRITON_EXT_CONFIG_FILE} _config_content)
-        string(STRIP "${_config_content}" _config_content)
-
-        if(_config_content)
-            # Config file is in CMake list format (semicolon-separated): name;status;hash
-            set(_config_list ${_config_content})
-            list(LENGTH _config_list _num_parts)
-
-            if(_num_parts GREATER_EQUAL 1)
-                list(GET _config_list 0 _ext_name)
-                string(STRIP "${_ext_name}" _ext_name)
-            endif()
-
-            if(_num_parts GREATER_EQUAL 2)
-                list(GET _config_list 1 _status)
-                string(STRIP "${_status}" _status)
-            endif()
-
-            if(_num_parts GREATER_EQUAL 3)
-                list(GET _config_list 2 _hash)
-                string(STRIP "${_hash}" _hash)
-            endif()
-        endif()
+    if(NOT TRITON_EXT_NAME)
+        message(FATAL_ERROR "triton-ext.toml not found or missing 'name' in ${CMAKE_CURRENT_SOURCE_DIR}")
     endif()
 
-    if(NOT _ext_name)
-        message(FATAL_ERROR "triton_ext.conf file not found or empty in ${CMAKE_CURRENT_SOURCE_DIR}")
-    endif()
-
-    project(${_ext_name})
-    set(TRITON_EXT_NAME ${PROJECT_NAME})
+    project(${TRITON_EXT_NAME})
     set(TRITON_EXT_CLASS ${ext_class})
-    set(TRITON_EXT_STATUS ${_status})
-    if(_hash)
-        set(TRITON_EXT_HASH ${_hash})
-    endif()
+    add_compile_definitions(TRITON_EXT_VERSION="${TRITON_EXT_VERSION}")
 
     set_property(GLOBAL APPEND PROPERTY TRITON_EXT_BUILT_TARGETS ${PROJECT_NAME})
 endmacro()

@@ -18,8 +18,11 @@
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -300,6 +303,21 @@ struct ConvertTritonAppleGPUToLLVMPass
     return "Lower TritonGPU ops (Apple MPS, nano) to LLVM IR";
   }
 
+  // The pass builds a TritonGPUToLLVMTypeConverter and applies LLVM/arith/
+  // math/index/cf/ub conversion patterns, and it emits gpu ops that the
+  // subsequent LowerGPUToAirPass consumes. Constructing the type converter
+  // lazily loads the `llvm` dialect, which is illegal once the PassManager is
+  // multi-threaded (as it is under triton-opt). Declare every dialect the pass
+  // creates so MLIR loads them up front, before threading begins.
+  // ub ops are only ever consumed (populateUBToLLVMConversionPatterns), never
+  // created here, so the UB dialect is intentionally absent — and the Linux
+  // LLVM artifact does not ship its header anyway.
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<mlir::LLVM::LLVMDialect, mlir::arith::ArithDialect,
+                    mlir::math::MathDialect, mlir::index::IndexDialect,
+                    mlir::cf::ControlFlowDialect, mlir::gpu::GPUDialect>();
+  }
+
   void runOnOperation() override {
     auto mod = getOperation();
     auto *ctx = &getContext();
@@ -441,6 +459,10 @@ struct LowerGPUToAirPass
   StringRef getArgument() const override { return "lower-gpu-to-air"; }
   StringRef getDescription() const override {
     return "Lower gpu.thread_id / gpu.block_dim to air intrinsics / constants";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<mlir::LLVM::LLVMDialect, mlir::gpu::GPUDialect>();
   }
 
   void runOnOperation() override {

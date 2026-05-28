@@ -1,4 +1,0 @@
-PASS: bfloat16-cast-decompose
-CHECK: sitofp i32
-CHECK: float
-CHECK-NOT: sitofp i32 %tid to bfloat

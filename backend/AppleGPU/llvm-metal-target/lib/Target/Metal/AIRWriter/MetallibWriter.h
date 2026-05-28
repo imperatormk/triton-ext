@@ -18,7 +18,7 @@ namespace llvm {
 namespace metal {
 
 /// Platform tag stored in the .metallib `PLAT` field. Empirically observed
-/// in Apple's metal-ir-pipeline dylib (no public spec available); macOS uses
+/// in Apple's IR pipeline dylib (no public spec available); macOS uses
 /// 0x81, iOS uses 0x82.
 enum class MetalPlatform : uint8_t {
   macOS = 0x81,
@@ -27,7 +27,7 @@ enum class MetalPlatform : uint8_t {
 
 /// Default OS major recorded in the metallib `OSVR` field. Apple's metallib
 /// writer pins this to 26 regardless of host SDK; matches the byte-identical
-/// output produced by the metal-ir-pipeline oracle.
+/// output produced by Apple's reference metallib writer.
 inline constexpr uint16_t DefaultMetalLibOSMajor = 26;
 
 /// Default Metal Shading Language version recorded in the metallib `LANG`

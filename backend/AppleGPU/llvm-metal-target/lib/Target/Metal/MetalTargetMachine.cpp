@@ -118,7 +118,7 @@ public:
   FunctionPass *createTargetRegisterAllocator(bool) override { return nullptr; }
 
   void addCodeGenPrepare() override {
-    // metal-ir-pipeline passes (LLVM IR -> AIR-conformant IR), in order.
+    // Metal IR pipeline passes (LLVM IR -> AIR-conformant IR), in order.
     addPass(createMetalInlineNonKernelLegacyPass());
     addPass(createMetalLowerFNegLegacyPass());
     addPass(createMetalNaNMinMaxLegacyPass());

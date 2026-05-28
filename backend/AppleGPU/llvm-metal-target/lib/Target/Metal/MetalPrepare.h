@@ -8,10 +8,10 @@
 ///
 /// \file
 /// Final IR-level normalizations needed before .metallib serialization.
-/// Consolidates several small typed-pointer-cluster transforms from the
-/// metal-ir-pipeline (the side-table half of that cluster lives in the
-/// AIRWriter as `buildPointeeTypeMap`; this pass only performs the
-/// IR-mutating work the writer cannot do on its own).
+/// Consolidates several small typed-pointer-cluster transforms (the
+/// side-table half of that cluster lives in the AIRWriter as
+/// `buildPointeeTypeMap`; this pass only performs the IR-mutating work the
+/// writer cannot do on its own).
 ///
 /// Specifically:
 ///   * Normalize `getelementptr i1, ...` to `getelementptr i8, ...` because

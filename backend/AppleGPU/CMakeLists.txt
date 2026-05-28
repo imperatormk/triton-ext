@@ -40,6 +40,57 @@ file(GLOB TOLLVM_SRCS lib/TritonAppleGPUToLLVM/*.cpp)
 # out-of-tree LLVM Metal target at <triton-ext>/llvm-metal-target/.
 # The Python driver shells out to its `metal-llc` binary.
 
+# The convert-to-LLVM pass needs `populatePolynomialApproximateErfPattern`
+# (math.erf lowering) which lives in MLIRMathTransforms. How we pull it in
+# depends on how the pinned LLVM artifact ships that library:
+#
+#   * Linux artifact -> libMLIRMathTransforms.so (SHARED). Link it normally;
+#     a shared lib's static initializers (LLVM cl::opt registrations) live in
+#     the .so itself and run once, so dlopen-ing this plugin from a non-Python
+#     host such as triton-opt is fine, and there is no size bloat.
+#
+#   * macOS artifact -> libMLIRMathTransforms.a (STATIC). Linking the whole
+#     archive would drag in its transitive closure (MLIRX86Dialect ->
+#     MLIRLLVMDialect -> LLVMCore) and bake those cl::opt initializers into
+#     the plugin. They then re-register and crash when triton-opt dlopen's it
+#     ("Option '...' registered more than once"), and bloat the .so ~15x. So
+#     extract only the single object that defines the erf pattern (~0.5 MB,
+#     no cl::opt initializers); its MLIR/Arith symbol references stay
+#     undefined and resolve at load time from the host (libtriton.so under
+#     Python, triton-opt's own symbols under lit).
+if(NOT TARGET MLIRMathTransforms)
+    message(FATAL_ERROR "MLIRMathTransforms target not found; cannot provide "
+                        "the math.erf polynomial-approximation pattern")
+endif()
+get_target_property(_MATH_TRANSFORMS_LIB MLIRMathTransforms IMPORTED_LOCATION)
+if(NOT _MATH_TRANSFORMS_LIB)
+    get_target_property(_MATH_TRANSFORMS_LIB MLIRMathTransforms
+                        IMPORTED_LOCATION_RELEASE)
+endif()
+if(NOT _MATH_TRANSFORMS_LIB OR NOT EXISTS "${_MATH_TRANSFORMS_LIB}")
+    message(FATAL_ERROR "Could not locate the MLIRMathTransforms library "
+                        "(got '${_MATH_TRANSFORMS_LIB}')")
+endif()
+
+set(_ERF_OBJECT "")
+if(_MATH_TRANSFORMS_LIB MATCHES "\\.a$")
+    # Static archive: extract the single erf object at configure time so it is
+    # never a build-graph input.
+    set(_ERF_OBJECT_DIR "${CMAKE_CURRENT_BINARY_DIR}/erf-obj")
+    set(_ERF_OBJECT "${_ERF_OBJECT_DIR}/PolynomialApproximation.cpp.o")
+    file(MAKE_DIRECTORY "${_ERF_OBJECT_DIR}")
+    execute_process(
+        COMMAND "${CMAKE_AR}" x "${_MATH_TRANSFORMS_LIB}"
+                PolynomialApproximation.cpp.o
+        WORKING_DIRECTORY "${_ERF_OBJECT_DIR}"
+        RESULT_VARIABLE _ERF_EXTRACT_RC)
+    if(NOT _ERF_EXTRACT_RC EQUAL 0 OR NOT EXISTS "${_ERF_OBJECT}")
+        message(FATAL_ERROR "Failed to extract PolynomialApproximation.cpp.o "
+                            "from ${_MATH_TRANSFORMS_LIB} "
+                            "(rc=${_ERF_EXTRACT_RC})")
+    endif()
+endif()
+
 # Build as a single shared library
 add_mlir_library(TritonAppleGPUBackend
     ExportAppleGPU.cpp
@@ -55,8 +106,15 @@ add_mlir_library(TritonAppleGPUBackend
     LINK_LIBS PUBLIC
     TritonExtensionSupport
     ${TRITON_LIB}
-    MLIRMathTransforms
 )
+
+if(_ERF_OBJECT)
+    # macOS: link the single extracted object (not the whole archive).
+    target_link_options(TritonAppleGPUBackend PRIVATE "${_ERF_OBJECT}")
+else()
+    # Linux: MLIRMathTransforms is shared; link it directly.
+    target_link_libraries(TritonAppleGPUBackend PUBLIC MLIRMathTransforms)
+endif()
 
 set_target_properties(TritonAppleGPUBackend PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY

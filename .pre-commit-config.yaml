@@ -49,6 +49,12 @@ repos:
     hooks:
       - id: mypy
         additional_dependencies: [types-requests]
+        # lit config scripts are executed by lit with an injected `config`
+        # object; they are not importable modules. Several share the filename
+        # `lit.local.cfg.py`, which makes mypy raise "Duplicate module" when it
+        # type-checks more than one at once. They carry no type-checkable logic,
+        # so exclude them.
+        exclude: '(^|/)lit(\.local)?\.cfg\.py$'
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v19.1.6

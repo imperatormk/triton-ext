@@ -62,6 +62,7 @@ add_mlir_library(TritonAppleGPUBackend
 set_target_properties(TritonAppleGPUBackend PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY
     "${TRITON_EXT_LIBRARY_DIR}"
+    OUTPUT_NAME "applegpu_backend"
     CXX_STANDARD 17)
 
 # On macOS with shared LLVM, use flat namespace so the plugin can resolve

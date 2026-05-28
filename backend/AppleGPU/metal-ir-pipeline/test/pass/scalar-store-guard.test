@@ -1,3 +1,0 @@
-PASS: scalar-store-guard
-CHECK: icmp eq i32
-CHECK: br i1

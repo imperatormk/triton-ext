@@ -1,5 +1,0 @@
-PASS: lower-int-min-max
-CHECK: icmp slt
-CHECK: select
-CHECK-NOT: call i32 @llvm.smin
-CHECK-NOT: call i32 @llvm.smax

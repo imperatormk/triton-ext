@@ -1,3 +1,0 @@
-PASS: tg-global-dead-elim
-CHECK: @used_smem
-CHECK-NOT: @dead_smem

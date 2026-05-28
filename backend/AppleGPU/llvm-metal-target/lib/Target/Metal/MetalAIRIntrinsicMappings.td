@@ -24,7 +24,7 @@ def AIRIntrinsicRenames : GenericTable {
   let Fields = ["LLVMName", "AIRName"];
 }
 
-// Keep in sync with metal-ir-pipeline's air::kIntrinsicRenames.
+// Keep in sync with Apple's air::kIntrinsicRenames table.
 
 def : IntrinsicRename<"llvm.maxnum.f32", "air.fmax.f32">;
 def : IntrinsicRename<"llvm.minnum.f32", "air.fmin.f32">;

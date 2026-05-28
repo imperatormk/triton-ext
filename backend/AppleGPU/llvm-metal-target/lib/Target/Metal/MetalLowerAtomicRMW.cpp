@@ -22,8 +22,8 @@ using namespace llvm;
 // Metal address spaces. Inlined here (rather than pulled from a separate
 // header) since this pass only needs the threadgroup constant.
 
-// Build an AIR atomic intrinsic name with the same sign-prefix rules as the
-// metal-ir-pipeline `air::atomicName` helper.
+// Build an AIR atomic intrinsic name with the same sign-prefix rules Apple's
+// `air::atomicName` helper uses.
 static std::string buildAtomicName(bool IsGlobal, AtomicRMWInst::BinOp Op,
                                    bool IsFloat) {
   std::string Name = "air.atomic.";

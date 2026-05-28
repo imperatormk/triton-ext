@@ -39,10 +39,9 @@ constexpr unsigned ASThreadgroup = 3;
 constexpr unsigned PtrPhiLimit = 32;
 } // namespace
 
-// ── IRUtil helpers (ported 1:1 from metal-ir-pipeline IRUtil.h) ─────────────
+// ── IRUtil helpers ───────────────────────────────────────────────────────
 // Anonymous-TU statics; only the helpers used by the TG-global-GEP-rewrite
-// logic below are ported here. Semantics are preserved verbatim from the
-// standalone repo so the per-sub-pass logic can rely on identical behavior.
+// logic below are kept here.
 
 namespace {
 
@@ -228,7 +227,7 @@ static bool foldExtractInsert(Module &M) {
 
 } // namespace
 
-// ── TG global GEP rewrite (ported from metal-ir-pipeline pass 14) ───────────
+// ── TG global GEP rewrite ─────────────────────────────────────────────────
 // Retypes [N x i8] threadgroup globals into typed arrays based on usage
 // inference, and rewrites byte-offset GEPs into element-index GEPs. Six
 // sub-stages run in sequence (see comments below). Must run BEFORE the

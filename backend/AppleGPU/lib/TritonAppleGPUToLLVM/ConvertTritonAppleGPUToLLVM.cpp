@@ -2243,8 +2243,8 @@ struct ExternElementwiseOpAppleConversion
 
     // Trig functions not in LLVM intrinsics — use math lib calls
     // tan, asin, acos, atan, atan2, sinh, cosh, tanh, asinh, acosh, atanh
-    // For now, emit as external function calls (the metal-ir-pipeline
-    // LLVMToAIRIntrinsics pass will map them to air.* builtins)
+    // For now, emit as external function calls; metal-llc's
+    // MetalLLVMToAIRIntrinsics pass maps them to air.* builtins.
     {
       auto funcTy = operands[0].size() == 1
                         ? LLVM::LLVMFunctionType::get(elemTy, {elemTy})

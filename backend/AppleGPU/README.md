@@ -1,10 +1,11 @@
 # Apple GPU Backend for Triton
 
-Out-of-tree Apple GPU (Metal) backend for the Triton compiler, built as a triton-ext plugin.
+Out-of-tree Apple GPU (Metal) backend for the Triton compiler, built as a
+triton-ext plugin.
 
 ## Architecture
 
-```
+```text
 triton-ext/backend/AppleGPU/
   ├── ExportAppleGPU.cpp         Plugin registration (tritonGetPluginInfo API)
   ├── CMakeLists.txt + lib/      C++ MLIR passes
@@ -13,7 +14,7 @@ triton-ext/backend/AppleGPU/
   │           ├── compiler.py    TTIR → TTGIR → LLVM IR → metallib
   │           ├── driver.py      MPS GPU dispatch, buffer binding, scalar packing
   │           └── metal_utils.m  ObjC++ Metal bridge (compiled at install time)
-  └── metal-ir-pipeline/        LLVM IR → Metal AIR → metallib compiler (git submodule)
+  └── llvm-metal-target/         LLVM IR → Metal AIR → metallib compiler
 ```
 
 ## Prerequisites
@@ -102,13 +103,13 @@ python your_triton_script.py  # kernels run on MPS
 
 ### C++ MLIR Passes (loaded via TRITON_PLUGIN_PATHS)
 
-| Pass | Purpose |
-|------|---------|
-| `add_accelerate_matmul` | Rewrite tt.dot → AppleMmaEncoding (simdgroup MMA) |
-| `add_simplify_gather` | Strip efficient_layout from large gathers (Metal JIT limit) |
-| `add_to_llvmir` | Lower AppleMmaEncoding → LLVM IR with simdgroup intrinsics |
-| `add_lower_gpu_to_air` | Lower gpu.thread_id/block_dim → AIR intrinsics |
-| `add_reconcile_unrealized_casts` | Clean up leftover conversion casts |
+| Pass                             | Purpose                                                     |
+| -------------------------------- | ----------------------------------------------------------- |
+| `add_accelerate_matmul`          | Rewrite tt.dot → AppleMmaEncoding (simdgroup MMA)           |
+| `add_simplify_gather`            | Strip efficient_layout from large gathers (Metal JIT limit) |
+| `add_to_llvmir`                  | Lower AppleMmaEncoding → LLVM IR with simdgroup intrinsics  |
+| `add_lower_gpu_to_air`           | Lower gpu.thread_id/block_dim → AIR intrinsics              |
+| `add_reconcile_unrealized_casts` | Clean up leftover conversion casts                          |
 
 ### TritonAppleGPU Dialect
 
@@ -117,8 +118,10 @@ python your_triton_script.py  # kernels run on MPS
 ## Test Status
 
 - 71/72 backend-specific tests passing (1 xfail for shared memory limit)
-- Upstream test_core.py: remaining failures are float64, FP8, int64 atomics, NVIDIA-specific tests
-- 3 backend bugs tracked: phi(undef,ptr) crash, LICM metadata, multi-return noinline
+- Upstream test_core.py: remaining failures are float64, FP8, int64 atomics,
+  NVIDIA-specific tests
+- 3 backend bugs tracked: phi(undef,ptr) crash, LICM metadata, multi-return
+  noinline
 
 ## Known Limitations
 
@@ -127,4 +130,3 @@ python your_triton_script.py  # kernels run on MPS
 - `int64` atomics — Metal doesn't support 64-bit atomic operations
 - `num_warps >= 16` — exceeds Apple GPU max threads per threadgroup (384)
 - Cross-threadgroup spinlocks — Apple GPU has no forward progress guarantee
-

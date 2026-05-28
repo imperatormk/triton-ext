@@ -24,25 +24,29 @@ def _pmaybe_enable_debug(pm):
 
 
 def _find_llc():
-    """Locate the out-of-tree `metal-llc` shipped by triton-ext.
+    """Locate the metal-llc binary shipped by the AppleGPU backend.
 
-    The MPS backend compiles kernels by piping LLVM IR through a custom
-    `llc` built from the in-repo `llvm-metal-target/` project (which
-    links against Triton's pinned LLVM). The expected location is
-    `<triton-ext>/llvm-metal-target/build/bin/metal-llc`. Override with
-    `METAL_LLC_PATH` only for development; production should use the
-    shipped binary.
+    `metal-llc` is produced by `backend/AppleGPU/llvm-metal-target/`. Two
+    layouts are supported:
+      - Nested (default `make build`):
+          <triton-ext>/build/backend/AppleGPU/llvm-metal-target/bin/metal-llc
+      - Standalone (`cmake -S llvm-metal-target -B llvm-metal-target/build`):
+          <triton-ext>/backend/AppleGPU/llvm-metal-target/build/bin/metal-llc
+    Override with METAL_LLC_PATH for ad-hoc dev.
     """
     if os.environ.get('METAL_LLC_PATH'):
         return os.environ['METAL_LLC_PATH']
-    # compiler.py is at <triton-ext>/backend/AppleGPU/python/triton_apple_backend/
-    # llvm-metal-target is at <triton-ext>/llvm-metal-target/
     here = os.path.dirname(os.path.abspath(__file__))
-    triton_ext = os.path.abspath(os.path.join(here, '..', '..', '..', '..'))
-    candidate = os.path.join(triton_ext, 'llvm-metal-target', 'build', 'bin',
-                             'metal-llc')
-    if os.path.exists(candidate):
-        return candidate
+    apple_gpu = os.path.abspath(os.path.join(here, '..', '..'))
+    triton_ext = os.path.abspath(os.path.join(apple_gpu, '..', '..'))
+    candidates = [
+        os.path.join(triton_ext, 'build', 'bin', 'metal-llc'),
+        os.path.join(apple_gpu, 'llvm-metal-target', 'build', 'bin',
+                     'metal-llc'),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
     return None
 
 

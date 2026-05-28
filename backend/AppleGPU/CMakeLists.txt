@@ -69,3 +69,9 @@ set_target_properties(TritonAppleGPUBackend PROPERTIES
 if(APPLE)
     target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-flat_namespace)
 endif()
+
+# Out-of-tree LLVM Metal/AIR target that produces metal-llc, the binary the
+# AppleGPU plugin shells out to at runtime to emit .metallib from LLVM IR.
+# This is an AppleGPU-private tool; it lives under backend/AppleGPU/ rather
+# than at the repo root.
+add_subdirectory(llvm-metal-target)

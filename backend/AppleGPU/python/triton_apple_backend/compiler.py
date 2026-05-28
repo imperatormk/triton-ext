@@ -39,8 +39,8 @@ def _find_llc():
     # llvm-metal-target is at <triton-ext>/llvm-metal-target/
     here = os.path.dirname(os.path.abspath(__file__))
     triton_ext = os.path.abspath(os.path.join(here, '..', '..', '..', '..'))
-    candidate = os.path.join(
-        triton_ext, 'llvm-metal-target', 'build', 'bin', 'metal-llc')
+    candidate = os.path.join(triton_ext, 'llvm-metal-target', 'build', 'bin',
+                             'metal-llc')
     if os.path.exists(candidate):
         return candidate
     return None
@@ -49,8 +49,15 @@ def _find_llc():
 # Sized scalar types that may appear as the element type of an `addrspace(3)`
 # global. Vectors are handled by multiplying through.
 _LLVM_SCALAR_BYTES = {
-    'i1': 1, 'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8,
-    'half': 2, 'bfloat': 2, 'float': 4, 'double': 8,
+    'i1': 1,
+    'i8': 1,
+    'i16': 2,
+    'i32': 4,
+    'i64': 8,
+    'half': 2,
+    'bfloat': 2,
+    'float': 4,
+    'double': 8,
 }
 
 
@@ -86,13 +93,15 @@ def _tg_memory_bytes(llvm_ir: str) -> int:
     # `@name = ... addrspace(3) global <type> ..., align N`
     pat = re.compile(
         r'^@[\w$.]+\s*=\s*(?:[^@\n]*?\s)?addrspace\(3\)\s+(?:[\w]+\s+)?global\s+'
-        r'(.+?)(?:,\s*align\s+(\d+))?\s*$',
-        re.MULTILINE)
+        r'(.+?)(?:,\s*align\s+(\d+))?\s*$', re.MULTILINE)
     for m in pat.finditer(llvm_ir):
         # The captured initializer-or-type group may start with the type
         # followed by the initializer; take the leading well-formed type.
         head = m.group(1).strip()
-        ty = re.match(r'(<[^>]+>|\[[^\]]+\]|[\w]+)', head).group(1)
+        tm = re.match(r'(<[^>]+>|\[[^\]]+\]|[\w]+)', head)
+        if not tm:
+            raise ValueError(f"unrecognized addrspace(3) type head: {head!r}")
+        ty = tm.group(1)
         align = int(m.group(2)) if m.group(2) else 1
         if total % align:
             total += align - (total % align)
@@ -110,8 +119,8 @@ def _load_metalir():
             "    cmake -B build -G Ninja && cmake --build build")
 
     def compile_ir(llvm_ir: str) -> bytes:
-        with tempfile.NamedTemporaryFile(
-                suffix='.metallib', delete=False) as out_f:
+        with tempfile.NamedTemporaryFile(suffix='.metallib',
+                                         delete=False) as out_f:
             out_path = out_f.name
         try:
             if os.environ.get('TRITON_MPS_DEBUG'):
@@ -251,8 +260,8 @@ class MPSBackend(BaseBackend):
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         # Apple plugin passes (loaded via TRITON_PASS_PLUGIN_PATH)
-        _plugin.add_simplify_gather(pm)
-        _plugin.add_accelerate_matmul(pm)
+        # _plugin.add_simplify_gather(pm)
+        # _plugin.add_accelerate_matmul(pm)
 
         # Clean up redundant layout conversions introduced by the rewrite
         passes.ttgpuir.add_remove_layout_conversions(pm)

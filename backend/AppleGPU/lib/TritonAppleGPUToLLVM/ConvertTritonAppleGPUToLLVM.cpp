@@ -245,6 +245,47 @@ struct GetNumProgramsOpAppleConversion
   }
 };
 
+// ── WarpIdOpConversion ────────────────────────────────────────────────────
+// Lower ttg::WarpIdOp → air.thread_position_in_threadgroup[0] / threadsPerWarp.
+struct WarpIdOpConversion
+    : public mlir::ConvertOpToLLVMPattern<triton::gpu::WarpIdOp> {
+  using mlir::ConvertOpToLLVMPattern<
+      triton::gpu::WarpIdOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::WarpIdOp op,
+                  triton::gpu::WarpIdOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto mod = op->getParentOfType<ModuleOp>();
+
+    auto arrI32x3Ty = LLVM::LLVMArrayType::get(i32Ty, 3);
+    auto tidFnTy = LLVMFunctionType::get(arrI32x3Ty, {}, false);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(mod.getBody());
+      if (!mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup"))
+        LLVMFuncOp::create(rewriter, mod.getLoc(),
+                           "air.thread_position_in_threadgroup", tidFnTy,
+                           Linkage::External);
+    }
+    auto tidFn =
+        mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup");
+    Value tidStruct =
+        LLVM::CallOp::create(rewriter, loc, tidFn, ValueRange{}).getResult();
+    Value tid = LLVM::ExtractValueOp::create(rewriter, loc, i32Ty, tidStruct,
+                                             ArrayRef<int64_t>{0});
+
+    int tpw = ttg::lookupThreadsPerWarp(rewriter);
+    Value warpSize = arith::ConstantIntOp::create(rewriter, loc, tpw, 32);
+    Value warpId = arith::DivUIOp::create(rewriter, loc, tid, warpSize);
+    rewriter.replaceOp(op, warpId);
+    return success();
+  }
+};
+
 // ── ConvertTritonAppleGPUToLLVMPass ───────────────────────────────────────
 struct ConvertTritonAppleGPUToLLVMPass
     : public PassWrapper<ConvertTritonAppleGPUToLLVMPass,
@@ -327,6 +368,8 @@ struct ConvertTritonAppleGPUToLLVMPass
                                     patternBenefitDefault);
 
     patterns.add<GetNumProgramsOpAppleConversion>(
+        typeConverter, PatternBenefit(patternBenefitDefault + 10));
+    patterns.add<WarpIdOpConversion>(
         typeConverter, PatternBenefit(patternBenefitDefault + 10));
 
     mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);

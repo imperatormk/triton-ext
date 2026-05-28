@@ -57,8 +57,7 @@ static bool scalarizeVectorMinMax(Module &M) {
     for (Function *F : VectorDecls) {
       auto *VTy = cast<FixedVectorType>(F->getReturnType());
       Type *EltTy = VTy->getElementType();
-      Function *Scalar =
-          Intrinsic::getOrInsertDeclaration(&M, ID, {EltTy});
+      Function *Scalar = Intrinsic::getOrInsertDeclaration(&M, ID, {EltTy});
       SmallVector<CallInst *, 8> Calls;
       for (User *U : F->users())
         if (auto *CI = dyn_cast<CallInst>(U))

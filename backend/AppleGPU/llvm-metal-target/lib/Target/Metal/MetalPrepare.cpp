@@ -879,8 +879,9 @@ static bool insertPreambleGEPs(Module &M) {
                                 (SrcTy->isFloatTy() &&
                                  (GVElem->isBFloatTy() || GVElem->isHalfTy()));
             if (NeedsBitcast) {
-              auto *BC = CastInst::Create(Instruction::BitCast, NewOp,
-                                          NewOp->getType(), "", &I);
+              auto *BC =
+                  CastInst::Create(Instruction::BitCast, NewOp,
+                                   NewOp->getType(), "", I.getIterator());
               NewOp = BC;
             }
           }

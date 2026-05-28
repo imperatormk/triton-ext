@@ -66,7 +66,7 @@ static bool predecessorEndsWithBarrier(BasicBlock *BB) {
   return false;
 }
 
-static void ensureBarrierBeforeConditionalBranch(BranchInst *BI, Module &M,
+static void ensureBarrierBeforeConditionalBranch(CondBrInst *BI, Module &M,
                                                  bool &Changed) {
   auto *Parent = BI->getParent();
   if (Instruction *Prev = BI->getPrevNode())
@@ -104,8 +104,7 @@ static bool tgBarrierInsert(Module &M) {
     // Conditional-branch successor targets (barrier divergence risk).
     SmallPtrSet<BasicBlock *, 8> CondTargets;
     for (BasicBlock &BB : F) {
-      auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
-      if (BI && BI->isConditional()) {
+      if (auto *BI = dyn_cast<CondBrInst>(BB.getTerminator())) {
         CondTargets.insert(BI->getSuccessor(0));
         CondTargets.insert(BI->getSuccessor(1));
       }
@@ -144,8 +143,8 @@ static bool tgBarrierInsert(Module &M) {
     // Strategy 2: barrier before any conditional branch whose true successor
     // writes TG memory, so all threads participate.
     for (BasicBlock &BB : F) {
-      auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
-      if (!BI || !BI->isConditional())
+      auto *BI = dyn_cast<CondBrInst>(BB.getTerminator());
+      if (!BI)
         continue;
       BasicBlock *TrueBB = BI->getSuccessor(0);
       if (TGStoreBlocks.count(TrueBB))
@@ -183,7 +182,7 @@ static bool tgBarrierInsert(Module &M) {
           break;
         }
         Instruction *SuccTerm = Succ->getTerminator();
-        if (isa<BranchInst>(SuccTerm)) {
+        if (isa<CondBrInst>(SuccTerm) || isa<UncondBrInst>(SuccTerm)) {
           for (unsigned J = 0; J < SuccTerm->getNumSuccessors(); ++J) {
             if (TGStoreBlocks.count(SuccTerm->getSuccessor(J))) {
               bool SuccHasBarrier = false;
@@ -202,15 +201,10 @@ static bool tgBarrierInsert(Module &M) {
       if (SuccHasTGStore) {
         // Barrier immediately before a conditional branch in the same block
         // crashes Metal's GPU JIT. Split off so they live in separate blocks.
-        if (auto *CBI = dyn_cast<BranchInst>(Term)) {
-          if (CBI->isConditional()) {
-            BB.splitBasicBlock(Term, BB.getName() + ".war");
-            IRBuilder<> B(BB.getTerminator());
-            createBarrier(B, M);
-          } else {
-            IRBuilder<> B(Term);
-            createBarrier(B, M);
-          }
+        if (isa<CondBrInst>(Term)) {
+          BB.splitBasicBlock(Term, BB.getName() + ".war");
+          IRBuilder<> B(BB.getTerminator());
+          createBarrier(B, M);
         } else {
           IRBuilder<> B(Term);
           createBarrier(B, M);

@@ -107,12 +107,12 @@ int main(int argc, char **argv) {
 
   // Resolve target.
   std::string ErrStr;
-  const Target *TheTarget = TargetRegistry::lookupTarget(MTriple, ErrStr);
+  Triple TT(MTriple);
+  const Target *TheTarget = TargetRegistry::lookupTarget(TT, ErrStr);
   if (!TheTarget)
     return reportError("lookupTarget failed: " + ErrStr);
 
   TargetOptions Options;
-  Triple TT(MTriple);
   std::unique_ptr<TargetMachine> TM(TheTarget->createTargetMachine(
       TT, /*CPU=*/"", /*Features=*/"", Options, std::nullopt));
   if (!TM)

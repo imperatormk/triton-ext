@@ -75,7 +75,21 @@ def _find_libpython():
 libtriton_dir = _find_libtriton_dir()
 libpython = _find_libpython()
 
-if not os.path.isfile(plugin) or not libtriton_dir or not libpython:
+# The conversion pass rewrites *triton* ops (tt.func, tt.make_range, ttg.warp_id).
+# Under triton-opt those ops are created with triton-opt's own, statically-linked
+# triton::*Op TypeIDs, while the plugin's conversion patterns were compiled
+# against libtriton.so's TypeIDs (a different binary → different inline TypeID
+# symbols). cast<triton::FuncOp> then asserts on the TypeID mismatch.
+#
+# macOS resolves this with -Wl,-flat_namespace, which collapses the two copies
+# into one identity. Linux has no per-symbol equivalent and the TypeID symbols
+# have hidden visibility, so the two copies cannot be unified — the same dual-
+# library identity wall tracked in triton-ext#43. The pass itself is exercised
+# by the Python pytest path (where only libtriton is loaded); here we only run
+# it where the identity can actually be unified.
+if platform.system() != "Darwin":
+    config.unsupported = True
+elif not os.path.isfile(plugin) or not libtriton_dir or not libpython:
     config.unsupported = True
 else:
     config.environment["TRITON_PLUGIN_PATHS"] = plugin

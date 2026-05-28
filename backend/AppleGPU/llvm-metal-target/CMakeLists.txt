@@ -1,51 +1,44 @@
-cmake_minimum_required(VERSION 3.20)
-project(LLVMMetalTarget LANGUAGES CXX C)
-
 # ---------------------------------------------------------------------------
-# Out-of-tree LLVM Metal/AIR target plugin.
+# Out-of-tree LLVM Metal/AIR target.
 #
-# This project mirrors llvm/lib/Target/Metal from the user's in-tree
-# `metal-target-poc` branch and builds it against Triton-main's PINNED prebuilt
-# LLVM (SHA 87717bf9). The result is a shared library + thin `metal-llc`
-# driver that the AppleGPU Triton backend can load without requiring users to
-# rebuild Triton's LLVM.
+# Mirrors llvm/lib/Target/Metal and builds it against the prebuilt LLVM that
+# triton-ext already pulls (~/.triton/llvm/llvm-<sha>-...). Produces
+# libLLVMMetalTarget + the metal-llc driver. The AppleGPU plugin shells out
+# to metal-llc at runtime to lower LLVM IR to .metallib.
 #
-# STAGE 1: scaffold only. Do NOT expect this to configure cleanly yet --
-# see STAGE_2_NOTES.md for the known gaps.
+# Buildable two ways:
+#  1. Nested (default): as a subdirectory of backend/AppleGPU when triton-ext
+#     is built top-level. Inherits LLVM discovery from the parent project.
+#  2. Standalone: cmake -S <this-dir> -B <build> for fast iteration on the
+#     target without rebuilding the rest of triton-ext.
 # ---------------------------------------------------------------------------
 
-# Match the prebuilt LLVM's C++ ABI. Triton's LLVM is built with C++17.
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Default to Triton's prebuilt LLVM. User can override with -DLLVM_DIR=...
-if(NOT LLVM_DIR)
-  set(LLVM_DIR "$ENV{HOME}/.triton/llvm/llvm-87717bf9-macos-arm64/lib/cmake/llvm"
-      CACHE PATH "Path to LLVMConfig.cmake")
+if(NOT CMAKE_PROJECT_NAME)
+  cmake_minimum_required(VERSION 3.20)
+  project(LLVMMetalTarget LANGUAGES CXX C)
 endif()
 
-find_package(LLVM REQUIRED CONFIG)
-message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
-message(STATUS "  LLVM_DIR          = ${LLVM_DIR}")
-message(STATUS "  LLVM_INCLUDE_DIRS = ${LLVM_INCLUDE_DIRS}")
-message(STATUS "  LLVM_LIBRARY_DIRS = ${LLVM_LIBRARY_DIRS}")
-message(STATUS "  LLVM_ENABLE_RTTI  = ${LLVM_ENABLE_RTTI}")
-message(STATUS "  LLVM_ENABLE_EH    = ${LLVM_ENABLE_EH}")
-
-list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+if(NOT LLVM_FOUND)
+  # Standalone build: do our own LLVM discovery.
+  if(NOT LLVM_DIR)
+    set(LLVM_DIR
+        "$ENV{HOME}/.triton/llvm/llvm-87717bf9-macos-arm64/lib/cmake/llvm"
+        CACHE PATH "Path to LLVMConfig.cmake")
+  endif()
+  find_package(LLVM REQUIRED CONFIG)
+  message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} at ${LLVM_DIR}")
+  list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+  include(AddLLVM)
+  include(TableGen)
+  include(HandleLLVMOptions)
+endif()
 
 include_directories(${LLVM_INCLUDE_DIRS})
 separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})
 add_definitions(${LLVM_DEFINITIONS_LIST})
 link_directories(${LLVM_LIBRARY_DIRS})
-
-# LLVM TableGen + helper macros. The prebuilt ships AddLLVM.cmake +
-# TableGen.cmake under LLVM_CMAKE_DIR.
-include(AddLLVM)
-include(TableGen)
-include(HandleLLVMOptions)
 
 # Point TableGen at the prebuilt llvm-tblgen binary.
 if(NOT LLVM_TABLEGEN_EXE)

@@ -6,9 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file is used as the registry of passes that are part of the Metal
-// backend. New-PM passes are registered here as the metal-ir-pipeline
-// transforms are ported in. See docs/upstreaming-plan.md.
+// Registry of New-PM passes that are part of the Metal backend.
 //
 //===----------------------------------------------------------------------===//
 

@@ -30,7 +30,7 @@ using namespace llvm;
 #define DEBUG_TYPE "metal-scalar-buffer-packing"
 
 namespace {
-// Mirror metal-ir-pipeline's AS namespace.
+// Metal address-space constants used throughout this pass.
 constexpr unsigned ASDevice = 1;
 constexpr unsigned ASConstant = 2;
 } // namespace

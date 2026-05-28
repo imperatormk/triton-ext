@@ -63,26 +63,16 @@ cd triton-ext
 git checkout apple-gpu
 ```
 
-### 3. Build metal-ir-pipeline
+### 3. Build the plugin
 
 ```bash
-cd backend/AppleGPU/metal-ir-pipeline
-cmake -B build -DLLVM_DIR=~/projects/oss/triton-main/llvm-project/build/lib/cmake/llvm
-cmake --build build -j$(sysctl -n hw.ncpu)
-cd ../../..
+make build
 ```
 
-### 4. Build the plugin
-
-```bash
-mkdir build && cd build
-TRITON_INSTALL_DIR=~/projects/oss/triton-main/build/install \
-cmake .. \
-  -DLLVM_DIR=~/projects/oss/triton-main/llvm-project/build/lib/cmake/llvm \
-  -DMLIR_DIR=~/projects/oss/triton-main/llvm-project/build/lib/cmake/mlir \
-  -DFILECHECK_PATH=~/projects/oss/triton-main/llvm-project/build/bin/FileCheck
-make -j$(sysctl -n hw.ncpu)
-```
+This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/` and
+the `metal-llc` binary under `build/bin/` via the nested
+`backend/AppleGPU/llvm-metal-target/` project. No separate cmake invocation
+is needed.
 
 ### 5. Install the Python backend
 

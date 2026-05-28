@@ -145,7 +145,8 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
       if (cvt.getSrc().getType() == newCType)
         newC = cvt.getSrc();
       else
-        newC = ttg::ConvertLayoutOp::create(rewriter, loc, newCType, dot.getC());
+        newC =
+            ttg::ConvertLayoutOp::create(rewriter, loc, newCType, dot.getC());
     } else {
       newC = ttg::ConvertLayoutOp::create(rewriter, loc, newCType, dot.getC());
     }

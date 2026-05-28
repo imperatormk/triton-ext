@@ -46,9 +46,8 @@ extern "C" void LLVMInitializeMetalTargetMC();
 extern "C" void LLVMInitializeMetalTarget();
 // Out-of-tree: AsmPrinter path is disabled (see MetalTargetMachine).
 
-static cl::opt<std::string> InputFile(cl::Positional,
-                                      cl::desc("<input IR file or ->"),
-                                      cl::init("-"));
+static cl::opt<std::string>
+    InputFile(cl::Positional, cl::desc("<input IR file or ->"), cl::init("-"));
 
 static cl::opt<std::string> OutputFile("o", cl::desc("Output metallib path"),
                                        cl::value_desc("filename"),

@@ -238,7 +238,8 @@ static bool scalarBufferPacking(Module &M) {
       Ni++;
     }
     BufNewIdx = Ni;
-    NewParamTypes.push_back(PointerType::get(M.getContext(), metal::AS::Device));
+    NewParamTypes.push_back(
+        PointerType::get(M.getContext(), metal::AS::Device));
     Ni++;
 
     SmallVector<std::string, 8> OldArgNames;

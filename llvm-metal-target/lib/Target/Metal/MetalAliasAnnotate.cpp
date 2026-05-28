@@ -97,16 +97,14 @@ static bool annotateFunction(Function &F) {
   MDBuilder MDB(Ctx);
 
   // Per-kernel scope domain.
-  std::string DomainName =
-      ("air-alias-scopes(" + F.getName() + ")").str();
+  std::string DomainName = ("air-alias-scopes(" + F.getName() + ")").str();
   MDNode *Domain = MDB.createAnonymousAliasScopeDomain(DomainName);
 
   // Per-buffer-arg scope.
   SmallVector<MDNode *, 8> ArgScope(BufArgs.size(), nullptr);
   for (unsigned I = 0; I < BufArgs.size(); I++) {
     unsigned ArgNo = BufArgs[I]->getArgNo();
-    std::string ScopeName =
-        "air-alias-scope-arg(" + utostr(ArgNo) + ")";
+    std::string ScopeName = "air-alias-scope-arg(" + utostr(ArgNo) + ")";
     ArgScope[I] = MDB.createAnonymousAliasScope(Domain, ScopeName);
   }
 

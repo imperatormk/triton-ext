@@ -59,12 +59,11 @@ struct MetallibOptions {
 // → custom bitcode (typed POINTER records, not LLVM's BitcodeWriter)
 // → bitcode wrapper (0x0B17C0DE magic)
 // → metallib container (MTLB header + 4 sections)
-bool writeMetallib(llvm::Module &M, PointeeTypeMap &PTM,
-                   llvm::raw_ostream &OS, const MetallibOptions &Opts = {});
+bool writeMetallib(llvm::Module &M, PointeeTypeMap &PTM, llvm::raw_ostream &OS,
+                   const MetallibOptions &Opts = {});
 
 // Convenience: write to a byte vector.
-std::vector<uint8_t> serializeMetallib(llvm::Module &M,
-                                       PointeeTypeMap &PTM,
+std::vector<uint8_t> serializeMetallib(llvm::Module &M, PointeeTypeMap &PTM,
                                        const MetallibOptions &Opts = {});
 
 } // namespace metal

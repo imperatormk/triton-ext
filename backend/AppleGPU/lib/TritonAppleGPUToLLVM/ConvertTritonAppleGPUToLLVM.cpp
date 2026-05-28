@@ -2338,10 +2338,10 @@ static Value getOrCreateEventAlloca(Operation *op, RewriterBase &rewriter) {
 
 // Struct to hold all components extracted from the async_copy pointer chain.
 struct AsyncCopyPtrInfo {
-  Value stride;     // Row stride scalar (MLIR, in elements)
-  Value basePtr;    // Scalar base pointer (MLIR, tt.ptr)
-  Value rowStart;   // Scalar first-row index (MLIR, i32/i64), or nullptr if 0
-  Value colStart;   // Scalar first-col index (MLIR, i32/i64), or nullptr if 0
+  Value stride;   // Row stride scalar (MLIR, in elements)
+  Value basePtr;  // Scalar base pointer (MLIR, tt.ptr)
+  Value rowStart; // Scalar first-row index (MLIR, i32/i64), or nullptr if 0
+  Value colStart; // Scalar first-col index (MLIR, i32/i64), or nullptr if 0
 };
 
 // Extract the first-element scalar from a 1D index tensor.
@@ -2409,7 +2409,8 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info) {
   if (!innerOp || !isa<triton::AddPtrOp>(innerOp))
     return false;
 
-  // Extract scalar base pointer from splat(base) — first operand of inner addptr
+  // Extract scalar base pointer from splat(base) — first operand of inner
+  // addptr
   auto *baseSplatOp = innerOp->getOperand(0).getDefiningOp();
   if (!baseSplatOp || !isa<triton::SplatOp>(baseSplatOp))
     return false;
@@ -2446,9 +2447,8 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info) {
   // broadcast(expand_dims(col_offs_1d)) or broadcast(col_offs)
   Value colOffset = addptrOp->getOperand(1);
   auto *colBroadcastOp = colOffset.getDefiningOp();
-  if (colBroadcastOp &&
-      (isa<triton::BroadcastOp>(colBroadcastOp) ||
-       isa<triton::ExpandDimsOp>(colBroadcastOp))) {
+  if (colBroadcastOp && (isa<triton::BroadcastOp>(colBroadcastOp) ||
+                         isa<triton::ExpandDimsOp>(colBroadcastOp))) {
     info.colStart = extractFirstElemScalar(colBroadcastOp->getOperand(0));
   }
   // nullptr means first col = 0
@@ -2657,9 +2657,9 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     }
     if (llvmColStart) {
       // GEP by colStart (in elements)
-      srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy,
-                                    srcBase,
-                                    ArrayRef<LLVM::GEPArg>{llvmColStart});
+      srcBase =
+          LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy, srcBase,
+                              ArrayRef<LLVM::GEPArg>{llvmColStart});
     }
 
     // Destination base pointer: shared memory object base

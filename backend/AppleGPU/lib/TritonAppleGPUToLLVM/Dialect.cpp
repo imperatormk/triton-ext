@@ -29,8 +29,7 @@ struct AppleGPUInferLayoutInterface
     : public triton::DialectInferLayoutInterface {
   using DialectInferLayoutInterface::DialectInferLayoutInterface;
 
-  LogicalResult
-  verifyCatOpEncodingCompatibility(Operation *op) const override {
+  LogicalResult verifyCatOpEncodingCompatibility(Operation *op) const override {
     auto cat = cast<CatOp>(op);
     int64_t operandRegs =
         ttg::getUniqueElemsPerThread(cat.getLhs().getType()) * 2;

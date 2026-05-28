@@ -83,7 +83,8 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       {"add_simplify_gather", "0.1.0", addSimplifyGather,
        registerSimplifyGather},
       {"add_to_llvmir", "0.1.0", addToLLVMIR, registerToLLVMIR},
-      {"add_lower_gpu_to_air", "0.1.0", addLowerGPUToAIR, registerLowerGPUToAIR},
+      {"add_lower_gpu_to_air", "0.1.0", addLowerGPUToAIR,
+       registerLowerGPUToAIR},
       {"add_reconcile_unrealized_casts", "0.1.0", addReconcileUnrealizedCasts,
        registerReconcileUnrealizedCasts},
   };

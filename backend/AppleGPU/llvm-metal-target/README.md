@@ -20,7 +20,7 @@ This directory builds the Metal target as a **plugin shared library**
 
 ```text
 llvm-metal-target/
-├── CMakeLists.txt              top-level: find_package(LLVM CONFIG)
+├── CMakeLists.txt              top-level: builds against the parent's LLVM
 ├── README.md                   this file
 ├── STAGE_2_NOTES.md            known build gaps and the plan to close them
 ├── MIRROR_MANIFEST.txt         source files mirrored + their in-tree origin
@@ -33,22 +33,17 @@ llvm-metal-target/
 └── test/                       placeholder for lit tests
 ```
 
-## Build (stage 2 territory)
+## Build
 
-```sh
-cmake -B build -S . \
-  -DLLVM_DIR=$HOME/.triton/llvm/llvm-87717bf9-macos-arm64/lib/cmake/llvm
-cmake --build build -j
-```
-
-By default `LLVM_DIR` points at Triton's prebuilt LLVM. Override it to build
-against any other LLVM 21.x install.
+Built as part of triton-ext: `backend/AppleGPU/CMakeLists.txt` pulls it in via
+`add_subdirectory(llvm-metal-target)`, so a normal top-level build produces the
+driver at `<triton-ext>/build/bin/metal-llc`. It inherits LLVM discovery from
+the parent project (the prebuilt LLVM that triton-ext already locates).
 
 ## How the AppleGPU backend consumes it
 
-The plan: `triton_apple_backend.compiler._find_llc()` already honours the
-`METAL_LLC_PATH` env var. Once stage 2 produces a working `build/bin/metal-llc`,
-point that env var at it:
+`triton_apple_backend.compiler._find_llc()` honours the `METAL_LLC_PATH` env
+var; point it at the built driver to override the default lookup:
 
 ```sh
 export METAL_LLC_PATH=$PWD/build/bin/metal-llc

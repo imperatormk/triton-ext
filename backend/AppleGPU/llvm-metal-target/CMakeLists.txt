@@ -2,38 +2,16 @@
 # Out-of-tree LLVM Metal/AIR target.
 #
 # Mirrors llvm/lib/Target/Metal and builds it against the prebuilt LLVM that
-# triton-ext already pulls (~/.triton/llvm/llvm-<sha>-...). Produces
-# libLLVMMetalTarget + the metal-llc driver. The AppleGPU plugin shells out
-# to metal-llc at runtime to lower LLVM IR to .metallib.
+# triton-ext already pulls. Produces libLLVMMetalTarget + the metal-llc driver.
+# The AppleGPU plugin shells out to metal-llc at runtime to lower LLVM IR to
+# .metallib.
 #
-# Buildable two ways:
-#  1. Nested (default): as a subdirectory of backend/AppleGPU when triton-ext
-#     is built top-level. Inherits LLVM discovery from the parent project.
-#  2. Standalone: cmake -S <this-dir> -B <build> for fast iteration on the
-#     target without rebuilding the rest of triton-ext.
+# Built as a subdirectory of backend/AppleGPU when triton-ext is configured
+# top-level, inheriting LLVM discovery (LLVM_FOUND, the CMake module path, and
+# the AddLLVM/TableGen helpers) from the parent project.
 # ---------------------------------------------------------------------------
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-if(NOT CMAKE_PROJECT_NAME)
-  cmake_minimum_required(VERSION 3.20)
-  project(LLVMMetalTarget LANGUAGES CXX C)
-endif()
-
-if(NOT LLVM_FOUND)
-  # Standalone build: do our own LLVM discovery.
-  if(NOT LLVM_DIR)
-    set(LLVM_DIR
-        "$ENV{HOME}/.triton/llvm/llvm-87717bf9-macos-arm64/lib/cmake/llvm"
-        CACHE PATH "Path to LLVMConfig.cmake")
-  endif()
-  find_package(LLVM REQUIRED CONFIG)
-  message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} at ${LLVM_DIR}")
-  list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
-  include(AddLLVM)
-  include(TableGen)
-  include(HandleLLVMOptions)
-endif()
 
 include_directories(${LLVM_INCLUDE_DIRS})
 separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})

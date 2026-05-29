@@ -1,6 +1,8 @@
 build
-llvm-*
-triton-*
-!triton-ext.toml
+# Downloaded LLVM/Triton artifact trees live at the repo root; anchor with a
+# leading slash so the patterns don't also swallow similarly-named files in
+# subdirectories (e.g. the llvm-to-air-intrinsics*.ll lit tests).
+/llvm-*
+/triton-*
 *.pyc
 *.so

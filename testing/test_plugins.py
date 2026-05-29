@@ -41,6 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = Path(os.environ.get("TRITON_EXT_BUILD_DIR", REPO_ROOT / "build"))
 PLUGIN_LIB_DIR = BUILD_DIR / "lib"
 SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+PLUGIN_EXT = ".dylib" if sys.platform == "darwin" else ".so"
 
 sys.path.insert(0, str(REPO_ROOT / "ci"))
 import extension_config  # noqa: E402  (ci/ is added to sys.path above)
@@ -65,7 +66,7 @@ PLUGINS = _discover_plugins()
 
 
 def _plugin_path(name: str) -> Path:
-    return PLUGIN_LIB_DIR / f"lib{name}.so"
+    return PLUGIN_LIB_DIR / f"lib{name}{PLUGIN_EXT}"
 
 
 def _format_command(env_overrides: dict[str, str], args: list[str]) -> str:

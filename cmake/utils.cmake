@@ -1,4 +1,42 @@
 
+# triton_ext_link_mlir_lib(<target> <mlir_lib_target>)
+#
+# Link an extension `<target>` against an MLIR/LLVM library that `libtriton`
+# does NOT re-export (e.g. MLIRMathTransforms, which provides
+# `populatePolynomialApproximateErfPattern` for math.erf). The pinned LLVM
+# artifact ships its libraries differently per platform; this hides the
+# difference so an extension just names the library it needs.
+#
+#   * Shared library (Linux artifact ships lib*.so). Linking it is enough: the
+#     dynamic loader resolves its transitive deps, and its static initializers
+#     (LLVM cl::opt registrations) live in the .so and run once -- no bloat.
+#
+#   * Static archive (macOS artifact ships lib*.a). The linker pulls only the
+#     archive members needed to satisfy our references, but those can transit
+#     into cl::opt-registering objects (MLIRLLVMDialect -> LLVMCore) that abort
+#     with "Option '...' registered more than once" if a second copy loads, and
+#     bloat the plugin. `-dead_strip` then garbage-collects every section not
+#     reachable from the extension's own code, dropping those dead cl::opt
+#     objects -- so the plugin stays small and carries no duplicate
+#     registrations. References that remain are resolved from the host
+#     (libtriton + the loading process) at load time.
+#
+# On ELF `--gc-sections` is the equivalent, though there the library is shared
+# so it is effectively a no-op; it is set for parity / future static artifacts.
+function(triton_ext_link_mlir_lib target mlir_lib)
+    if(NOT TARGET ${mlir_lib})
+        message(FATAL_ERROR "triton_ext_link_mlir_lib: MLIR target '${mlir_lib}'"
+                            " not found (was find_package(MLIR) run?)")
+    endif()
+
+    target_link_libraries(${target} PUBLIC ${mlir_lib})
+    if(APPLE)
+        target_link_options(${target} PRIVATE -Wl,-dead_strip)
+    else()
+        target_link_options(${target} PRIVATE -Wl,--gc-sections)
+    endif()
+endfunction()
+
 # Function to get the current Triton git hash
 function(get_triton_git_hash triton_source_dir result_var)
     # Try to get git hash from the triton source directory

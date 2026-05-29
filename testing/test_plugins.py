@@ -21,8 +21,9 @@ it up. To exempt a plugin from a parametrized test, mark it at parametrize
 time with `pytest.param(..., marks=pytest.mark.skip(...))` -- see
 `_COMPILE_PLUGINS` for an example.
 
-The kernel-compile and tlx-DSL scenarios live as standalone scripts under
-`testing/scripts/` so they can be run by hand to debug a plugin, e.g.
+The kernel-compile, AppleGPU-lowering, and tlx-DSL scenarios live as standalone
+scripts under `testing/scripts/` so they can be run by hand to debug a plugin,
+e.g.
 `TRITON_PLUGIN_PATHS=build/lib/lib<name>.so python testing/scripts/compile_kernel.py`.
 On failure each test prints the exact command to reproduce it.
 """
@@ -168,3 +169,40 @@ def test_utlx_registers_tlx_dsl() -> None:
         f"utlx tlx-DSL check failed. Reproduce with:\n  {command}\n"
         f"--- stdout ---\n{result.stdout}\n"
         f"--- stderr ---\n{result.stderr}")
+
+
+@pytest.mark.skipif(not _plugin_path("applegpu_backend").is_file(),
+                    reason="applegpu_backend plugin not built")
+def test_applegpu_lowers_warpid() -> None:
+    """AppleGPU lowers a make_range kernel to LLVM with air intrinsics.
+
+    Drives the MPS backend's make_ttir -> make_ttgir -> make_llir stages on a
+    `tl.arange` + load/store kernel and checks the lowered LLVM IR. The
+    `tt.make_range` emits `ttg.warp_id`, which the Apple convert pass lowers to
+    `air.thread_position_in_threadgroup`; absence of that call is the WarpId
+    lowering regression this guards against.
+
+    Runs in-process (no GPU/driver/Metal needed): the conversion is exercised
+    through Python rather than `triton-opt` so it operates inside the single
+    `libtriton` dialect identity. `triton-opt` statically embeds its own copy
+    of the Triton dialect, distinct from the `libtriton` the plugin links, so
+    an op it parses carries a different op-properties TypeID than the plugin's
+    patterns expect -- which aborts before any check can run.
+    """
+    plugin_path = _plugin_path("applegpu_backend")
+    backend_python = REPO_ROOT / "backend" / "AppleGPU" / "python"
+    pythonpath = f"{backend_python}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
+    result, command = _run(
+        {
+            "TRITON_PLUGIN_PATHS": str(plugin_path),
+            "TRITON_PASS_PLUGIN_PATH": str(plugin_path),
+            "PYTHONPATH": pythonpath,
+        }, [sys.executable,
+            str(SCRIPTS_DIR / "lower_apple_kernel.py")])
+    assert result.returncode == 0, (
+        f"AppleGPU kernel lowering failed. Reproduce with:\n  {command}\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}")
+    assert "air.thread_position_in_threadgroup" in result.stdout, (
+        f"WarpId lowering missing from AppleGPU LLVM IR. Reproduce with:\n"
+        f"  {command}\n--- stdout ---\n{result.stdout}")

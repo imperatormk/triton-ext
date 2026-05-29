@@ -56,8 +56,7 @@ file(GLOB TOLLVM_SRCS lib/TritonAppleGPUToLLVM/*.cpp)
 #     ("Option '...' registered more than once"), and bloat the .so ~15x. So
 #     extract only the single object that defines the erf pattern (~0.5 MB,
 #     no cl::opt initializers); its MLIR/Arith symbol references stay
-#     undefined and resolve at load time from the host (libtriton.so under
-#     Python, triton-opt's own symbols under lit).
+#     undefined and resolve from libtriton.so at load time.
 if(NOT TARGET MLIRMathTransforms)
     message(FATAL_ERROR "MLIRMathTransforms target not found; cannot provide "
                         "the math.erf polynomial-approximation pattern")

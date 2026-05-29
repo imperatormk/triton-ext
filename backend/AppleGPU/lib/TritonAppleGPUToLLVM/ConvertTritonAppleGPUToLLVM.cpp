@@ -303,19 +303,19 @@ struct ConvertTritonAppleGPUToLLVMPass
     return "Lower TritonGPU ops (Apple MPS, nano) to LLVM IR";
   }
 
-  // The pass builds a TritonGPUToLLVMTypeConverter and applies LLVM/arith/
-  // math/index/cf/ub conversion patterns, and it emits gpu ops that the
-  // subsequent LowerGPUToAirPass consumes. Constructing the type converter
-  // lazily loads the `llvm` dialect, which is illegal once the PassManager is
-  // multi-threaded (as it is under triton-opt). Declare every dialect the pass
-  // creates so MLIR loads them up front, before threading begins.
-  // ub ops are only ever consumed (populateUBToLLVMConversionPatterns), never
-  // created here, so the UB dialect is intentionally absent — and the Linux
-  // LLVM artifact does not ship its header anyway.
+  // Constructing the TritonGPUToLLVMTypeConverter lazily loads the `llvm`
+  // dialect, which is illegal once the PassManager is multi-threaded (as it is
+  // under triton-opt). Pre-declare the dialects this pass *produces* so MLIR
+  // loads them before threading begins:
+  //   - LLVM: the conversion target; the type converter loads it eagerly.
+  //   - gpu:  emitted by the shared make_range/SPMD patterns, consumed by the
+  //           subsequent LowerGPUToAirPass.
+  // The arith/math/index/cf/ub source dialects are only *consumed* (their ops
+  // come in from the input IR, so they are already loaded) — registering them
+  // is unnecessary, and `index`'s TypeID symbol is not exported by libtriton
+  // on macOS, so listing it would break loading the plugin there.
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<mlir::LLVM::LLVMDialect, mlir::arith::ArithDialect,
-                    mlir::math::MathDialect, mlir::index::IndexDialect,
-                    mlir::cf::ControlFlowDialect, mlir::gpu::GPUDialect>();
+    registry.insert<mlir::LLVM::LLVMDialect, mlir::gpu::GPUDialect>();
   }
 
   void runOnOperation() override {

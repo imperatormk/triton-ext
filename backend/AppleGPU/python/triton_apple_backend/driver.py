@@ -334,8 +334,21 @@ class MPSDriver(DriverBase):
 
     @staticmethod
     def is_active():
+        # Require BOTH Metal hardware AND the Apple pass-plugin to be loaded.
+        # The `apple` backend is installed as an entry point in the Triton
+        # environment, so without the plugin check MPSDriver would claim every
+        # compile on any Mac with MPS -- even when a different plugin is loaded
+        # and the Apple plugin's passes (e.g. add_to_llvmir) are absent, which
+        # then aborts that plugin's compile. Gate on the plugin's passes module
+        # being present so MPS only activates when the Apple backend can run.
         try:
-            return torch.backends.mps.is_available()
+            if not torch.backends.mps.is_available():
+                return False
+        except Exception:
+            return False
+        try:
+            from triton._C.libtriton import passes
+            return hasattr(getattr(passes, "plugin", None), "add_to_llvmir")
         except Exception:
             return False
 

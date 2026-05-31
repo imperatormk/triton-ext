@@ -1417,14 +1417,14 @@ struct AtomicCASOpAppleConversion
     if (valueTy.isF16() || valueTy.isBF16())
       return emitF16BF16CAS(rewriter, loc, mod, ptr, cmp, val, valueTy);
 
+    // Only 32-bit CAS reaches here — i64/f64 are rejected at the pattern entry
+    // (no 64-bit atomics on Apple GPU). f16/bf16 take the emitF16BF16CAS path
+    // above.
     std::string airName;
     Type casTy;
     if (valueTy.isInteger(32) || valueTy.isF32()) {
       airName = "air.atomic.global.cmpxchg.weak.i32";
       casTy = IntegerType::get(ctx, 32);
-    } else if (valueTy.isInteger(64) || valueTy.isF64()) {
-      airName = "air.atomic.global.cmpxchg.weak.i64";
-      casTy = IntegerType::get(ctx, 64);
     } else {
       llvm_unreachable("unsupported CAS type");
     }
@@ -1497,10 +1497,15 @@ struct AtomicCASOpAppleConversion
         tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
                  : getTypeConverter()->convertType(op.getType());
 
-    // Check supported types
-    if (!(valueTy.isInteger(32) || valueTy.isF32() || valueTy.isInteger(64) ||
-          valueTy.isF64() || valueTy.isF16() || valueTy.isBF16()))
-      return failure();
+    // Check supported types. Apple GPUs have NO 64-bit atomics — there is no
+    // `air.atomic.global.cmpxchg.weak.i64` intrinsic, and emitting one crashes
+    // the Metal compiler service (XPC_ERROR_CONNECTION_INTERRUPTED). Fail the
+    // lowering cleanly (the op stays illegal -> compile error) rather than
+    // producing AIR that brings down the GPU compiler.
+    if (!(valueTy.isInteger(32) || valueTy.isF32() || valueTy.isF16() ||
+          valueTy.isBF16()))
+      return rewriter.notifyMatchFailure(
+          op, "Apple GPU has no 64-bit atomics (i64/f64 CAS unsupported)");
 
     if (!tensorTy) {
       // Scalar CAS: only thread 0 executes, broadcast result to all threads.

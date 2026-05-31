@@ -1,6 +1,9 @@
 build
-llvm-*
-triton-*
+# Downloaded LLVM/Triton artifact trees live at the repo root; anchor with a
+# leading slash so the patterns don't also swallow similarly-named paths in
+# subdirectories (e.g. backend/AppleGPU/llvm-metal-target).
+/llvm-*
+/triton-*
 !triton-ext.toml
 *.pyc
 *.so

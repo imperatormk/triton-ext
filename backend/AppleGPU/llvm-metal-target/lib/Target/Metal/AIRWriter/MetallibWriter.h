@@ -9,6 +9,7 @@
 #ifndef LLVM_LIB_TARGET_METAL_AIRWRITER_METALLIBWRITER_H
 #define LLVM_LIB_TARGET_METAL_AIRWRITER_METALLIBWRITER_H
 
+#include "MetalVersion.h"
 #include "PointeeTypeMap.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
@@ -42,6 +43,10 @@ struct MetallibOptions {
   uint16_t OSPatch = 0;
   uint16_t MetalMajor = DefaultMetalLangMajor;
   uint16_t MetalMinor = DefaultMetalLangMinor;
+  // Per-target AIR version (drives the VERS air_minor). Defaults to the
+  // macOS-16 (26-era) values so behavior is unchanged when no OS info is
+  // available. See MetalVersion.h.
+  MetalVersion Version = MetalVersion::fromOSMajor(16);
 };
 
 // Write the module as a metallib to the output stream.

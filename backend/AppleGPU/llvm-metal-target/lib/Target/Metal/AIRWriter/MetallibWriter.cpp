@@ -101,12 +101,14 @@ static std::string buildEntryTags(StringRef Name, ArrayRef<uint8_t> Hash,
   writeU64(OS, 0);
   writeU64(OS, 0);
 
-  // VERS (air_major=2, air_minor=8, metal_major, metal_minor)
+  // VERS (air_major, air_minor, metal_major, metal_minor)
+  // air_major is always 2; air_minor is derived from the target macOS major
+  // (OSmajor-8), empirically verified via `xcrun metal -mmacosx-version-min`.
   writeTag(OS, "VERS", 8);
-  writeU16(OS, 2);
-  writeU16(OS, 8);
-  writeU16(OS, Opts.MetalMajor);
-  writeU16(OS, Opts.MetalMinor);
+  writeU16(OS, MetalVersion::AIRMajor);
+  writeU16(OS, Opts.Version.AIRMinor);
+  writeU16(OS, Opts.Version.MSLMajor);
+  writeU16(OS, Opts.Version.MSLMinor);
 
   OS.flush();
   return Buf;
@@ -115,7 +117,13 @@ static std::string buildEntryTags(StringRef Name, ArrayRef<uint8_t> Hash,
 // ── Main writer ──────────────────────────────────────────────────────────
 
 bool writeMetallib(Module &M, PointeeTypeMap &PTM, raw_ostream &OS,
-                   const MetallibOptions &Opts) {
+                   const MetallibOptions &OptsIn) {
+  // The target triple is the single source of truth for the AIR version.
+  // Derive it here (falling back to macOS 16 when absent) so the VERS tag's
+  // air_minor tracks the target macOS major.
+  MetallibOptions Opts = OptsIn;
+  Opts.Version = MetalVersion::fromTriple(M.getTargetTriple().str());
+
   // Emit bitcode with typed pointers (the whole point of this project)
   auto Bitcode = emitMetalBitcode(M, PTM);
   auto WrappedBC = wrapBitcode(Bitcode);
@@ -209,10 +217,16 @@ bool writeMetallib(Module &M, PointeeTypeMap &PTM, raw_ostream &OS,
 
   OS.write("MTLB", 4);
 
+  // MTLB header bytes 4-15. Byte 4 (Platform[4]) is the container-format
+  // version and byte 8 (Platform[8]) is the OS major — both vary by target
+  // macOS and are derived from the version (verified vs `xcrun metal`:
+  // 13->07/13, 14->07/14, 15->08/15, 16->09/26). The OS byte uses the renumber
+  // (16 -> 26).
   uint8_t Platform[12] = {0x01, 0x80, 0x02, 0x00, 0x09, 0x00,
                           0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  Platform[4] = Opts.Version.ContainerByte & 0xFF;
   Platform[7] = static_cast<uint8_t>(Opts.Platform);
-  Platform[8] = Opts.OSMajor & 0xFF;
+  Platform[8] = Opts.Version.TripleOSMajor & 0xFF;
   OS.write(reinterpret_cast<const char *>(Platform), 12);
 
   writeU64(OS, TotalSize);

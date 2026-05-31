@@ -119,8 +119,19 @@ int main(int argc, char **argv) {
     return reportError("createTargetMachine returned null");
 
   M->setDataLayout(TM->createDataLayout());
-  if (M->getTargetTriple().empty())
-    M->setTargetTriple(TT);
+  // The -mtriple flag carries the target macOS version (e.g.
+  // air64_v26-apple-macosx14.0.0), which drives all per-OS AIR version fields
+  // (air.version, MSL language version, VERS, subarch). The module's own triple
+  // is typically a bare "air"/"" with NO OS component, so prefer the flag's
+  // OS-bearing triple. Only keep the module triple if IT already carries a
+  // macosx OS version and the flag does not.
+  {
+    StringRef ModTriple = M->getTargetTriple().str();
+    bool ModHasOS = ModTriple.contains("macosx");
+    bool FlagHasOS = StringRef(MTriple).contains("macosx");
+    if (FlagHasOS || !ModHasOS)
+      M->setTargetTriple(TT);
+  }
 
   // Open output. Text for asm (IR dump), binary for obj (metallib bytes).
   std::error_code EC;

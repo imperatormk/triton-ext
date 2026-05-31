@@ -40,6 +40,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/SmallVector.h"
+#include <cstdlib>
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
@@ -204,6 +205,34 @@ static Value makeI64Vec2(OpBuilder &b, Location loc, int64_t a, int64_t b_val) {
   return vec;
 }
 
+static Value makeI64(OpBuilder &b, Location loc, int64_t v) {
+  return arith::ConstantIntOp::create(b, loc, v, 64);
+}
+static Value makeI1False(OpBuilder &b, Location loc) {
+  return arith::ConstantIntOp::create(b, loc, 0, 1);
+}
+
+// The air.simdgroup_matrix_8x8_{load,store} intrinsic signature changed at
+// macOS 16:
+//   macOS <= 15 (canonical, matching Metal's metal_simdgroup_matrix header):
+//     load:  (ptr, i64 elements_per_row, <2 x i64> origin, i1 transpose)
+//     store: (<64 x T>, ptr, i64 elements_per_row, <2 x i64> origin, i1
+//     transpose)
+//   macOS >= 16 (3-vector shape/stride/offset form, current shipping target):
+//     load:  (ptr, <2 x i64> shape, <2 x i64> stride, <2 x i64> origin)
+//     store: (<64 x T>, ptr, <2 x i64> shape, <2 x i64> stride, <2 x i64>
+//     origin)
+// Selected at runtime via TRITON_MPS_TARGET_OS_MAJOR (default 16 = 3-vector).
+static unsigned getTargetOSMajor() {
+  if (const char *e = std::getenv("TRITON_MPS_TARGET_OS_MAJOR")) {
+    unsigned v = std::atoi(e);
+    if (v)
+      return v;
+  }
+  return 16; // default = current shipping target (3-vector signature)
+}
+static bool useCanonicalSimdgroupSig() { return getTargetOSMajor() <= 15; }
+
 static LLVMFuncOp getOrInsertIntrinsic(ConversionPatternRewriter &rewriter,
                                        ModuleOp mod, StringRef name,
                                        LLVMFunctionType fnTy) {
@@ -211,8 +240,58 @@ static LLVMFuncOp getOrInsertIntrinsic(ConversionPatternRewriter &rewriter,
     return fn;
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(mod.getBody());
-  return LLVMFuncOp::create(rewriter, mod.getLoc(), name, fnTy,
-                            Linkage::External);
+  auto fn =
+      LLVMFuncOp::create(rewriter, mod.getLoc(), name, fnTy, Linkage::External);
+  // The simdgroup-matrix intrinsics need the same attributes Apple's `xcrun
+  // metal` emits — the macOS 13/14/15 Metal driver rejects the declarations
+  // otherwise ("Compiler encountered an internal error"); macOS 26 is lenient.
+  // The attributes are universal (Apple emits them on all OSes), so safe both.
+  if (name.contains("simdgroup")) {
+    auto *ctx = mod.getContext();
+    auto unit = UnitAttr::get(ctx);
+    bool isLoad = name.contains("_load");
+    bool isStore = name.contains("_store");
+
+    SmallVector<Attribute> pass;
+    auto add = [&](StringRef kw) { pass.push_back(StringAttr::get(ctx, kw)); };
+    add("convergent");
+    add("mustprogress");
+    if (isLoad)
+      add("nofree");
+    add("nounwind");
+    add("willreturn");
+    fn.setPassthroughAttr(ArrayAttr::get(ctx, pass));
+
+    // readonly/writeonly: not valid as function keyword attrs in modern LLVM,
+    // expressed via memory effects instead (semantics identical).
+    if (isLoad || isStore) {
+      auto mr = isStore ? LLVM::ModRefInfo::Mod : LLVM::ModRefInfo::Ref;
+      fn.setMemoryEffectsAttr(
+          LLVM::MemoryEffectsAttr::get(ctx, {mr, mr, mr, mr, mr, mr}));
+    }
+
+    fn.setUnnamedAddr(LLVM::UnnamedAddr::Local);
+
+    // Matrix pointer arg: nocapture readonly (load) / nocapture writeonly
+    // (store). Load ptr is arg 0; store ptr is arg 1.
+    if (isLoad || isStore) {
+      unsigned ptrArg = isStore ? 1u : 0u;
+      unsigned nArgs = fnTy.getNumParams();
+      SmallVector<Attribute> argDicts(nArgs, DictionaryAttr::get(ctx, {}));
+      SmallVector<NamedAttribute> ptrAttrs;
+      ptrAttrs.push_back(NamedAttribute(
+          StringAttr::get(ctx, LLVM::LLVMDialect::getNoCaptureAttrName()),
+          unit));
+      ptrAttrs.push_back(NamedAttribute(
+          StringAttr::get(ctx, isStore
+                                   ? LLVM::LLVMDialect::getWriteOnlyAttrName()
+                                   : LLVM::LLVMDialect::getReadonlyAttrName()),
+          unit));
+      argDicts[ptrArg] = DictionaryAttr::get(ctx, ptrAttrs);
+      fn.setArgAttrsAttr(ArrayAttr::get(ctx, argDicts));
+    }
+  }
+  return fn;
 }
 
 static LLVM::GlobalOp getOrCreateTGGlobal(ConversionPatternRewriter &rewriter,
@@ -390,15 +469,27 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     (void)getOrInsertIntrinsic(rewriter, mod, "air.simdgroup.barrier", barrTy);
 
     auto vec2i64Ty = LLVM::getVectorType(IntegerType::get(ctx, 64), 2);
+    auto i1Ty = IntegerType::get(ctx, 1);
+    bool canonSG = useCanonicalSimdgroupSig();
+    // Build the simdgroup load/store arg-type lists for the selected target
+    // ABI.
+    auto sgLoadArgTys = [&](Type ptrTy) -> SmallVector<Type> {
+      if (canonSG)
+        return {ptrTy, i64Ty, vec2i64Ty, i1Ty};
+      return {ptrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty};
+    };
+    auto sgStoreArgTys = [&](Type matVecTy, Type ptrTy) -> SmallVector<Type> {
+      if (canonSG)
+        return {matVecTy, ptrTy, i64Ty, vec2i64Ty, i1Ty};
+      return {matVecTy, ptrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty};
+    };
     // f32 TG load/store/MMA (always needed for C accumulator)
     auto loadFn = getOrInsertIntrinsic(
         rewriter, mod, "air.simdgroup_matrix_8x8_load.v64f32.p3f32",
-        LLVMFunctionType::get(matTy, {tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty},
-                              false));
+        LLVMFunctionType::get(matTy, sgLoadArgTys(tgPtrTy), false));
     auto storeFn = getOrInsertIntrinsic(
         rewriter, mod, "air.simdgroup_matrix_8x8_store.v64f32.p3f32",
-        LLVMFunctionType::get(
-            voidTy, {matTy, tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty}, false));
+        LLVMFunctionType::get(voidTy, sgStoreArgTys(matTy, tgPtrTy), false));
 
     // Type-specific A/B MMA intrinsics (bf16/f16 use native MMA).
     // For batchSize > 1, fall back to f32 to avoid batch offset mismatch
@@ -410,8 +501,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                      : getMMAIntrinsicInfo(ctx, f32Ty);
     auto abLoadFn = getOrInsertIntrinsic(
         rewriter, mod, abMmaInfo.tgLoadName,
-        LLVMFunctionType::get(abMmaInfo.matVecTy,
-                              {tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty},
+        LLVMFunctionType::get(abMmaInfo.matVecTy, sgLoadArgTys(tgPtrTy),
                               false));
     auto abMmaFn = getOrInsertIntrinsic(
         rewriter, mod, abMmaInfo.mmaName,
@@ -419,6 +509,33 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             matTy, {abMmaInfo.matVecTy, abMmaInfo.matVecTy, matTy}, false));
     // Determine TG element type for A/B scatter.
     Type abTgElemTy = useNativeABType ? aElemTy : f32Ty;
+
+    // simdgroup load/store emitters: pick the canonical (macOS<=15) or the
+    // 3-vector (macOS>=16) argument list at runtime.  shapeDim is the first
+    // lane of the 3-vector shape; pitch is the row pitch (3-vector stride lane1
+    // / canonical elements_per_row).
+    auto emitSGLoad = [&](LLVMFuncOp fn, Value ptr, int64_t shapeDim,
+                          int64_t pitch, Value off) -> Value {
+      SmallVector<Value> args;
+      if (canonSG)
+        args = {ptr, makeI64(rewriter, loc, pitch), off,
+                makeI1False(rewriter, loc)};
+      else
+        args = {ptr, makeI64Vec2(rewriter, loc, shapeDim, 8),
+                makeI64Vec2(rewriter, loc, 1, pitch), off};
+      return LLVM::CallOp::create(rewriter, loc, fn, args).getResult();
+    };
+    auto emitSGStore = [&](LLVMFuncOp fn, Value mat, Value ptr,
+                           int64_t shapeDim, int64_t pitch, Value off) {
+      SmallVector<Value> args;
+      if (canonSG)
+        args = {mat, ptr, makeI64(rewriter, loc, pitch), off,
+                makeI1False(rewriter, loc)};
+      else
+        args = {mat, ptr, makeI64Vec2(rewriter, loc, shapeDim, 8),
+                makeI64Vec2(rewriter, loc, 1, pitch), off};
+      LLVM::CallOp::create(rewriter, loc, fn, args);
+    };
 
     // ── Constants ────────────────────────────────────────────────────
 
@@ -1375,13 +1492,8 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
         for (int64_t tk = 0; tk < tilesK; ++tk) {
           Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
-          Value aStride = makeI64Vec2(rewriter, loc, 1, Kpad);
-          Value aShape = makeI64Vec2(rewriter, loc, Kpad, 8);
           matA_tiles[tm][tk] =
-              LLVM::CallOp::create(
-                  rewriter, loc, abLoadFn,
-                  ValueRange{curPtrTGBatch, aShape, aStride, aOff})
-                  .getResult();
+              emitSGLoad(abLoadFn, curPtrTGBatch, Kpad, Kpad, aOff);
         }
         LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                              ValueRange{fenceTG, execMod});
@@ -1399,15 +1511,10 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                              ValueRange{fenceTG, execMod});
 
-        Value cStride = makeI64Vec2(rewriter, loc, 1, Npad);
-        Value cShape = makeI64Vec2(rewriter, loc, Npad, 8);
         for (int64_t tn = 0; tn < tilesN; ++tn) {
           Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
           matC_tiles[tm][tn] =
-              LLVM::CallOp::create(
-                  rewriter, loc, loadFn,
-                  ValueRange{curPtrTGBatch, cShape, cStride, cOff})
-                  .getResult();
+              emitSGLoad(loadFn, curPtrTGBatch, Npad, Npad, cOff);
         }
         LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                              ValueRange{fenceTG, execMod});
@@ -1453,14 +1560,9 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           }
 
           // MMA on current slot (data ready from previous barrier)
-          Value bStride = makeI64Vec2(rewriter, loc, 1, Npad);
-          Value bShape = makeI64Vec2(rewriter, loc, Npad, 8);
           for (int64_t tn = 0; tn < tilesN; ++tn) {
             Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-            Value matB = LLVM::CallOp::create(
-                             rewriter, loc, abLoadFn,
-                             ValueRange{curSlotPtr, bShape, bStride, bOff})
-                             .getResult();
+            Value matB = emitSGLoad(abLoadFn, curSlotPtr, Npad, Npad, bOff);
 
             for (int64_t tm = 0; tm < tilesM; ++tm) {
               matC_tiles[tm][tn] =
@@ -1498,14 +1600,9 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                                ValueRange{fenceTG, execMod});
 
-          Value bStride = makeI64Vec2(rewriter, loc, 1, Npad);
-          Value bShape = makeI64Vec2(rewriter, loc, Npad, 8);
           for (int64_t tn = 0; tn < tilesN; ++tn) {
             Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-            Value matB = LLVM::CallOp::create(
-                             rewriter, loc, abLoadFn,
-                             ValueRange{curPtrTGBatch, bShape, bStride, bOff})
-                             .getResult();
+            Value matB = emitSGLoad(abLoadFn, curPtrTGBatch, Npad, Npad, bOff);
 
             for (int64_t tm = 0; tm < tilesM; ++tm) {
               matC_tiles[tm][tn] =
@@ -1524,13 +1621,10 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       for (int64_t tm = 0; tm < tilesM; ++tm) {
         int64_t rowStart = tm * 8;
 
-        Value cStoreStride = makeI64Vec2(rewriter, loc, 1, Npad);
-        Value cStoreShape = makeI64Vec2(rewriter, loc, Npad, 8);
         for (int64_t tn = 0; tn < tilesN; ++tn) {
           Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-          LLVM::CallOp::create(rewriter, loc, storeFn,
-                               ValueRange{matC_tiles[tm][tn], curPtrTGBatch,
-                                          cStoreShape, cStoreStride, cOff});
+          emitSGStore(storeFn, matC_tiles[tm][tn], curPtrTGBatch, Npad, Npad,
+                      cOff);
         }
         LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                              ValueRange{fenceTG, execMod});
@@ -1679,22 +1773,33 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     (void)getOrInsertIntrinsic(rewriter, mod, "air.simdgroup.barrier", barrTy);
 
     auto vec2i64Ty = LLVM::getVectorType(IntegerType::get(ctx, 64), 2);
+    auto i1Ty = IntegerType::get(ctx, 1);
+    bool canonSG = useCanonicalSimdgroupSig();
+    // Build the simdgroup load/store arg-type lists for the selected target
+    // ABI.
+    auto sgLoadArgTys = [&](Type ptrTy) -> SmallVector<Type> {
+      if (canonSG)
+        return {ptrTy, i64Ty, vec2i64Ty, i1Ty};
+      return {ptrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty};
+    };
+    auto sgStoreArgTys = [&](Type matVecTy, Type ptrTy) -> SmallVector<Type> {
+      if (canonSG)
+        return {matVecTy, ptrTy, i64Ty, vec2i64Ty, i1Ty};
+      return {matVecTy, ptrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty};
+    };
     // f32 TG load/store (C accumulator always f32)
     auto loadFn = getOrInsertIntrinsic(
         rewriter, mod, "air.simdgroup_matrix_8x8_load.v64f32.p3f32",
-        LLVMFunctionType::get(matTy, {tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty},
-                              false));
+        LLVMFunctionType::get(matTy, sgLoadArgTys(tgPtrTy), false));
     auto storeFn = getOrInsertIntrinsic(
         rewriter, mod, "air.simdgroup_matrix_8x8_store.v64f32.p3f32",
-        LLVMFunctionType::get(
-            voidTy, {matTy, tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty}, false));
+        LLVMFunctionType::get(voidTy, sgStoreArgTys(matTy, tgPtrTy), false));
 
     // Type-specific TG MMA load/multiply for A/B (bf16/f16 use native MMA)
     auto abTgMmaInfo = getMMAIntrinsicInfo(ctx, aType.getElementType());
     auto abTgLoadFn = getOrInsertIntrinsic(
         rewriter, mod, abTgMmaInfo.tgLoadName,
-        LLVMFunctionType::get(abTgMmaInfo.matVecTy,
-                              {tgPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty},
+        LLVMFunctionType::get(abTgMmaInfo.matVecTy, sgLoadArgTys(tgPtrTy),
                               false));
     auto abTgMmaFn = getOrInsertIntrinsic(
         rewriter, mod, abTgMmaInfo.mmaName,
@@ -1706,6 +1811,43 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       abTgScatterTy = Float16Type::get(ctx);
     else if (aType.getElementType().isBF16())
       abTgScatterTy = BFloat16Type::get(ctx);
+
+    // simdgroup TG load/store emitters (compile-time-constant pitch). See the
+    // identically-named helpers in DotOpBlockedConversion for the ABI details.
+    auto emitSGLoad = [&](LLVMFuncOp fn, Value ptr, int64_t shapeDim,
+                          int64_t pitch, Value off) -> Value {
+      SmallVector<Value> args;
+      if (canonSG)
+        args = {ptr, makeI64(rewriter, loc, pitch), off,
+                makeI1False(rewriter, loc)};
+      else
+        args = {ptr, makeI64Vec2(rewriter, loc, shapeDim, 8),
+                makeI64Vec2(rewriter, loc, 1, pitch), off};
+      return LLVM::CallOp::create(rewriter, loc, fn, args).getResult();
+    };
+    auto emitSGStore = [&](LLVMFuncOp fn, Value mat, Value ptr,
+                           int64_t shapeDim, int64_t pitch, Value off) {
+      SmallVector<Value> args;
+      if (canonSG)
+        args = {mat, ptr, makeI64(rewriter, loc, pitch), off,
+                makeI1False(rewriter, loc)};
+      else
+        args = {mat, ptr, makeI64Vec2(rewriter, loc, shapeDim, 8),
+                makeI64Vec2(rewriter, loc, 1, pitch), off};
+      LLVM::CallOp::create(rewriter, loc, fn, args);
+    };
+    // Device simdgroup load emitter: strides are runtime Values. devStride is
+    // the row pitch (canonical elements_per_row), devShape the 3-vector shape.
+    auto emitDevSGLoad = [&](LLVMFuncOp fn, Value ptr, Value devShape,
+                             Value devStride, Value off,
+                             Value transposeFalse) -> Value {
+      SmallVector<Value> args;
+      if (canonSG)
+        args = {ptr, devStride, off, transposeFalse};
+      else
+        args = {ptr, devShape, devStride, off};
+      return LLVM::CallOp::create(rewriter, loc, fn, args).getResult();
+    };
 
     // ── Device memory MMA intrinsics (type-specific) ─────────────────
     // For f16/bf16 data: load returns <64 x half/bfloat>, MMA takes
@@ -1741,8 +1883,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     auto devMatTy = LLVM::getVectorType(devMatElemTy, 64);
     auto devLoadFn = getOrInsertIntrinsic(
         rewriter, mod, devLoadName,
-        LLVMFunctionType::get(
-            devMatTy, {devPtrTy, vec2i64Ty, vec2i64Ty, vec2i64Ty}, false));
+        LLVMFunctionType::get(devMatTy, sgLoadArgTys(devPtrTy), false));
     auto devMmaFn = getOrInsertIntrinsic(
         rewriter, mod, devMmaName,
         LLVMFunctionType::get(matTy, {devMatTy, devMatTy, matTy}, false));
@@ -2156,7 +2297,26 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // stride = <colStride, rowStride>
     // For row-major data: colStride=1, rowStride=numCols
     // For col-major data: colStride=numRows, rowStride=1
+    // Canonical (macOS<=15) device load uses a scalar elements_per_row (the row
+    // stride); the 3-vector form uses the <colStride, rowStride> vector.
     auto makeDevMmaStride = [&](Value colStride, Value rowStride) -> Value {
+      if (canonSG) {
+        // Canonical (macOS<=15) simdgroup load takes a single scalar
+        // elements_per_row pitch plus a transpose bool — it cannot express a
+        // 2D <colStride,rowStride>.  The 3-vector form addresses element (i,j)
+        // as base + i*rowStride + j*colStride.  The canonical form addresses
+        // (i,j) as base + i*pitch + j  (transpose=false) or base + i + j*pitch
+        // (transpose=true).  For a device MMA tile exactly one of the two
+        // strides is unit (the operand is contiguous in one dim):
+        //   row-major  (colStride==1): pitch=rowStride, transpose=false
+        //   col-major  (rowStride==1): pitch=colStride, transpose=true
+        // Pick the non-unit stride as the pitch.  The transpose flag is derived
+        // at the call site from the same comparison.
+        Value rowBig = arith::CmpIOp::create(
+            rewriter, loc, arith::CmpIPredicate::uge, rowStride, colStride);
+        return arith::SelectOp::create(rewriter, loc, rowBig, rowStride,
+                                       colStride);
+      }
       auto ty = LLVM::getVectorType(IntegerType::get(ctx, 64), 2);
       Value vec = UndefOp::create(rewriter, loc, ty);
       Value i0 = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
@@ -2164,6 +2324,16 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       vec = InsertElementOp::create(rewriter, loc, ty, vec, colStride, i0);
       vec = InsertElementOp::create(rewriter, loc, ty, vec, rowStride, i1);
       return vec;
+    };
+    // Canonical transpose flag for a device MMA load: true when the operand is
+    // column-major (rowStride < colStride, i.e. rows are the contiguous dim).
+    // Returns i1 false for the 3-vector path (transpose is folded into the
+    // stride vector there).
+    auto makeDevMmaTranspose = [&](Value colStride, Value rowStride) -> Value {
+      if (!canonSG)
+        return makeI1False(rewriter, loc);
+      return arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
+                                   rowStride, colStride);
     };
 
     // ── Compute runtime thread base position ──────────────────────────
@@ -2408,14 +2578,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                            ValueRange{fenceTG, execMod});
 
-      Value cStride = makeI64Vec2(rewriter, loc, 1, Npad);
-      Value cShape = makeI64Vec2(rewriter, loc, Npad, 8);
       for (int64_t tn = 0; tn < tilesN; ++tn) {
         Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-        matC_tiles[tm][tn] =
-            LLVM::CallOp::create(rewriter, loc, loadFn,
-                                 ValueRange{ptrTG, cShape, cStride, cOff})
-                .getResult();
+        matC_tiles[tm][tn] = emitSGLoad(loadFn, ptrTG, Npad, Npad, cOff);
       }
       LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                            ValueRange{fenceTG, execMod});
@@ -2430,6 +2595,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       Value bDevStride = makeDevMmaStride(bColStride, bRowStride);
       Value mmaShape = makeI64Vec2(rewriter, loc, 8, 8);
       Value zeroOff = makeI64Vec2(rewriter, loc, 0, 0);
+      // Per-operand canonical transpose flag (i1 false for the 3-vector path).
+      Value aDevTranspose = makeDevMmaTranspose(aColStride, aRowStride);
+      Value bDevTranspose = makeDevMmaTranspose(bColStride, bRowStride);
 
       // Prologue: load A tiles for tk=0
       SmallVector<Value> matA_cur(tilesM);
@@ -2437,10 +2605,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         Value aTilePtr =
             computeTileDevPtr(aPtrs, aOffsets, aRowStride, aColStride, aBaseRow,
                               aBaseCol, tm * 8, 0);
-        matA_cur[tm] = LLVM::CallOp::create(
-                           rewriter, loc, devLoadFn,
-                           ValueRange{aTilePtr, mmaShape, aDevStride, zeroOff})
-                           .getResult();
+        matA_cur[tm] = emitDevSGLoad(devLoadFn, aTilePtr, mmaShape, aDevStride,
+                                     zeroOff, aDevTranspose);
       }
 
       for (int64_t tk = 0; tk < tilesK; ++tk) {
@@ -2451,11 +2617,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             Value aTilePtr =
                 computeTileDevPtr(aPtrs, aOffsets, aRowStride, aColStride,
                                   aBaseRow, aBaseCol, tm * 8, (tk + 1) * 8);
-            matA_next[tm] =
-                LLVM::CallOp::create(
-                    rewriter, loc, devLoadFn,
-                    ValueRange{aTilePtr, mmaShape, aDevStride, zeroOff})
-                    .getResult();
+            matA_next[tm] = emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
+                                          aDevStride, zeroOff, aDevTranspose);
           }
         }
 
@@ -2464,10 +2627,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           Value bTilePtr =
               computeTileDevPtr(bPtrs, bOffsets, bRowStride, bColStride,
                                 bBaseRow, bBaseCol, tk * 8, tn * 8);
-          Value matB = LLVM::CallOp::create(
-                           rewriter, loc, devLoadFn,
-                           ValueRange{bTilePtr, mmaShape, bDevStride, zeroOff})
-                           .getResult();
+          Value matB = emitDevSGLoad(devLoadFn, bTilePtr, mmaShape, bDevStride,
+                                     zeroOff, bDevTranspose);
 
           for (int64_t tm = 0; tm < tilesM; ++tm) {
             matC_tiles[tm][tn] =
@@ -2500,12 +2661,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                  ValueRange{fenceTG, execMod});
 
             Value aOff = makeI64Vec2(rewriter, loc, tk * 8, 0);
-            Value aStride = makeI64Vec2(rewriter, loc, 1, Kpad);
-            Value aShape = makeI64Vec2(rewriter, loc, Kpad, 8);
-            matA_strip[tm] =
-                LLVM::CallOp::create(rewriter, loc, abTgLoadFn,
-                                     ValueRange{ptrTG, aShape, aStride, aOff})
-                    .getResult();
+            matA_strip[tm] = emitSGLoad(abTgLoadFn, ptrTG, Kpad, Kpad, aOff);
             LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                                  ValueRange{fenceTG, execMod});
           }
@@ -2519,14 +2675,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                                ValueRange{fenceTG, execMod});
 
-          Value bStride = makeI64Vec2(rewriter, loc, 1, Npad);
-          Value bShape = makeI64Vec2(rewriter, loc, Npad, 8);
           for (int64_t tn = 0; tn < tilesN; ++tn) {
             Value bOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-            Value matB =
-                LLVM::CallOp::create(rewriter, loc, abTgLoadFn,
-                                     ValueRange{ptrTG, bShape, bStride, bOff})
-                    .getResult();
+            Value matB = emitSGLoad(abTgLoadFn, ptrTG, Npad, Npad, bOff);
 
             for (int64_t tm = 0; tm < tilesM; ++tm) {
               matC_tiles[tm][tn] =
@@ -2731,13 +2882,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       for (int64_t tm = 0; tm < tilesM; ++tm) {
         int64_t rowStart = tm * 8;
 
-        Value cStoreStride = makeI64Vec2(rewriter, loc, 1, Npad);
-        Value cStoreShape = makeI64Vec2(rewriter, loc, Npad, 8);
         for (int64_t tn = 0; tn < tilesN; ++tn) {
           Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-          LLVM::CallOp::create(rewriter, loc, storeFn,
-                               ValueRange{matC_tiles[tm][tn], ptrTG,
-                                          cStoreShape, cStoreStride, cOff});
+          emitSGStore(storeFn, matC_tiles[tm][tn], ptrTG, Npad, Npad, cOff);
         }
         LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                              ValueRange{fenceTG, execMod});

@@ -14,6 +14,45 @@ import tempfile
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm
 
+
+def _host_macos_major() -> int:
+    """Target macOS major version for AIR emission.
+
+    Triton JITs on the machine it runs on, so the host macOS version IS the
+    target. Apple changed the simdgroup-MMA intrinsic signature + several AIR
+    version fields across OS versions (verified via `xcrun metal
+    -mmacosx-version-min=N`): the discriminator is the macOS major. macOS 26
+    (the 2025 renumber) maps to the "16" era for AIR purposes.
+
+    Override with TRITON_MPS_TARGET_OS_MAJOR (e.g. for cross-compiling).
+    """
+    env = os.environ.get("TRITON_MPS_TARGET_OS_MAJOR")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    try:
+        import platform
+        major = int(platform.mac_ver()[0].split(".")[0])
+        # Apple renumbered macOS 16 -> 26; both are the same AIR era ("16").
+        major = 16 if major >= 16 else major
+    except Exception:
+        major = 16  # default: current shipping target
+    # Export so the C++ DotOp lowering pass (reads TRITON_MPS_TARGET_OS_MAJOR)
+    # selects the matching simdgroup intrinsic signature.
+    os.environ.setdefault("TRITON_MPS_TARGET_OS_MAJOR", str(major))
+    return major
+
+
+def _air_triple(os_major: int) -> str:
+    """Canonical AIR triple for a target macOS major. subarch _vNN = major+12;
+    macOS 16-era is written as macosx26 (Apple renumber)."""
+    sub = os_major + 12
+    triple_os = 26 if os_major >= 16 else os_major
+    return f"air64_v{sub}-apple-macosx{triple_os}.0.0"
+
+
 # Libdevice patching: see _LibdevicePatchFinder in __init__.py
 _plugin = getattr(passes, 'plugin', None)
 
@@ -128,12 +167,16 @@ def _load_metalir():
             out_path = out_f.name
         try:
             if os.environ.get('TRITON_MPS_DEBUG'):
-                print(f"[mps] llc: {llc} -mtriple=air -filetype=obj")
-            proc = subprocess.run(
-                [llc, '-mtriple=air', '-filetype=obj', '-o', out_path, '-'],
-                input=llvm_ir.encode(),
-                capture_output=True,
-                check=False)
+                print(
+                    f"[mps] llc: {llc} -mtriple={_air_triple(_host_macos_major())} -filetype=obj (os_major={_host_macos_major()})"
+                )
+            proc = subprocess.run([
+                llc, '-mtriple=' + _air_triple(_host_macos_major()),
+                '-filetype=obj', '-o', out_path, '-'
+            ],
+                                  input=llvm_ir.encode(),
+                                  capture_output=True,
+                                  check=False)
             if proc.returncode != 0:
                 raise RuntimeError(
                     f"llc failed: {proc.stderr.decode(errors='replace')}")
@@ -294,6 +337,17 @@ class MPSBackend(BaseBackend):
 
     # ── Stage 3: LLVM IR with simdgroup intrinsics ─────────────────────────
     def make_llir(self, mod, metadata, options):
+        # Resolve the target macOS major *before* running the lowering passes.
+        # The C++ DotOp→AIR pass reads TRITON_MPS_TARGET_OS_MAJOR via getenv to
+        # pick the simdgroup-matrix intrinsic signature (canonical for macOS<=15
+        # vs the 3-vector form for macOS>=16). `_host_macos_major()` exports the
+        # env var as a side effect; it must run here, since make_metallib (which
+        # also calls it, for the llc triple) runs only AFTER this pass — too late
+        # to influence the signature. Without this, macOS 14 was handed the
+        # macOS-16 3-vector MMA intrinsic and the driver crashed PSO creation
+        # ("Compiler encountered an internal error").
+        _host_macos_major()
+
         pm = ir.pass_manager(mod.context)
         _pmaybe_enable_debug(pm)
 

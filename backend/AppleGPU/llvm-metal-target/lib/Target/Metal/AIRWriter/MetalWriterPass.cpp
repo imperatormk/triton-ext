@@ -20,7 +20,11 @@ static void writeMetallibImpl(Module &M, raw_pwrite_stream &OS) {
   // Reconstruct typed-pointer info into a side table (AIR v1 bitcode needs
   // typed pointers; the module itself stays opaque).
   metal::PointeeTypeMap PTM = metal::buildPointeeTypeMap(M);
-  metal::writeMetallib(M, PTM, OS);
+  // The target triple drives the AIR version (VERS air_minor); derive it from
+  // the module's triple, falling back to macOS 16 when none is present.
+  metal::MetallibOptions Opts;
+  Opts.Version = metal::MetalVersion::fromTriple(M.getTargetTriple().str());
+  metal::writeMetallib(M, PTM, OS, Opts);
 }
 
 PreservedAnalyses MetalWriterPass::run(Module &M, ModuleAnalysisManager &AM) {

@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MetalAIRSystemValues.h"
+#include "AIRWriter/MetalVersion.h"
 #include "Metal.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -275,24 +276,48 @@ static bool airSystemValues(Module &M) {
     Changed = true;
   }
 
-  // Version metadata.
+  // Version metadata: air.version = (2, AIRMinor, 0). The minor is driven by
+  // the target macOS major (OSmajor-8), derived from the module triple and
+  // falling back to macOS 16 when absent. Empirically verified against Apple's
+  // `xcrun metal -mmacosx-version-min=N`.
+  auto AIRVer = metal::MetalVersion::fromTriple(M.getTargetTriple().str());
   auto *VerMD = M.getOrInsertNamedMetadata(kNMDVersion);
   if (VerMD->getNumOperands() == 0) {
-    VerMD->addOperand(
-        MDNode::get(Ctx, {ConstantAsMetadata::get(ConstantInt::get(I32, 2)),
-                          ConstantAsMetadata::get(ConstantInt::get(I32, 8)),
-                          ConstantAsMetadata::get(ConstantInt::get(I32, 0))}));
+    VerMD->addOperand(MDNode::get(
+        Ctx, {ConstantAsMetadata::get(
+                  ConstantInt::get(I32, metal::MetalVersion::AIRMajor)),
+              ConstantAsMetadata::get(ConstantInt::get(I32, AIRVer.AIRMinor)),
+              ConstantAsMetadata::get(ConstantInt::get(I32, 0))}));
     Changed = true;
   }
 
-  // Language version metadata.
+  // Language version metadata = ("Metal", MSLMajor, MSLMinor, 0). The MSL
+  // version the target macOS supports: 13->3.0, 14->3.1, 15->3.2, 16->4.0.
+  // An OS rejects a metallib stamped with a newer MSL than it supports, so
+  // this MUST track the target macOS major. Empirically verified against
+  // Apple's `xcrun metal -mmacosx-version-min=N`.
   if (!M.getNamedMetadata(kNMDLanguageVersion)) {
     auto *LangMD = M.getOrInsertNamedMetadata(kNMDLanguageVersion);
-    LangMD->addOperand(
-        MDNode::get(Ctx, {MDString::get(Ctx, "Metal"),
-                          ConstantAsMetadata::get(ConstantInt::get(I32, 3)),
-                          ConstantAsMetadata::get(ConstantInt::get(I32, 2)),
-                          ConstantAsMetadata::get(ConstantInt::get(I32, 0))}));
+    LangMD->addOperand(MDNode::get(
+        Ctx, {MDString::get(Ctx, "Metal"),
+              ConstantAsMetadata::get(ConstantInt::get(I32, AIRVer.MSLMajor)),
+              ConstantAsMetadata::get(ConstantInt::get(I32, AIRVer.MSLMinor)),
+              ConstantAsMetadata::get(ConstantInt::get(I32, 0))}));
+    Changed = true;
+  }
+
+  // air.compile_options — Apple's `xcrun metal` always emits these three
+  // top-level options. The stricter macOS 13/14/15 Metal driver rejects AIR
+  // that lacks them ("Compiler encountered an internal error"); macOS 26 is
+  // lenient. Empirically required for the older-OS path.
+  if (!M.getNamedMetadata("air.compile_options")) {
+    auto *OptsMD = M.getOrInsertNamedMetadata("air.compile_options");
+    OptsMD->addOperand(
+        MDNode::get(Ctx, {MDString::get(Ctx, "air.compile.denorms_disable")}));
+    OptsMD->addOperand(
+        MDNode::get(Ctx, {MDString::get(Ctx, "air.compile.fast_math_enable")}));
+    OptsMD->addOperand(MDNode::get(
+        Ctx, {MDString::get(Ctx, "air.compile.framebuffer_fetch_enable")}));
     Changed = true;
   }
 

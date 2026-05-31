@@ -14,6 +14,31 @@ import tempfile
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm
 
+
+def _host_macos_major() -> int:
+    """Target macOS major for AIR emission (Triton JITs on the run host).
+    macOS 26 (2025 renumber) maps to the AIR "16" era. Override via
+    TRITON_MPS_TARGET_OS_MAJOR for cross-compiling."""
+    env = os.environ.get("TRITON_MPS_TARGET_OS_MAJOR")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    try:
+        import platform
+        major = int(platform.mac_ver()[0].split(".")[0])
+        return 16 if major >= 16 else major
+    except Exception:
+        return 16
+
+
+def _air_triple(os_major: int) -> str:
+    """AIR triple for a target macOS major: subarch _vNN = major+12; the
+    macOS-16 era is written macosx26 (Apple renumber)."""
+    return f"air64_v{os_major + 12}-apple-macosx{26 if os_major >= 16 else os_major}.0.0"
+
+
 # Libdevice patching: see _LibdevicePatchFinder in __init__.py
 _plugin = getattr(passes, 'plugin', None)
 
@@ -128,12 +153,16 @@ def _load_metalir():
             out_path = out_f.name
         try:
             if os.environ.get('TRITON_MPS_DEBUG'):
-                print(f"[mps] llc: {llc} -mtriple=air -filetype=obj")
-            proc = subprocess.run(
-                [llc, '-mtriple=air', '-filetype=obj', '-o', out_path, '-'],
-                input=llvm_ir.encode(),
-                capture_output=True,
-                check=False)
+                print(
+                    f"[mps] llc: {llc} -mtriple={_air_triple(_host_macos_major())} -filetype=obj"
+                )
+            proc = subprocess.run([
+                llc, '-mtriple=' + _air_triple(_host_macos_major()),
+                '-filetype=obj', '-o', out_path, '-'
+            ],
+                                  input=llvm_ir.encode(),
+                                  capture_output=True,
+                                  check=False)
             if proc.returncode != 0:
                 raise RuntimeError(
                     f"llc failed: {proc.stderr.decode(errors='replace')}")

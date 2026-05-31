@@ -16,7 +16,9 @@
 #include "BitcodeEncoding.h"
 #include "MetadataWriter.h"
 #include "MetalConstraints.h"
+#include "MetalVersion.h"
 #include "ValueEnumerator.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Bitcode/LLVMBitCodes.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
 #include "llvm/IR/Attributes.h"
@@ -493,6 +495,37 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
   DenseMap<const Function *, unsigned> FnAttrListID;
   SmallVector<SmallVector<unsigned, 4>, 8> AttrLists;
 
+  // Synthesize attribute groups on the simdgroup-matrix intrinsic declarations
+  // to match Apple's `xcrun metal` AIR — the macOS 13/14/15 Metal driver
+  // rejects the metallib otherwise. The groups must be encoded with bitcode
+  // ATTR_KIND_* values, which do NOT match LLVM's in-memory Attribute::AttrKind
+  // enum (e.g. convergent is 6 in-memory but 43 in bitcode).
+  enum : uint64_t {
+    BK_NO_CAPTURE = 11,
+    BK_NO_UNWIND = 18,
+    BK_READ_ONLY = 21,
+    BK_CONVERGENT = 43,
+    BK_WRITEONLY = 52,
+    BK_WILLRETURN = 61,
+    BK_NOFREE = 62,
+    BK_MUSTPROGRESS = 70,
+  };
+  // A synthesized group: target index (~0u=function, N=param N) + bitcode
+  // enum attr-kinds.
+  struct SynthGroup {
+    uint64_t Index; // ~0u for function attrs, param index (1-based) otherwise
+    SmallVector<uint64_t, 6> EnumKinds;
+  };
+  // Pending synthesized groups, in emission order, with their assigned IDs.
+  SmallVector<std::pair<unsigned, SynthGroup>, 8> SynthGroups;
+  // Functions that should be marked local_unnamed_addr in their record.
+  DenseSet<const Function *> LocalUnnamedFns;
+  auto addSynthGroup = [&](SynthGroup G) -> unsigned {
+    unsigned ID = GroupID.size() + 1 + SynthGroups.size();
+    SynthGroups.push_back({ID, std::move(G)});
+    return ID;
+  };
+
   bool HasMMALoad = false;
   for (auto &F : M) {
     if (F.getName().starts_with("air.simdgroup_matrix_8x8_load")) {
@@ -529,7 +562,51 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
     FnAttrListID[&F] = ListID;
   }
 
-  if (!GroupID.empty()) {
+  // Now synthesize declaration attribute groups for the simdgroup intrinsics.
+  for (auto &F : M) {
+    if (!F.isDeclaration())
+      continue;
+    StringRef Name = F.getName();
+    if (!Name.starts_with("air.simdgroup_matrix_8x8_"))
+      continue;
+    bool IsLoad = Name.contains("_load");
+    bool IsStore = Name.contains("_store");
+
+    // Function-attr group (matches Apple). Order matches Apple's textual AIR.
+    SynthGroup FnG;
+    FnG.Index = ~0u;
+    FnG.EnumKinds.push_back(BK_CONVERGENT);
+    FnG.EnumKinds.push_back(BK_MUSTPROGRESS);
+    if (IsLoad)
+      FnG.EnumKinds.push_back(BK_NOFREE);
+    FnG.EnumKinds.push_back(BK_NO_UNWIND);
+    if (IsLoad)
+      FnG.EnumKinds.push_back(BK_READ_ONLY);
+    FnG.EnumKinds.push_back(BK_WILLRETURN);
+    if (IsStore)
+      FnG.EnumKinds.push_back(BK_WRITEONLY);
+    unsigned FnGID = addSynthGroup(std::move(FnG));
+
+    SmallVector<unsigned, 4> GroupIDs;
+    GroupIDs.push_back(FnGID);
+
+    // Pointer-arg group: load ptr is arg 0, store ptr is arg 1
+    // (`nocapture readonly` / `nocapture writeonly`).
+    if (IsLoad || IsStore) {
+      SynthGroup PG;
+      PG.Index = IsStore ? 2u : 1u; // 1-based param index
+      PG.EnumKinds.push_back(BK_NO_CAPTURE);
+      PG.EnumKinds.push_back(IsStore ? BK_WRITEONLY : BK_READ_ONLY);
+      GroupIDs.push_back(addSynthGroup(std::move(PG)));
+    }
+
+    unsigned ListID = AttrLists.size() + 1;
+    AttrLists.push_back(std::move(GroupIDs));
+    FnAttrListID[&F] = ListID;
+    LocalUnnamedFns.insert(&F);
+  }
+
+  if (!GroupID.empty() || !SynthGroups.empty()) {
     W.EnterSubblock(bitc::PARAMATTR_GROUP_BLOCK_ID, 4);
     for (auto &K : GroupOrder) {
       unsigned ID = GroupID.lookup(K);
@@ -574,6 +651,19 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
       }
       W.EmitRecord(bitc::PARAMATTR_GRP_CODE_ENTRY, Grp);
     }
+    // Synthesized declaration groups (simdgroup-matrix intrinsics). Each entry
+    // is (ID, Index, [0, kind]...) — every attr here is a plain bitcode enum
+    // (record-code 0), with the bitcode ATTR_KIND_* values set above.
+    for (auto &IDG : SynthGroups) {
+      SmallVector<uint64_t, 16> Grp;
+      Grp.push_back(IDG.first);        // group ID
+      Grp.push_back(IDG.second.Index); // ~0u = function, else param index
+      for (uint64_t Kind : IDG.second.EnumKinds) {
+        Grp.push_back(0); // 0 = well-known enum attribute (no value)
+        Grp.push_back(Kind);
+      }
+      W.EmitRecord(bitc::PARAMATTR_GRP_CODE_ENTRY, Grp);
+    }
     W.ExitBlock();
 
     W.EnterSubblock(bitc::PARAMATTR_BLOCK_ID, 4);
@@ -598,7 +688,9 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
   {
     std::string T = M.getTargetTriple().str();
     if (T.empty() || T == "air")
-      T = "air64_v28-apple-macosx26.0.0";
+      // Derive the canonical AIR triple from whatever OS info is present
+      // (falls back to macOS 16 / 26-era), rather than hardcoding it.
+      T = MetalVersion::fromTriple(M.getTargetTriple().str()).tripleString();
     emitString(W, bitc::MODULE_CODE_TRIPLE, T);
   }
   // Emit data layout - Metal GPU JIT uses this for type size/alignment.
@@ -654,7 +746,16 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
         ListID = It->second + (HasMMALoad ? 1 : 0);
       Ops.push_back(ListID);
       Ops.push_back(0); // align
-      for (int J = 0; J < 10; J++)
+      // Function record fields 6..15: section, visibility, gc, unnamed_addr,
+      // prologuedata, dllstorageclass, comdat, prefixdata, personalityfn, ...
+      // Field 9 is unnamed_addr. Bitcode encoding (getEncodedUnnamedAddr):
+      // None=0, Global=1, Local=2. Apple's simdgroup intrinsic decls are
+      // `local_unnamed_addr` (=2); the macOS-14 driver expects this to match.
+      Ops.push_back(0);                                      // 6: section
+      Ops.push_back(0);                                      // 7: visibility
+      Ops.push_back(0);                                      // 8: gc
+      Ops.push_back(LocalUnnamedFns.contains(Fn) ? 2u : 0u); // 9: unnamed_addr
+      for (int J = 10; J < 16; J++)
         Ops.push_back(0);
       Ops.push_back(Fn->getAddressSpace());
       W.EmitRecord(bitc::MODULE_CODE_FUNCTION, Ops);

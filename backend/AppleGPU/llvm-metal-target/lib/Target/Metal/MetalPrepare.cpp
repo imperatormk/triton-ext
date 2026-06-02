@@ -1093,16 +1093,209 @@ static bool rewriteTGGlobalGEPs(Module &M) {
 static bool normalizeI1Pointers(Module &M) {
   bool Changed = false;
   Type *I8 = Type::getInt8Ty(M.getContext());
+
+  // AIR has no 1-bit memory type; load/store i1 (e.g. mask values staged
+  // through threadgroup memory) fails Metal PSO creation. Legalize i1 in memory
+  // to i8: globals, GEP element types, and the load/store value types.
+
+  // Retype `[N x i1]`/`i1` globals to i8 (collect first; erasing while
+  // iterating M.globals() is invalid).
+  SmallVector<GlobalVariable *, 4> I1Globals;
+  for (GlobalVariable &GV : M.globals()) {
+    Type *VT = GV.getValueType();
+    if (VT->isIntegerTy(1))
+      I1Globals.push_back(&GV);
+    else if (auto *AT = dyn_cast<ArrayType>(VT))
+      if (AT->getElementType()->isIntegerTy(1))
+        I1Globals.push_back(&GV);
+  }
+  for (GlobalVariable *GV : I1Globals) {
+    Type *VT = GV->getValueType();
+    Type *NewVT =
+        VT->isIntegerTy(1)
+            ? I8
+            : ArrayType::get(I8, cast<ArrayType>(VT)->getNumElements());
+    auto *NewGV = new GlobalVariable(
+        M, NewVT, GV->isConstant(), GV->getLinkage(),
+        GV->hasInitializer() ? UndefValue::get(NewVT) : nullptr, "", GV,
+        GV->getThreadLocalMode(), GV->getAddressSpace());
+    NewGV->setAlignment(GV->getAlign().valueOrOne());
+    NewGV->takeName(GV);
+    GV->replaceAllUsesWith(NewGV);
+    GV->eraseFromParent();
+    Changed = true;
+  }
+
   for (Function &F : M)
     for (BasicBlock &BB : F)
-      for (Instruction &I : BB) {
-        auto *GEP = dyn_cast<GetElementPtrInst>(&I);
-        if (!GEP || !GEP->getSourceElementType()->isIntegerTy(1))
+      for (Instruction &I : llvm::make_early_inc_range(BB)) {
+        // GEP i1 element -> i8. Includes array-of-i1 source types (the
+        // `__base_` preamble GEP synthesized off a `[N x i1]` global), which
+        // otherwise reach the writer as an unmaterializable i1 array type.
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+          Type *SrcTy = GEP->getSourceElementType();
+          if (SrcTy->isIntegerTy(1)) {
+            GEP->setSourceElementType(I8);
+            GEP->setResultElementType(I8);
+            Changed = true;
+          } else if (auto *AT = dyn_cast<ArrayType>(SrcTy);
+                     AT && AT->getElementType()->isIntegerTy(1)) {
+            auto *NewAT = ArrayType::get(I8, AT->getNumElements());
+            GEP->setSourceElementType(NewAT);
+            if (GEP->getResultElementType() == AT)
+              GEP->setResultElementType(NewAT);
+            else if (GEP->getResultElementType()->isIntegerTy(1))
+              GEP->setResultElementType(I8);
+            Changed = true;
+          }
           continue;
-        GEP->setSourceElementType(I8);
-        GEP->setResultElementType(I8);
-        Changed = true;
+        }
+        // store i1 -> store i8 (zext).
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          Value *V = SI->getValueOperand();
+          if (V->getType()->isIntegerTy(1)) {
+            IRBuilder<> B(SI);
+            SI->setOperand(0, B.CreateZExt(V, I8));
+            Changed = true;
+          }
+          continue;
+        }
+        // load i1 -> trunc(load i8).
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          if (LI->getType()->isIntegerTy(1)) {
+            IRBuilder<> B(LI);
+            auto *L8 = B.CreateLoad(I8, LI->getPointerOperand());
+            L8->setAlignment(LI->getAlign());
+            Value *Tr = B.CreateTrunc(L8, LI->getType());
+            LI->replaceAllUsesWith(Tr);
+            LI->eraseFromParent();
+            Changed = true;
+          }
+          continue;
+        }
       }
+  return Changed;
+}
+
+// ── Struct-phi decomposition ────────────────────────────────────────────────
+//
+// The Metal GPU JIT cannot materialize struct-typed phi nodes (Triton wraps
+// loop-carried values in singleton structs for runtime-bound loops, producing
+// `phi { ptr }` etc.). Split each struct phi into one scalar phi per element,
+// tracing the insertvalue chain for each incoming value and rewriting the
+// extractvalue users. Runs BEFORE ptrPhiToI64 so the exposed bare ptr phis get
+// the i64 treatment.
+
+/// Trace an insertvalue chain to find the scalar value for element `idx`.
+/// Returns nullptr if it cannot be resolved statically.
+static Value *traceInsertValueElement(Value *V, unsigned Idx) {
+  while (auto *IV = dyn_cast<InsertValueInst>(V)) {
+    if (IV->getNumIndices() == 1 && IV->getIndices()[0] == Idx)
+      return IV->getInsertedValueOperand();
+    V = IV->getAggregateOperand();
+  }
+  if (isa<UndefValue>(V))
+    return UndefValue::get(cast<StructType>(V->getType())->getElementType(Idx));
+  if (isa<ConstantAggregateZero>(V))
+    return Constant::getNullValue(
+        cast<StructType>(V->getType())->getElementType(Idx));
+  if (auto *C = dyn_cast<Constant>(V))
+    if (auto *ST = dyn_cast<StructType>(V->getType()))
+      if (Idx < ST->getNumElements())
+        return C->getAggregateElement(Idx);
+  return nullptr;
+}
+
+static bool decomposeStructPhis(Module &M,
+                                SmallPtrSetImpl<Function *> &Decomposed) {
+  bool Changed = false;
+
+  for (Function &F : M) {
+    // Collect struct phis (can't modify while iterating).
+    SmallVector<PHINode *, 8> StructPhis;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *PN = dyn_cast<PHINode>(&I))
+          if (isa<StructType>(PN->getType()))
+            StructPhis.push_back(PN);
+
+    if (StructPhis.empty())
+      continue;
+
+    Decomposed.insert(&F);
+
+    for (PHINode *PN : StructPhis) {
+      auto *ST = cast<StructType>(PN->getType());
+      unsigned NumElems = ST->getNumElements();
+      IRBuilder<> B(PN);
+
+      // Create one scalar phi per struct element.
+      SmallVector<PHINode *, 4> ScalarPhis;
+      for (unsigned i = 0; i < NumElems; i++)
+        ScalarPhis.push_back(B.CreatePHI(ST->getElementType(i),
+                                         PN->getNumIncomingValues(),
+                                         PN->getName() + "_" + Twine(i)));
+
+      // Populate scalar phi incoming values.
+      for (unsigned Inc = 0; Inc < PN->getNumIncomingValues(); Inc++) {
+        Value *InVal = PN->getIncomingValue(Inc);
+        BasicBlock *InBB = PN->getIncomingBlock(Inc);
+
+        for (unsigned i = 0; i < NumElems; i++) {
+          Value *Elem = traceInsertValueElement(InVal, i);
+          if (!Elem) {
+            // Fallback: materialize an extractvalue in the predecessor,
+            // before its terminator.
+            IRBuilder<> PredB(InBB->getTerminator());
+            Elem = PredB.CreateExtractValue(
+                InVal, i, InVal->getName() + "_ext" + Twine(i));
+          }
+          ScalarPhis[i]->addIncoming(Elem, InBB);
+        }
+      }
+
+      // Replace extractvalue users with the matching scalar phi.
+      SmallVector<Instruction *, 8> ToRemove;
+      for (User *U : PN->users())
+        if (auto *EV = dyn_cast<ExtractValueInst>(U))
+          if (EV->getNumIndices() == 1) {
+            unsigned Idx = EV->getIndices()[0];
+            if (Idx < NumElems) {
+              EV->replaceAllUsesWith(ScalarPhis[Idx]);
+              ToRemove.push_back(EV);
+            }
+          }
+      for (Instruction *I : ToRemove)
+        I->eraseFromParent();
+
+      // Any remaining uses: rebuild the struct from the scalar phis.
+      if (!PN->use_empty()) {
+        IRBuilder<> AfterB(&*PN->getParent()->getFirstNonPHIIt());
+        Value *Agg = UndefValue::get(ST);
+        for (unsigned i = 0; i < NumElems; i++)
+          Agg = AfterB.CreateInsertValue(Agg, ScalarPhis[i], i,
+                                         PN->getName() + "_rebuild");
+        PN->replaceAllUsesWith(Agg);
+      }
+
+      PN->eraseFromParent();
+      Changed = true;
+    }
+
+    // Clean up dead insertvalue chains left behind.
+    bool CleanedUp = true;
+    while (CleanedUp) {
+      CleanedUp = false;
+      for (BasicBlock &BB : F)
+        for (Instruction &I : llvm::make_early_inc_range(BB))
+          if (auto *IV = dyn_cast<InsertValueInst>(&I))
+            if (IV->use_empty()) {
+              IV->eraseFromParent();
+              CleanedUp = true;
+            }
+    }
+  }
+
   return Changed;
 }
 
@@ -1146,11 +1339,18 @@ static void convertPtrPhiToI64(PHINode *PN, Type *I64) {
   PN->eraseFromParent();
 }
 
-static bool ptrPhiToI64(Module &M) {
+static bool ptrPhiToI64(Module &M,
+                        const SmallPtrSetImpl<Function *> &ForceConvert) {
   bool Changed = false;
   Type *I64 = Type::getInt64Ty(M.getContext());
 
   for (Function &F : M) {
+    // Functions whose struct phis were just decomposed expose loop-carried
+    // bare ptr phis. The Metal GPU JIT cannot materialize those either (they
+    // were previously hidden inside the struct wrapper), so force-convert
+    // every ptr phi in such functions to i64.
+    bool ForceAll = ForceConvert.contains(&F);
+
     bool FunctionHasUndefPtrPhi = false;
     for (BasicBlock &BB : F)
       for (Instruction &I : BB)
@@ -1167,7 +1367,7 @@ static bool ptrPhiToI64(Module &M) {
           if (PN->getType()->isPointerTy())
             PtrPhis.push_back(PN);
 
-      if (PtrPhis.size() <= PtrPhiLimit && !FunctionHasUndefPtrPhi)
+      if (!ForceAll && PtrPhis.size() <= PtrPhiLimit && !FunctionHasUndefPtrPhi)
         continue;
 
       for (PHINode *PN : PtrPhis) {
@@ -1238,9 +1438,14 @@ static bool metalPrepare(Module &M) {
   // globals and rewrites their byte-offset GEPs, which produces patterns the
   // later three stages (i1 normalization, ptr-phi-to-i64, atomic-intrinsic
   // typed-pointer transition) may need to normalize.
+  // Decompose struct-typed phi nodes FIRST: the Metal GPU JIT cannot
+  // materialize them, and decomposing exposes bare ptr phis that the later
+  // ptrPhiToI64 / i1 / TG-GEP stages must still normalize.
+  SmallPtrSet<Function *, 4> DecomposedFns;
+  Changed |= decomposeStructPhis(M, DecomposedFns);
   Changed |= rewriteTGGlobalGEPs(M);
   Changed |= normalizeI1Pointers(M);
-  Changed |= ptrPhiToI64(M);
+  Changed |= ptrPhiToI64(M, DecomposedFns);
   Changed |= atomicTypedPointerFixup(M);
   return Changed;
 }

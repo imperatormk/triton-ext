@@ -628,6 +628,15 @@ static bool retypeByteGlobals(Module &M) {
 
   for (auto *GV : ByteGlobals) {
     expandConstantExprUsers(GV);
+    // A threadgroup byte-global with no remaining users is dead: some autotune
+    // configs declare @global_smem but never touch it. Left in place it stays
+    // an untyped [N x i8] addrspace(3) global, which metal-objdump rejects as a
+    // truncated module. Erase it instead.
+    if (GV->use_empty()) {
+      GV->eraseFromParent();
+      Changed = true;
+      continue;
+    }
     Type *StoreTy = inferElementType(GV);
     if (!StoreTy)
       continue;

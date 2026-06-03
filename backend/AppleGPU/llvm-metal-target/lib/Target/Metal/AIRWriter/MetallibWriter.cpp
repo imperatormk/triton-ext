@@ -58,22 +58,37 @@ static void writeENDT(raw_ostream &OS) { OS.write("ENDT", 4); }
 // It emits typed pointers using the PointeeTypeMap.
 
 static std::vector<uint8_t> wrapBitcode(const std::vector<uint8_t> &BC) {
+  // The wrapped section is [20-byte wrapper header][bitcode][8 zero bytes].
+  // The wrapper's size field is the TRUE bitcode length: metal-objdump reads
+  // exactly that many bytes as the bitstream, so it must equal a complete,
+  // word-aligned bitstream (see emitMetalBitcode, which now flushes its final
+  // 32-bit word). A short or misaligned size makes the reader over-read and
+  // report "truncated module". Apple's `xcrun metallib` reports the unpadded
+  // bitcode size here too. Every derived size (section size, MDSZ, total file
+  // size, hash) flows from WrappedBC.size(), so reporting it here keeps them
+  // all self-consistent.
+  uint32_t Size = BC.size();
   std::string Buf;
   raw_string_ostream RSO(Buf);
-  writeU32(RSO, 0x0B17C0DE); // wrapper magic
-  writeU32(RSO, 0);          // version
-  writeU32(RSO, 20);         // offset to bitcode
-  writeU32(RSO, BC.size());  // bitcode size
-  writeU32(RSO, 0xFFFFFFFF); // CPU type
+  writeU32(RSO, 0x0B17C0DE);  // wrapper magic
+  writeU32(RSO, 0);           // version
+  writeU32(RSO, 20);          // offset to bitcode
+  writeU32(RSO, Size);        // bitcode size (true, word-aligned length)
+  writeU32(RSO, 0xFFFFFFFF);  // CPU type
   RSO.write(reinterpret_cast<const char *>(BC.data()), BC.size());
-  // Apple's `xcrun metallib` always appends 8 zero bytes after the wrapped
-  // bitcode in this section. Metal's module loader reads expecting that
-  // trailing region; without it the load reports "truncated module" and
-  // silently degrades to a binding path that ignores setBuffer:offset: (so
-  // tensor storage_offset is dropped). Every derived size (section size, MDSZ,
-  // total file size, hash) flows from WrappedBC.size(), so adding it here keeps
-  // them all self-consistent.
-  RSO.write("\0\0\0\0\0\0\0\0", 8);
+  // Append trailing zero bytes so the whole wrapped section spans a multiple
+  // of 16. metal-objdump's bitcode reader needs read-ahead slack past the
+  // declared bitstream end and reports "truncated module" unless the section
+  // (20-byte wrapper + bitcode + trailing) is 16-aligned; verified by sweeping
+  // many sizes against `xcrun metal-objdump`. The slack is trailing zeros, not
+  // counted in the wrapper size field, so the embedded module is unchanged. Use
+  // a full 16-byte block when already aligned so there is always nonzero slack.
+  size_t SectionSoFar = 20u + BC.size();
+  size_t Pad = (16u - (SectionSoFar % 16u)) % 16u;
+  if (Pad == 0)
+    Pad = 16;
+  for (size_t I = 0; I < Pad; ++I)
+    RSO.write('\0');
   RSO.flush();
   return std::vector<uint8_t>(Buf.begin(), Buf.end());
 }

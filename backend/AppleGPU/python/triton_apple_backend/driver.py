@@ -118,9 +118,19 @@ class MPSUtils:
         try:
             module = self._metal.load_metallib(bytes(metallib_bytes))
             function = module.get_function(name)
-            # Report 1024 to Triton so it doesn't reject configs early.
-            # Actual capping happens at dispatch via PSO's max_total_threads.
-            return module, function, 0, 0, 1024
+            # Report the PSO's real maxTotalThreadsPerThreadgroup as n_max_threads.
+            # Triton (compiler.py) rejects configs where num_warps*warp_size
+            # exceeds this via OutOfResources, letting the autotuner drop them.
+            # This MUST be accurate: a kernel using cross-warp threadgroup memory
+            # (e.g. a multi-warp scan/reduction) is only correct when ALL its
+            # warps launch. If register pressure caps the PSO below the required
+            # thread count, silently launching fewer threads leaves some warps'
+            # threadgroup-memory slots unwritten -> uninitialized reads -> racy,
+            # nondeterministic results. Reporting the true max forces such a
+            # config to be discarded instead of producing wrong answers.
+            max_threads = getattr(function,
+                                  'max_total_threads_per_threadgroup', 1024)
+            return module, function, 0, 0, max_threads
         except RuntimeError as e:
             msg = str(e)
             m = _re.search(
@@ -245,10 +255,21 @@ class MPSLauncher:
     def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata,
                  launch_metadata, launch_enter_hook, launch_exit_hook, *args):
 
-        # Cap threadgroup size to PSO's max (varies per kernel based on register pressure)
+        # The kernel requires exactly num_warps*warp_size threads; with fewer,
+        # cross-warp threadgroup-memory cooperation breaks (unwritten smem slots
+        # -> uninitialized reads -> nondeterministic results). load_binary
+        # reports the PSO's real maxTotalThreadsPerThreadgroup so triton drops
+        # any config that needs more threads than the PSO supports. If we ever
+        # reach dispatch with a deficit, fail loudly instead of silently capping
+        # and returning wrong answers.
         max_threads = getattr(function, 'max_total_threads_per_threadgroup',
                               1024)
-        self.lx = min(self._requested_threads, max_threads)
+        if self._requested_threads > max_threads:
+            raise RuntimeError(
+                f"kernel needs {self._requested_threads} threads/threadgroup "
+                f"but PSO supports only {max_threads}; this config should have "
+                f"been rejected at load_binary (OutOfResources)")
+        self.lx = self._requested_threads
 
         if launch_enter_hook:
             launch_enter_hook(launch_metadata)

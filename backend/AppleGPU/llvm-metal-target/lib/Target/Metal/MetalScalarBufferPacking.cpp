@@ -189,6 +189,13 @@ static bool scalarBufferPacking(Module &M) {
           if (LoadTy) {
             ScalarParams.push_back({i, LoadTy, true, false});
           } else {
+            // No load to infer the width from. The Apple lowering emits scalar
+            // arg loads as volatile precisely so this branch is not reached for
+            // ordinary scalar params: a mis-sized slot would shift every
+            // following scalar's byte offset and desync from the Python
+            // driver's _compute_scalar_layout. This path now only covers
+            // genuinely load-free descriptor groups, sized by
+            // DescriptorTypeForParam.
             Type *DeadTy = Type::getInt32Ty(M.getContext());
             auto It = DescriptorTypeForParam.find(i);
             if (It != DescriptorTypeForParam.end())

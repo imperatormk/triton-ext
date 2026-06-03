@@ -15,6 +15,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -26,6 +27,9 @@
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/SCCPSolver.h"
 #include <cstdlib>
 #include <functional>
 
@@ -1487,6 +1491,62 @@ static bool normalizeI1Pointers(Module &M) {
   return Changed;
 }
 
+// ── Conditional constant folding ────────────────────────────────────────────
+//
+// Triton emits loop-carried integer recurrences (loop counters, modulo
+// double-buffer selectors) and the predicates/threadgroup-buffer indices
+// derived from them in a form that is range- or constant-determinable only by
+// sparse conditional constant propagation. Local simplification (InstSimplify,
+// EarlyCSE, GVN) leaves them as live SSA values. Metal's PSO compiler crashes
+// (XPC_ERROR_CONNECTION_INTERRUPTED) on some of those residual patterns. Run
+// SCCP's solver and replace every integer value it proves constant; this is
+// what InstCombine/SCCP/CorrelatedValuePropagation each independently do to
+// remove the crash. CFG is left untouched (no block/edge removal) so the rest
+// of the AIR pipeline sees the same control flow.
+static bool foldConditionalConstants(Module &M) {
+  bool Changed = false;
+  TargetLibraryInfoImpl TLIImpl(Triple(M.getTargetTriple()));
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    SCCPSolver Solver(
+        M.getDataLayout(),
+        [&](Function &Fn) -> const TargetLibraryInfo & {
+          static TargetLibraryInfo TLI(TLIImpl, &Fn);
+          return TLI;
+        },
+        M.getContext());
+
+    Solver.markBlockExecutable(&F.front());
+    for (Argument &A : F.args())
+      Solver.trackValueOfArgument(&A);
+
+    bool ResolvedUndefs = true;
+    while (ResolvedUndefs) {
+      Solver.solve();
+      ResolvedUndefs = Solver.resolvedUndefsIn(F);
+    }
+
+    for (BasicBlock &BB : F) {
+      if (!Solver.isBlockExecutable(&BB))
+        continue;
+      for (Instruction &I : llvm::make_early_inc_range(BB)) {
+        if (!I.getType()->isIntegerTy() || I.use_empty())
+          continue;
+        Constant *C = Solver.getConstantOrNull(&I);
+        if (!C)
+          continue;
+        I.replaceAllUsesWith(C);
+        if (isInstructionTriviallyDead(&I))
+          I.eraseFromParent();
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
 // ── Struct-phi decomposition ────────────────────────────────────────────────
 //
 // The Metal GPU JIT cannot materialize struct-typed phi nodes (Triton wraps
@@ -1744,14 +1804,14 @@ static bool atomicTypedPointerFixup(Module &M) {
 
 static bool metalPrepare(Module &M) {
   bool Changed = false;
-  // Run TG-global retype/GEP rewrite FIRST: it retypes threadgroup [N x i8]
-  // globals and rewrites their byte-offset GEPs, which produces patterns the
-  // later three stages (i1 normalization, ptr-phi-to-i64, atomic-intrinsic
-  // typed-pointer transition) may need to normalize.
-  // Decompose struct-typed phi nodes FIRST: the Metal GPU JIT cannot
-  // materialize them, and decomposing exposes bare ptr phis that the later
-  // ptrPhiToI64 / i1 / TG-GEP stages must still normalize.
+  // Fold conditionally-constant integer recurrences FIRST: Metal's PSO compiler
+  // crashes on the unfolded loop-carried counters/selectors and the predicates
+  // and threadgroup-buffer indices derived from them.
+  // Then decompose struct-typed phi nodes: the Metal GPU JIT cannot materialize
+  // them, and decomposing exposes bare ptr phis that the later ptrPhiToI64 /
+  // i1 / TG-GEP stages must still normalize.
   SmallPtrSet<Function *, 4> DecomposedFns;
+  Changed |= foldConditionalConstants(M);
   Changed |= decomposeStructPhis(M, DecomposedFns);
   Changed |= rewriteTGGlobalGEPs(M);
   Changed |= normalizeI1Pointers(M);

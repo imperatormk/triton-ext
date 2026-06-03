@@ -181,6 +181,16 @@ static void fixGEPTypeMismatches(Module &M, PointeeTypeMap &PTM) {
           unsigned AS = GEP->getPointerAddressSpace();
           if (AS != metal::AS::Device && AS != metal::AS::Threadgroup)
             continue;
+          // Don't float-ify a GEP whose pointer is a genuine integer buffer
+          // (e.g. the i32 output of an int8 dot, whose f32 accumulator is
+          // fptosi'd to i32). The collapse-to-float assumption holds only for
+          // buffers fed to float MMA intrinsics; rewriting an i32 buffer's GEP
+          // source to float leaves its pointee i32 → "Explicit gep type does
+          // not match pointee type" → materializeAll failure.
+          if (Type *Pointee = PTM.get(GEP->getPointerOperand()))
+            if (Pointee->isIntegerTy() &&
+                Pointee == GEP->getSourceElementType())
+              continue;
           ToFix.push_back(GEP);
         }
 

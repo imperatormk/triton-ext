@@ -1503,6 +1503,33 @@ static bool normalizeI1Pointers(Module &M) {
 // what InstCombine/SCCP/CorrelatedValuePropagation each independently do to
 // remove the crash. CFG is left untouched (no block/edge removal) so the rest
 // of the AIR pipeline sees the same control flow.
+
+// True if Val is used, directly or through integer arithmetic / casts / selects
+// / phis / GEP chains, as an index of a GEP into threadgroup (addrspace 3)
+// memory.
+static bool feedsThreadgroupGEPIndex(Value *Val) {
+  SmallVector<Value *, 16> Work{Val};
+  SmallPtrSet<Value *, 16> Seen;
+  while (!Work.empty()) {
+    Value *V = Work.pop_back_val();
+    if (!Seen.insert(V).second)
+      continue;
+    for (User *U : V->users()) {
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+        if (GEP->getPointerAddressSpace() == ASThreadgroup)
+          for (auto &Idx : GEP->indices())
+            if (Idx.get() == V)
+              return true;
+        Work.push_back(GEP);
+      } else if (isa<BinaryOperator>(U) || isa<CastInst>(U) ||
+                 isa<SelectInst>(U) || isa<PHINode>(U)) {
+        Work.push_back(U);
+      }
+    }
+  }
+  return false;
+}
+
 static bool foldConditionalConstants(Module &M) {
   bool Changed = false;
   TargetLibraryInfoImpl TLIImpl(Triple(M.getTargetTriple()));
@@ -1528,6 +1555,30 @@ static bool foldConditionalConstants(Module &M) {
       ResolvedUndefs = Solver.resolvedUndefsIn(F);
     }
 
+    // Values that transitively derive from a thread-varying system-value
+    // argument. MetalAIRSystemValues (run before this pass) lowers the thread/
+    // lane-position intrinsics to kernel arguments: tid* / tidtg* / simdlane
+    // are per-thread/per-lane, pid* / numprog* are threadgroup-uniform. SCCP
+    // can "prove" a per-warp/per-lane value constant; folding such a value when
+    // it indexes threadgroup memory is the bug below, so collect them here.
+    SmallPtrSet<Value *, 32> ThreadVarying;
+    {
+      SmallVector<Value *, 32> Work;
+      for (Argument &A : F.args()) {
+        StringRef N = A.getName();
+        if (N.starts_with("tid") || N.starts_with("simdlane"))
+          Work.push_back(&A);
+      }
+      while (!Work.empty()) {
+        Value *V = Work.pop_back_val();
+        if (!ThreadVarying.insert(V).second)
+          continue;
+        for (User *U : V->users())
+          if (isa<Instruction>(U))
+            Work.push_back(U);
+      }
+    }
+
     for (BasicBlock &BB : F) {
       if (!Solver.isBlockExecutable(&BB))
         continue;
@@ -1536,6 +1587,18 @@ static bool foldConditionalConstants(Module &M) {
           continue;
         Constant *C = Solver.getConstantOrNull(&I);
         if (!C)
+          continue;
+        // Refuse to fold a thread-varying value that feeds a threadgroup GEP
+        // index. SCCP can prove a per-warp/per-lane index constant for a single
+        // thread, but it genuinely varies across the threadgroup. Replacing it
+        // collapses the threadgroup address (every warp reads/writes warp 0's
+        // slot), so a multi-warp cummax/cummin argmax scan stages its index
+        // through the wrong threadgroup location and returns wrong results -
+        // and the now-constant offset also makes the byte-global splitter
+        // fragment the one index buffer into distinct per-offset globals.
+        // Uniform folds (the ones that fix the fla chunk PSO crash) are not
+        // thread-varying and proceed.
+        if (ThreadVarying.count(&I) && feedsThreadgroupGEPIndex(&I))
           continue;
         I.replaceAllUsesWith(C);
         if (isInstructionTriviallyDead(&I))

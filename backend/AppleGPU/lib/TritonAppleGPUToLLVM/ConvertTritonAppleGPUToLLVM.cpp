@@ -2020,7 +2020,18 @@ struct AppleFuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
         oldArg.setType(newArgTypes[i]);
         auto origTy = getTypeConverter()->convertType(
             funcOp.getFunctionType().getInput(i));
-        Value loaded = LLVM::LoadOp::create(rewriter, loc, origTy, oldArg);
+        // Mark the scalar-arg load volatile so it is never eliminated. Once the
+        // arg becomes an opaque addrspace(2) pointer, its original width is not
+        // recoverable from the type; the scalar-buffer-packing pass recovers it
+        // from this load's result type. If the load were dead (e.g. it feeds
+        // only a bounds-check assert that later gets elided), the pass would
+        // have to guess the width, mis-size the packed slot, and corrupt every
+        // following scalar's byte offset. Keeping the load alive guarantees an
+        // exact, signature-matching layout. A constant-buffer load is cheap and
+        // any genuinely unused result is dropped after packing rewrites it.
+        Value loaded = LLVM::LoadOp::create(rewriter, loc, origTy, oldArg,
+                                            /*alignment=*/0,
+                                            /*isVolatile=*/true);
         oldArg.replaceAllUsesExcept(loaded, loaded.getDefiningOp());
       } else {
         oldArg.setType(newArgTypes[i]);

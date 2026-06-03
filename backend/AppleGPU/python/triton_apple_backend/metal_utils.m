@@ -74,6 +74,16 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
     PyObject *arg = PyTuple_GetItem(args, i);
     if (THPVariable_Check(arg)) {
       at::Tensor t = THPVariable_Unpack(arg);
+      // Guard before touching t.device(): a tensor with no storage/device
+      // (e.g. from an ABI-skewed libtorch build) makes t.device() abort with
+      // an uncatchable c10::Error. Report cleanly instead of crashing.
+      if (!t.defined() || !t.has_storage()) {
+        PyErr_Format(PyExc_RuntimeError,
+                     "Arg %zd: tensor is undefined or has no storage "
+                     "(rebuild metal_utils against the current libtorch?)",
+                     i);
+        return NULL;
+      }
       if (!t.is_mps()) {
         PyErr_Format(PyExc_RuntimeError,
                      "Arg %zd: tensor must be on MPS device, got %s", i,

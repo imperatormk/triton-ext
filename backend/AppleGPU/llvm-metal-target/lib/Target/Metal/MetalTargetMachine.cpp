@@ -20,6 +20,7 @@
 #include "MetalAsyncEventToAlloca.h"
 #include "MetalBFloat16CastDecompose.h"
 #include "MetalBarrierRename.h"
+#include "MetalDemoteF64.h"
 #include "MetalDeviceLoadsVolatile.h"
 #include "MetalInlineNonKernel.h"
 #include "MetalLLVMToAIRIntrinsics.h"
@@ -59,6 +60,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMetalTarget() {
   RegisterTargetMachine<MetalTargetMachine> X(getTheMetalTarget());
   auto *PR = PassRegistry::getPassRegistry();
   initializeMetalInlineNonKernelLegacyPass(*PR);
+  initializeMetalDemoteF64LegacyPass(*PR);
   initializeMetalLowerFNegLegacyPass(*PR);
   initializeMetalNaNMinMaxLegacyPass(*PR);
   initializeMetalLLVMToAIRIntrinsicsLegacyPass(*PR);
@@ -120,6 +122,10 @@ public:
   void addCodeGenPrepare() override {
     // Metal IR pipeline passes (LLVM IR -> AIR-conformant IR), in order.
     addPass(createMetalInlineNonKernelLegacyPass());
+    // Apple GPU has no double type; demote all f64 to f32 before anything
+    // else touches the IR (and before serialization, which would crash the
+    // Metal shader compiler on any surviving double).
+    addPass(createMetalDemoteF64LegacyPass());
     addPass(createMetalLowerFNegLegacyPass());
     addPass(createMetalNaNMinMaxLegacyPass());
     addPass(createMetalLLVMToAIRIntrinsicsLegacyPass());

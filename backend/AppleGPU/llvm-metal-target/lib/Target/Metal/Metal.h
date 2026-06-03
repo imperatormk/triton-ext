@@ -25,6 +25,12 @@ void initializeMetalInlineNonKernelLegacyPass(PassRegistry &);
 /// Pass to inline all calls to defined functions (AIR has no call stack).
 ModulePass *createMetalInlineNonKernelLegacyPass();
 
+/// Initializer for the Metal f64-to-f32 demotion pass.
+void initializeMetalDemoteF64LegacyPass(PassRegistry &);
+
+/// Pass to rewrite all `double` operations to `float` (Apple GPU has no f64).
+ModulePass *createMetalDemoteF64LegacyPass();
+
 /// Initializer for the Metal lower-fneg pass.
 void initializeMetalLowerFNegLegacyPass(PassRegistry &);
 

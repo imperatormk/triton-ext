@@ -44,9 +44,11 @@ def ty_to_cpp(ty):
 # Scalar type → (struct.pack format char, byte size, alignment)
 _SCALAR_PACK_INFO = {
     "i1": ("b", 1, 1),  # i1 stored as 1 byte
-    "u1": ("b", 1, 1),  # u1 (unsigned boolean)
+    "u1": ("B", 1, 1),  # u1 (unsigned boolean)
     "i8": ("b", 1, 1),
+    "u8": ("B", 1, 1),
     "i16": ("h", 2, 2),
+    "u16": ("H", 2, 2),
     "i32": ("i", 4, 4),
     "i64": ("q", 8, 8),
     "u32": ("I", 4, 4),
@@ -263,9 +265,13 @@ class MPSLauncher:
             """Recursively flatten an arg value, expanding tuples to leaves."""
             if isinstance(a, TensorWrapper):
                 out.append(a.base)
-            elif hasattr(a, '_base') and isinstance(getattr(a, '_base', None),
-                                                    torch.Tensor):
-                out.append(a._base)
+            elif isinstance(a, torch.Tensor):
+                # Pass tensors (including views) through unchanged. Do NOT unwrap
+                # to `a._base`: for a view like `base[4:20]`, `._base` is the
+                # offset-0 base tensor, which drops the storage_offset and makes
+                # the kernel read from the wrong location. The launcher applies
+                # storage_offset() itself via setBuffer:offset:.
+                out.append(a)
             elif isinstance(a, TensorDescriptor):
                 out.extend(decompose_descriptor(a))
             elif isinstance(a, tuple):

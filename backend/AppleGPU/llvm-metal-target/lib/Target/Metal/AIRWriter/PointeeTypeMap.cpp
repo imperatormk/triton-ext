@@ -399,6 +399,43 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
         }
       }
 
+  // Phase 8b: Unify pointer-typed select arms.
+  //
+  // A `select i1, ptr, ptr` is emitted with no explicit result-type record; the
+  // Metal GPU JIT derives the result pointee from the two arm value type IDs
+  // and refuses to materialize when they disagree. This bites the indirect
+  // scatter/gather pattern where one arm is a concrete typed GEP (e.g. half*)
+  // and the other is `inttoptr i64 <tg-loaded ptr>` whose pointee was inferred
+  // independently (and may have collapsed to a different scalar, e.g. float*).
+  // Force both arms — and the select itself — to one pointee, preferring a
+  // concrete (non-inttoptr) arm's type so real typed accesses stay correct.
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        auto *Sel = dyn_cast<SelectInst>(&I);
+        if (!Sel || !Sel->getType()->isPointerTy())
+          continue;
+        Value *TV = Sel->getTrueValue();
+        Value *FV = Sel->getFalseValue();
+        Type *TT = PTM.get(TV);
+        Type *FT = PTM.get(FV);
+        if (TT == FT)
+          continue;
+        // Prefer the arm that is NOT an inttoptr (concrete typed pointer).
+        Type *Unified = nullptr;
+        if (TT && !isa<IntToPtrInst>(TV))
+          Unified = TT;
+        else if (FT && !isa<IntToPtrInst>(FV))
+          Unified = FT;
+        else
+          Unified = TT ? TT : FT;
+        if (!Unified)
+          continue;
+        PTM.set(TV, Unified);
+        PTM.set(FV, Unified);
+        PTM.set(Sel, Unified);
+      }
+
   // Phase 9: Function pointer
   for (auto &F : M)
     if (!F.isDeclaration()) {

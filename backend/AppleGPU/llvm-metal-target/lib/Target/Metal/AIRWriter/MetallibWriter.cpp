@@ -70,11 +70,11 @@ static std::vector<uint8_t> wrapBitcode(const std::vector<uint8_t> &BC) {
   uint32_t Size = BC.size();
   std::string Buf;
   raw_string_ostream RSO(Buf);
-  writeU32(RSO, 0x0B17C0DE);  // wrapper magic
-  writeU32(RSO, 0);           // version
-  writeU32(RSO, 20);          // offset to bitcode
-  writeU32(RSO, Size);        // bitcode size (true, word-aligned length)
-  writeU32(RSO, 0xFFFFFFFF);  // CPU type
+  writeU32(RSO, 0x0B17C0DE); // wrapper magic
+  writeU32(RSO, 0);          // version
+  writeU32(RSO, 20);         // offset to bitcode
+  writeU32(RSO, Size);       // bitcode size (true, word-aligned length)
+  writeU32(RSO, 0xFFFFFFFF); // CPU type
   RSO.write(reinterpret_cast<const char *>(BC.data()), BC.size());
   // Append trailing zero bytes so the whole wrapped section spans a multiple
   // of 16. metal-objdump's bitcode reader needs read-ahead slack past the

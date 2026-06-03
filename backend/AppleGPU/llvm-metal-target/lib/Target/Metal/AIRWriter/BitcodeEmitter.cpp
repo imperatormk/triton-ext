@@ -510,11 +510,12 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
     DenseMap<const Function *, unsigned> FnAttrListID;
     SmallVector<SmallVector<unsigned, 4>, 8> AttrLists;
 
-    // Synthesize attribute groups on the simdgroup-matrix intrinsic declarations
-    // to match Apple's `xcrun metal` AIR — the macOS 13/14/15 Metal driver
-    // rejects the metallib otherwise. The groups must be encoded with bitcode
-    // ATTR_KIND_* values, which do NOT match LLVM's in-memory Attribute::AttrKind
-    // enum (e.g. convergent is 6 in-memory but 43 in bitcode).
+    // Synthesize attribute groups on the simdgroup-matrix intrinsic
+    // declarations to match Apple's `xcrun metal` AIR — the macOS 13/14/15
+    // Metal driver rejects the metallib otherwise. The groups must be encoded
+    // with bitcode ATTR_KIND_* values, which do NOT match LLVM's in-memory
+    // Attribute::AttrKind enum (e.g. convergent is 6 in-memory but 43 in
+    // bitcode).
     enum : uint64_t {
       BK_NO_CAPTURE = 11,
       BK_NO_UNWIND = 18,
@@ -666,9 +667,9 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
         }
         W.EmitRecord(bitc::PARAMATTR_GRP_CODE_ENTRY, Grp);
       }
-      // Synthesized declaration groups (simdgroup-matrix intrinsics). Each entry
-      // is (ID, Index, [0, kind]...) — every attr here is a plain bitcode enum
-      // (record-code 0), with the bitcode ATTR_KIND_* values set above.
+      // Synthesized declaration groups (simdgroup-matrix intrinsics). Each
+      // entry is (ID, Index, [0, kind]...) — every attr here is a plain bitcode
+      // enum (record-code 0), with the bitcode ATTR_KIND_* values set above.
       for (auto &IDG : SynthGroups) {
         SmallVector<uint64_t, 16> Grp;
         Grp.push_back(IDG.first);        // group ID
@@ -733,8 +734,9 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
         SmallVector<uint64_t, 14> Ops;
         Ops.push_back(E.globalPtrTypeIdx(G)); // ptr-to-valueType
         Ops.push_back(G->isConstant() ? 1 : 0);
-        Ops.push_back(
-            G->hasInitializer() ? E.moduleConstIdx(G->getInitializer()) + 1 : 0);
+        Ops.push_back(G->hasInitializer()
+                          ? E.moduleConstIdx(G->getInitializer()) + 1
+                          : 0);
         Ops.push_back(encodeLinkage(G->getLinkage()));
         Ops.push_back(G->getAlign() ? Log2_32(G->getAlign()->value()) + 1 : 0);
         for (int J = 0; J < 3; J++)
@@ -766,10 +768,11 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
         // Field 9 is unnamed_addr. Bitcode encoding (getEncodedUnnamedAddr):
         // None=0, Global=1, Local=2. Apple's simdgroup intrinsic decls are
         // `local_unnamed_addr` (=2); the macOS-14 driver expects this to match.
-        Ops.push_back(0);                                      // 6: section
-        Ops.push_back(0);                                      // 7: visibility
-        Ops.push_back(0);                                      // 8: gc
-        Ops.push_back(LocalUnnamedFns.contains(Fn) ? 2u : 0u); // 9: unnamed_addr
+        Ops.push_back(0); // 6: section
+        Ops.push_back(0); // 7: visibility
+        Ops.push_back(0); // 8: gc
+        Ops.push_back(LocalUnnamedFns.contains(Fn) ? 2u
+                                                   : 0u); // 9: unnamed_addr
         for (int J = 10; J < 16; J++)
           Ops.push_back(0);
         Ops.push_back(Fn->getAddressSpace());

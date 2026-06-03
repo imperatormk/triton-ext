@@ -35,6 +35,7 @@ set(METAL_CODEGEN_SOURCES
   MetalAsyncEventToAlloca.cpp
   MetalBFloat16CastDecompose.cpp
   MetalBarrierRename.cpp
+  MetalDemoteF64.cpp
   MetalDeviceLoadsVolatile.cpp
   MetalInlineNonKernel.cpp
   MetalLLVMToAIRIntrinsics.cpp

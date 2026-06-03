@@ -337,8 +337,21 @@ struct ConvertLayoutOpAppleConversion
     SmallVector<Value> dstElems(dstCoords.size());
     Value zeroElem;
     if (isPointerElem) {
-      Value zeroInt = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
-      zeroElem = LLVM::IntToPtrOp::create(rewriter, loc, elemTy, zeroInt);
+      // The masked-out fallback for a pointer-typed lane must NOT be a null
+      // (address 0) device pointer. Metal's AIR materializer refuses to build a
+      // PSO for a kernel that can store through a constant-null device pointer
+      // ("Failed to materializeAll"), even when that store is predicated off.
+      // Reuse a real input pointer (srcElems[0]) as the neutral element: it is
+      // a valid pointer of the right type and address space, and is only ever
+      // selected into masked-out lanes whose stores are disabled, so it is
+      // never actually dereferenced. This keeps the materializer happy without
+      // changing observable behaviour.
+      if (!srcElems.empty()) {
+        zeroElem = srcElems[0];
+      } else {
+        Value zeroInt = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
+        zeroElem = LLVM::IntToPtrOp::create(rewriter, loc, elemTy, zeroInt);
+      }
     } else {
       zeroElem = arith::ConstantOp::create(rewriter, loc, elemTy,
                                            rewriter.getZeroAttr(elemTy));

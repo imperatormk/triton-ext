@@ -66,6 +66,14 @@ static std::vector<uint8_t> wrapBitcode(const std::vector<uint8_t> &BC) {
   writeU32(RSO, BC.size());  // bitcode size
   writeU32(RSO, 0xFFFFFFFF); // CPU type
   RSO.write(reinterpret_cast<const char *>(BC.data()), BC.size());
+  // Apple's `xcrun metallib` always appends 8 zero bytes after the wrapped
+  // bitcode in this section. Metal's module loader reads expecting that
+  // trailing region; without it the load reports "truncated module" and
+  // silently degrades to a binding path that ignores setBuffer:offset: (so
+  // tensor storage_offset is dropped). Every derived size (section size, MDSZ,
+  // total file size, hash) flows from WrappedBC.size(), so adding it here keeps
+  // them all self-consistent.
+  RSO.write("\0\0\0\0\0\0\0\0", 8);
   RSO.flush();
   return std::vector<uint8_t>(Buf.begin(), Buf.end());
 }

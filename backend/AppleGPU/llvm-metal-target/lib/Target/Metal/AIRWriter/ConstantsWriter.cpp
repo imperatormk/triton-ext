@@ -37,9 +37,14 @@ void emitConstantsBlock(BitstreamWriter &W, ValueEnumerator &E,
     } else if (auto *CI = dyn_cast<ConstantInt>(C)) {
       // Always use INTEGER for ints (even zero) - Metal doesn't
       // accept NULL for integer types in some contexts.
-      // Use ZExtValue for i1 (Metal convention), SExtValue for wider types.
-      int64_t Val = CI->getType()->isIntegerTy(1) ? (int64_t)CI->getZExtValue()
-                                                  : CI->getSExtValue();
+      // The bitcode reader decodes CST_CODE_INTEGER via
+      // decodeSignRotatedValue and then builds
+      // ConstantInt::get(Ty, V, /*isSigned=*/true), so the emitted value
+      // must be the *signed* representation of the constant. For i1 this
+      // means `true` is -1 (not +1): an i1 cannot hold signed +1, and
+      // emitting +1 trips APInt's isIntN assertion in the reader. Use
+      // getSExtValue() for all widths so true -> -1 sign-rotates correctly.
+      int64_t Val = CI->getSExtValue();
       V.push_back(Val >= 0 ? uint64_t(Val) << 1 : (uint64_t(-Val) << 1) | 1);
       W.EmitRecord(bitc::CST_CODE_INTEGER, V);
     } else if (auto *CF = dyn_cast<ConstantFP>(C)) {

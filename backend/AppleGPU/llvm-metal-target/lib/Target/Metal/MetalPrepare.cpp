@@ -45,6 +45,93 @@ constexpr unsigned PtrPhiLimit = 32;
 
 namespace {
 
+// Strip identity-noise ops (xor X,0 / add X,0 / or X,0 / sub X,0, either
+// operand order) that the Triton layout lowering threads through threadgroup
+// byte offsets. They don't change the value but lengthen the use chain past
+// computeKnownBits's default recursion depth, hiding provable alignment — which
+// makes the byte-global retype path conservatively bail and leave an i8 array
+// (and dynamic i8 GEPs) that the Metal GPU JIT then refuses to materialize.
+static Value *stripIdentityIntOps(Value *V) {
+  for (;;) {
+    auto *BO = dyn_cast<BinaryOperator>(V);
+    if (!BO)
+      return V;
+    unsigned Op = BO->getOpcode();
+    if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1)))
+      if (C->isZero() && (Op == Instruction::Xor || Op == Instruction::Add ||
+                          Op == Instruction::Or || Op == Instruction::Sub)) {
+        V = BO->getOperand(0);
+        continue;
+      }
+    if (auto *C0 = dyn_cast<ConstantInt>(BO->getOperand(0)))
+      if (C0->isZero() && (Op == Instruction::Xor || Op == Instruction::Add ||
+                           Op == Instruction::Or)) {
+        V = BO->getOperand(1);
+        continue;
+      }
+    return V;
+  }
+}
+
+// Provable power-of-two alignment (min count of trailing zero bits) of an
+// integer SSA value. computeKnownBits caps recursion at depth 6, which the
+// long index chains the Triton layout lowering emits routinely exceed — so the
+// byte-global retype path conservatively bails and leaves dynamic i8 GEPs the
+// Metal GPU JIT refuses to materialize. This walks only the alignment-relevant
+// integer ops with a generous depth so the common strided-offset shapes
+// (shl/mul-by-const, add/or/and of aligned terms, select, zext) are provable.
+static unsigned minTrailingZeros(Value *V, unsigned Depth = 0) {
+  Type *Ty = V->getType();
+  if (!Ty->isIntegerTy())
+    return 0;
+  unsigned BitW = Ty->getIntegerBitWidth();
+  if (auto *CI = dyn_cast<ConstantInt>(V))
+    return CI->isZero() ? BitW : CI->getValue().countr_zero();
+  if (Depth > 24)
+    return 0;
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    Value *A = BO->getOperand(0), *B = BO->getOperand(1);
+    switch (BO->getOpcode()) {
+    case Instruction::Shl:
+      if (auto *C = dyn_cast<ConstantInt>(B))
+        return std::min(BitW, minTrailingZeros(A, Depth + 1) +
+                                  (unsigned)C->getZExtValue());
+      return minTrailingZeros(A, Depth + 1);
+    case Instruction::LShr:
+    case Instruction::AShr:
+      if (auto *C = dyn_cast<ConstantInt>(B)) {
+        unsigned Sh = (unsigned)C->getZExtValue();
+        unsigned TZA = minTrailingZeros(A, Depth + 1);
+        return TZA > Sh ? TZA - Sh : 0;
+      }
+      return 0;
+    case Instruction::Mul:
+      return std::min(BitW, minTrailingZeros(A, Depth + 1) +
+                                minTrailingZeros(B, Depth + 1));
+    case Instruction::Add:
+    case Instruction::Sub:
+    case Instruction::Or:
+    case Instruction::Xor:
+      return std::min(minTrailingZeros(A, Depth + 1),
+                      minTrailingZeros(B, Depth + 1));
+    case Instruction::And:
+      // result trailing zeros ≥ max of the two operands' trailing zeros.
+      return std::max(minTrailingZeros(A, Depth + 1),
+                      minTrailingZeros(B, Depth + 1));
+    default:
+      return 0;
+    }
+  }
+  if (auto *Sel = dyn_cast<SelectInst>(V))
+    return std::min(minTrailingZeros(Sel->getTrueValue(), Depth + 1),
+                    minTrailingZeros(Sel->getFalseValue(), Depth + 1));
+  if (auto *ZE = dyn_cast<ZExtInst>(V))
+    return minTrailingZeros(ZE->getOperand(0), Depth + 1);
+  if (auto *TR = dyn_cast<TruncInst>(V))
+    return std::min(BitW, minTrailingZeros(TR->getOperand(0), Depth + 1));
+  return 0;
+}
+
 static void collectTGByteGlobals(Module &M,
                                  SmallVectorImpl<GlobalVariable *> &Out) {
   for (auto &GV : M.globals()) {
@@ -565,25 +652,33 @@ static bool retypeByteGlobals(Module &M) {
     if (ElemTy->isBFloatTy())
       ElemTy = Type::getHalfTy(Ctx);
 
-    // TODO(metal-revisit GH-XXX): when the inferred type is a vector
-    // (e.g. <8 x half>) but the function also contains scalar GEPs of the
-    // element type, prefer the scalar type — Metal's typed bitcode rejects
-    // the mismatched pointer at validate time.
+    // When the inferred type is a vector (e.g. <4 x i32> / <8 x half>), Metal's
+    // typed bitcode rejects a vector-element threadgroup global — and any mix
+    // of a vector pointee with the scalar GEPs the same global is also accessed
+    // by fails PSO creation. Always demote to a scalar element type. Prefer a
+    // same-sized scalar type already used by a sibling GEP (so all GEPs share
+    // one consistent pointee); otherwise fall back to the vector's own scalar.
     if (auto *VT = dyn_cast<FixedVectorType>(ElemTy)) {
       Type *ScalarTy = VT->getElementType();
-      bool HasScalarGEP = false;
+      unsigned ScalarBytes = DL.getTypeAllocSize(ScalarTy);
+      Type *SiblingScalar = nullptr;
       std::function<void(Value *)> CheckGEPs = [&](Value *V) {
         for (auto *U : V->users()) {
           if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-            if (GEP->getSourceElementType() == ScalarTy)
-              HasScalarGEP = true;
+            Type *ST = GEP->getSourceElementType();
+            if ((ST->isFloatingPointTy() || ST->isIntegerTy()) &&
+                DL.getTypeAllocSize(ST) == ScalarBytes) {
+              if (ST == ScalarTy)
+                SiblingScalar = ScalarTy; // exact match wins
+              else if (!SiblingScalar)
+                SiblingScalar = ST;
+            }
             CheckGEPs(GEP);
           }
         }
       };
       CheckGEPs(GV);
-      if (HasScalarGEP)
-        ElemTy = ScalarTy;
+      ElemTy = SiblingScalar ? SiblingScalar : ScalarTy;
     }
 
     unsigned ElemSize = DL.getTypeAllocSize(ElemTy);
@@ -601,11 +696,12 @@ static bool retypeByteGlobals(Module &M) {
         return true;
       if (GEP->getNumIndices() != 1)
         return false;
-      Value *Idx = GEP->getOperand(1);
+      Value *Idx = stripIdentityIntOps(GEP->getOperand(1));
       if (auto *CI = dyn_cast<ConstantInt>(Idx))
         return CI->getZExtValue() % ElemSize == 0;
-      KnownBits Known = computeKnownBits(Idx, DL);
-      return (1u << Known.countMinTrailingZeros()) >= ElemSize;
+      unsigned TZ = std::max(minTrailingZeros(Idx),
+                             computeKnownBits(Idx, DL).countMinTrailingZeros());
+      return (1u << TZ) >= ElemSize;
     };
 
     // If any byte GEP into GV has a dynamic index whose alignment to ElemSize
@@ -922,6 +1018,85 @@ static bool fixResidualI8GEPs(Module &M) {
       if (auto *AT = dyn_cast<ArrayType>(ElemTy))
         ElemTy = AT->getElementType();
       unsigned ElemSize = DL.getTypeAllocSize(ElemTy);
+
+      // Vec-access value bitcasts (filled in for the byte-base case below).
+      Type *AccessTy = nullptr;
+      SmallVector<std::pair<Instruction *, Value *>, 2> MemUsers;
+
+      // When the producing GEP is the [N x i8] array base (element i8, size 1),
+      // the parent type carries no useful access width. Infer the real access
+      // type from this i8 GEP's own load/store users instead: the Metal GPU JIT
+      // rejects a dynamic-index i8-source TG GEP feeding a wider (e.g. <4 x
+      // i32>) access, so retype the GEP to match the memory op. Only safe when
+      // the byte index is provably a multiple of the access size.
+      if (ElemSize <= 1) {
+        // Look through identity ptr→ptr bitcasts (inserted by 14d) to reach the
+        // real load/store (and its pointer alias) and learn its access width.
+        std::function<void(Value *)> FindAccess = [&](Value *V) {
+          for (auto *U : V->users()) {
+            if (auto *LI = dyn_cast<LoadInst>(U)) {
+              AccessTy = LI->getType();
+              MemUsers.push_back({LI, V});
+            } else if (auto *SI = dyn_cast<StoreInst>(U)) {
+              if (SI->getPointerOperand() == V) {
+                AccessTy = SI->getValueOperand()->getType();
+                MemUsers.push_back({SI, V});
+              }
+            } else if (auto *BC = dyn_cast<BitCastInst>(U)) {
+              if (BC->getType()->isPointerTy())
+                FindAccess(BC);
+            }
+          }
+        };
+        FindAccess(GEP);
+        if (!AccessTy)
+          continue;
+        unsigned AccessSize = DL.getTypeAllocSize(AccessTy);
+        if (AccessSize <= 1)
+          continue;
+
+        // All GEPs that share this threadgroup byte-global base must use one
+        // consistent scalar element type, else the Metal GPU JIT rejects the
+        // pipeline (mixed float/i32/<N> pointee types on a single TG global).
+        // Anchor on the dominant scalar element type already used by sibling
+        // GEPs on the same base; default to the access's scalar type.
+        Type *ScalarTy = AccessTy->getScalarType();
+        DenseMap<Type *, unsigned> ScalarVotes;
+        for (auto *U : SrcGEP->users())
+          if (auto *Sib = dyn_cast<GetElementPtrInst>(U)) {
+            Type *ST = Sib->getSourceElementType();
+            if (ST->isFloatingPointTy() || ST->isIntegerTy())
+              ScalarVotes[ST]++;
+          }
+        unsigned BestVotes = 0;
+        for (auto &KV : ScalarVotes)
+          if (DL.getTypeAllocSize(KV.first) == DL.getTypeAllocSize(ScalarTy) &&
+              KV.second > BestVotes) {
+            BestVotes = KV.second;
+            ScalarTy = KV.first;
+          }
+
+        unsigned ScalarSize = DL.getTypeAllocSize(ScalarTy);
+        if (ScalarSize == 0)
+          continue;
+
+        // Index must be provably a multiple of the scalar element size.
+        Value *ByteIdx = GEP->getOperand(1);
+        Value *AlignIdx = stripIdentityIntOps(ByteIdx);
+        bool Aligned = false;
+        if (auto *CI = dyn_cast<ConstantInt>(AlignIdx))
+          Aligned = CI->getZExtValue() % ScalarSize == 0;
+        else {
+          unsigned TZ =
+              std::max(minTrailingZeros(AlignIdx),
+                       computeKnownBits(AlignIdx, DL).countMinTrailingZeros());
+          Aligned = (1u << TZ) >= ScalarSize;
+        }
+        if (!Aligned)
+          continue;
+        ElemTy = ScalarTy;
+        ElemSize = ScalarSize;
+      }
       if (ElemSize == 0 || ElemSize == 1)
         continue;
 
@@ -936,8 +1111,40 @@ static bool fixResidualI8GEPs(Module &M) {
                                ConstantInt::get(ByteIdx->getType(), ElemSize));
       auto *NewGEP = B.CreateInBoundsGEP(ElemTy, GEP->getPointerOperand(),
                                          ElemIdx, GEP->getName());
+
+      // If the access type's scalar differs from the anchor element type (e.g.
+      // <4 x i32> vector access through a float-anchored TG global), rewrite
+      // the memory ops to load/store <N x ElemTy> and bitcast the value at the
+      // leaf so every pointer derived from the global stays one consistent
+      // type.
+      if (AccessTy && AccessTy->getScalarType() != ElemTy) {
+        unsigned NumElems = 1;
+        if (auto *VT = dyn_cast<FixedVectorType>(AccessTy))
+          NumElems = VT->getNumElements();
+        Type *NewAccessTy = NumElems > 1
+                                ? (Type *)FixedVectorType::get(ElemTy, NumElems)
+                                : ElemTy;
+        for (auto &[I, PtrAlias] : MemUsers) {
+          if (auto *SI = dyn_cast<StoreInst>(I)) {
+            IRBuilder<> SB(SI);
+            Value *Val = SB.CreateBitCast(SI->getValueOperand(), NewAccessTy);
+            SB.CreateAlignedStore(Val, NewGEP, SI->getAlign(),
+                                  SI->isVolatile());
+            SI->eraseFromParent();
+          } else if (auto *LI = dyn_cast<LoadInst>(I)) {
+            IRBuilder<> LB(LI);
+            Value *NewLoad = LB.CreateAlignedLoad(
+                NewAccessTy, NewGEP, LI->getAlign(), LI->isVolatile());
+            Value *Casted = LB.CreateBitCast(NewLoad, LI->getType());
+            LI->replaceAllUsesWith(Casted);
+            LI->eraseFromParent();
+          }
+        }
+      }
+
       GEP->replaceAllUsesWith(NewGEP);
-      GEP->eraseFromParent();
+      if (GEP->use_empty())
+        GEP->eraseFromParent();
       Changed = true;
     }
   }
@@ -1034,6 +1241,96 @@ static bool fixMismatchedTGGEPs(Module &M) {
   return Changed;
 }
 
+// 14g: Scalarize wide-vector stores to a threadgroup global that is also
+// accessed at a *different* vector width.
+//
+// Metal 4 / macOS 26 handles a `store <N x T>` to threadgroup memory fine when
+// every access to that global uses the same width (the audited vec4/vec2
+// fast-path). But when a wide-vector store (e.g. `store <4 x float>`) coexists
+// on the same global with a narrower dynamic-indexed load (e.g.
+// `load <1 x float>` / scalar `load float` through a `udiv`-derived index, as
+// emitted by tile/combo reductions like var_mean), the Metal shader compiler
+// fails `materializeAll` on the resulting metallib. Demoting only the wide
+// stores on such mixed-width globals to a sequence of element stores fixes the
+// materialization while leaving the audited same-width vec4/vec2 path intact.
+static bool scalarizeMixedWidthTGVecStores(Module &M) {
+  bool Changed = false;
+  Type *I32 = Type::getInt32Ty(M.getContext());
+  const DataLayout &DL = M.getDataLayout();
+
+  // Walk the def-use chain from a TG global pointer through GEPs/bitcasts and
+  // collect the loads/stores plus their (vector) element counts.
+  auto collect = [&](GlobalVariable &GV, SmallVectorImpl<StoreInst *> &Stores,
+                     unsigned &MaxStoreElems, unsigned &MinAccessElems,
+                     bool &SawNarrowerAccess) {
+    SmallVector<Value *, 16> Work{&GV};
+    SmallPtrSet<Value *, 16> Seen;
+    while (!Work.empty()) {
+      Value *V = Work.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      for (User *U : V->users()) {
+        if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U)) {
+          Work.push_back(U);
+          continue;
+        }
+        Type *AccTy = nullptr;
+        StoreInst *SI = dyn_cast<StoreInst>(U);
+        if (SI && SI->getPointerOperand() == V)
+          AccTy = SI->getValueOperand()->getType();
+        else if (auto *LI = dyn_cast<LoadInst>(U))
+          AccTy = LI->getType();
+        if (!AccTy)
+          continue;
+        unsigned Elems = 1;
+        if (auto *VT = dyn_cast<FixedVectorType>(AccTy))
+          Elems = VT->getNumElements();
+        MinAccessElems = std::min(MinAccessElems, Elems);
+        if (SI && SI->getPointerOperand() == V) {
+          if (Elems > 1) {
+            Stores.push_back(SI);
+            MaxStoreElems = std::max(MaxStoreElems, Elems);
+          }
+        }
+      }
+    }
+    SawNarrowerAccess = MinAccessElems < MaxStoreElems;
+  };
+
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.getAddressSpace() != ASThreadgroup)
+      continue;
+    SmallVector<StoreInst *, 8> WideStores;
+    unsigned MaxStoreElems = 1, MinAccessElems = ~0u;
+    bool Mixed = false;
+    collect(GV, WideStores, MaxStoreElems, MinAccessElems, Mixed);
+    if (!Mixed || WideStores.empty())
+      continue;
+
+    for (StoreInst *SI : WideStores) {
+      auto *VT = cast<FixedVectorType>(SI->getValueOperand()->getType());
+      Type *ElemTy = VT->getElementType();
+      IRBuilder<> B(SI);
+      Value *Vec = SI->getValueOperand();
+      Value *BasePtr = SI->getPointerOperand();
+      Align A = SI->getAlign();
+      for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+        Value *Elt = B.CreateExtractElement(Vec, ConstantInt::get(I32, i));
+        Value *Ptr = i == 0 ? BasePtr
+                            : B.CreateInBoundsGEP(ElemTy, BasePtr,
+                                                  ConstantInt::get(I32, i));
+        // Element i sits at byte offset i*sizeof(ElemTy); preserve alignment
+        // only where it still holds (offset 0 keeps the vector alignment).
+        Align EltAlign = i == 0 ? A : DL.getABITypeAlign(ElemTy);
+        B.CreateAlignedStore(Elt, Ptr, EltAlign, SI->isVolatile());
+      }
+      SI->eraseFromParent();
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 static bool rewriteTGGlobalGEPs(Module &M) {
   // Cheap early-out: nothing to do unless there is an array-typed TG global.
   bool HasArrayTG = false;
@@ -1083,6 +1380,10 @@ static bool rewriteTGGlobalGEPs(Module &M) {
            << LastFiringIter << "\n";
 
   Changed |= fixMismatchedTGGEPs(M);
+  // After the global is fully retyped and GEPs are normalized, demote wide
+  // vector stores on any TG global that is also accessed at a narrower width
+  // (mixed-width aliasing crashes Metal's materializeAll; see helper comment).
+  Changed |= scalarizeMixedWidthTGVecStores(M);
   return Changed;
 }
 

@@ -212,6 +212,34 @@ static bool tgBarrierInsert(Module &M) {
         Changed = true;
       }
     }
+
+    // Strategy 4: coalesce redundant consecutive barriers within a block.
+    // Two barrier calls separated only by instructions that touch neither
+    // threadgroup memory nor any call are equivalent to a single barrier: the
+    // first already synchronised the threadgroup and nothing observable to
+    // other threads happened in between, so the second is a no-op. Removing it
+    // is the dominant per-K-step saving in the MMA dot lowering, which emits a
+    // barrier at the end of one phase and the start of the next.
+    for (BasicBlock &BB : F) {
+      Instruction *PrevBarrier = nullptr;
+      SmallVector<Instruction *, 8> ToErase;
+      for (Instruction &I : BB) {
+        if (isBarrierCall(&I)) {
+          if (PrevBarrier)
+            ToErase.push_back(&I);
+          else
+            PrevBarrier = &I;
+          continue;
+        }
+        if (isTGStore(&I) || isTGLoad(&I) || isa<CallInst>(I) ||
+            I.mayReadOrWriteMemory())
+          PrevBarrier = nullptr;
+      }
+      for (Instruction *I : ToErase) {
+        I->eraseFromParent();
+        Changed = true;
+      }
+    }
   }
 
   return Changed;

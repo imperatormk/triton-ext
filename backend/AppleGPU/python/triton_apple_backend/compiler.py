@@ -401,19 +401,27 @@ class MPSBackend(BaseBackend):
     def make_metallib(self, llvm_mod, metadata, options):
         llvm_ir = metadata.pop("_llvm_ir", None) or str(llvm_mod)
 
-        # Extract kernel name. Triton emits exactly one `define void @<kernel>`
-        # entry per module; guard that assumption so a future multi-function
-        # module fails loudly instead of silently picking the first symbol.
-        kernel_names = [
+        # Extract the kernel name. A module usually has exactly one
+        # `define void @<kernel>`, but a kernel that calls a `noinline` device
+        # function has two: the kernel entry and the callee. The kernel is the
+        # entry -- the one no `call` targets -- so pick the uncalled define.
+        defined_names = [
             line[len('define void @'):].split('(')[0]
             for line in llvm_ir.splitlines()
             if line.startswith('define void @')
         ]
-        if len(kernel_names) != 1:
+        if not defined_names:
+            raise RuntimeError("no 'define void @' kernel entry found")
+        called = {
+            m.group(1)
+            for m in re.finditer(r'call[^@\n]*@([\w$.]+)\s*\(', llvm_ir)
+        }
+        entry_names = [n for n in defined_names if n not in called]
+        if len(entry_names) != 1:
             raise RuntimeError(
-                f"expected exactly one 'define void @' kernel entry, found "
-                f"{len(kernel_names)}: {kernel_names}")
-        metadata["name"] = kernel_names[0]
+                f"expected exactly one uncalled kernel entry among "
+                f"{defined_names}, found {len(entry_names)}: {entry_names}")
+        metadata["name"] = entry_names[0]
 
         debug = os.environ.get('TRITON_MPS_DEBUG')
 

@@ -215,8 +215,8 @@ static PyObject *MetalLibrary_get_function(MetalLibraryObject *self,
       [full appendFormat:@" | userInfo=%@", info];
     NSError *under = [[error userInfo] objectForKey:NSUnderlyingErrorKey];
     if (under)
-      [full appendFormat:@" | underlying=%@ (%@)",
-                         [under localizedDescription], [under userInfo]];
+      [full appendFormat:@" | underlying=%@ (%@)", [under localizedDescription],
+                         [under userInfo]];
     PyErr_Format(PyExc_RuntimeError, "PSO creation failed: %s",
                  [full UTF8String]);
     return NULL;

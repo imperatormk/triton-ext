@@ -1977,6 +1977,71 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       return unpack(mappedPtrs);
     };
 
+    // ── Try to resolve an operand straight from pipeline shared memory ──
+    // When the software pipeline (num_stages>=2) stages A/B into threadgroup
+    // memory, the dot operand is convert_layout?(local_load(memdesc)).  The
+    // memdesc already holds the operand tile in shared (addrspace 3) row-major,
+    // so we can feed air.simdgroup_matrix_8x8_load.p3 directly from it and skip
+    // the re-scatter into the dot's own TG buffer (the double-staging fix).
+    struct SharedOperand {
+      Value base;   // addrspace(3) base ptr, offset to the buffer slot
+      Type elemTy;  // shared element type (f32/f16/bf16)
+      int64_t rows; // shared tile rows
+      int64_t cols; // shared tile cols (row pitch, elements)
+      bool valid = false;
+    };
+    auto resolveSharedOperand = [&](Value tritonVal) -> SharedOperand {
+      Value src = tritonVal;
+      if (auto cvt = tritonVal.getDefiningOp<ttg::ConvertLayoutOp>())
+        src = cvt.getSrc();
+      auto ll = src.getDefiningOp<ttg::LocalLoadOp>();
+      if (!ll)
+        return {};
+      auto memTy = cast<ttg::MemDescType>(ll.getSrc().getType());
+      if (memTy.getRank() != 2)
+        return {};
+      // Only an identity-swizzle row-major shared layout maps 1:1 to the
+      // simdgroup load's (row*pitch + col) addressing.
+      auto sh = dyn_cast<ttg::SwizzledSharedEncodingAttr>(memTy.getEncoding());
+      if (!sh || sh.getMaxPhase() != 1)
+        return {};
+      auto ord = sh.getOrder();
+      if (ord.size() != 2 || ord[0] != 1 || ord[1] != 0)
+        return {};
+      // The Metal AIR simdgroup_matrix_8x8_load lowering only addresses a
+      // threadgroup buffer correctly from a constant global base; a runtime
+      // GEP base (the dynamic pipeline slot index) produces wrong results.
+      // For a single-buffered pipeline stage (alloc leading dim 1) the slot is
+      // always 0, so resolve the alloc's constant base and skip the dynamic
+      // memdesc_index.
+      Value memSrc = ll.getSrc();
+      if (auto idx = memSrc.getDefiningOp<ttg::MemDescIndexOp>()) {
+        auto allocTy = cast<ttg::MemDescType>(idx.getSrc().getType());
+        if (allocTy.getRank() == 3 && allocTy.getShape()[0] == 1)
+          memSrc = idx.getSrc();
+        else
+          return {}; // multi-buffered: runtime slot, not supported here
+      }
+      Value mapped = rewriter.getRemappedValue(memSrc);
+      if (!mapped)
+        return {};
+      auto memSrcTy = cast<ttg::MemDescType>(memSrc.getType());
+      auto llElemTy = getTypeConverter()->convertType(memTy.getElementType());
+      auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, mapped,
+                                                           llElemTy, rewriter);
+      Value off = smemObj.getShmemOffset(loc, rewriter, memSrcTy);
+      Value base =
+          LLVM::GEPOp::create(rewriter, loc, tgPtrTy, llElemTy,
+                              smemObj.getBase(), ArrayRef<LLVM::GEPArg>{off});
+      SharedOperand so;
+      so.base = base;
+      so.elemTy = llElemTy;
+      so.rows = memTy.getShape()[0];
+      so.cols = memTy.getShape()[1];
+      so.valid = true;
+      return so;
+    };
+
     auto [elemsA, aOffsets, aSrcEnc] =
         resolveOperand(op.getA(), adaptor.getA(), aType);
     auto [elemsB, bOffsets, bSrcEnc] =
@@ -1992,11 +2057,38 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         (int64_t)elemsC.size() != (int64_t)cOffsets.size())
       return failure();
 
+    // Try to feed A/B simdgroup loads straight from pipeline shared memory.
+    // Opt-in (TRITON_SHARED_MMA=1) while the @global_smem simdgroup-load path
+    // is being brought up; default OFF keeps the proven scatter path.
+    SharedOperand aShared, bShared;
+    {
+      const char *envVar = std::getenv("TRITON_SHARED_MMA");
+      if (envVar && std::string(envVar) == "1") {
+        aShared = resolveSharedOperand(op.getA());
+        bShared = resolveSharedOperand(op.getB());
+      }
+    }
+    // The contracting (K) dimension must be a multiple of 8 for whole-tile
+    // simdgroup loads; the M/N dims are guaranteed multiples of 8 by the MMA
+    // tiling.  A is [M,K] (cols=K), B is [K,N] (rows=K).
+    if (aShared.valid && aShared.cols % 8 != 0)
+      aShared.valid = false;
+    if (bShared.valid && bShared.rows % 8 != 0)
+      bShared.valid = false;
+    bool useSharedA = aShared.valid;
+    bool useSharedB = bShared.valid;
+
     // Try to get device pointers for A and B
     auto aPtrs = resolveDevicePointers(op.getA());
     auto bPtrs = resolveDevicePointers(op.getB());
     bool useDeviceA = (aPtrs.size() == elemsA.size() && !aPtrs.empty());
     bool useDeviceB = (bPtrs.size() == elemsB.size() && !bPtrs.empty());
+    // Shared-direct path takes priority over the device path: in the pipelined
+    // case operands come from local_load (shared), not tt.load.
+    if (useSharedA)
+      useDeviceA = false;
+    if (useSharedB)
+      useDeviceB = false;
 
     // Env var TRITON_DEVICE_MMA=0 to force TG path (for debugging)
     {
@@ -2594,7 +2686,152 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     SmallVector<SmallVector<Value>> matC_tiles(tilesM);
     for (int64_t tm = 0; tm < tilesM; ++tm)
       matC_tiles[tm].resize(tilesN);
-    if (batchStrips) {
+
+    // Shared-direct path: build the MMA accumulator straight from the incoming
+    // C registers via a simd_shuffle, skipping the per-K-step C scatter/gather
+    // through threadgroup memory.  Inverse of the Phase-4 extract.  The base
+    // matrix comes from air.simdgroup_matrix_8x8_init_filled so the per-lane
+    // <64xf32> has the proper distributed structure, into which we splat this
+    // lane's two physical-register values (indices 0,1, matching Phase-4).
+    //
+    // CORRECT but SLOWER than the TG C-load (the per-tile select-chain + 2
+    // shuffles/tile cost more than the threadgroup round-trip on Apple), so it
+    // is opt-in via TRITON_C_IN_REGS=1 and left off by default; the C-out
+    // shuffle (Phase-4) is the kept register-resident win.
+    bool buildCInRegs = (useSharedA || useSharedB) &&
+                        std::getenv("TRITON_C_IN_REGS") != nullptr;
+    if (buildCInRegs) {
+      auto i16Ty = IntegerType::get(ctx, 16);
+      auto matVecTy = getSimdgroupMatrixType(ctx);
+      auto shuffleFn = getOrInsertIntrinsic(
+          rewriter, mod, "air.simd_shuffle.f32",
+          LLVMFunctionType::get(f32Ty, {f32Ty, i16Ty}, false));
+      auto initFn = getOrInsertIntrinsic(
+          rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
+          LLVMFunctionType::get(matVecTy, {f32Ty}, false));
+      Value fz =
+          arith::ConstantOp::create(rewriter, loc, rewriter.getZeroAttr(f32Ty));
+      Value zeroMat =
+          LLVM::CallOp::create(rewriter, loc, initFn, ValueRange{fz})
+              .getResult();
+      Value extractIdx0 = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+      Value extractIdx1 = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+
+      auto extractBit = [&](Value v, int bit) -> Value {
+        Value shifted =
+            (bit > 0) ? arith::ShRUIOp::create(rewriter, loc, v,
+                                               arith::ConstantIntOp::create(
+                                                   rewriter, loc, bit, 32))
+                      : v;
+        return arith::AndIOp::create(
+            rewriter, loc, shifted,
+            arith::ConstantIntOp::create(rewriter, loc, 1, 32));
+      };
+      auto shl = [&](Value v, int s) -> Value {
+        if (s == 0)
+          return v;
+        return arith::ShLIOp::create(
+            rewriter, loc, v,
+            arith::ConstantIntOp::create(rewriter, loc, s, 32));
+      };
+      Value L0 = extractBit(laneId, 0);
+      Value L1 = extractBit(laneId, 1);
+      Value L2 = extractBit(laneId, 2);
+      Value L3 = extractBit(laneId, 3);
+      Value L4 = extractBit(laneId, 4);
+
+      // Warp tile origin (runtime): owned absolute tile (absTm,absTn) =
+      // (cWarpRow + localTm, cWarpCol + localTn).
+      auto cWpc = cMmaEnc.getWarpsPerCTA();
+      unsigned wN = cWpc[1];
+      Value cWarpRow = divByConst(rewriter, loc, warpId, wN);
+      Value cWarpCol = remByConst(rewriter, loc, warpId, wN);
+
+      // This lane's logical C values, keyed by local tile (localTm,localTn) and
+      // logical register (0/1).  Each lane holds exactly its owned positions.
+      struct LocalVal {
+        int64_t localTm, localTn, logReg;
+        Value v;
+      };
+      SmallVector<LocalVal> locals;
+      for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
+        int64_t rowOff = cOffsets[idx][0];
+        int64_t colOff = cOffsets[idx][1];
+        Value v = elemsC[idx];
+        if (v.getType() != f32Ty)
+          v = toF32(rewriter, loc, v, f32Ty);
+        locals.push_back(
+            {rowOff / 8, colOff / 8, (rowOff % 8 >= 4) ? 1 : 0, v});
+      }
+
+      // Source-lane S for physical reg R (inverse of the Phase-4 extract):
+      //   owner = R | (L0<<1) | (L3<<2) | (L1<<3) | (L2<<4),  source logReg =
+      //   L4.
+      auto srcLaneFor = [&](int R) -> Value {
+        Value Rc = arith::ConstantIntOp::create(rewriter, loc, R, 32);
+        Value S = arith::OrIOp::create(rewriter, loc, Rc, shl(L0, 1));
+        S = arith::OrIOp::create(rewriter, loc, S, shl(L3, 2));
+        S = arith::OrIOp::create(rewriter, loc, S, shl(L1, 3));
+        S = arith::OrIOp::create(rewriter, loc, S, shl(L2, 4));
+        return arith::TruncIOp::create(rewriter, loc, i16Ty, S);
+      };
+      Value S0_i16 = srcLaneFor(0);
+      Value S1_i16 = srcLaneFor(1);
+      Value sRnz = arith::CmpIOp::create(
+          rewriter, loc, arith::CmpIPredicate::ne, L4,
+          arith::ConstantIntOp::create(rewriter, loc, 0, 32));
+
+      // For each compile-time absolute tile (tm,tn) and physical reg R, gather
+      // the logical value whose owned absolute position matches (tm,tn): pick
+      // the local entry with (cWarpRow+localTm,cWarpCol+localTn) == (tm,tn) and
+      // logReg == L4, then shuffle it from the owning source lane.  Tiles this
+      // warp does not own collapse to 0 (discarded by Phase-4 anyway).
+      for (int64_t tm = 0; tm < tilesM; ++tm)
+        for (int64_t tn = 0; tn < tilesN; ++tn) {
+          // This lane's logReg-0 and logReg-1 values for absolute tile (tm,tn)
+          // (0 if this lane does not own the tile).
+          Value src0 = fz, src1 = fz;
+          for (auto &lv : locals) {
+            Value absTm = arith::AddIOp::create(
+                rewriter, loc, cWarpRow,
+                arith::ConstantIntOp::create(rewriter, loc, lv.localTm, 32));
+            Value absTn = arith::AddIOp::create(
+                rewriter, loc, cWarpCol,
+                arith::ConstantIntOp::create(rewriter, loc, lv.localTn, 32));
+            Value tmEq = arith::CmpIOp::create(
+                rewriter, loc, arith::CmpIPredicate::eq, absTm,
+                arith::ConstantIntOp::create(rewriter, loc, tm, 32));
+            Value tnEq = arith::CmpIOp::create(
+                rewriter, loc, arith::CmpIPredicate::eq, absTn,
+                arith::ConstantIntOp::create(rewriter, loc, tn, 32));
+            Value match = arith::AndIOp::create(rewriter, loc, tmEq, tnEq);
+            if (lv.logReg == 0)
+              src0 = arith::SelectOp::create(rewriter, loc, match, lv.v, src0);
+            else
+              src1 = arith::SelectOp::create(rewriter, loc, match, lv.v, src1);
+          }
+          // Physical reg R of this lane = the owner lane's value at the owner's
+          // source logReg (sR = this lane's L4).  Each lane exposes src0/src1;
+          // the shuffle pulls from the owning lane, and we pick the source
+          // logReg with L4.
+          auto pullReg = [&](Value srcLane) -> Value {
+            Value v0 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
+                                            ValueRange{src0, srcLane})
+                           .getResult();
+            Value v1 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
+                                            ValueRange{src1, srcLane})
+                           .getResult();
+            return arith::SelectOp::create(rewriter, loc, sRnz, v1, v0);
+          };
+          Value p0 = pullReg(S0_i16);
+          Value p1 = pullReg(S1_i16);
+          Value vec = InsertElementOp::create(rewriter, loc, matVecTy, zeroMat,
+                                              p0, extractIdx0);
+          vec = InsertElementOp::create(rewriter, loc, matVecTy, vec, p1,
+                                        extractIdx1);
+          matC_tiles[tm][tn] = vec;
+        }
+    } else if (batchStrips) {
       // Scatter all M strips into distinct TG blocks, one barrier, load all,
       // one barrier. Each strip tm occupies rows [tm*8, tm*8+8).
       for (int64_t tm = 0; tm < tilesM; ++tm)
@@ -2627,7 +2864,88 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       }
 
     // ── Phase 2: A/B loads + MMA ──────────────────────────────────
-    if (useDeviceA && useDeviceB) {
+    if (useSharedA || useSharedB) {
+      // ── SHARED-DIRECT PATH ──────────────────────────────────────────
+      // Feed simdgroup_matrix_8x8_load.p3 straight from the pipeline's shared
+      // (local_load) buffer for whichever operand is staged there, skipping the
+      // re-scatter into the dot's own TG buffer.  The pipeline's async_wait
+      // already guarantees the shared tiles are present, so no A/B barrier is
+      // needed.  An operand not staged in shared (rare in the pipelined case)
+      // falls back to the per-strip TG scatter.
+      int64_t aMaxBase = maxBaseRow(aSrcEnc);
+      int64_t bMaxBase = maxBaseRow(bSrcEnc);
+      auto aBuckets = bucketElements(aOffsets, aMaxBase, tilesM, 0);
+      auto bBuckets = bucketElements(bOffsets, bMaxBase, tilesK, 0);
+
+      // Load all A tiles into registers: matA[tm][tk].
+      SmallVector<SmallVector<Value>> matA(tilesM);
+      for (int64_t tm = 0; tm < tilesM; ++tm)
+        matA[tm].resize(tilesK);
+      if (useSharedA || useSharedB)
+        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
+                             ValueRange{fenceTG, execMod});
+      if (useSharedA) {
+        int64_t pitchA = aShared.cols;
+        for (int64_t tm = 0; tm < tilesM; ++tm)
+          for (int64_t tk = 0; tk < tilesK; ++tk) {
+            Value aOff = makeI64Vec2(rewriter, loc, tk * 8, tm * 8);
+            matA[tm][tk] =
+                emitSGLoad(abTgLoadFn, aShared.base, pitchA, pitchA, aOff);
+          }
+      } else {
+        // TG scatter A: all M strips into per-strip blocks, one barrier pair.
+        for (int64_t tm = 0; tm < tilesM; ++tm)
+          filteredScatter(ptrTG, garbageIdx, aBaseRow, aBaseCol, elemsA,
+                          aOffsets, aBuckets[tm], Kpad, tm * 8, abTgScatterTy,
+                          tm);
+        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
+                             ValueRange{fenceTG, execMod});
+        for (int64_t tm = 0; tm < tilesM; ++tm)
+          for (int64_t tk = 0; tk < tilesK; ++tk) {
+            Value aOff = makeI64Vec2(rewriter, loc, tk * 8, tm * 8);
+            matA[tm][tk] = emitSGLoad(abTgLoadFn, ptrTG, Kpad, Kpad, aOff);
+          }
+        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
+                             ValueRange{fenceTG, execMod});
+      }
+
+      // Stream B tiles + MMA.
+      if (useSharedB) {
+        int64_t pitchB = bShared.cols;
+        for (int64_t tk = 0; tk < tilesK; ++tk)
+          for (int64_t tn = 0; tn < tilesN; ++tn) {
+            Value bOff = makeI64Vec2(rewriter, loc, tn * 8, tk * 8);
+            Value matB =
+                emitSGLoad(abTgLoadFn, bShared.base, pitchB, pitchB, bOff);
+            for (int64_t tm = 0; tm < tilesM; ++tm)
+              matC_tiles[tm][tn] =
+                  LLVM::CallOp::create(
+                      rewriter, loc, abTgMmaFn,
+                      ValueRange{matA[tm][tk], matB, matC_tiles[tm][tn]})
+                      .getResult();
+          }
+      } else {
+        for (int64_t tk = 0; tk < tilesK; ++tk)
+          filteredScatter(ptrTG, garbageIdx, bBaseRow, bBaseCol, elemsB,
+                          bOffsets, bBuckets[tk], Npad, tk * 8, abTgScatterTy,
+                          tk);
+        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
+                             ValueRange{fenceTG, execMod});
+        for (int64_t tk = 0; tk < tilesK; ++tk)
+          for (int64_t tn = 0; tn < tilesN; ++tn) {
+            Value bOff = makeI64Vec2(rewriter, loc, tn * 8, tk * 8);
+            Value matB = emitSGLoad(abTgLoadFn, ptrTG, Npad, Npad, bOff);
+            for (int64_t tm = 0; tm < tilesM; ++tm)
+              matC_tiles[tm][tn] =
+                  LLVM::CallOp::create(
+                      rewriter, loc, abTgMmaFn,
+                      ValueRange{matA[tm][tk], matB, matC_tiles[tm][tn]})
+                      .getResult();
+          }
+        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
+                             ValueRange{fenceTG, execMod});
+      }
+    } else if (useDeviceA && useDeviceB) {
       // ── DEVICE PATH: Direct MMA loads from device memory ──────────
       // No TG scatter, no barriers for A/B.
       // Prefetch: A tiles for tk+1 loaded before MMA of tk.
@@ -2789,8 +3107,12 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       resultElems[i] = arith::ConstantOp::create(
           rewriter, loc, rewriter.getZeroAttr(outElemTy));
 
+    // C-out via register shuffle is correct for register-resident MMA tiles but
+    // measured SLOWER than the threadgroup gather on Apple (the per-lane
+    // shuffle network costs more than the TG round-trip), so the shared path
+    // keeps the TG C-out; only the device path uses the shuffle.
     if (useDeviceA && useDeviceB) {
-      // ── DEVICE PATH: Shuffle-based MMA extract (no TG round-trip) ───
+      // ── Shuffle-based MMA extract (no TG round-trip) ───
       //
       // The MMA hardware register layout differs from the logical layout
       // defined by toLinearLayout:

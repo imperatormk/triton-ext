@@ -23,6 +23,35 @@ def _load_metal_utils():
     return metal_utils
 
 
+# Use torch's native MPS shader API (torch.mps.load_metallib) instead of the
+# bundled metal_utils.m launcher. The native path dispatches on torch's own MPS
+# command stream, so kernels are timed by the same events inductor's autotuner
+# records (fixing the "End event N was not recorded" benchmarker failure) and we
+# shed the custom ObjC++ launcher. Set TRITON_MPS_NATIVE_DISPATCH=0 to fall back.
+_USE_NATIVE_DISPATCH = _os.environ.get("TRITON_MPS_NATIVE_DISPATCH", "1") == "1"
+
+
+def _native_load_metallib_available():
+    return hasattr(torch, "mps") and hasattr(torch.mps, "load_metallib")
+
+
+class _NativeKernel:
+    """Adapts a native _mps_MetalKernel to the attribute the launcher reads.
+
+    The launcher reads `max_total_threads_per_threadgroup`; the native kernel
+    exposes `max_threads_per_threadgroup`. The call signature
+    (`fn(*args, threads=, group_size=)`) is identical, so __call__ forwards.
+    """
+
+    def __init__(self, fn):
+        self._fn = fn
+        self.max_total_threads_per_threadgroup = getattr(
+            fn, "max_threads_per_threadgroup", 1024)
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
 def ty_to_cpp(ty):
     if ty[0] == '*':
         return "void*"
@@ -113,15 +142,20 @@ class MPSUtils:
     """
 
     def __init__(self):
-        self._metal = _load_metal_utils()
+        self._native = _USE_NATIVE_DISPATCH and _native_load_metallib_available()
+        self._metal = None if self._native else _load_metal_utils()
 
     def load_binary(self, name, metallib_bytes, shared_mem, device):
         """
         Returns (module, function, n_regs, n_spills, n_max_threads).
         """
         try:
-            module = self._metal.load_metallib(bytes(metallib_bytes))
-            function = module.get_function(name)
+            if self._native:
+                module = torch.mps.load_metallib(bytes(metallib_bytes))
+                function = _NativeKernel(getattr(module, name))
+            else:
+                module = self._metal.load_metallib(bytes(metallib_bytes))
+                function = module.get_function(name)
             # Report the PSO's real maxTotalThreadsPerThreadgroup as n_max_threads.
             # Triton (compiler.py) rejects configs where num_warps*warp_size
             # exceeds this via OutOfResources, letting the autotuner drop them.

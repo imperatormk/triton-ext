@@ -126,11 +126,10 @@ def _llvm_type_size(ty: str) -> int:
 
 
 def _tg_memory_bytes(llvm_ir: str) -> int:
-    """Sum bytes for `addrspace(3)` globals in the IR, with alignment padding.
+    """Sum bytes for `addrspace(3)` globals, padding the total to each align.
 
-    Matches the C bridge's metalir_tg_memory_bytes: walks each addrspace(3)
-    global in declaration order, pads the running total up to that global's
-    align, then adds its allocation size.
+    Plain summer; pass POST-coalesce IR (from `llc -filetype=asm`) so merged
+    buffers are already reflected. Pre-coalesce IR over-reports.
     """
     total = 0
     # `@name = ... addrspace(3) global <type> ..., align N`
@@ -161,18 +160,23 @@ def _load_metalir():
             "  cd <triton-ext>/llvm-metal-target && \\\n"
             "    cmake -B build -G Ninja && cmake --build build")
 
-    def compile_ir(llvm_ir: str) -> bytes:
-        with tempfile.NamedTemporaryFile(suffix='.metallib',
+    def _run_llc(llvm_ir: str, filetype: str) -> bytes:
+        """Run `llc -filetype=<filetype>`; return output bytes.
+
+        Both filetypes run the full pipeline (incl. TG-global coalescing); only
+        the emit differs: `obj` writes the metallib, `asm` the post-pass IR.
+        """
+        with tempfile.NamedTemporaryFile(suffix='.' + filetype,
                                          delete=False) as out_f:
             out_path = out_f.name
         try:
             if os.environ.get('TRITON_MPS_DEBUG'):
                 print(
-                    f"[mps] llc: {llc} -mtriple={_air_triple(_host_macos_major())} -filetype=obj (os_major={_host_macos_major()})"
+                    f"[mps] llc: {llc} -mtriple={_air_triple(_host_macos_major())} -filetype={filetype} (os_major={_host_macos_major()})"
                 )
             proc = subprocess.run([
                 llc, '-mtriple=' + _air_triple(_host_macos_major()),
-                '-filetype=obj', '-o', out_path, '-'
+                '-filetype=' + filetype, '-o', out_path, '-'
             ],
                                   input=llvm_ir.encode(),
                                   capture_output=True,
@@ -188,7 +192,16 @@ def _load_metalir():
             except OSError:
                 pass
 
-    compile_ir.tg_memory_bytes = _tg_memory_bytes
+    def compile_ir(llvm_ir: str) -> bytes:
+        return _run_llc(llvm_ir, 'obj')
+
+    def tg_memory_bytes(llvm_ir: str) -> int:
+        # Size shared memory from the post-coalesce IR (`llc -filetype=asm`), so
+        # the real merged footprint is measured rather than re-modelled here.
+        asm = _run_llc(llvm_ir, 'asm').decode(errors='replace')
+        return _tg_memory_bytes(asm)
+
+    compile_ir.tg_memory_bytes = tg_memory_bytes
     return compile_ir
 
 

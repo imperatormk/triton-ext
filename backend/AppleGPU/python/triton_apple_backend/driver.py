@@ -28,7 +28,8 @@ def _load_metal_utils():
 # command stream, so kernels are timed by the same events inductor's autotuner
 # records (fixing the "End event N was not recorded" benchmarker failure) and we
 # shed the custom ObjC++ launcher. Set TRITON_MPS_NATIVE_DISPATCH=0 to fall back.
-_USE_NATIVE_DISPATCH = _os.environ.get("TRITON_MPS_NATIVE_DISPATCH", "1") == "1"
+_USE_NATIVE_DISPATCH = _os.environ.get("TRITON_MPS_NATIVE_DISPATCH",
+                                       "1") == "1"
 
 
 def _native_load_metallib_available():
@@ -142,7 +143,8 @@ class MPSUtils:
     """
 
     def __init__(self):
-        self._native = _USE_NATIVE_DISPATCH and _native_load_metallib_available()
+        self._native = _USE_NATIVE_DISPATCH and _native_load_metallib_available(
+        )
         self._metal = None if self._native else _load_metal_utils()
 
     def load_binary(self, name, metallib_bytes, shared_mem, device):

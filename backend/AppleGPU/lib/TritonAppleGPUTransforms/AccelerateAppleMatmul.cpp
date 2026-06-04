@@ -92,26 +92,30 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     if (M < 16 || N < 16)
       return failure();
 
+    int64_t K = aType.getShape()[1];
+
+    // K must be a multiple of the simdgroup MMA K-tile (8). A valid tl.dot
+    // already constrains K to a power of two >= 16, so this is always true in
+    // practice; the guard is here so any future non-tile-aligned K fails
+    // cleanly instead of silently corrupting the accumulation.
+    if (K % 8 != 0)
+      return failure();
+
     // Create AppleMmaEncoding for the result only.
     // A and B keep their blocked encoding — DotOpToLLVM handles the
     // mismatch by scattering blocked inputs through TG while producing
     // MMA-encoded output. Only one ConvertLayoutOp (result → blocked)
     // is needed downstream, vs 4 if we converted all operands.
+    // Previously this pass bailed out for non-square warpsPerCTA (e.g. [2,1]
+    // from num_warps=2) and for K > 32, on the theory that the core
+    // ConvertLayoutOp(mma->blocked) shared-memory path corrupted those cases.
+    // That has since been fixed upstream in transferSwizzlingLocalMemImpl: a
+    // full M/N/K/num_warps numeric sweep (square and non-square wpc, K up to
+    // 128) now matches torch matmul bit-for-bit (max_err = 0.0). The only
+    // remaining failures are OutOfResources for over-budget threadgroup memory,
+    // which the autotuner discards. So both guards are removed; oversized tiles
+    // fail cleanly via the shared-memory budget rather than corrupting.
     auto wpc = warpsPerTileApple(M, N, numWarps);
-
-    int64_t K = aType.getShape()[1];
-
-    // Guard: core Triton's ConvertLayoutOp(mma→blocked) via shared memory
-    // produces wrong results for AppleMma when:
-    // - wpc is non-square (e.g. [2,1] from num_warps=2), or
-    // - K > 32 (large K dimension causes data corruption)
-    // Root cause is in transferSwizzlingLocalMemImpl's handling of our
-    // LinearLayout. Works correctly for square wpc with K <= 32.
-    // TODO: root-cause the core conversion issue for these cases.
-    if (wpc[0] != wpc[1])
-      return failure();
-    if (K > 32)
-      return failure();
     auto mmaEnc = AppleMmaEncodingAttr::get(ctx, wpc);
 
     auto newCType =

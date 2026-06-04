@@ -2554,15 +2554,28 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         (useDeviceA && useDeviceB) ? tgCStripSize : tgABStripSize;
     // Multi-strip batching: give each 8-row strip its own TG block so all
     // tilesM (A/C) or tilesK (B) strips can be scattered, then read back, under
-    // a single pair of barriers instead of one pair per strip. Only on the TG
-    // path (not device path) and only when the widened buffer fits the 16KB
-    // budget. blockStrips = how many strips share the buffer concurrently.
+    // a single pair of barriers instead of one pair per strip. This trades
+    // threadgroup memory for fewer barriers (42->14 on a 512^2 dot), so it must
+    // fit alongside the @global_smem arena (ttg.shared, already set by the
+    // allocate-shared pass that runs before this lowering) within the 32KB
+    // hardware budget. Budget the batched buffer against what ttg.shared leaves
+    // free, capped at 16KB so a near-empty arena does not let one dot claim the
+    // whole budget. When it does not fit, fall back to the per-strip path (one
+    // strip-sized buffer) which always fits. blockStrips = strips sharing the
+    // buffer concurrently.
     bool tgPath = !(useDeviceA && useDeviceB);
     int64_t maxStripsAB = std::max(M / 8, K / 8);
     int64_t batchedABSize = maxStripsAB * tgABStripSize + 1;
     int64_t batchedCSize = (M / 8) * tgCStripSize + 1;
+    int64_t sharedBytes = 0;
+    if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.shared"))
+      sharedBytes = attr.getValue().getZExtValue();
+    // Reserve a small margin for alignment padding of the globals.
+    int64_t batchBudgetBytes =
+        std::min<int64_t>(16384, 32 * 1024 - sharedBytes - 256);
     bool batchStrips =
-        tgPath && (std::max(batchedABSize, batchedCSize) * 4 <= 16384);
+        tgPath && batchBudgetBytes > 0 &&
+        (std::max(batchedABSize, batchedCSize) * 4 <= batchBudgetBytes);
     int64_t tgSize = tgStripSize + 1;
     if (batchStrips)
       tgSize = std::max(batchedABSize, batchedCSize);

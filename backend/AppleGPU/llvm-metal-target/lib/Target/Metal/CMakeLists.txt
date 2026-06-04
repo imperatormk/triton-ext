@@ -32,6 +32,7 @@ add_public_tablegen_target(MetalCommonTableGen)
 set(METAL_CODEGEN_SOURCES
   MetalAIRSystemValues.cpp
   MetalAliasAnnotate.cpp
+  MetalAsyncCopyToCooperative.cpp
   MetalAsyncEventToAlloca.cpp
   MetalBFloat16CastDecompose.cpp
   MetalBarrierRename.cpp

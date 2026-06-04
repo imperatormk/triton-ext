@@ -2625,6 +2625,13 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     // Mask must be absent or a uniform splat (scalar boolean).
     auto shape = srcTy.getShape();
     bool canAsyncDMA = (shape.size() == 2);
+    // NOTE: the shared-direct MMA path (TRITON_SHARED_MMA=1) reads the pipeline
+    // threadgroup buffer with air.simdgroup_matrix_8x8_load.  That used to fail
+    // Metal PSO creation ("Failed to materializeAll") when the buffer was also
+    // written by air.simdgroup_async_copy.  metal-llc now lowers exactly those
+    // async copies to a cooperative threadgroup copy
+    // (MetalAsyncCopyToCooperative), so the async DMA path is kept here and the
+    // trap is handled at the backend.
 
     // Check mask: either absent, or a splat of scalar i1
     Value mlirMaskScalar;

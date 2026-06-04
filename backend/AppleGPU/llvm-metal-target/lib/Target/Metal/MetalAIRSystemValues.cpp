@@ -199,6 +199,23 @@ static bool airSystemValues(Module &M) {
       if (F.isDeclaration())
         continue;
 
+      // A kernel that calls a noinline device function leaves that callee in
+      // the module as a second definition. Only the kernel is an entry point;
+      // the callee is reached through a call and must not get !air.kernel
+      // metadata (it would be mis-emitted as a second kernel). The kernel is
+      // the definition with no callers.
+      bool IsCalled = false;
+      for (User *U : F.users()) {
+        if (auto *CB = dyn_cast<CallBase>(U)) {
+          if (CB->getCalledFunction() == &F) {
+            IsCalled = true;
+            break;
+          }
+        }
+      }
+      if (IsCalled)
+        continue;
+
       SmallVector<Metadata *, 16> ParamNodes;
       unsigned ArgIdx = 0;
       auto *FTy = F.getFunctionType();

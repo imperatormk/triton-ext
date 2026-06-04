@@ -2410,6 +2410,37 @@ static Value extractFirstElemScalar(Value tensor) {
   return nullptr;
 }
 
+// Detect whether a tensor value's def chain contains a modulo (arith.remui /
+// arith.remsi). The async-DMA fast path below reconstructs each row's device
+// address as `basePtr + rowStart*stride + ...` with a single constant stride,
+// which is only valid when the index is an affine function of the program/
+// thread coordinates. Inductor's mm template wraps row/col indices with
+// `(pid*BLOCK + arange) % M` (the standard bounds-wrapping idiom); that modulo
+// makes the per-row stride non-constant (it folds back to the tensor origin at
+// the wrap), so the linear DMA reads the wrong rows for any program_id > 0.
+// When detected we fall back to the synchronous per-element copy, which uses
+// each element's own (already-correct) pointer and is modulo-safe.
+static bool defChainContainsModulo(Value v, unsigned budget = 128) {
+  llvm::SmallVector<Value, 16> worklist;
+  llvm::SmallPtrSet<Operation *, 32> visited;
+  worklist.push_back(v);
+  while (!worklist.empty() && budget-- > 0) {
+    Value cur = worklist.pop_back_val();
+    Operation *def = cur.getDefiningOp();
+    if (!def || !visited.insert(def).second)
+      continue;
+    if (isa<arith::RemUIOp, arith::RemSIOp>(def))
+      return true;
+    // Stop at splat/make_range leaves; they cannot hide a modulo upstream that
+    // affects the per-element row pattern.
+    if (isa<triton::SplatOp, triton::MakeRangeOp>(def))
+      continue;
+    for (Value in : def->getOperands())
+      worklist.push_back(in);
+  }
+  return false;
+}
+
 // Extract all pointer components from a pointer tensor's MLIR def chain.
 //
 // Pattern: async_copy src = tt.addptr(broadcast(addptr(splat(base),
@@ -2452,6 +2483,11 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info) {
   if (!muliOp || !isa<arith::MulIOp>(muliOp))
     return false;
 
+  // Non-affine (modulo-indexed) row offset defeats the constant-stride DMA
+  // reconstruction below. Bail so the caller uses the sync per-element copy.
+  if (defChainContainsModulo(rowOffset))
+    return false;
+
   // One operand of muli is expand_dims(range), the other is splat(stride)
   Value expandDimsVal;
   bool foundStride = false;
@@ -2475,6 +2511,9 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info) {
   // Extract col offset from outer addptr's second operand:
   // broadcast(expand_dims(col_offs_1d)) or broadcast(col_offs)
   Value colOffset = addptrOp->getOperand(1);
+  // A modulo on the column index is likewise non-affine; bail to sync copy.
+  if (defChainContainsModulo(colOffset))
+    return false;
   auto *colBroadcastOp = colOffset.getDefiningOp();
   if (colBroadcastOp && (isa<triton::BroadcastOp>(colBroadcastOp) ||
                          isa<triton::ExpandDimsOp>(colBroadcastOp))) {

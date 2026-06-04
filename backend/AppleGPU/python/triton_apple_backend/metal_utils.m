@@ -112,6 +112,17 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
   // synchronize with other MPS operations (MPSGraph, blit copies, etc.)
   // that also use this queue. Without this, commandEncoder/endKernelCoalescing
   // race with concurrent MPS graph executions causing nondeterministic results.
+  //
+  // PERF: We deliberately do NOT call endKernelCoalescing() here. PyTorch's
+  // MPSStream::commandEncoder() caches one compute encoder; reusing it across
+  // back-to-back Triton dispatches coalesces them into a single encoder (and a
+  // single command buffer), so Metal pipelines them instead of paying encoder
+  // setup/teardown per kernel. The encoder uses the default serial dispatch
+  // type, so RAW dependencies between consecutive kernels are still honored by
+  // the implicit barrier between serial dispatches. Whenever torch needs to
+  // interleave a blit copy or MPSGraph it calls endKernelCoalescing() itself
+  // (MPSStream::copy / executeMPSGraph), so our open encoder is always closed
+  // before any other queue work, preserving global ordering and correctness.
   @autoreleasepool {
     auto stream = at::mps::getCurrentMPSStream();
 
@@ -139,8 +150,6 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
         MTLSize threadsPerGroup = MTLSizeMake(gx, gy, gz);
         [enc dispatchThreadgroups:threadgroups
             threadsPerThreadgroup:threadsPerGroup];
-
-        stream->endKernelCoalescing();
       }
     });
   }

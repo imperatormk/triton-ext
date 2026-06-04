@@ -58,7 +58,14 @@ Value TargetInfo::getClusterCTAId(RewriterBase &rewriter, Location loc) const {
 
 Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
                          Value cmp) const {
-  return arith::ConstantIntOp::create(rewriter, loc, 0, 64);
+  // No correct AIR simd-vote/ballot lowering is wired up yet. Returning a
+  // constant (the previous behavior) silently computes the wrong mask for any
+  // kernel that relies on ballot semantics. Fail loudly at lowering time so
+  // such a kernel errors instead of producing garbage. Implement via the Metal
+  // simd_vote / simd_ballot intrinsics when a real use case appears.
+  mlir::emitError(loc) << "ballot is not implemented on the Apple GPU backend; "
+                          "this kernel uses an unsupported warp-vote operation";
+  return LLVM::UndefOp::create(rewriter, loc, type);
 }
 
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
@@ -223,12 +230,24 @@ Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
 }
 Value TargetInfo::permute(RewriterBase &rewriter, Location loc, Value a,
                           Value b, Value selector) const {
-  return a;
+  // permute selects/interleaves bytes from (a, b) per the selector, like
+  // NVIDIA's prmt. It is used by the warp-shuffle ConvertLayout fast path.
+  // There is no correct AIR lowering wired up; returning `a` (the previous
+  // behavior) silently corrupts that layout conversion. Fail loudly so a kernel
+  // that reaches this path errors at compile time instead of computing garbage.
+  mlir::emitError(loc)
+      << "permute (byte-permute / warp-shuffle layout conversion) is not "
+         "implemented on the Apple GPU backend";
+  return LLVM::UndefOp::create(rewriter, loc, a.getType());
 }
 
 bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
                             SmallVector<Value> &acc, triton::ReduceOp op,
                             unsigned reduceLaneIdMask) const {
+  // Returning false is the correct "decline" contract: it tells the generic
+  // ReduceOpToLLVM lowering to perform the warp reduction with shuffleXor
+  // (which IS implemented correctly above). This is not a stub; there is simply
+  // no single-instruction warp-reduce intrinsic to special-case here.
   return false;
 }
 

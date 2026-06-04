@@ -388,11 +388,19 @@ class MPSBackend(BaseBackend):
     def make_metallib(self, llvm_mod, metadata, options):
         llvm_ir = metadata.pop("_llvm_ir", None) or str(llvm_mod)
 
-        # Extract kernel name (first defined void function = kernel entry)
-        for line in llvm_ir.splitlines():
-            if line.startswith('define void @'):
-                metadata["name"] = line[len('define void @'):].split('(')[0]
-                break
+        # Extract kernel name. Triton emits exactly one `define void @<kernel>`
+        # entry per module; guard that assumption so a future multi-function
+        # module fails loudly instead of silently picking the first symbol.
+        kernel_names = [
+            line[len('define void @'):].split('(')[0]
+            for line in llvm_ir.splitlines()
+            if line.startswith('define void @')
+        ]
+        if len(kernel_names) != 1:
+            raise RuntimeError(
+                f"expected exactly one 'define void @' kernel entry, found "
+                f"{len(kernel_names)}: {kernel_names}")
+        metadata["name"] = kernel_names[0]
 
         debug = os.environ.get('TRITON_MPS_DEBUG')
 

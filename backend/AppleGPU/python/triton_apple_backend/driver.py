@@ -8,6 +8,7 @@ Dispatch pipeline:
     → kernel(*tensors, threads=, group_size=)  [zero-copy via getMTLBufferStorage]
 """
 
+import os as _os
 import re as _re
 import struct as _struct
 import torch
@@ -54,7 +55,10 @@ _SCALAR_PACK_INFO = {
     "u32": ("I", 4, 4),
     "u64": ("Q", 8, 8),
     "fp16": ("e", 2, 2),
-    "bf16": ("e", 2, 2),  # bf16 → pack as fp16 (Metal treats both as 2-byte)
+    # bf16 is 2 bytes but is NOT IEEE fp16: _pack_scalars handles it explicitly
+    # (truncate the f32 bit pattern to the high 16 bits). The pack char below is
+    # only used for its size/alignment (2), never for struct.pack of bf16.
+    "bf16": ("e", 2, 2),
     "fp32": ("f", 4, 4),
     "fp64": ("d", 8, 8),
 }
@@ -308,6 +312,14 @@ class MPSLauncher:
             _flatten_arg(a, all_flat_args)
 
         # Apply keep mask: drop constexpr-inside-tuple positions.
+        # The flattened runtime args must line up 1:1 with the keep mask built
+        # from the signature in __init__; a mismatch means zip() would silently
+        # truncate and pass the wrong buffers. Fail loudly instead.
+        if len(all_flat_args) != len(self._flat_arg_keep):
+            raise RuntimeError(
+                f"flat arg count {len(all_flat_args)} does not match signature "
+                f"keep-mask length {len(self._flat_arg_keep)}; kernel call "
+                f"signature is out of sync with the compiled IR")
         flat_args = [
             v for v, keep in zip(all_flat_args, self._flat_arg_keep) if keep
         ]
@@ -327,7 +339,6 @@ class MPSLauncher:
         else:
             reordered_args = tuple(ptr_args)
 
-        import os as _os
         if _os.environ.get('TRITON_MPS_DEBUG'):
             _threads = [gridX * self.lx, gridY * self.ly, gridZ * self.lz]
             _gs = [self.lx, self.ly, self.lz]

@@ -205,8 +205,20 @@ static PyObject *MetalLibrary_get_function(MetalLibraryObject *self,
   id<MTLComputePipelineState> pso =
       [get_device() newComputePipelineStateWithFunction:fn error:&error];
   if (!pso) {
+    // The Metal PSO compiler often hides the real diagnostic in the error's
+    // userInfo (and any underlying error) rather than localizedDescription.
+    // Surface the whole thing so codegen failures are actionable.
+    NSMutableString *full = [NSMutableString string];
+    [full appendFormat:@"%@", [error localizedDescription]];
+    NSDictionary *info = [error userInfo];
+    if (info && [info count])
+      [full appendFormat:@" | userInfo=%@", info];
+    NSError *under = [[error userInfo] objectForKey:NSUnderlyingErrorKey];
+    if (under)
+      [full appendFormat:@" | underlying=%@ (%@)",
+                         [under localizedDescription], [under userInfo]];
     PyErr_Format(PyExc_RuntimeError, "PSO creation failed: %s",
-                 [[error localizedDescription] UTF8String]);
+                 [full UTF8String]);
     return NULL;
   }
 

@@ -2625,6 +2625,11 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     // Mask must be absent or a uniform splat (scalar boolean).
     auto shape = srcTy.getShape();
     bool canAsyncDMA = (shape.size() == 2);
+    {
+      const char *e = std::getenv("TRITON_DMA_DISABLE");
+      if (e && std::string(e) == "1")
+        canAsyncDMA = false;
+    }
     // NOTE: the shared-direct MMA path (TRITON_SHARED_MMA=1) reads the pipeline
     // threadgroup buffer with air.simdgroup_matrix_8x8_load.  That used to fail
     // Metal PSO creation ("Failed to materializeAll") when the buffer was also

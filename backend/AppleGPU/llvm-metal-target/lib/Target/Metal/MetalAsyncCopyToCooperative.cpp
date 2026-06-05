@@ -275,8 +275,8 @@ static bool lowerAsyncCopy(CallInst *CI, Module &M, unsigned TGSize) {
 }
 
 static bool asyncCopyToCooperative(Module &M, unsigned TGSize) {
-  // Disabled: keep the genuine air.simdgroup_async_copy_2d hardware DMA. The AGX
-  // materializeAll trap this pass worked around no longer reproduces here.
+  // Disabled: keep the genuine air.simdgroup_async_copy_2d hardware DMA. The
+  // AGX materializeAll trap this pass worked around no longer reproduces here.
   return false;
   if (!moduleUsesMMA(M) || !moduleHasAsyncCopy(M))
     return false;

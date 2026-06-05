@@ -242,15 +242,57 @@ Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
 }
 Value TargetInfo::permute(RewriterBase &rewriter, Location loc, Value a,
                           Value b, Value selector) const {
-  // permute selects/interleaves bytes from (a, b) per the selector, like
-  // NVIDIA's prmt. It is used by the warp-shuffle ConvertLayout fast path.
-  // There is no correct AIR lowering wired up; returning `a` (the previous
-  // behavior) silently corrupts that layout conversion. Fail loudly so a kernel
-  // that reaches this path errors at compile time instead of computing garbage.
-  mlir::emitError(loc)
-      << "permute (byte-permute / warp-shuffle layout conversion) is not "
-         "implemented on the Apple GPU backend";
-  return LLVM::UndefOp::create(rewriter, loc, a.getType());
+  // Byte permute, matching NVIDIA's prmt in index mode (the only mode the
+  // warp-shuffle ConvertLayout fast path emits: every selector nibble is in
+  // [0, 7], no sign-replicate bit set). The eight source bytes are the
+  // concatenation {b, a}: bytes 0..3 are a's bytes low..high, bytes 4..7 are
+  // b's. For each of the four result bytes k, selector nibble k picks source
+  // byte (nibble & 7). AIR has no prmt intrinsic, so synthesize it with plain
+  // 32-bit bit ops (portable, works on every Metal version).
+  //
+  // Implemented as a parallel byte gather. For source byte index s, the value
+  // is (concat >> (8*s)) & 0xFF where concat is the 64-bit {b:a}. Done per
+  // result byte, then OR'd into the i32 result.
+  auto i32Ty = IntegerType::get(rewriter.getContext(), 32);
+  auto i64Ty = IntegerType::get(rewriter.getContext(), 64);
+  auto cst32 = [&](int v) {
+    return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                    rewriter.getI32IntegerAttr(v));
+  };
+  auto cst64 = [&](int64_t v) {
+    return LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                    rewriter.getI64IntegerAttr(v));
+  };
+
+  // concat = (zext(b) << 32) | zext(a), giving bytes a0..a3,b0..b3 at byte
+  // positions 0..7.
+  Value aw = LLVM::ZExtOp::create(rewriter, loc, i64Ty, a);
+  Value bw = LLVM::ZExtOp::create(rewriter, loc, i64Ty, b);
+  Value concat = LLVM::OrOp::create(
+      rewriter, loc, aw, LLVM::ShlOp::create(rewriter, loc, bw, cst64(32)));
+
+  Value result = cst32(0);
+  for (int k = 0; k < 4; ++k) {
+    // nib = (selector >> (4*k)) & 0x7   (index-mode selector nibble)
+    Value shifted = LLVM::LShrOp::create(rewriter, loc, selector, cst32(4 * k));
+    Value nib = LLVM::AndOp::create(rewriter, loc, shifted, cst32(0x7));
+    // byteShift = nib * 8 (the bit offset of source byte `nib` in concat)
+    Value byteShift = LLVM::ShlOp::create(rewriter, loc, nib, cst32(3));
+    Value byteShift64 = LLVM::ZExtOp::create(rewriter, loc, i64Ty, byteShift);
+    // srcByte = (concat >> byteShift) & 0xFF
+    Value srcByte64 = LLVM::AndOp::create(
+        rewriter, loc, LLVM::LShrOp::create(rewriter, loc, concat, byteShift64),
+        cst64(0xFF));
+    Value srcByte = LLVM::TruncOp::create(rewriter, loc, i32Ty, srcByte64);
+    // place into result byte k
+    Value placed = LLVM::ShlOp::create(rewriter, loc, srcByte, cst32(8 * k));
+    result = LLVM::OrOp::create(rewriter, loc, result, placed);
+  }
+  // a may be a non-i32 type; the shuffle path always passes i32-typed packed
+  // registers here, but bitcast back to a's type to keep the contract.
+  if (a.getType() != i32Ty)
+    return LLVM::BitcastOp::create(rewriter, loc, a.getType(), result);
+  return result;
 }
 
 bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,

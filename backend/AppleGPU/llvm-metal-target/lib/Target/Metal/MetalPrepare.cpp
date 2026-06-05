@@ -153,8 +153,18 @@ static void collectTGTypedGlobals(Module &M,
     if (GV.getAddressSpace() != ASThreadgroup)
       continue;
     auto *AT = dyn_cast<ArrayType>(GV.getValueType());
-    if (AT && !AT->getElementType()->isIntegerTy(8))
-      Out.push_back(&GV);
+    if (!AT || AT->getElementType()->isIntegerTy(8))
+      continue;
+    // Only genuine MMA operand scratch (__tg_dot_ab_*) is a valid merge target
+    // for the byte arena. Other typed threadgroup globals - notably the
+    // convert_layout scratch (__tg_cvt_*) - are independent live buffers; the
+    // byte arena (e.g. a multi-warp scan's i64 index + f32 value partials) must
+    // not be overlaid onto them, which would alias distinct live data and route
+    // f32/f16 stores through an i64-typed global the Metal JIT cannot
+    // materialize.
+    if (!GV.getName().starts_with("__tg_dot_ab_"))
+      continue;
+    Out.push_back(&GV);
   }
 }
 
@@ -449,6 +459,11 @@ splitMixedByteGlobals(Module &M,
 
     SmallPtrSet<Type *, 4> AllScalarTypes;
     SmallVector<int64_t, 4> ConstOffsets;
+    // A wide (>1 byte) element type indexed by a runtime value directly off the
+    // arena base (offset 0). The allocator overlaps time-disjoint buffers in
+    // one byte arena, so this buffer's dynamic slots may run past an interior
+    // constant offset that belongs to a later, time-disjoint reuse buffer.
+    bool WideRuntimeBaseBuffer = false;
     std::function<void(Value *, int64_t)> CollectTypes = [&](Value *V,
                                                              int64_t BaseOff) {
       for (auto *U : V->users()) {
@@ -470,6 +485,11 @@ splitMixedByteGlobals(Module &M,
               ConstOffsets.push_back(ByteOff);
             CollectTypes(GEP, BaseOff + ByteOff);
           } else {
+            Type *ST = GEP->getSourceElementType();
+            if (BaseOff == 0 &&
+                (ST->isIntegerTy() || ST->isFloatingPointTy()) &&
+                DL.getTypeAllocSize(ST) > 1)
+              WideRuntimeBaseBuffer = true;
             CollectTypes(GEP, BaseOff);
           }
         } else if (isa<BitCastInst>(U)) {
@@ -486,6 +506,16 @@ splitMixedByteGlobals(Module &M,
     ConstOffsets.erase(std::unique(ConstOffsets.begin(), ConstOffsets.end()),
                        ConstOffsets.end());
 
+    // Size of the base (offset-0) typed global. Normally it ends at the first
+    // constant offset. But when the offset-0 buffer is a wide runtime-indexed
+    // buffer it may span past interior offsets that belong to time-disjoint
+    // reuse buffers; size it to the last (largest) offset so its dynamic slots
+    // are not truncated. The interior reuse buffers still split off into their
+    // own typed globals, which Metal places at independent threadgroup
+    // addresses, so the (source) byte overlap is harmless.
+    int64_t BaseRegionEnd =
+        WideRuntimeBaseBuffer ? ConstOffsets.back() : ConstOffsets.front();
+
     DenseMap<int64_t, GlobalVariable *> SplitMap;
     for (int64_t Off : ConstOffsets) {
       uint64_t RegionSize = TotalBytes - Off;
@@ -500,7 +530,7 @@ splitMixedByteGlobals(Module &M,
       SplitMap[Off] = SplitGV;
     }
 
-    auto *NewAT = ArrayType::get(Type::getInt8Ty(Ctx), ConstOffsets[0]);
+    auto *NewAT = ArrayType::get(Type::getInt8Ty(Ctx), BaseRegionEnd);
     auto *NewGV = new GlobalVariable(
         M, NewAT, false, GV->getLinkage(), UndefValue::get(NewAT),
         GV->getName().str(), GV, GlobalVariable::NotThreadLocal, ASThreadgroup);

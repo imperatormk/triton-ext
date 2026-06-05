@@ -2371,7 +2371,47 @@ struct AsyncCopyPtrInfo {
   Value basePtr;  // Scalar base pointer (MLIR, tt.ptr)
   Value rowStart; // Scalar first-row index (MLIR, i32/i64), or nullptr if 0
   Value colStart; // Scalar first-col index (MLIR, i32/i64), or nullptr if 0
+  // Compile-time fallbacks used when the first-element offset is a FOLDED splat
+  // constant (arith.constant dense<C>) rather than a tt.splat of an SSA scalar.
+  // The software pipeliner emits the prefetched buffer's K-block offset this way
+  // (make_range + dense<BLOCK_K>); without capturing it, every prefetched slab
+  // read K-block 0, corrupting num_stages>=3. INT64_MIN means "no constant".
+  int64_t rowStartConst = 0;
+  int64_t colStartConst = 0;
 };
+
+// First element of a 1D index tensor as a compile-time constant, when the tensor
+// is `addi(make_range, dense<C>)` / `dense<C>` / `make_range` (=0). Returns true
+// + sets `out` on success; false when the offset is not a folded constant (the
+// caller then falls back to the SSA-scalar extractFirstElemScalar path).
+static bool extractFirstElemConst(Value tensor, int64_t &out) {
+  auto *defOp = tensor.getDefiningOp();
+  if (!defOp)
+    return false;
+  if (isa<triton::ExpandDimsOp>(defOp))
+    return extractFirstElemConst(defOp->getOperand(0), out);
+  if (isa<triton::MakeRangeOp>(defOp)) {
+    out = 0;
+    return true;
+  }
+  if (auto cst = dyn_cast<arith::ConstantOp>(defOp)) {
+    if (auto dense = dyn_cast<DenseIntElementsAttr>(cst.getValue()))
+      if (dense.isSplat()) {
+        out = dense.getSplatValue<APInt>().getSExtValue();
+        return true;
+      }
+    return false;
+  }
+  if (isa<arith::AddIOp>(defOp)) {
+    int64_t a, b;
+    if (extractFirstElemConst(defOp->getOperand(0), a) &&
+        extractFirstElemConst(defOp->getOperand(1), b)) {
+      out = a + b;
+      return true;
+    }
+  }
+  return false;
+}
 
 // Extract the first-element scalar from a 1D index tensor.
 //
@@ -2504,9 +2544,12 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info) {
     return false;
 
   // Extract first-row scalar from expand_dims(row_offs_1d)
-  if (expandDimsVal)
+  if (expandDimsVal) {
     info.rowStart = extractFirstElemScalar(expandDimsVal);
-  // nullptr means first row = 0
+    if (!info.rowStart)
+      extractFirstElemConst(expandDimsVal, info.rowStartConst);
+  }
+  // nullptr (and rowStartConst 0) means first row = 0
 
   // Extract col offset from outer addptr's second operand:
   // broadcast(expand_dims(col_offs_1d)) or broadcast(col_offs)
@@ -2518,8 +2561,10 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info) {
   if (colBroadcastOp && (isa<triton::BroadcastOp>(colBroadcastOp) ||
                          isa<triton::ExpandDimsOp>(colBroadcastOp))) {
     info.colStart = extractFirstElemScalar(colBroadcastOp->getOperand(0));
+    if (!info.colStart)
+      extractFirstElemConst(colBroadcastOp->getOperand(0), info.colStartConst);
   }
-  // nullptr means first col = 0
+  // nullptr (and colStartConst 0) means first col = 0
 
   return true;
 }
@@ -2734,12 +2779,29 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
                                          llvmRowStart, llvmStride);
       srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy,
                                     srcBase, ArrayRef<LLVM::GEPArg>{rowOff});
+    } else if (ptrInfo.rowStartConst != 0) {
+      // Folded-constant first row: GEP by (rowStartConst * stride) elements.
+      Value rc = LLVM::ConstantOp::create(
+          rewriter, loc, llvmStride.getType(),
+          rewriter.getIntegerAttr(llvmStride.getType(), ptrInfo.rowStartConst));
+      Value rowOff = LLVM::MulOp::create(rewriter, loc, llvmStride.getType(), rc,
+                                         llvmStride);
+      srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy,
+                                    srcBase, ArrayRef<LLVM::GEPArg>{rowOff});
     }
     if (llvmColStart) {
       // GEP by colStart (in elements)
       srcBase =
           LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy, srcBase,
                               ArrayRef<LLVM::GEPArg>{llvmColStart});
+    } else if (ptrInfo.colStartConst != 0) {
+      // Folded-constant first col (the prefetched K-block offset): GEP by
+      // colStartConst elements. THIS is the num_stages>=3 correctness fix.
+      Value cc = LLVM::ConstantOp::create(
+          rewriter, loc, i32Ty,
+          rewriter.getI32IntegerAttr((int32_t)ptrInfo.colStartConst));
+      srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy,
+                                    srcBase, ArrayRef<LLVM::GEPArg>{cc});
     }
 
     // Destination base pointer: shared memory object base

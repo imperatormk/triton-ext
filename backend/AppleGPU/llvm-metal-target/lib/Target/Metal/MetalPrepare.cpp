@@ -1428,16 +1428,11 @@ static bool rewriteTGGlobalGEPs(Module &M) {
   // 14e: iterate; scalarized i8 GEPs form chains that peel one level per pass.
   // Bound is empirical (sub-track Q instrumentation): max observed depth is 1
   // on the sentinel + extended suite. Bound is defensive padding.
-  int LastFiringIter = -1;
   for (int Iter = 0; Iter < 8; Iter++) {
     if (!fixResidualI8GEPs(M))
       break;
-    LastFiringIter = Iter;
     Changed = true;
   }
-  if (std::getenv("METAL_PREPARE_LOG_I8GEP_ITER") && LastFiringIter >= 0)
-    errs() << "[metal-prepare] fixResidualI8GEPs last firing Iter="
-           << LastFiringIter << "\n";
 
   Changed |= fixMismatchedTGGEPs(M);
   // After the global is fully retyped and GEPs are normalized, demote wide

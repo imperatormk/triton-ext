@@ -1628,11 +1628,38 @@ static bool feedsThreadgroupGEPIndex(Value *Val) {
   return false;
 }
 
+// SCCP's solver tracks a per-element lattice value for every aggregate it
+// visits. For an N-element struct built by a chain of N insertvalue
+// instructions (the pattern torch-inductor emits for wide reductions), each
+// insertvalue re-merges all N element states, so solve() is O(N^2). On the
+// conv1d_depthwise kernel (a 1024-element struct, 1024-long insertvalue chain)
+// that is ~45s of pure aggregate lattice churn inside a single llc invocation.
+//
+// foldConditionalConstants only ever consumes INTEGER constants (the loop
+// below skips any non-integer instruction), so none of that aggregate lattice
+// work is ever read back. Skip the solver entirely for any function whose
+// insertvalue aggregate work exceeds this bound. Such kernels are wide
+// reduction bodies, not the small thread/lane/pid index recurrences that need
+// the PSO-crash fold, so skipping the fold for them is safe: the byte-exact
+// scalar integer patterns Metal's PSO compiler crashes on do not appear in a
+// 1024-wide insertvalue aggregate. Small kernels stay below the bound and are
+// folded exactly as before.
+static constexpr uint64_t kMaxAggregateFoldWork = 4096;
+
 static bool foldConditionalConstants(Module &M) {
   bool Changed = false;
   TargetLibraryInfoImpl TLIImpl(Triple(M.getTargetTriple()));
   for (Function &F : M) {
     if (F.isDeclaration())
+      continue;
+
+    uint64_t AggregateWork = 0;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *IVI = dyn_cast<InsertValueInst>(&I))
+          if (auto *STy = dyn_cast<StructType>(IVI->getType()))
+            AggregateWork += STy->getNumElements();
+    if (AggregateWork > kMaxAggregateFoldWork)
       continue;
 
     SCCPSolver Solver(

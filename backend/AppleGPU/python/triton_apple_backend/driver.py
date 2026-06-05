@@ -179,6 +179,10 @@ class MPSUtils:
             if m:
                 raise OutOfResources(int(m.group(1)), int(m.group(2)),
                                      "Metal PSO") from e
+            # Over-budget register/stack footprint: skip the config (like an OOM)
+            # instead of hard-failing the compile. See test_large_block_sizes.
+            if 'exceeds available stack space' in msg:
+                raise OutOfResources(0, 0, "Metal PSO stack space") from e
             raise
 
     def unload_module(self, module):

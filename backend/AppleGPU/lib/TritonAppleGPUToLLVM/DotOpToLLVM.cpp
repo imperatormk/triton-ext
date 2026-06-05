@@ -635,6 +635,16 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       auto loadOp = src.getDefiningOp<tt::LoadOp>();
       if (!loadOp)
         return {};
+      // A masked load (tt.load %ptr, %mask, %other) zero-fills (or `other`-
+      // fills) the out-of-bounds lanes in registers. The device-direct
+      // simdgroup_matrix_8x8_load.p1 reads raw device memory and so CANNOT see
+      // that masking - it would feed the MMA the unmasked device bytes for the
+      // masked-out positions, corrupting the result (100% mismatch on masked
+      // tl.dot, e.g. depthwise / grouped conv2d_backward). Decline the device
+      // path so the operand goes through the TG scatter, which scatters the
+      // already-masked register values and preserves the zero fill.
+      if (loadOp.getMask())
+        return {};
       Value ptrTensor = loadOp.getPtr();
       Value mappedPtrs = rewriter.getRemappedValue(ptrTensor);
       if (!mappedPtrs)
@@ -1968,6 +1978,16 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // Check if source is a LoadOp
       auto loadOp = src.getDefiningOp<tt::LoadOp>();
       if (!loadOp)
+        return {};
+      // A masked load (tt.load %ptr, %mask, %other) zero-/other-fills the
+      // out-of-bounds lanes in registers. The device-direct
+      // simdgroup_matrix_8x8_load.p1 reads raw device memory and cannot see
+      // that masking, so it would feed the MMA the unmasked device bytes for
+      // the masked-out positions and corrupt the result (100% mismatch on
+      // masked tl.dot, e.g. depthwise / grouped conv2d_backward). Decline the
+      // device path so the operand goes through the TG scatter, which scatters
+      // the already-masked register values and preserves the fill.
+      if (loadOp.getMask())
         return {};
       // Get the pointer operand (tensor of device pointers)
       Value ptrTensor = loadOp.getPtr();

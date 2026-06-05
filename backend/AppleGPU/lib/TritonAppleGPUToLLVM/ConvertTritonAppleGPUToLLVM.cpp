@@ -2373,15 +2373,17 @@ struct AsyncCopyPtrInfo {
   Value colStart; // Scalar first-col index (MLIR, i32/i64), or nullptr if 0
   // Compile-time fallbacks used when the first-element offset is a FOLDED splat
   // constant (arith.constant dense<C>) rather than a tt.splat of an SSA scalar.
-  // The software pipeliner emits the prefetched buffer's K-block offset this way
-  // (make_range + dense<BLOCK_K>); without capturing it, every prefetched slab
-  // read K-block 0, corrupting num_stages>=3. INT64_MIN means "no constant".
+  // The software pipeliner emits the prefetched buffer's K-block offset this
+  // way (make_range + dense<BLOCK_K>); without capturing it, every prefetched
+  // slab read K-block 0, corrupting num_stages>=3. INT64_MIN means "no
+  // constant".
   int64_t rowStartConst = 0;
   int64_t colStartConst = 0;
 };
 
-// First element of a 1D index tensor as a compile-time constant, when the tensor
-// is `addi(make_range, dense<C>)` / `dense<C>` / `make_range` (=0). Returns true
+// First element of a 1D index tensor as a compile-time constant, when the
+// tensor is `addi(make_range, dense<C>)` / `dense<C>` / `make_range` (=0).
+// Returns true
 // + sets `out` on success; false when the offset is not a folded constant (the
 // caller then falls back to the SSA-scalar extractFirstElemScalar path).
 static bool extractFirstElemConst(Value tensor, int64_t &out) {
@@ -2784,8 +2786,8 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       Value rc = LLVM::ConstantOp::create(
           rewriter, loc, llvmStride.getType(),
           rewriter.getIntegerAttr(llvmStride.getType(), ptrInfo.rowStartConst));
-      Value rowOff = LLVM::MulOp::create(rewriter, loc, llvmStride.getType(), rc,
-                                         llvmStride);
+      Value rowOff = LLVM::MulOp::create(rewriter, loc, llvmStride.getType(),
+                                         rc, llvmStride);
       srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy,
                                     srcBase, ArrayRef<LLVM::GEPArg>{rowOff});
     }

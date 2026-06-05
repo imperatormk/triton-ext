@@ -99,7 +99,19 @@ void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter) const {
   barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
 }
 
-void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {}
+void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
+  // On NVIDIA a warp runs in lockstep, so an intra-warp shared-memory layout
+  // conversion (one simdgroup writing then reading threadgroup memory across
+  // its own lanes) needs no fence. Apple simdgroups do NOT auto-order
+  // threadgroup memory across lanes: a lane reading a TG slot written by
+  // another lane in the same simdgroup may observe stale data without an
+  // explicit fence. The upstream membar pass emits warpSync (not barrier) for
+  // single-warp conversions, which is why small single-warp MMA tiles (e.g.
+  // 16x16) produced wrong, sometimes nondeterministic results while multi-warp
+  // tiles (which get a full barrier) were correct. Emit a threadgroup-scoped
+  // fence so the cross-lane TG traffic is ordered.
+  barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+}
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
                               std::optional<Value> ctaId, Value val,

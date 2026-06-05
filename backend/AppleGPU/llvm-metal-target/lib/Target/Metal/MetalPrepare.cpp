@@ -331,8 +331,22 @@ namespace {
 // NewGV with element type ElemTy.
 static bool rewriteByteGEPs(GlobalVariable *OldGV, GlobalVariable *NewGV,
                             ArrayType *OldAT, ArrayType *NewAT, Type *ElemTy,
-                            unsigned ElemSize, LLVMContext &Ctx) {
+                            unsigned ElemSize, LLVMContext &Ctx,
+                            uint64_t ExtraElemOffset = 0) {
   bool Changed = false;
+  // When the byte arena is concatenated after the MMA scratch, every element
+  // index must be shifted by ExtraElemOffset so the arena lands at its slot in
+  // the merged buffer.  addOff folds the shift in (constant-folded when the
+  // index is constant).
+  auto addOff = [&](IRBuilder<> &B, Value *Idx) -> Value * {
+    if (ExtraElemOffset == 0)
+      return Idx;
+    Value *Off = ConstantInt::get(Idx->getType(), ExtraElemOffset);
+    if (auto *CI = dyn_cast<ConstantInt>(Idx))
+      return ConstantInt::get(Idx->getType(),
+                              CI->getZExtValue() + ExtraElemOffset);
+    return B.CreateAdd(Idx, Off);
+  };
   SmallVector<GetElementPtrInst *, 16> Users;
   for (auto *U : OldGV->users())
     if (auto *GEP = dyn_cast<GetElementPtrInst>(U))
@@ -355,6 +369,7 @@ static bool rewriteByteGEPs(GlobalVariable *OldGV, GlobalVariable *NewGV,
       else
         ElemIdx = B.CreateUDiv(ByteIdx,
                                ConstantInt::get(ByteIdx->getType(), ElemSize));
+      ElemIdx = addOff(B, ElemIdx);
       auto *NewGEP = GetElementPtrInst::CreateInBounds(
           NewAT, NewGV, {ConstantInt::get(Type::getInt64Ty(Ctx), 0), ElemIdx},
           GEP->getName());
@@ -370,13 +385,25 @@ static bool rewriteByteGEPs(GlobalVariable *OldGV, GlobalVariable *NewGV,
       else
         ElemIdx = B.CreateUDiv(ByteIdx,
                                ConstantInt::get(ByteIdx->getType(), ElemSize));
-      auto *NewGEP = GetElementPtrInst::CreateInBounds(ElemTy, NewGV, ElemIdx,
-                                                       GEP->getName());
+      ElemIdx = addOff(B, ElemIdx);
+      auto *NewGEP = GetElementPtrInst::CreateInBounds(
+          NewAT, NewGV, {ConstantInt::get(Type::getInt64Ty(Ctx), 0), ElemIdx},
+          GEP->getName());
       NewGEP->insertBefore(B.GetInsertPoint());
       GEP->replaceAllUsesWith(NewGEP);
       GEP->eraseFromParent();
     } else {
-      GEP->setOperand(0, NewGV);
+      // Direct base use (no GEP offset): point at element ExtraElemOffset.
+      if (ExtraElemOffset == 0) {
+        GEP->setOperand(0, NewGV);
+      } else {
+        IRBuilder<> B2(GEP);
+        Value *Base = B2.CreateInBoundsGEP(
+            NewAT, NewGV,
+            {ConstantInt::get(Type::getInt64Ty(Ctx), 0),
+             ConstantInt::get(Type::getInt64Ty(Ctx), ExtraElemOffset)});
+        GEP->setOperand(0, Base);
+      }
     }
     Changed = true;
   }
@@ -390,9 +417,17 @@ static bool rewriteByteGEPs(GlobalVariable *OldGV, GlobalVariable *NewGV,
     DirectUsers.push_back(I);
   }
   for (auto *I : DirectUsers) {
+    Value *Base = NewGV;
+    if (ExtraElemOffset != 0) {
+      IRBuilder<> B2(I);
+      Base = B2.CreateInBoundsGEP(
+          NewAT, NewGV,
+          {ConstantInt::get(Type::getInt64Ty(Ctx), 0),
+           ConstantInt::get(Type::getInt64Ty(Ctx), ExtraElemOffset)});
+    }
     for (unsigned Op = 0; Op < I->getNumOperands(); Op++)
       if (I->getOperand(Op) == OldGV)
-        I->setOperand(Op, NewGV);
+        I->setOperand(Op, Base);
     Changed = true;
   }
   return Changed;
@@ -511,24 +546,46 @@ splitMixedByteGlobals(Module &M,
   return Changed;
 }
 
-// Returns true if any user of \p GV (through GEP/bitcast chains) is an
-// air.simdgroup_matrix_8x8_load/store call.  When the threadgroup byte arena is
-// read directly by simdgroup-matrix ops (the pipeline-shared MMA path), the
-// byte arena and the MMA scratch buffer are live at the same time, so
-// overlapping them at offset 0 corrupts the operands.  In that case
-// mergeByteMMA must place the MMA buffer AFTER the byte arena instead of
-// aliasing it.
-static bool hasMMAMatrixUser(Value *V, SmallPtrSetImpl<Value *> &Seen) {
+// Returns true when the threadgroup byte arena (\p GV) is live at the SAME TIME
+// as the MMA scratch buffer, so the two must NOT be overlapped at offset 0.
+//
+// Two cases make the byte arena concurrently live:
+//
+//   1. It is read/written directly by air.simdgroup_matrix_8x8_load/store
+//      (the opt-in TRITON_SHARED_MMA path that feeds the MMA from shared).
+//
+//   2. It is the destination of an air.simdgroup_async_copy_2d.  That is the
+//      software-pipeline (num_stages>=2) staging buffer: the prefetch DMA for
+//      a future loop iteration writes the byte arena WHILE the current dot is
+//      scattering its operands/accumulator into the MMA scratch.  With
+//      multi-buffering (num_stages>=3) the arena holds more than one live slot,
+//      so an MMA scratch overlapped at offset 0 stomps the prefetched operand
+//      tile and corrupts the next iteration (bug #46).  The plain-load scatter
+//      path reads the arena into registers, but those reads are NOT ordered
+//      before the concurrent prefetch writes, so the regions still alias-clash;
+//      keying off the async-copy destination captures every pipelined dot.
+//
+// In either case mergeByteMMA concatenates (MMA buffer AFTER the arena) instead
+// of aliasing.  For non-pipelined kernels the arena has neither user and the
+// cheaper offset-0 overlap is kept.
+static bool concurrentWithMMAScratch(Value *V, SmallPtrSetImpl<Value *> &Seen) {
   if (!Seen.insert(V).second)
     return false;
   for (User *U : V->users()) {
     if (auto *CI = dyn_cast<CallInst>(U)) {
-      if (auto *Callee = CI->getCalledFunction())
-        if (Callee->getName().starts_with("air.simdgroup_matrix_8x8_load") ||
-            Callee->getName().starts_with("air.simdgroup_matrix_8x8_store"))
+      if (auto *Callee = CI->getCalledFunction()) {
+        StringRef N = Callee->getName();
+        if (N.starts_with("air.simdgroup_matrix_8x8_load") ||
+            N.starts_with("air.simdgroup_matrix_8x8_store"))
           return true;
+        // Destination (arg 2) of the async-copy DMA = pipeline staging buffer.
+        if (N.starts_with("air.simdgroup_async_copy")) {
+          if (CI->arg_size() > 2 && CI->getArgOperand(2) == V)
+            return true;
+        }
+      }
     } else if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U)) {
-      if (hasMMAMatrixUser(U, Seen))
+      if (concurrentWithMMAScratch(U, Seen))
         return true;
     }
   }
@@ -616,17 +673,20 @@ static bool mergeByteMMA(Module &M,
     MergeElemSize = 4;
   }
 
-  // If the byte arena itself is read/written by simdgroup-matrix ops (the
-  // pipeline-shared MMA path), it is live at the same time as the MMA scratch
-  // buffer, so the two regions must NOT alias.  Concatenate: byte arena at
-  // offset 0, MMA buffer immediately after.  Otherwise overlap them at offset 0
-  // (legacy behaviour: the byte arena's data is consumed into registers before
-  // the MMA buffer is touched, so sharing the space is safe and cheaper).
+  // If the byte arena is live at the same time as the MMA scratch (pipeline
+  // staging via async-copy, or the shared-direct MMA path), concatenate the two
+  // regions instead of overlapping them at offset 0 (bug #46).  The MMA scratch
+  // is kept at offset 0 (its air.simdgroup_matrix_8x8_load/store read a
+  // CONSTANT global base; a non-zero constant-GEP base makes the Metal PSO
+  // compiler fail to materialize), and the byte arena is shifted to start right
+  // after it.  The arena's accesses are already dynamic GEPs, so a constant
+  // element offset is harmless.  Non-pipelined kernels keep the cheaper
+  // offset-0 overlap.
   SmallPtrSet<Value *, 16> SeenMMA;
-  bool ByteIsMMA = hasMMAMatrixUser(ByteGV, SeenMMA);
+  bool ByteIsMMA = concurrentWithMMAScratch(ByteGV, SeenMMA);
   uint64_t ByteElemCount = (ByteBytes + MergeElemSize - 1) / MergeElemSize;
   uint64_t MMAElemCount = (MMABytes + MergeElemSize - 1) / MergeElemSize;
-  uint64_t MMAOffset = ByteIsMMA ? ByteElemCount : 0;
+  uint64_t ByteOffset = ByteIsMMA ? MMAElemCount : 0;
   uint64_t MergedElemCount =
       ByteIsMMA
           ? (ByteElemCount + MMAElemCount)
@@ -641,21 +701,17 @@ static bool mergeByteMMA(Module &M,
                          ByteGV, GlobalVariable::NotThreadLocal, ASThreadgroup);
   MergedGV->setAlignment(ByteGV->getAlign());
 
+  // Rewrite the byte arena's accesses onto the merged buffer, shifted by
+  // ByteOffset elements (0 in the overlap case, MMAElemCount in the concat case
+  // so the arena sits right after the MMA scratch).
   Changed |= rewriteByteGEPs(ByteGV, MergedGV, ByteAT, MergedAT, MergeElemTy,
-                             MergeElemSize, Ctx);
+                             MergeElemSize, Ctx, ByteOffset);
 
   if (ByteGV->use_empty())
     ByteGV->eraseFromParent();
-  if (MMAOffset == 0) {
-    MMAGV->replaceAllUsesWith(MergedGV);
-  } else {
-    // Rebase every MMA-buffer access to MergedGV + MMAOffset elements.
-    Constant *Idx0 = ConstantInt::get(Type::getInt64Ty(Ctx), 0);
-    Constant *IdxOff = ConstantInt::get(Type::getInt64Ty(Ctx), MMAOffset);
-    Constant *MMABase = ConstantExpr::getInBoundsGetElementPtr(
-        MergedAT, MergedGV, ArrayRef<Constant *>{Idx0, IdxOff});
-    MMAGV->replaceAllUsesWith(MMABase);
-  }
+  // MMA scratch stays at offset 0 of the merged buffer (constant base) so its
+  // air.simdgroup_matrix_8x8_load/store keep a materializable constant base.
+  MMAGV->replaceAllUsesWith(MergedGV);
   MMAGV->eraseFromParent();
 
   if (BestIdx >= 0)

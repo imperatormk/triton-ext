@@ -104,8 +104,40 @@ _LLVM_SCALAR_BYTES = {
 }
 
 
+def _split_struct_fields(body: str) -> list:
+    """Split a struct body 'T1, T2, ...' on top-level commas only.
+
+    Nested aggregates (`<..>`, `[..]`, `{..}`) contain commas of their own that
+    must not split the field list, so track bracket depth.
+    """
+    fields = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(body):
+        if ch in '<[{':
+            depth += 1
+        elif ch in '>]}':
+            depth -= 1
+        elif ch == ',' and depth == 0:
+            fields.append(body[start:i])
+            start = i + 1
+    tail = body[start:].strip()
+    if tail:
+        fields.append(tail)
+    return fields
+
+
 def _llvm_type_size(ty: str) -> int:
-    """Total bytes for an LLVM IR type literal as it appears in a global decl."""
+    """Total bytes for an LLVM IR type literal as it appears in a global decl.
+
+    Handles scalars, iN, vectors <N x T>, arrays [N x T] (both recursively, so
+    nested aggregates like [4 x [8 x float]] size correctly), and literal
+    structs {T1, T2, ...}. Anything else raises so a new TG type is never
+    silently under-counted (which would let an over-budget config slip past the
+    autotuner and OOM/stall at runtime). Note: struct sizing here is a plain
+    field sum without inter-field ABI padding; AIR threadgroup structs emitted
+    by our lowering are packed scalar/vector tiles, so this matches in practice.
+    """
     ty = ty.strip()
     # Vector: <N x T>
     m = re.fullmatch(r'<\s*(\d+)\s*x\s*(.+?)\s*>', ty)
@@ -115,6 +147,13 @@ def _llvm_type_size(ty: str) -> int:
     m = re.fullmatch(r'\[\s*(\d+)\s*x\s*(.+?)\s*\]', ty)
     if m:
         return int(m.group(1)) * _llvm_type_size(m.group(2))
+    # Literal struct: {T1, T2, ...} (packed form <{...}> too)
+    m = re.fullmatch(r'<?\{\s*(.*?)\s*\}>?', ty, re.DOTALL)
+    if m:
+        body = m.group(1).strip()
+        if not body:
+            return 0
+        return sum(_llvm_type_size(f) for f in _split_struct_fields(body))
     # Sized scalar
     if ty in _LLVM_SCALAR_BYTES:
         return _LLVM_SCALAR_BYTES[ty]
@@ -125,26 +164,68 @@ def _llvm_type_size(ty: str) -> int:
     raise ValueError(f"unsupported LLVM type for tg-memory sizing: {ty!r}")
 
 
+def _leading_llvm_type(head: str) -> str:
+    """Extract the leading well-formed LLVM type token from a decl tail.
+
+    The text after `global ` starts with the type, optionally followed by an
+    initializer and attributes. Aggregates can nest, so a depth-tracking scan is
+    needed rather than a flat `[^>]`/`[^\\]]` class (which mis-stops on the first
+    inner bracket of e.g. [4 x [8 x float]]).
+    """
+    head = head.lstrip()
+    if not head:
+        raise ValueError("empty addrspace(3) type head")
+    first = head[0]
+    if first in '<[{':
+        depth = 0
+        for i, ch in enumerate(head):
+            if ch in '<[{':
+                depth += 1
+            elif ch in '>]}':
+                depth -= 1
+                if depth == 0:
+                    # `<{...}>` packed struct: consume the trailing '>' too.
+                    end = i + 1
+                    if ch == '}' and end < len(head) and head[end] == '>':
+                        end += 1
+                    return head[:end]
+        raise ValueError(f"unbalanced aggregate in type head: {head!r}")
+    # Scalar / iN: up to the next space, comma, or end.
+    m = re.match(r'[\w]+', head)
+    if not m:
+        raise ValueError(f"unrecognized addrspace(3) type head: {head!r}")
+    return m.group(0)
+
+
 def _tg_memory_bytes(llvm_ir: str) -> int:
     """Sum bytes for `addrspace(3)` globals, padding the total to each align.
 
     Plain summer; pass POST-coalesce IR (from `llc -filetype=asm`) so merged
     buffers are already reflected. Pre-coalesce IR over-reports.
+
+    Every `@x = ... addrspace(3) ... global ...` line MUST be sized; a line that
+    matches the addrspace(3) anchor but not the full `global <type>` shape (e.g.
+    an unexpected qualifier order, an external decl) raises rather than being
+    silently skipped, because a silent skip under-counts the budget and lets an
+    over-budget config slip past the autotuner and OOM / stall at runtime.
     """
     total = 0
-    # `@name = ... addrspace(3) global <type> ..., align N`
-    pat = re.compile(
+    # Anchor: any global decl line whose address space is 3 (threadgroup).
+    anchor = re.compile(r'^@[\w$.]+\s*=\s*[^\n]*?addrspace\(3\)[^\n]*$',
+                        re.MULTILINE)
+    # Detailed shape: capture the type tail after `global ` and an optional align.
+    detail = re.compile(
         r'^@[\w$.]+\s*=\s*(?:[^@\n]*?\s)?addrspace\(3\)\s+(?:[\w]+\s+)?global\s+'
-        r'(.+?)(?:,\s*align\s+(\d+))?\s*$', re.MULTILINE)
-    for m in pat.finditer(llvm_ir):
-        # The captured initializer-or-type group may start with the type
-        # followed by the initializer; take the leading well-formed type.
-        head = m.group(1).strip()
-        tm = re.match(r'(<[^>]+>|\[[^\]]+\]|[\w]+)', head)
-        if not tm:
-            raise ValueError(f"unrecognized addrspace(3) type head: {head!r}")
-        ty = tm.group(1)
-        align = int(m.group(2)) if m.group(2) else 1
+        r'(.+?)(?:,\s*align\s+(\d+))?\s*$')
+    for am in anchor.finditer(llvm_ir):
+        line = am.group(0)
+        dm = detail.match(line)
+        if not dm:
+            raise ValueError(
+                f"addrspace(3) global not understood for tg-memory sizing: "
+                f"{line.strip()!r}")
+        ty = _leading_llvm_type(dm.group(1))
+        align = int(dm.group(2)) if dm.group(2) else 1
         if total % align:
             total += align - (total % align)
         total += _llvm_type_size(ty)

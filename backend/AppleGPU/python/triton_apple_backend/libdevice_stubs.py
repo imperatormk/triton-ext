@@ -262,6 +262,203 @@ def _fast_gelu(x):
     return 0.5 * x * (1.0 + _tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
 
 
+@triton.jit
+def _cyl_bessel_i0(x):
+    # Modified Bessel function I0, Abramowitz & Stegun 9.8.1 / 9.8.2.
+    # I0 is even, so work in |x|. Split at 3.75: a polynomial in (x/3.75)^2
+    # for the small range, an asymptotic exp(ax)/sqrt(ax) * poly(3.75/ax) for
+    # the large range. Single-precision accurate (|err| < ~1.6e-7), which is
+    # all f32 (and Metal, which has no f64) can carry anyway.
+    ax = tl.abs(x)
+    small = ax < 3.75
+    # --- small branch: t = (x/3.75)^2 ---
+    ts = (ax / 3.75) * (ax / 3.75)
+    ps = 0.0045813
+    ps = 0.0360768 + ps * ts
+    ps = 0.2659732 + ps * ts
+    ps = 1.2067492 + ps * ts
+    ps = 3.0899424 + ps * ts
+    ps = 3.5156229 + ps * ts
+    ps = 1.0 + ps * ts
+    # --- large branch: t = 3.75/|x| ---
+    # guard the division so the unused branch never sees ax==0 (NaN poisons
+    # tl.where even on the not-taken side).
+    axl = tl.where(small, 3.75, ax)
+    tl_ = 3.75 / axl
+    pl = 0.00392377
+    pl = -0.01647633 + pl * tl_
+    pl = 0.02635537 + pl * tl_
+    pl = -0.02057706 + pl * tl_
+    pl = 0.00916281 + pl * tl_
+    pl = -0.00157565 + pl * tl_
+    pl = 0.00225319 + pl * tl_
+    pl = 0.01328592 + pl * tl_
+    pl = 0.39894228 + pl * tl_
+    large = (tl.exp(axl) / tl.sqrt(axl)) * pl
+    return tl.where(small, ps, large)
+
+
+@triton.jit
+def _cyl_bessel_i1(x):
+    # Modified Bessel function I1, Abramowitz & Stegun 9.8.3 / 9.8.4.
+    # I1 is odd: compute for |x| then restore the sign. Same 3.75 split.
+    ax = tl.abs(x)
+    small = ax < 3.75
+    # --- small branch: t = (x/3.75)^2, result is ax * poly(t) ---
+    ts = (ax / 3.75) * (ax / 3.75)
+    ps = 0.00032411
+    ps = 0.00301532 + ps * ts
+    ps = 0.02658733 + ps * ts
+    ps = 0.15084934 + ps * ts
+    ps = 0.51498869 + ps * ts
+    ps = 0.87890594 + ps * ts
+    ps = 0.5 + ps * ts
+    small_val = ax * ps
+    # --- large branch: t = 3.75/|x|, result is exp(ax)/sqrt(ax) * poly(t) ---
+    axl = tl.where(small, 3.75, ax)
+    tl_ = 3.75 / axl
+    pl = -0.00420059
+    pl = 0.01787654 + pl * tl_
+    pl = -0.02895312 + pl * tl_
+    pl = 0.02282967 + pl * tl_
+    pl = -0.01031555 + pl * tl_
+    pl = 0.00163801 + pl * tl_
+    pl = -0.00362018 + pl * tl_
+    pl = -0.03988024 + pl * tl_
+    pl = 0.39894228 + pl * tl_
+    large_val = (tl.exp(axl) / tl.sqrt(axl)) * pl
+    mag = tl.where(small, small_val, large_val)
+    # restore odd sign: I1(-x) = -I1(x)
+    return tl.where(x < 0.0, -mag, mag)
+
+
+@triton.jit
+def _j0(x):
+    # Bessel J0, Abramowitz & Stegun 9.4.1 / 9.4.3 (Numerical Recipes form).
+    # Even function. Small |x|<8: rational polynomial. Large: amplitude/phase
+    # asymptotic. Single-precision accurate.
+    ax = tl.abs(x)
+    small = ax < 8.0
+    # --- small branch: rational in y = x^2 ---
+    y = x * x
+    p1 = 57568490574.0 + y * (-13362590354.0 + y * (651619640.7 + y *
+                                                    (-11214424.18 + y *
+                                                     (77392.33017 + y *
+                                                      (-184.9052456)))))
+    q1 = 57568490411.0 + y * (1029532985.0 + y * (9494680.718 + y *
+                                                  (59272.64853 + y *
+                                                   (267.8532712 + y))))
+    small_val = p1 / q1
+    # --- large branch: xx = |x| - 0.785398164 ---
+    axl = tl.where(small, 8.0, ax)
+    z = 8.0 / axl
+    y2 = z * z
+    xx = axl - 0.785398164
+    pa = 1.0 + y2 * (-0.1098628627e-2 + y2 *
+                     (0.2734510407e-4 + y2 *
+                      (-0.2073370639e-5 + y2 * 0.2093887211e-6)))
+    pb = -0.1562499995e-1 + y2 * (0.1430488765e-3 + y2 *
+                                  (-0.6911147651e-5 + y2 *
+                                   (0.7621095161e-6 + y2 * (-0.934935152e-7))))
+    large_val = tl.sqrt(
+        0.636619772 / axl) * (tl.cos(xx) * pa - z * tl.sin(xx) * pb)
+    return tl.where(small, small_val, large_val)
+
+
+@triton.jit
+def _j1(x):
+    # Bessel J1, A&S 9.4.4 / 9.4.6. Odd function.
+    ax = tl.abs(x)
+    small = ax < 8.0
+    y = x * x
+    p1 = x * (72362614232.0 + y * (-7895059235.0 + y * (242396853.1 + y *
+                                                        (-2972611.439 + y *
+                                                         (15704.48260 + y *
+                                                          (-30.16036606))))))
+    q1 = 144725228442.0 + y * (2300535178.0 + y * (18583304.74 + y *
+                                                   (99447.43394 + y *
+                                                    (376.9991397 + y))))
+    small_val = p1 / q1
+    axl = tl.where(small, 8.0, ax)
+    z = 8.0 / axl
+    y2 = z * z
+    xx = axl - 2.356194491
+    pa = 1.0 + y2 * (0.183105e-2 + y2 * (-0.3516396496e-4 + y2 *
+                                         (0.2457520174e-5 + y2 *
+                                          (-0.240337019e-6))))
+    pb = 0.04687499995 + y2 * (-0.2002690873e-3 + y2 *
+                               (0.8449199096e-5 + y2 *
+                                (-0.88228987e-6 + y2 * 0.105787412e-6)))
+    mag = tl.sqrt(0.636619772 / axl) * (tl.cos(xx) * pa - z * tl.sin(xx) * pb)
+    large_val = tl.where(x < 0.0, -mag, mag)
+    return tl.where(small, small_val, large_val)
+
+
+@triton.jit
+def _y0(x):
+    # Bessel Y0 (second kind), A&S 9.4.2 / 9.4.3. Defined for x > 0; singular
+    # at 0 (-> -inf). Small x<8: rational + (2/pi) * J0(x) * ln(x). Large:
+    # amplitude/phase asymptotic.
+    small = x < 8.0
+    y = x * x
+    p1 = -2957821389.0 + y * (7062834065.0 + y *
+                              (-512359803.6 + y *
+                               (10879881.29 + y *
+                                (-86327.92757 + y * 228.4622733))))
+    q1 = 40076544269.0 + y * (745249964.8 + y * (7189466.438 + y *
+                                                 (47447.26470 + y *
+                                                  (226.1030244 + y))))
+    # ln(x) guarded so the unused (large) branch never evaluates ln of a big x
+    # in a way that poisons the where; x>0 by domain so abs is just safety.
+    xs = tl.where(small, x, 1.0)
+    small_val = (p1 / q1) + 0.636619772 * _j0(x) * tl.log(xs)
+    xl = tl.where(small, 8.0, x)
+    z = 8.0 / xl
+    y2 = z * z
+    xx = xl - 0.785398164
+    pa = 1.0 + y2 * (-0.1098628627e-2 + y2 *
+                     (0.2734510407e-4 + y2 *
+                      (-0.2073370639e-5 + y2 * 0.2093887211e-6)))
+    pb = -0.1562499995e-1 + y2 * (0.1430488765e-3 + y2 *
+                                  (-0.6911147651e-5 + y2 *
+                                   (0.7621095161e-6 + y2 * (-0.934935152e-7))))
+    large_val = tl.sqrt(
+        0.636619772 / xl) * (tl.sin(xx) * pa + z * tl.cos(xx) * pb)
+    return tl.where(small, small_val, large_val)
+
+
+@triton.jit
+def _y1(x):
+    # Bessel Y1 (second kind), A&S 9.4.5 / 9.4.6. x > 0.
+    small = x < 8.0
+    y = x * x
+    p1 = x * (-0.4900604943e13 + y *
+              (0.1275274390e13 + y *
+               (-0.5153438139e11 + y *
+                (0.7349264551e9 + y *
+                 (-0.4237922726e7 + y * 0.8511937935e4)))))
+    q1 = 0.2499580570e14 + y * (0.4244419664e12 + y *
+                                (0.3733650367e10 + y *
+                                 (0.2245904002e8 + y *
+                                  (0.1020426050e6 + y *
+                                   (0.3549632885e3 + y)))))
+    xs = tl.where(small, x, 1.0)
+    small_val = (p1 / q1) + 0.636619772 * (_j1(x) * tl.log(xs) - 1.0 / xs)
+    xl = tl.where(small, 8.0, x)
+    z = 8.0 / xl
+    y2 = z * z
+    xx = xl - 2.356194491
+    pa = 1.0 + y2 * (0.183105e-2 + y2 * (-0.3516396496e-4 + y2 *
+                                         (0.2457520174e-5 + y2 *
+                                          (-0.240337019e-6))))
+    pb = 0.04687499995 + y2 * (-0.2002690873e-3 + y2 *
+                               (0.8449199096e-5 + y2 *
+                                (-0.88228987e-6 + y2 * 0.105787412e-6)))
+    large_val = tl.sqrt(
+        0.636619772 / xl) * (tl.sin(xx) * pa + z * tl.cos(xx) * pb)
+    return tl.where(small, small_val, large_val)
+
+
 COMPOSITES = {
     'log1p': _log1p,
     'cbrt': _cbrt,
@@ -292,6 +489,12 @@ COMPOSITES = {
     'fast_tanh': _tanh,
     'fast_erf': DIRECT.get('erf', _tanh),
     'fast_gelu': _fast_gelu,
+    'cyl_bessel_i0': _cyl_bessel_i0,
+    'cyl_bessel_i1': _cyl_bessel_i1,
+    'j0': _j0,
+    'j1': _j1,
+    'y0': _y0,
+    'y1': _y1,
 }
 
 ALL_STUBS = {**DIRECT, **COMPOSITES}

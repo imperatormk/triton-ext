@@ -629,6 +629,25 @@ static bool mergeByteMMA(Module &M,
   if (ByteGlobals.empty() || MMAGlobals.size() != 1)
     return false;
 
+  // Bail when convert_layout scratch (__tg_cvt_*) is also live.
+  // collectTGTypedGlobals now lists only __tg_dot_ab_* as the MMA target, so a
+  // kernel that has one genuine dot scratch PLUS one or more cvt buffers (e.g.
+  // conv and uint4x2 mixed-mm) reaches here with MMAGlobals.size()==1 and would
+  // overlay the byte arena onto the dot scratch at offset 0. That arena
+  // coexists with the cvt buffers, so the overlay aliases live data and
+  // corrupts results (conv produced NaNs). Historically these kernels bailed
+  // because every non-i8 typed global (cvt + dot) was counted, making the
+  // size!=1 guard fire; preserve that by skipping the merge whenever any cvt
+  // scratch is present. cummin stays correct independently: it has no
+  // __tg_dot_ab_* at all, so MMAGlobals is empty and the merge already bails
+  // above.
+  for (auto &GV : M.globals()) {
+    if (GV.getAddressSpace() != ASThreadgroup)
+      continue;
+    if (GV.getName().starts_with("__tg_cvt_"))
+      return false;
+  }
+
   bool Changed = false;
   auto &Ctx = M.getContext();
   auto &DL = M.getDataLayout();

@@ -2506,23 +2506,20 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       Value tNsN = arith::ConstantIntOp::create(rewriter, loc, tN * sN, 32);
       Value sN_val = arith::ConstantIntOp::create(rewriter, loc, sN, 32);
 
-      // Warp decomposition: Morton order when both dims are power-of-2,
-      // otherwise linear div/mod.
+      // Warp decomposition: linear div/mod, matching the canonical blocked
+      // layout that emitOffsetForLayout enumerates. The A/B scatter and the
+      // simdgroup load round-trip through ABSOLUTE threadgroup positions (the
+      // load reads tile (tk*8, tm*8) by absolute offset), so each logical
+      // element must land at the absolute (row,col) that emitOffsetForLayout
+      // assigns it. That layout uses row/col-major warp order (warpId / wN and
+      // warpId % wN per the operand's getOrder), NOT Morton. A Morton warp
+      // remap here disagrees with the absolute gather for any square
+      // power-of-2 warpsPerCTA (e.g. [2,2]): warps 1 and 2 swap tiles, so the
+      // MMA reads the wrong operand rows/cols and the whole result is wrong.
+      // (The C accumulator in makeBaseMma already deliberately uses linear
+      // order for this same reason.)
       Value wR, wC;
-      unsigned mortonBits = mortonBitsPerDim(wM, wN);
-      if (mortonBits > 0) {
-        if (colFastest) {
-          wR = mortonDeinterleaveEven(rewriter, loc, warpId, mortonBits);
-          wC = mortonDeinterleaveOdd(rewriter, loc, warpId, mortonBits);
-        } else {
-          wC = mortonDeinterleaveEven(rewriter, loc, warpId, mortonBits);
-          wR = mortonDeinterleaveOdd(rewriter, loc, warpId, mortonBits);
-        }
-        if (wM < (1LL << mortonBits))
-          wR = remByConst(rewriter, loc, wR, wM);
-        if (wN < (1LL << mortonBits))
-          wC = remByConst(rewriter, loc, wC, wN);
-      } else if (colFastest) {
+      if (colFastest) {
         wR = divByConst(rewriter, loc, warpId, wN);
         wC = remByConst(rewriter, loc, warpId, wN);
       } else {

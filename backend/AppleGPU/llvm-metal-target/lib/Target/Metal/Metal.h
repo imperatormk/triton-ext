@@ -102,12 +102,10 @@ void initializeMetalAsyncEventToAllocaLegacyPass(PassRegistry &);
 ModulePass *createMetalAsyncEventToAllocaLegacyPass();
 
 /// Initializer for the async-copy-to-cooperative pass.
-void initializeMetalAsyncCopyToCooperativeLegacyPass(PassRegistry &);
 
 /// Pass to lower air.simdgroup_async_copy_2d to a cooperative threadgroup copy
 /// (and air.wait_simdgroup_events to a barrier) when the module also uses
 /// simdgroup-matrix ops, to dodge the AGX "materializeAll" PSO bug.
-ModulePass *createMetalAsyncCopyToCooperativeLegacyPass();
 
 /// Initializer for the Metal normalize-allocas pass.
 void initializeMetalNormalizeAllocasLegacyPass(PassRegistry &);

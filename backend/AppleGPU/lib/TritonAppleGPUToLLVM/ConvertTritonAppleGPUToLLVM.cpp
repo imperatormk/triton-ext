@@ -2934,12 +2934,8 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
         }
       }
     }
-    if (kRow0 < 0) {
-      for (auto &o : regOffsets)
-        llvm::errs() << "(" << o[0] << "," << o[1] << ")";
-      llvm::errs() << "\n";
+    if (kRow0 < 0)
       return failure();
-    }
 
     auto i32Ty = IntegerType::get(ctx, 32);
     auto i64Ty = IntegerType::get(ctx, 64);

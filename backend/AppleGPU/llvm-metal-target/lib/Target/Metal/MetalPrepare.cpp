@@ -626,26 +626,45 @@ static bool concurrentWithMMAScratch(Value *V, SmallPtrSetImpl<Value *> &Seen) {
 static bool mergeByteMMA(Module &M,
                          SmallVectorImpl<GlobalVariable *> &ByteGlobals,
                          SmallVectorImpl<GlobalVariable *> &MMAGlobals) {
-  if (ByteGlobals.empty() || MMAGlobals.size() != 1)
+  if (ByteGlobals.empty())
     return false;
 
-  // Bail when convert_layout scratch (__tg_cvt_*) is also live.
-  // collectTGTypedGlobals now lists only __tg_dot_ab_* as the MMA target, so a
-  // kernel that has one genuine dot scratch PLUS one or more cvt buffers (e.g.
-  // conv and uint4x2 mixed-mm) reaches here with MMAGlobals.size()==1 and would
-  // overlay the byte arena onto the dot scratch at offset 0. That arena
-  // coexists with the cvt buffers, so the overlay aliases live data and
-  // corrupts results (conv produced NaNs). Historically these kernels bailed
-  // because every non-i8 typed global (cvt + dot) was counted, making the
-  // size!=1 guard fire; preserve that by skipping the merge whenever any cvt
-  // scratch is present. cummin stays correct independently: it has no
-  // __tg_dot_ab_* at all, so MMAGlobals is empty and the merge already bails
-  // above.
+  // Count convert_layout scratch (__tg_cvt_*) globals. collectTGTypedGlobals
+  // lists only __tg_dot_ab_* as the MMA target, so a kernel that has one
+  // genuine dot scratch PLUS one or more cvt buffers (e.g. conv and uint4x2
+  // mixed-mm) reaches here with MMAGlobals.size()==1. Overlaying the byte arena
+  // onto the dot scratch at offset 0 there aliases the concurrently-live cvt
+  // buffers and corrupts results (conv produced NaNs), so that combination must
+  // bail.
+  //
+  // But a scan (cummax) has NO __tg_dot_ab_* and exactly one cvt buffer that is
+  // time-disjoint from the scan's byte arena (the convert finishes, a barrier,
+  // then the scan reuses the same threadgroup region). Overlaying the arena's
+  // index partials onto that cvt scratch is what kept these kernels under the
+  // 32KB threadgroup budget. Re-enable that single-cvt overlay as the merge
+  // target when there is no dot scratch, and require an EXACT element-type
+  // match below so an f32/f16 value region is never routed through an i64-typed
+  // cvt global (the cummin index miscompile: mismatched-width stores fail
+  // Metal's materializeAll and alias distinct live data).
+  GlobalVariable *CvtGV = nullptr;
+  unsigned CvtCount = 0;
   for (auto &GV : M.globals()) {
     if (GV.getAddressSpace() != ASThreadgroup)
       continue;
-    if (GV.getName().starts_with("__tg_cvt_"))
+    if (GV.getName().starts_with("__tg_cvt_")) {
+      CvtCount++;
+      CvtGV = &GV;
+    }
+  }
+
+  bool CvtOverlay = false;
+  if (MMAGlobals.size() != 1) {
+    if (!MMAGlobals.empty() || CvtCount != 1)
       return false;
+    MMAGlobals.push_back(CvtGV);
+    CvtOverlay = true;
+  } else if (CvtCount != 0) {
+    return false;
   }
 
   bool Changed = false;
@@ -690,16 +709,23 @@ static bool mergeByteMMA(Module &M,
     auto *BAT = cast<ArrayType>(ByteGlobals[I]->getValueType());
     uint64_t BBytes = BAT->getNumElements();
     Type *Inferred = inferElementType(ByteGlobals[I]);
+    // The cvt overlay must be exact: only a byte region whose element type is
+    // bit-identical to the cvt scratch may share its storage. The i32<->float
+    // relaxation and the size-based fallback below are for genuine MMA operand
+    // scratch (__tg_dot_ab_*), where every region is the same width as the dot
+    // tile; allowing them for a cvt target is what overlaid a wide value region
+    // onto a narrower-or-wider cvt buffer and corrupted the scan index.
     bool TypeMatch =
         Inferred && (Inferred == MMAElemTy ||
-                     (Inferred->isIntegerTy(32) && MMAElemTy->isFloatTy()) ||
-                     (Inferred->isFloatTy() && MMAElemTy->isIntegerTy(32)));
+                     (!CvtOverlay &&
+                      ((Inferred->isIntegerTy(32) && MMAElemTy->isFloatTy()) ||
+                       (Inferred->isFloatTy() && MMAElemTy->isIntegerTy(32)))));
     if (TypeMatch && BBytes > BestBytes) {
       BestIdx = I;
       BestBytes = BBytes;
     }
   }
-  if (BestIdx < 0) {
+  if (BestIdx < 0 && !CvtOverlay) {
     for (int I = 0; I < (int)ByteGlobals.size(); I++) {
       auto *BAT = cast<ArrayType>(ByteGlobals[I]->getValueType());
       if (BAT->getNumElements() > BestBytes) {
@@ -708,6 +734,12 @@ static bool mergeByteMMA(Module &M,
       }
     }
   }
+
+  // No exact-type byte region matched the cvt scratch: there is nothing safe to
+  // overlay (e.g. cummin's offset-0 region is f32 while the cvt is i64). Leave
+  // every buffer un-merged so the scan writes through correctly-typed globals.
+  if (CvtOverlay && BestIdx < 0)
+    return Changed;
 
   ByteGV = ByteGlobals[BestIdx >= 0 ? BestIdx : 0];
   auto *ByteAT = cast<ArrayType>(ByteGV->getValueType());

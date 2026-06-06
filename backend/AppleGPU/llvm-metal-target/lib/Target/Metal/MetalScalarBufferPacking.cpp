@@ -419,17 +419,52 @@ static bool scalarBufferPacking(Module &M) {
             Preamble.push_back(Cast);
             Loaded = Cast;
           } else if (SP.ScalarType->isDoubleTy()) {
-            auto *Ld = new LoadInst(SP.ScalarType, Gep, Name, false, Align(4));
-            Preamble.pop_back(); // AsI32
-            Preamble.pop_back(); // RawLoad
-            Preamble.push_back(Ld);
-            Loaded = Ld;
+            // double is 8 bytes: assemble from two 4-byte float slots exactly
+            // like the i64 case (the buffer element type is float, so a single
+            // GEP loads only 4 bytes and loading a double straight off a float*
+            // GEP emits an explicit-gep-type mismatch that the Metal bitcode
+            // reader rejects). Combine lo|hi into an i64, then bitcast to
+            // double.
+            auto *LoI64 = CastInst::Create(Instruction::ZExt, AsI32,
+                                           Type::getInt64Ty(M.getContext()),
+                                           Name + "_lo64");
+            Preamble.push_back(LoI64);
+            auto *GepHi = GetElementPtrInst::CreateInBounds(
+                BufElemTy, BufArg,
+                ConstantInt::get(Type::getInt64Ty(M.getContext()), GepIdx + 1),
+                Name + "_gep_hi");
+            Preamble.push_back(GepHi);
+            auto *HiRaw = new LoadInst(BufElemTy, GepHi, Name + "_hi_raw",
+                                       false, Align(4));
+            Preamble.push_back(HiRaw);
+            auto *HiI32 = CastInst::Create(Instruction::BitCast, HiRaw,
+                                           Type::getInt32Ty(M.getContext()),
+                                           Name + "_hi32");
+            Preamble.push_back(HiI32);
+            auto *HiI64 = CastInst::Create(Instruction::ZExt, HiI32,
+                                           Type::getInt64Ty(M.getContext()),
+                                           Name + "_hi64");
+            Preamble.push_back(HiI64);
+            auto *Shifted = BinaryOperator::Create(
+                Instruction::Shl, HiI64,
+                ConstantInt::get(Type::getInt64Ty(M.getContext()), 32),
+                Name + "_shift");
+            Preamble.push_back(Shifted);
+            auto *Combined = BinaryOperator::Create(Instruction::Or, Shifted,
+                                                    LoI64, Name + "_bits");
+            Preamble.push_back(Combined);
+            auto *Cast = CastInst::Create(Instruction::BitCast, Combined,
+                                          SP.ScalarType, Name);
+            Preamble.push_back(Cast);
+            Loaded = Cast;
           } else {
-            auto *Ld = new LoadInst(SP.ScalarType, Gep, Name, false, Align(4));
-            Preamble.pop_back(); // AsI32
-            Preamble.pop_back(); // RawLoad
-            Preamble.push_back(Ld);
-            Loaded = Ld;
+            // Unknown wide scalar: fall back to a direct typed load. The buffer
+            // element type may differ, but keep the GEP/pointee consistent by
+            // loading the buffer element and bitcasting where sizes match.
+            auto *Conv = CastInst::Create(Instruction::BitCast, AsI32,
+                                          SP.ScalarType, Name);
+            Preamble.push_back(Conv);
+            Loaded = Conv;
           }
         }
       }

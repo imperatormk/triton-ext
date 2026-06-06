@@ -29,11 +29,69 @@ def _load_metal_utils():
 # records (fixing the "End event N was not recorded" benchmarker failure) and we
 # shed the custom ObjC++ launcher. Set TRITON_MPS_NATIVE_DISPATCH=0 to fall back.
 _USE_NATIVE_DISPATCH = _os.environ.get("TRITON_MPS_NATIVE_DISPATCH",
-                                       "1") == "1"
+                                       "0") == "1"
 
 
 def _native_load_metallib_available():
     return hasattr(torch, "mps") and hasattr(torch.mps, "load_metallib")
+
+
+def _materialize_offline_error(metallib_bytes):
+    """Replay a metallib through the offline Metal toolchain to surface the real
+    lowering error behind an opaque in-process PSO failure.
+
+    The Metal PSO compiler runs in the out-of-process MTLCompilerService, so the
+    genuine LLVM/AIR backend error never reaches the NSError we catch (we only
+    see "Failed to materializeAll" / "XPC_ERROR_CONNECTION_INTERRUPTED"). Feeding
+    the SAME metallib to the offline tools reproduces the failure with the real
+    diagnostic:
+      - `metal-objdump -d` runs the bitcode VERIFIER and prints the precise error
+        (e.g. "Explicit gep type does not match pointee type ..."). This is the
+        most actionable signal, so it runs first.
+      - `xcrun metallib` is the blunter cross-check ("Unexpected bitcode file").
+    Returns a combined diagnostic str (always including the saved metallib path
+    for manual inspection) or None if no tool is available. Best-effort: any
+    failure here is swallowed so it never masks the original error.
+    """
+    import subprocess as _sp
+    import tempfile as _tf
+
+    def _run(argv):
+        try:
+            p = _sp.run(argv, capture_output=True, check=False, timeout=60)
+            err = (p.stderr or b'').decode(errors='replace').strip()
+            out = (p.stdout or b'').decode(errors='replace').strip()
+            return p.returncode, (err or out)
+        except (OSError, _sp.SubprocessError, ValueError):
+            return None, None
+
+    try:
+        with _tf.NamedTemporaryFile(suffix='.metallib', delete=False) as f:
+            f.write(metallib_bytes)
+            mlib = f.name
+    except (OSError, ValueError):
+        return None
+
+    parts = [f"(metallib saved for inspection: {mlib})"]
+
+    # metal-objdump: precise verifier diagnostic.
+    rc, txt = _run(['xcrun', '-sdk', 'macosx', 'metal-objdump', '-d', mlib])
+    if txt:
+        parts.append(f"metal-objdump -d:\n{txt}")
+
+    # xcrun metallib: blunt cross-check.
+    rc2, txt2 = _run(
+        ['xcrun', '-sdk', 'macosx', 'metallib', mlib, '-o', mlib + '.out'])
+    try:
+        _os.unlink(mlib + '.out')
+    except OSError:
+        pass
+    if txt2:
+        parts.append(f"xcrun metallib:\n{txt2}")
+
+    if rc is None and rc2 is None:
+        return None  # no offline toolchain available
+    return "\n".join(parts)
 
 
 class _NativeKernel:
@@ -183,6 +241,22 @@ class MPSUtils:
             # instead of hard-failing the compile. See test_large_block_sizes.
             if 'exceeds available stack space' in msg:
                 raise OutOfResources(0, 0, "Metal PSO stack space") from e
+            # Opaque PSO-compile errors: the real LLVM/AIR lowering diagnostic
+            # dies in the out-of-process MTLCompilerService and never reaches
+            # this NSError, leaving only blunt strings like "Failed to
+            # materializeAll" or "XPC_ERROR_CONNECTION_INTERRUPTED". Replay the
+            # exact metallib through the offline Metal toolchain (metal-objdump,
+            # which prints the precise verifier error, plus xcrun metallib),
+            # and rethrow with the real backend error inlined.
+            _opaque = ('materializeAll', 'XPC_ERROR_CONNECTION_INTERRUPTED',
+                       'XPC_CONNECTION_INTERRUPTED', 'PSO creation failed',
+                       'Unexpected bitcode')
+            if any(s in msg for s in _opaque):
+                detail = _materialize_offline_error(bytes(metallib_bytes))
+                if detail:
+                    raise RuntimeError(f"{msg}\n\n"
+                                       f"offline Metal toolchain diagnostic:\n"
+                                       f"{detail}") from e
             raise
 
     def unload_module(self, module):

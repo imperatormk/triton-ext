@@ -136,19 +136,40 @@ static bool functionUsesMMA(const Function &F) {
 }
 
 // The MMA collapse forces every device pointer to float* because the Metal
-// GPU JIT rejects non-float device pointers fed to simdgroup_matrix
-// intrinsics. But an MMA kernel can still have a device buffer that is
-// genuinely a non-float integer type — e.g. the i32 output of an int8 dot
-// (the f32 accumulator is fptosi'd to i32 and stored to an i32* result). For
-// such a buffer the GEPs keep an i32 source element type, so collapsing the
-// pointer to float* makes the writer emit a GEP whose explicit source type
-// disagrees with the pointer's pointee, which the Metal reader rejects with
-// "Explicit gep type does not match pointee type" → materializeAll failure.
-// Preserve a device pointer whose inferred usage is a concrete non-float
-// integer scalar; that buffer is never fed to a float MMA intrinsic.
-static bool isIntegerDevicePointer(Value *Ptr) {
+// GPU JIT rejects non-float device pointers fed to float (v64f32) simdgroup
+// matrix intrinsics. But an MMA kernel can still have a device buffer that is
+// genuinely a non-float scalar type:
+//   - the i32 output of an int8 dot (the f32 accumulator is fptosi'd to i32 and
+//     stored to an i32* result), or
+//   - a half / bfloat input matrix that is loaded scalar-wise (load half /
+//     getelementptr half) to stage it into a threadgroup convert buffer, or
+//     fed directly into a v64f16/v64bf16 MMA load. The fp16 linear/matmul
+//     max-autotune kernels hit exactly this: %arg is a half device buffer, but
+//     the blanket collapse retags it float*, so a `load half` off a
+//     `getelementptr half` on it ends up with a float pointee.
+// For such a buffer the GEPs / loads / stores keep a concrete non-float scalar
+// element type, so collapsing the pointer to float* makes the writer emit an
+// access whose explicit type disagrees with the pointer's pointee, which the
+// Metal reader rejects with "Explicit load/store type does not match pointee
+// type" / "Explicit gep type does not match pointee type" → materializeAll
+// failure. Preserve a device pointer whose inferred usage is a concrete
+// non-float scalar (integer, half, or bfloat); such a buffer is never fed to a
+// float (v64f32) MMA intrinsic, so float collapse would only corrupt it.
+static bool isNonFloatScalarDevicePointer(Value *Ptr) {
   Type *Ty = PointeeTypeMap::inferFromUsage(Ptr);
-  return Ty && Ty->isIntegerTy() && !Ty->isIntegerTy(1);
+  if (!Ty)
+    return false;
+  if (Ty->isIntegerTy() && !Ty->isIntegerTy(1))
+    return true;
+  if (Ty->isHalfTy() || Ty->isBFloatTy())
+    return true;
+  return false;
+}
+
+// Back-compat name kept for the call sites; the predicate now covers half and
+// bfloat device buffers in addition to integers.
+static bool isIntegerDevicePointer(Value *Ptr) {
+  return isNonFloatScalarDevicePointer(Ptr);
 }
 
 PointeeTypeMap buildPointeeTypeMap(Module &M) {

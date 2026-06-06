@@ -2346,13 +2346,19 @@ static LLVMFuncOp getOrCreateFn(ModuleOp mod, RewriterBase &rewriter,
 // uses its own scalar slot rather than one shared array.
 
 // Create a FRESH single-event alloca in the function entry block, one per async
-// copy. Unlike getOrCreateEventAlloca this never reuses an existing slot, so two
-// copies issued before the same wait (e.g. the A and B operands of a GEMM stage)
-// each keep their own event handle instead of clobbering a shared slot. A single
-// shared slot made air.wait_simdgroup_events wait on only the LAST copy, leaving
-// the earlier copy's threadgroup tile possibly still in flight when the dot read
-// it -> nondeterministic miscompile. Per-copy slots avoid the "array of typed
-// pointers" Metal-bitcode limitation noted above by staying scalar.
+// copy. Each async copy owns its own scalar event slot; the slot pointer is
+// threaded out as the op's !ttg.async.token result so the matching async_wait
+// waits on exactly this copy (see the AsyncToken type conversion). A single
+// shared slot made air.wait_simdgroup_events wait on only the LAST copy, and a
+// scavenged "wait on every slot" set waited on the WRONG (loop-rotated) buffer
+// and on slots not yet stored on the first iteration (UB). Per-copy slots stay
+// scalar to avoid the Metal-v1 "array of typed pointers" bitcode limitation.
+//
+// The slot is zero-initialized in the entry block so that a token reaching a
+// wait WITHOUT a preceding store (the masked-skip branch, the sync-copy
+// fallback, or a wait that is loop-hoisted ahead of the store on iteration 0)
+// holds a complete/empty event: air.wait_simdgroup_events on a zero event slot
+// is a real no-op, never a read of an uninitialized pointer.
 static Value createEventAlloca(Operation *op, RewriterBase &rewriter) {
   auto *ctx = op->getContext();
   auto ptrTy3 = LLVMPointerType::get(ctx, 3);
@@ -2366,25 +2372,15 @@ static Value createEventAlloca(Operation *op, RewriterBase &rewriter) {
                                        rewriter.getI64IntegerAttr(1));
   auto alloca = LLVM::AllocaOp::create(rewriter, op->getLoc(), ptrTy0, ptrTy3,
                                        one, /*alignment=*/8);
+  Value nullEv = LLVM::ZeroOp::create(rewriter, op->getLoc(), ptrTy3);
+  LLVM::StoreOp::create(rewriter, op->getLoc(), nullEv, alloca.getResult());
   return alloca.getResult();
 }
 
-// Collect every single-event alloca in the function entry block. The wait waits
-// on each one so ALL outstanding async copies (not just the last) are flushed
-// before the threadgroup barrier. Waiting on an already-completed event is a
-// no-op, so over-waiting on a stale handle is safe.
-static SmallVector<Value> collectEventAllocas(Operation *op) {
-  SmallVector<Value> out;
-  auto *ctx = op->getContext();
-  auto ptrTy3 = LLVMPointerType::get(ctx, 3);
-  auto funcOp = op->getParentOfType<LLVM::LLVMFuncOp>();
-  if (!funcOp)
-    return out;
-  for (auto &existingOp : funcOp.getBody().front())
-    if (auto alloca = dyn_cast<LLVM::AllocaOp>(existingOp))
-      if (alloca.getElemType() == ptrTy3)
-        out.push_back(alloca.getResult());
-  return out;
+// A standalone zero-initialized event slot for an async-copy lowering path that
+// produces no real event (the sync fallback). Waiting on it is a no-op.
+static Value createCompletedEventSlot(Operation *op, RewriterBase &rewriter) {
+  return createEventAlloca(op, rewriter);
 }
 
 // Struct to hold all components extracted from the async_copy pointer chain.
@@ -2952,8 +2948,6 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     if (llMask)
       maskElems = unpackLLElements(loc, llMask, rewriter);
 
-    auto i32Ty = IntegerType::get(ctx, 32);
-
     SmallVector<Value> loadedVals;
     unsigned numElems = srcElems.size();
     for (unsigned i = 0; i < numElems; i++) {
@@ -2986,9 +2980,11 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     lowerLocalLdSt(loc, ctx, cvt, loadedVals, elemTy, dstTy, smemObj, rewriter,
                    targetInfo);
 
-    Value zeroToken = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                               rewriter.getI32IntegerAttr(0));
-    rewriter.replaceOp(op, zeroToken);
+    // The data is already in shared memory synchronously, so the matching
+    // async_wait must be a no-op for this token. Return a zero-initialized
+    // event slot: waiting on it does nothing. (Token type is ptr addrspace(0).)
+    Value evSlot = createCompletedEventSlot(op, rewriter);
+    rewriter.replaceOp(op, evSlot);
     return success();
   }
 
@@ -3188,9 +3184,8 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
             .getResult();
     LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
 
-    Value zeroToken = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                               rewriter.getI32IntegerAttr(0));
-    rewriter.replaceOp(op, zeroToken);
+    // Token IS this copy's event slot; the matching async_wait waits on it.
+    rewriter.replaceOp(op, evAlloca);
     return success();
   }
 
@@ -3524,7 +3519,10 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
       LLVM::BrOp::create(rewriter, loc, ValueRange{}, afterBlock);
 
-      // Continue in afterBlock
+      // Continue in afterBlock. The else (mask false) branch falls through
+      // without storing, leaving the entry-block zero-init event in the slot;
+      // air.wait_simdgroup_events on it is a no-op (the masked tile is a
+      // boundary the consumer does not read).
       rewriter.setInsertionPointToStart(afterBlock);
     } else {
       // Unmasked: always emit async DMA
@@ -3537,10 +3535,12 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
     }
 
-    // Return token = 0
-    Value zeroToken = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                               rewriter.getI32IntegerAttr(0));
-    rewriter.replaceOp(op, zeroToken);
+    // The token IS this copy's event slot. async_wait waits on exactly the
+    // slots carried by its operand tokens; because the token is a scf.for
+    // iter_arg the loop-carried value selects the correct alternating buffer
+    // each iteration. (Token type converts to ptr addrspace(0); see the
+    // AsyncToken type conversion registered on the converter.)
+    rewriter.replaceOp(op, evAlloca);
     return success();
   }
 };
@@ -3552,11 +3552,18 @@ struct AsyncCommitGroupOpAppleConversion
   LogicalResult
   matchAndRewrite(ttg::AsyncCommitGroupOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // No-op: Metal events are per-copy, no grouping needed.
-    Value zero = LLVM::ConstantOp::create(rewriter, op.getLoc(),
-                                          IntegerType::get(op.getContext(), 32),
-                                          rewriter.getI32IntegerAttr(0));
-    rewriter.replaceOp(op, zero);
+    // Forward the copy's event slot through the group token. Metal events are
+    // per-copy, so a "group" is just its member copies' slots threaded onward;
+    // the pipeliner emits exactly one copy per commit_group here. With no input
+    // token (empty group) return a zero-initialized completed slot so a later
+    // wait on it is a no-op.
+    auto inTokens = adaptor.getInputTokens();
+    if (!inTokens.empty()) {
+      rewriter.replaceOp(op, inTokens.front());
+      return success();
+    }
+    Value evSlot = createCompletedEventSlot(op, rewriter);
+    rewriter.replaceOp(op, evSlot);
     return success();
   }
 };
@@ -3581,20 +3588,23 @@ struct AsyncWaitOpAppleConversion
                            "air.simdgroup_async_copy_2d.p3i8.p1i8") != nullptr;
 
     if (hasAsyncDMA) {
-      // True async wait: wait on EVERY outstanding copy's event, then barrier to
-      // synchronize all threads. A GEMM stage issues two copies (A and B) before
-      // this wait; each owns its own single-event alloca. Waiting on only one
-      // (the old shared-slot design) left the other copy possibly in flight when
-      // the dot consumed its tile -> nondeterministic miscompile. Each event is
-      // a separate wait_simdgroup_events(1, slot) call to keep the slot scalar
-      // (Metal v1 bitcode handles arrays of typed pointers poorly).
+      // Wait on EXACTLY the copies whose tokens this wait consumes. Each token
+      // (adaptor operand) is that copy's event slot (ptr addrspace(0)); see the
+      // AsyncToken type conversion and the async_copy lowering. The token is a
+      // scf.for iter_arg, so the loop-carried value selects the correct
+      // alternating (double/triple-buffered) buffer each iteration: this is the
+      // num_stages>=3 correctness fix. A separate wait_simdgroup_events(1, slot)
+      // per token keeps the slot scalar (Metal v1 bitcode handles arrays of
+      // typed pointers poorly). Each slot is zero-initialized in the entry
+      // block, so a token from a sync/skip path holds a complete event and the
+      // wait is a real no-op, never a read of an uninitialized pointer.
       auto waitFn = getOrCreateFn(mod, rewriter, "air.wait_simdgroup_events",
                                   voidTy, {i32Ty, ptrTy0});
       Value oneI32 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
                                               rewriter.getI32IntegerAttr(1));
-      for (Value evAlloca : collectEventAllocas(op))
+      for (Value evSlot : adaptor.getAsyncToken())
         LLVM::CallOp::create(rewriter, loc, waitFn,
-                             ValueRange{oneI32, evAlloca});
+                             ValueRange{oneI32, evSlot});
     }
 
     // Always emit TG barrier (needed for both sync and async paths
@@ -3608,9 +3618,10 @@ struct AsyncWaitOpAppleConversion
     LLVM::CallOp::create(rewriter, loc, barrFn,
                          ValueRange{barrFlag, barrScope});
 
-    // Return token = 0
-    Value zeroToken = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                               rewriter.getI32IntegerAttr(0));
+    // The wait's result token (retToken) is consumed; after the wait all its
+    // input copies are complete, so return a zero-initialized completed event
+    // slot. Waiting on it later is a no-op.
+    Value zeroToken = createCompletedEventSlot(op, rewriter);
     rewriter.replaceOp(op, zeroToken);
     return success();
   }
@@ -3687,6 +3698,21 @@ struct ConvertTritonAppleGPUToLLVMPass
 
     TargetInfo targetInfo;
     TritonGPUToLLVMTypeConverter typeConverter(ctx, targetInfo);
+
+    // Thread the async-DMA completion event through the !ttg.async.token SSA
+    // value instead of throwing it away as i32 0. The Triton software
+    // pipeliner double/triple-buffers the K-loop and carries "which buffer's
+    // copy to wait on" through a token that is a scf.for iter_arg, so it
+    // alternates buffers each iteration. Mapping the token to the event-slot
+    // pointer (ptr addrspace(0), the thread-local alloca that holds the
+    // simdgroup event handle) lets air.wait_simdgroup_events wait on exactly
+    // the copy whose token the wait consumes; the loop-carried iter_arg then
+    // selects the correct alternating buffer. Registered last so it overrides
+    // the upstream i32 mapping (TypeConverter tries conversions newest-first).
+    typeConverter.addConversion(
+        [ctx](triton::gpu::AsyncTokenType type) -> std::optional<Type> {
+          return LLVM::LLVMPointerType::get(ctx, 0);
+        });
 
     // Membar analysis: insert barriers between conflicting TG memory accesses.
     {

@@ -2334,10 +2334,7 @@ static LLVMFuncOp getOrCreateFn(ModuleOp mod, RewriterBase &rewriter,
                             Linkage::External);
 }
 
-// Get or create a thread-local alloca for async copy event storage.
-// Returns a ptr (addrspace 0) pointing to a single ptr addrspace(3) slot.
-// The alloca is placed in the function's entry block so it's visible to both
-// async copy and wait patterns.
+// Async copy event storage notes:
 //
 // IMPORTANT: Metal's air.wait_simdgroup_events expects a thread-local
 // (addrspace 0) pointer-to-pointer, NOT a threadgroup (addrspace 3) pointer.
@@ -2345,40 +2342,49 @@ static LLVMFuncOp getOrCreateFn(ModuleOp mod, RewriterBase &rewriter,
 //
 // The alloca type is `ptr addrspace(3)` (a single event pointer), matching
 // the reference pattern: `%ev = alloca %event_t addrspace(3)*, align 8`.
-// Metal v1 bitcode doesn't handle arrays of typed pointers well.
-static Value getOrCreateEventAlloca(Operation *op, RewriterBase &rewriter) {
+// Metal v1 bitcode doesn't handle arrays of typed pointers well, so each copy
+// uses its own scalar slot rather than one shared array.
+
+// Create a FRESH single-event alloca in the function entry block, one per async
+// copy. Unlike getOrCreateEventAlloca this never reuses an existing slot, so two
+// copies issued before the same wait (e.g. the A and B operands of a GEMM stage)
+// each keep their own event handle instead of clobbering a shared slot. A single
+// shared slot made air.wait_simdgroup_events wait on only the LAST copy, leaving
+// the earlier copy's threadgroup tile possibly still in flight when the dot read
+// it -> nondeterministic miscompile. Per-copy slots avoid the "array of typed
+// pointers" Metal-bitcode limitation noted above by staying scalar.
+static Value createEventAlloca(Operation *op, RewriterBase &rewriter) {
   auto *ctx = op->getContext();
   auto ptrTy3 = LLVMPointerType::get(ctx, 3);
   auto ptrTy0 = LLVMPointerType::get(ctx, 0);
-
-  // Find the enclosing function
   auto funcOp = op->getParentOfType<LLVM::LLVMFuncOp>();
-
-  // Look for existing alloca with our event pointer type in the entry block
-  if (funcOp) {
-    auto &entryBlock = funcOp.getBody().front();
-    for (auto &existingOp : entryBlock) {
-      if (auto alloca = dyn_cast<LLVM::AllocaOp>(existingOp)) {
-        if (alloca.getElemType() == ptrTy3) {
-          return alloca.getResult();
-        }
-      }
-    }
-  }
-
-  // Create new alloca at function entry
   OpBuilder::InsertionGuard guard(rewriter);
-  if (funcOp) {
-    auto &entryBlock = funcOp.getBody().front();
-    rewriter.setInsertionPointToStart(&entryBlock);
-  }
-
+  if (funcOp)
+    rewriter.setInsertionPointToStart(&funcOp.getBody().front());
   auto i64Ty = IntegerType::get(ctx, 64);
   Value one = LLVM::ConstantOp::create(rewriter, op->getLoc(), i64Ty,
                                        rewriter.getI64IntegerAttr(1));
   auto alloca = LLVM::AllocaOp::create(rewriter, op->getLoc(), ptrTy0, ptrTy3,
                                        one, /*alignment=*/8);
   return alloca.getResult();
+}
+
+// Collect every single-event alloca in the function entry block. The wait waits
+// on each one so ALL outstanding async copies (not just the last) are flushed
+// before the threadgroup barrier. Waiting on an already-completed event is a
+// no-op, so over-waiting on a stale handle is safe.
+static SmallVector<Value> collectEventAllocas(Operation *op) {
+  SmallVector<Value> out;
+  auto *ctx = op->getContext();
+  auto ptrTy3 = LLVMPointerType::get(ctx, 3);
+  auto funcOp = op->getParentOfType<LLVM::LLVMFuncOp>();
+  if (!funcOp)
+    return out;
+  for (auto &existingOp : funcOp.getBody().front())
+    if (auto alloca = dyn_cast<LLVM::AllocaOp>(existingOp))
+      if (alloca.getElemType() == ptrTy3)
+        out.push_back(alloca.getResult());
+  return out;
 }
 
 // Struct to hold all components extracted from the async_copy pointer chain.
@@ -3172,7 +3178,7 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
         {i64Ty, i64Ty, ptrTy3, i64Ty, i64Ty, vec2i64Ty, ptrTy1, i64Ty, i64Ty,
          vec2i64Ty, vec2i64Ty, i32Ty});
 
-    Value evAlloca = getOrCreateEventAlloca(op, rewriter);
+    Value evAlloca = createEventAlloca(op, rewriter);
     // Mask is intentionally dropped: clamp_to_zero covers the boundary.
     Value event =
         LLVM::CallOp::create(rewriter, loc, asyncCopyFn,
@@ -3481,8 +3487,9 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
          vec2i64Ty,          // src, srcStride, srcElemStride, srcTile
          vec2i64Ty, i32Ty}); // offset, clamp
 
-    // Get event alloca (created once per function)
-    Value evAlloca = getOrCreateEventAlloca(op, rewriter);
+    // One event alloca per copy so concurrent A/B copies do not clobber a
+    // shared slot (see createEventAlloca).
+    Value evAlloca = createEventAlloca(op, rewriter);
 
     if (llvmMaskScalar) {
       // Masked path: gate the async DMA on the scalar boolean.
@@ -3574,16 +3581,20 @@ struct AsyncWaitOpAppleConversion
                            "air.simdgroup_async_copy_2d.p3i8.p1i8") != nullptr;
 
     if (hasAsyncDMA) {
-      // True async wait: wait on the event stored in the alloca,
-      // then barrier to synchronize all threads.
-      Value evAlloca = getOrCreateEventAlloca(op, rewriter);
-
-      // call void @air.wait_simdgroup_events(i32 1, ptr %ev_alloca)
+      // True async wait: wait on EVERY outstanding copy's event, then barrier to
+      // synchronize all threads. A GEMM stage issues two copies (A and B) before
+      // this wait; each owns its own single-event alloca. Waiting on only one
+      // (the old shared-slot design) left the other copy possibly in flight when
+      // the dot consumed its tile -> nondeterministic miscompile. Each event is
+      // a separate wait_simdgroup_events(1, slot) call to keep the slot scalar
+      // (Metal v1 bitcode handles arrays of typed pointers poorly).
       auto waitFn = getOrCreateFn(mod, rewriter, "air.wait_simdgroup_events",
                                   voidTy, {i32Ty, ptrTy0});
       Value oneI32 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
                                               rewriter.getI32IntegerAttr(1));
-      LLVM::CallOp::create(rewriter, loc, waitFn, ValueRange{oneI32, evAlloca});
+      for (Value evAlloca : collectEventAllocas(op))
+        LLVM::CallOp::create(rewriter, loc, waitFn,
+                             ValueRange{oneI32, evAlloca});
     }
 
     // Always emit TG barrier (needed for both sync and async paths

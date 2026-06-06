@@ -2651,6 +2651,33 @@ static bool extractFlatAsyncCopyPtrInfo(triton::AddPtrOp addptrOp,
         return bc->getOperand(0);
     return v;
   };
+  // Recover the expand_dims axis of an index term, i.e. which logical tensor
+  // dimension this index varies along. The DMA copies a row-major tile (rows
+  // `stride` apart, each row `tileCols` CONTIGUOUS elements). That is only valid
+  // when the strided term indexes the OUTER dim (axis-1 expand -> Nx1 column
+  // vector broadcast across columns) and the unit term indexes the INNER dim
+  // (axis-0 expand -> 1xM broadcast across rows). A TRANSPOSED operand swaps
+  // these (the strided term indexes the inner dim), which would make the DMA
+  // read the tile transposed -> silent miscompile. Returns the varying logical
+  // dim (0 = outer/row, 1 = inner/col) or -1 if it cannot be determined.
+  auto termVaryingDim = [&](Value term) -> int {
+    Value inner = peelBroadcast(term);
+    // Peel a muli(expand_dims, stride) to reach the expand_dims, or take the
+    // term directly if it is already an expand_dims (unit-stride col term).
+    if (auto *muli = inner.getDefiningOp())
+      if (isa<arith::MulIOp>(muli))
+        for (unsigned i = 0; i < 2; i++)
+          if (auto *e = muli->getOperand(i).getDefiningOp())
+            if (isa<triton::ExpandDimsOp>(e))
+              inner = muli->getOperand(i);
+    auto exp = inner.getDefiningOp<triton::ExpandDimsOp>();
+    if (!exp)
+      return -1;
+    // expand_dims axis A inserts a size-1 dim at A; the original index then
+    // varies along the OTHER dim. For 2D: axis 1 -> varies along dim 0 (row),
+    // axis 0 -> varies along dim 1 (col).
+    return exp.getAxis() == 1 ? 0 : 1;
+  };
   auto matchRowTerm = [&](Value term, Value &strideOut,
                           Value &rangeOut) -> bool {
     Value inner = peelBroadcast(term);
@@ -2685,6 +2712,18 @@ static bool extractFlatAsyncCopyPtrInfo(triton::AddPtrOp addptrOp,
     colTerm = lhs;
   else {
     return false;
+  }
+
+  // The strided term must index the OUTER dim and the unit-stride term the
+  // INNER dim. If they are swapped (transposed operand: inner dim is strided),
+  // the contiguous-row DMA would read the tile transposed. Bail so the caller
+  // falls back to the layout-exact sync copy.
+  {
+    Value stridedTerm = (colTerm == rhs) ? lhs : rhs;
+    int stridedDim = termVaryingDim(stridedTerm);
+    int colDim = termVaryingDim(colTerm);
+    if (stridedDim != 0 || colDim != 1)
+      return false;
   }
 
   info.basePtr = baseSplatOp->getOperand(0);
@@ -2761,6 +2800,15 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info,
   if (!foundStride)
     return false;
 
+  // The strided (row) offset must index the OUTER dim (expand_dims axis 1 ->
+  // Nx1 column vector). A transposed operand instead puts the explicit stride on
+  // the INNER dim (expand_dims axis 0), and the contiguous-row DMA would then
+  // read the tile transposed -> silent miscompile. Bail to the sync copy.
+  if (expandDimsVal)
+    if (auto exp = expandDimsVal.getDefiningOp<triton::ExpandDimsOp>())
+      if (exp.getAxis() != 1)
+        return false;
+
   // Extract first-row scalar from expand_dims(row_offs_1d)
   if (expandDimsVal) {
     info.rowStart = extractFirstElemScalar(expandDimsVal);
@@ -2785,6 +2833,83 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info,
   // nullptr (and colStartConst 0) means first col = 0
 
   return true;
+}
+
+// Conservative compile-time proof that the INNER (dim-1) index of a 2D source
+// pointer tensor is unit-stride, i.e. adjacent columns are adjacent in memory.
+// The async 2D DMA copies each tile row as `tileCols` CONTIGUOUS elements, so a
+// non-unit inner stride (transposed/strided-view operand) makes it read the
+// tile transposed -> silent miscompile. This walks the addptr index chain and
+// returns true ONLY when it positively proves the inner dim carries no stride
+// multiply; any unrecognized shape returns false (forces the exact sync copy).
+//
+// The offset feeding the addptr is a sum of per-dim terms; a strided dim looks
+// like broadcast?(muli(expand_dims(range, axis), splat/const stride)). The
+// inner dim is the one whose expand_dims axis == 0 (1xN, broadcast over rows).
+// If that inner term is multiplied by anything other than 1, columns are not
+// contiguous.
+static bool innerDimIsUnitStride(Value ptrTensor) {
+  auto *addptrOp = ptrTensor.getDefiningOp();
+  if (!addptrOp || !isa<triton::AddPtrOp>(addptrOp))
+    return false;
+
+  // Collect the additive index terms. Handle both the flat shape
+  // (addptr(splat(base), addi(rowTerm, colTerm))) and the nested shape
+  // (addptr(broadcast(addptr(splat(base), rowTerm)), colTerm)).
+  SmallVector<Value> terms;
+  SmallVector<Value> work;
+  work.push_back(addptrOp->getOperand(1));
+  if (auto *b = addptrOp->getOperand(0).getDefiningOp())
+    if (isa<triton::BroadcastOp>(b))
+      work.push_back(addptrOp->getOperand(0));
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    if (auto *bc = v.getDefiningOp()) {
+      if (isa<triton::BroadcastOp>(bc)) {
+        work.push_back(bc->getOperand(0));
+        continue;
+      }
+      if (auto add = dyn_cast<arith::AddIOp>(bc)) {
+        work.push_back(add.getLhs());
+        work.push_back(add.getRhs());
+        continue;
+      }
+      if (auto inAddptr = dyn_cast<triton::AddPtrOp>(bc)) {
+        // nested: the base carries another index term
+        work.push_back(inAddptr->getOperand(1));
+        continue;
+      }
+    }
+    terms.push_back(v);
+  }
+
+  auto peelBroadcast = [](Value v) -> Value {
+    if (auto *bc = v.getDefiningOp())
+      if (isa<triton::BroadcastOp>(bc))
+        return bc->getOperand(0);
+    return v;
+  };
+
+  // Find the inner-dim term (expand_dims axis 0). It must NOT be wrapped in a
+  // muli by a non-unit stride. We require that exactly one term is the inner
+  // dim and it is a bare expand_dims (unit stride).
+  bool sawInner = false;
+  for (Value t : terms) {
+    Value inner = peelBroadcast(t);
+    // A muli(expand_dims(.. axis 0 ..), stride) on the inner dim is non-unit.
+    if (auto muli = inner.getDefiningOp<arith::MulIOp>()) {
+      for (unsigned i = 0; i < 2; i++)
+        if (auto exp =
+                muli->getOperand(i).getDefiningOp<triton::ExpandDimsOp>())
+          if (exp.getAxis() == 0)
+            return false; // inner dim multiplied by a stride -> not unit
+      continue;
+    }
+    if (auto exp = inner.getDefiningOp<triton::ExpandDimsOp>())
+      if (exp.getAxis() == 0)
+        sawInner = true;
+  }
+  return sawInner;
 }
 
 struct AsyncCopyGlobalToLocalOpAppleConversion
@@ -3214,8 +3339,13 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       // canAsyncDMA was cleared) or an unaligned shape must NOT take it, else a
       // partial edge tile reads past the matrix and corrupts the result.
       bool noLiveBoundary = !llMask || mlirMaskScalar || tileFullyInBounds;
-      bool runtimeSafe =
-          (shape.size() == 2) && funcModuloSafe && noLiveBoundary;
+      // The runtime DMA assumes contiguous columns (inner unit stride). For a
+      // transposed/strided-view operand the inner dim is strided, so the
+      // contiguous-row copy reads the tile transposed. Require a positive
+      // unit-inner-stride proof; otherwise use the layout-exact sync copy.
+      bool innerUnit = innerDimIsUnitStride(op.getSrc());
+      bool runtimeSafe = (shape.size() == 2) && funcModuloSafe &&
+                         noLiveBoundary && innerUnit;
       {
         const char *e = std::getenv("TRITON_DMA_DISABLE");
         if (e && std::string(e) == "1")

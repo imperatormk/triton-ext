@@ -2630,21 +2630,30 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // a sane upper bound to stop one dot claiming an absurd buffer.
     //
     // The batchStrips path keeps the whole C grid resident, which is exactly
-    // what the per-warp owned-tile store-back (TASK #57) needs: each warp writes
-    // only its owned tiles to their ABSOLUTE positions, then the absolute-row
-    // gather reads each warp's elements back. The per-strip (non-batched) path
-    // cannot do this (single-strip buffer, no resident grid), so it still
-    // computes the full grid. To let the multi-warp configs that miss the 16KB
-    // bound (e.g. BLOCK 64x64 num_warps=4, ~18KB) take the per-warp batched
-    // path, the bound is 24KB: well under Metal's 32KB threadgroup cap, and the
-    // real post-coalesce footprint is still validated by the compiler.py
-    // gatekeeper. (24KB also bounds a single dot from hogging the budget.)
+    // what the per-warp owned-tile store-back (TASK #57) needs: each warp
+    // writes only its owned tiles to their ABSOLUTE positions, then the
+    // absolute-row gather reads each warp's elements back. The per-strip
+    // (non-batched) path cannot do this (single-strip buffer, no resident
+    // grid), so it still computes the full grid. To let the multi-warp configs
+    // that miss the 16KB bound (e.g. BLOCK 64x64 num_warps=4, ~18KB) take the
+    // per-warp batched path, the bound is 24KB: well under Metal's 32KB
+    // threadgroup cap, and the real post-coalesce footprint is still validated
+    // by the compiler.py gatekeeper. (24KB also bounds a single dot from
+    // hogging the budget.)
     bool tgPath = !(useDeviceA && useDeviceB);
     int64_t maxStripsAB = std::max(M / 8, K / 8);
     int64_t batchedABSize = maxStripsAB * tgABStripSize + 1;
     int64_t batchedCSize = (M / 8) * tgCStripSize + 1;
-    bool batchStrips =
-        tgPath && (std::max(batchedABSize, batchedCSize) * 4 <= 24576);
+    // Gate the resident-grid path on its REAL combined footprint vs Metal's
+    // 32KB threadgroup cap, not a bare grid bound: a sub-f32 dot also keeps two
+    // half-typed convert_layout buffers (__tg_cvt_*, the #mma<->#blocked round
+    // trip) resident, each about the C grid in operand bytes, and the launch
+    // gatekeeper sums all of them. The dot grid itself is f32-typed (4B/elem).
+    int64_t residentGridBytes = std::max(batchedABSize, batchedCSize) * 4;
+    unsigned aElemBytes = aElemTy.getIntOrFloatBitWidth() / 8;
+    int64_t cvtBytes =
+        (aElemBytes < 4) ? 2 * batchedCSize * (int64_t)aElemBytes : 0;
+    bool batchStrips = tgPath && (residentGridBytes + cvtBytes <= 30720);
     int64_t tgSize = tgStripSize + 1;
     if (batchStrips)
       tgSize = std::max(batchedABSize, batchedCSize);
@@ -2736,16 +2745,18 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
     // ── Per-warp C-tile ownership (TASK #57) ──────────────────────────
     // Both the device path (above) and the TG path tile the output in a
-    // warpsM x warpsN warp grid using the canonical linear mapping (warpRowCol).
-    // Warp (warpRow, warpCol) owns the absolute C tiles
-    //   (warpRow + k*warpsM, warpCol + j*warpsN),  k in [0,ownM), j in [0,ownN).
-    // Previously EVERY warp computed the full tilesM x tilesN grid (warpsM*warpsN
-    // x redundant MMA, the dominant nw=4 GEMM cost). Now each warp computes only
-    // its owned ownM x ownN tiles, stored as matC_tiles[k][j]. The TG store-back
-    // writes each owned tile to its ABSOLUTE threadgroup position (so exactly one
-    // warp writes each tile, no race) by folding the runtime warp origin into a
-    // base-pointer GEP, then the existing absolute-row-filtered gather reads each
-    // warp's elements back unchanged.
+    // warpsM x warpsN warp grid using the canonical linear mapping
+    // (warpRowCol). Warp (warpRow, warpCol) owns the absolute C tiles
+    //   (warpRow + k*warpsM, warpCol + j*warpsN),  k in [0,ownM), j in
+    //   [0,ownN).
+    // Previously EVERY warp computed the full tilesM x tilesN grid
+    // (warpsM*warpsN x redundant MMA, the dominant nw=4 GEMM cost). Now each
+    // warp computes only its owned ownM x ownN tiles, stored as
+    // matC_tiles[k][j]. The TG store-back writes each owned tile to its
+    // ABSOLUTE threadgroup position (so exactly one warp writes each tile, no
+    // race) by folding the runtime warp origin into a base-pointer GEP, then
+    // the existing absolute-row-filtered gather reads each warp's elements back
+    // unchanged.
     int64_t cWarpsM = cMmaEnc.getWarpsPerCTA()[0];
     int64_t cWarpsN = cMmaEnc.getWarpsPerCTA()[1];
     int64_t ownM = std::max<int64_t>(1, tilesM / cWarpsM);
@@ -2759,8 +2770,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // warpsM*warpsN == 1 (warp origin 0, ownM=tilesM), so the batchStrips path
     // uses it unconditionally.
     // Runtime warp origin in elements (warpRow*8, warpCol*8) and a base pointer
-    // pre-offset to this warp's (0,0) owned tile, used by the owned SG load/store
-    // (constant tile offsets only; a runtime SG offset mis-lowers).
+    // pre-offset to this warp's (0,0) owned tile, used by the owned SG
+    // load/store (constant tile offsets only; a runtime SG offset mis-lowers).
     auto [cWarpRowT, cWarpColT] = warpRowCol((unsigned)cWarpsN);
     Value c8own = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
     Value cWarpRowElem = arith::MulIOp::create(rewriter, loc, cWarpRowT, c8own);
@@ -2774,9 +2785,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // Owned base pointer for C tiles (only valid for the non-device TG path,
     // which round-trips C through the Npad-pitch TG buffer). The device path
     // builds its own ptrTGWarp inside deviceCIn.
-    Value ptrTGcWarp =
-        LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32Ty, ptrTG,
-                            ArrayRef<LLVM::GEPArg>{cWarpFlat64});
+    Value ptrTGcWarp = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32Ty, ptrTG,
+                                           ArrayRef<LLVM::GEPArg>{cWarpFlat64});
     // Owned A/B base pointers fold the runtime warp origin into the TG base so
     // each warp SG-loads only its owned operand tiles at CONSTANT tile offsets
     // (a runtime SG offset mis-lowers). A is scattered [strip=tile-row, Kpad]:

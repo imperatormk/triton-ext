@@ -661,6 +661,22 @@ static bool mergeByteMMA(Module &M,
   if (MMAGlobals.size() != 1) {
     if (!MMAGlobals.empty() || CvtCount != 1)
       return false;
+    // Only overlay onto a WIDE cvt scratch (element alloc size > 1 byte). The
+    // cummax case this path exists for has a [N x i64] cvt buffer that is
+    // time-disjoint from the scan byte arena, so overlaying the arena's i64
+    // index region onto it is safe and keeps the kernel under the 32KB
+    // threadgroup budget. A single-byte cvt buffer ([N x i8]) is the actively
+    // live convert_layout staging for an int8 cast/cat/trans kernel, NOT
+    // disjoint reuse scratch: its i8 element trivially "exactly matches" the
+    // byte arena's inferred i8 element, so the merge would replaceAllUsesWith
+    // the in-use cvt global and the Metal RAUW aborts. Gating on a wider-than-
+    // byte cvt element excludes exactly those int8 crashers while keeping the
+    // i64 cummax overlay, and leaves the dot+cvt bail (MMAGlobals.size()==1)
+    // below untouched so conv / uint4x2 mixed-mm still bail.
+    auto *CvtAT = dyn_cast<ArrayType>(CvtGV->getValueType());
+    if (!CvtAT ||
+        M.getDataLayout().getTypeAllocSize(CvtAT->getElementType()) <= 1)
+      return false;
     MMAGlobals.push_back(CvtGV);
     CvtOverlay = true;
   } else if (CvtCount != 0) {

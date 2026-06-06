@@ -97,10 +97,25 @@ struct ConvertLayoutOpAppleConversion
                              dstTy, loc, ctx, mod);
     }
 
-    if (shape.size() != 2)
+    // ND blocked->blocked: handle rank>=2 by operating on the trailing two
+    // dimensions (rows, cols). For rank>2 we require every leading dim to be
+    // size 1 so the whole tensor is a single (rows x cols) tile; this is the
+    // case the upstream transferWithinBlockSwizzling miscompiles for fp16/bf16
+    // replicated layouts (it vectorizes the replicated registers into a
+    // <2 x half> store at a 2-byte stride but reads them back at a 4-byte
+    // stride, corrupting the row+16 slot). Our scatter/gather is fully scalar
+    // and addresses TG by (row,col) coordinate, so it is correct regardless of
+    // replication. Routing the convert here keeps the fix entirely in-tree.
+    unsigned rank = shape.size();
+    if (rank < 2)
       return failure();
+    unsigned rd = rank - 2; // row dim index
+    unsigned cd = rank - 1; // col dim index
+    for (unsigned d = 0; d < rd; ++d)
+      if (shape[d] != 1)
+        return failure();
 
-    int64_t rows = shape[0], cols = shape[1];
+    int64_t rows = shape[rd], cols = shape[cd];
     auto elemTy = getTypeConverter()->convertType(srcTy.getElementType());
     auto i32Ty = IntegerType::get(ctx, 32);
     auto i64Ty = IntegerType::get(ctx, 64);
@@ -206,9 +221,9 @@ struct ConvertLayoutOpAppleConversion
       auto spt = enc.getSizePerThread();
       auto tpw = enc.getThreadsPerWarp();
       auto wpc = enc.getWarpsPerCTA();
-      int64_t sM = spt[0], sN = spt[1];
-      int64_t tM = tpw[0], tN = tpw[1];
-      int64_t wM = wpc[0], wN = wpc[1];
+      int64_t sM = spt[rd], sN = spt[cd];
+      int64_t tM = tpw[rd], tN = tpw[cd];
+      int64_t wM = wpc[rd], wN = wpc[cd];
       int64_t tileM = wM * tM * sM;
       int64_t tileN = wN * tN * sN;
 
@@ -221,7 +236,8 @@ struct ConvertLayoutOpAppleConversion
 
       // Respect layout order: order[0] is the fastest-changing dimension
       auto order = enc.getOrder();
-      bool colFastest = (order[0] == 1); // order=[1,0] => col fastest (default)
+      bool colFastest =
+          (order[0] == cd); // order=[..,cd,rd] => col fastest (default)
 
       // Warp decomposition: faster dim uses mod, slower uses div
       Value wR, wC;
@@ -286,9 +302,9 @@ struct ConvertLayoutOpAppleConversion
     // Convert to (row, col) pairs
     SmallVector<std::pair<int64_t, int64_t>> srcCoords, dstCoords;
     for (auto &off : srcOffsets)
-      srcCoords.push_back({off[0], off[1]});
+      srcCoords.push_back({off[rd], off[cd]});
     for (auto &off : dstOffsets)
-      dstCoords.push_back({off[0], off[1]});
+      dstCoords.push_back({off[rd], off[cd]});
 
     // Unpack source elements
     Value src = adaptor.getSrc();

@@ -436,49 +436,6 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     auto aType = cast<RankedTensorType>(op.getA().getType());
     auto bType = cast<RankedTensorType>(op.getB().getType());
 
-    // ── Convert-layout fold (correctness, not perf) ────────────────────
-    // When the dot result is immediately consumed by a single
-    // convert_layout to another blocked encoding, gather the final C
-    // result directly in the CONSUMER's layout and replace the convert.
-    //
-    // Why this is required: the dot result lives in cEnc (#blocked), but
-    // for 3D dots cEnc replicates the M dimension across warps so each
-    // thread owns 2 logical rows that are NOT spatially adjacent (e.g.
-    // rows r and r+16). The generic shared-memory convert_layout lowering
-    // (transferWithinBlockSwizzling) vectorizes those 2 registers into a
-    // single <2 x half> store (2-byte stride) but reads them back swizzled
-    // at a 4-byte stride, so the row r+16 slot ends up loading the
-    // neighboring thread's row r data. That corrupts ~50% of a 3D fp16 dot
-    // (the f32 path happens to dodge the broken vectorization). Our own
-    // gather is layout-agnostic -- it reads TG by (row,col) coordinate --
-    // so emitting it directly in the consumer layout side-steps the broken
-    // convert entirely while staying bit-exact.
-    ttg::ConvertLayoutOp foldConvert;
-    ttg::BlockedEncodingAttr outEnc = cEnc;
-    RankedTensorType outType = cType;
-    // Restricted to the single-batch case: that is the only configuration
-    // that both launches (others exceed the thread budget) and exercises the
-    // corrupting convert. Batched gathers route per-batch TG offsets that the
-    // simple coordinate gather below does not reproduce, so leave them alone.
-    bool singleBatchFold = true;
-    {
-      unsigned r = cType.getRank();
-      for (unsigned d = 0; d + 2 < r; ++d)
-        if (cType.getShape()[d] != 1)
-          singleBatchFold = false;
-    }
-    if (singleBatchFold && op->hasOneUse()) {
-      if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(*op->user_begin())) {
-        auto dstTy = cast<RankedTensorType>(cvt.getType());
-        if (auto dstEnc =
-                dyn_cast<ttg::BlockedEncodingAttr>(dstTy.getEncoding())) {
-          foldConvert = cvt;
-          outEnc = dstEnc;
-          outType = dstTy;
-        }
-      }
-    }
-
     // ── Extract M, N, K from last two dimensions ────────────────────
     unsigned rank = cType.getRank();
     unsigned rowDim = rank - 2;
@@ -660,12 +617,6 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         resolveOperand(op.getB(), adaptor.getB(), bType);
     auto elemsC = unpack(adaptor.getC());
     auto cOffsets = emitOffsetForLayout(cEnc, cType);
-    // Output offsets: identical to cOffsets unless we are folding a trailing
-    // convert_layout, in which case the final gather is emitted in the
-    // consumer's (outEnc) layout. The accumulator input scatter always uses
-    // cEnc; only the Phase-4 result gather uses these.
-    auto outOffsets =
-        foldConvert ? emitOffsetForLayout(outEnc, outType) : cOffsets;
 
     if (!aSrcEnc || !bSrcEnc)
       return failure();
@@ -1040,14 +991,6 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     auto [aBaseRow, aBaseCol] = makeBase(aSrcEnc, M, K);
     auto [bBaseRow, bBaseCol] = makeBase(bSrcEnc, K, N);
     auto [cBaseRow, cBaseCol] = makeBase(cEnc, M, N);
-    // Output gather base: in the consumer's layout when folding a convert,
-    // else identical to the C base.
-    Value outBaseRow = cBaseRow, outBaseCol = cBaseCol;
-    if (foldConvert) {
-      auto ob = makeBase(outEnc, M, N);
-      outBaseRow = ob.first;
-      outBaseCol = ob.second;
-    }
 
     // For DotOperandEncoding (Path 2), the contracting dimension (K)
     // is fully replicated per thread. The offsets from emitOffsetForLayout
@@ -1503,11 +1446,9 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     };
 
     // ── Initialize result to zero ────────────────────────────────────
-    // The result is packed in the output layout (outEnc/outType): equal to
-    // cEnc unless a trailing convert_layout is being folded in.
-    auto outElemTy = outType.getElementType();
-    SmallVector<Value> resultElems(outOffsets.size());
-    for (size_t i = 0; i < outOffsets.size(); ++i)
+    auto outElemTy = cType.getElementType();
+    SmallVector<Value> resultElems(cOffsets.size());
+    for (size_t i = 0; i < cOffsets.size(); ++i)
       resultElems[i] = arith::ConstantOp::create(
           rewriter, loc, rewriter.getZeroAttr(outElemTy));
 
@@ -1701,13 +1642,10 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                              ValueRange{fenceTG, execMod});
 
-        // Gather: each thread reads its C elements from TG.
-        // The result is gathered in the output layout (outEnc/outOffsets,
-        // outBaseRow/outBaseCol). Without a folded convert these alias the C
-        // accumulator layout exactly; with one they describe the consumer's
-        // blocked layout so the corrupting shared-memory convert is skipped.
-        for (size_t i = 0; i < outOffsets.size(); ++i) {
-          int64_t elemBatch = (rowDim > 0) ? elemBatchIndex(outOffsets, i) : 0;
+        // Gather: each thread reads its C elements from TG, in the C
+        // accumulator layout (cOffsets, cBaseRow/cBaseCol).
+        for (size_t i = 0; i < cOffsets.size(); ++i) {
+          int64_t elemBatch = (rowDim > 0) ? elemBatchIndex(cOffsets, i) : 0;
 
           // In sequential batch mode, skip elements not in current batch.
           if (batchRounds > 1 && rowDim > 0 && !cHasBatchWarps) {
@@ -1716,10 +1654,10 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
               continue;
           }
 
-          int64_t rowOff = outOffsets[i][rowDim];
-          int64_t colOff = outOffsets[i][colDim];
+          int64_t rowOff = cOffsets[i][rowDim];
+          int64_t colOff = cOffsets[i][colDim];
           Value actualRow = arith::AddIOp::create(
-              rewriter, loc, outBaseRow,
+              rewriter, loc, cBaseRow,
               arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
           Value inStrip = arith::AndIOp::create(
               rewriter, loc,
@@ -1741,8 +1679,8 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             inStrip = arith::AndIOp::create(rewriter, loc, inStrip, batchMatch);
           }
 
-          Value idx = stripFlatIdx(outBaseRow, outBaseCol, rowOff, colOff, Npad,
-                                   rowStart);
+          Value idx =
+              stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, Npad, rowStart);
           if (batchRounds > 1) {
             // Sequential mode: data is at TG base.
             Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip, idx,
@@ -1754,7 +1692,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                                      val, resultElems[i]);
           } else {
             // Warp-distributed mode: add batch TG offset.
-            Value batchOff = elemBatchTGOffset(outOffsets, i, cMixed);
+            Value batchOff = elemBatchTGOffset(cOffsets, i, cMixed);
             Value batchIdx =
                 arith::AddIOp::create(rewriter, loc, idx, batchOff);
             Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip,
@@ -1772,11 +1710,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     } // end batchRound loop
 
     // ── Pack result ───────────────────────────────────────────────────
-    // Build the struct in the output layout. When folding a trailing
-    // convert_layout, the gathered result already lives in the consumer's
-    // layout, so we replace the convert (not the dot) and let the dead dot
-    // be erased by the framework.
-    auto outLLVMTy = getTypeConverter()->convertType(outType);
+    auto outLLVMTy = getTypeConverter()->convertType(cType);
     if (!outLLVMTy)
       return failure();
 
@@ -1791,12 +1725,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       result = resultElems[0];
     }
 
-    if (foldConvert) {
-      rewriter.replaceOp(foldConvert, result);
-      rewriter.eraseOp(op);
-    } else {
-      rewriter.replaceOp(op, result);
-    }
+    rewriter.replaceOp(op, result);
     return success();
   }
 };

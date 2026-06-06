@@ -17,7 +17,6 @@
 #include "Metal.h"
 #include "MetalAIRSystemValues.h"
 #include "MetalAliasAnnotate.h"
-#include "MetalAsyncCopyToCooperative.h"
 #include "MetalAsyncEventToAlloca.h"
 #include "MetalBFloat16CastDecompose.h"
 #include "MetalBarrierRename.h"
@@ -72,7 +71,6 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMetalTarget() {
   initializeMetalTGGlobalCoalesceLegacyPass(*PR);
   initializeMetalTGBarrierInsertLegacyPass(*PR);
   initializeMetalDeviceLoadsVolatileLegacyPass(*PR);
-  initializeMetalAsyncCopyToCooperativeLegacyPass(*PR);
   initializeMetalAsyncEventToAllocaLegacyPass(*PR);
   initializeMetalNormalizeAllocasLegacyPass(*PR);
   initializeMetalBFloat16CastDecomposeLegacyPass(*PR);
@@ -135,13 +133,6 @@ public:
     addPass(createMetalLowerAtomicRMWLegacyPass());
     addPass(createMetalSplitI64ShuffleLegacyPass());
     addPass(createMetalScalarStoreGuardLegacyPass());
-    // AGX "materializeAll" trap: a kernel that reads a threadgroup arena with
-    // air.simdgroup_matrix_8x8_load while that same arena is written by
-    // air.simdgroup_async_copy_2d fails PSO creation with no diagnostic.  Lower
-    // those async copies to a cooperative threadgroup copy (and drop the toxic
-    // symbol) so the kernel is PSO-valid regardless of the producing frontend.
-    // Runs before TGGlobalCoalesce so the merge sees the cooperative form.
-    addPass(createMetalAsyncCopyToCooperativeLegacyPass());
     addPass(createMetalTGGlobalCoalesceLegacyPass());
     addPass(createMetalTGBarrierInsertLegacyPass());
     addPass(createMetalDeviceLoadsVolatileLegacyPass());

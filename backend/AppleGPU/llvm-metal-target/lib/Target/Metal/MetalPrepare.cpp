@@ -595,10 +595,22 @@ splitMixedByteGlobals(Module &M,
 //      before the concurrent prefetch writes, so the regions still alias-clash;
 //      keying off the async-copy destination captures every pipelined dot.
 //
+//   3. It is written by a plain StoreInst reached through a DYNAMIC-INDEX GEP.
+//      That is the sync (TRITON_DMA_DISABLE / no-DMA) twin of case 2: when the
+//      pipeline prefetch is lowered without async-copy, the per-element
+//      prefetch writes the arena with a `store <N x T>` through the
+//      rotating-slot GEP (a dynamic loop-carried index selects the live
+//      buffer).  That store runs WHILE the current dot scatters into the MMA
+//      scratch, so an offset-0 overlay stomps the prefetched tile exactly as in
+//      case 2.  Keying off a dynamic-index GEP store (not a constant-offset
+//      one) captures the rotating slot while leaving scan/conv overlays, which
+//      write CONSTANT offsets, on the cheaper offset-0 path.
+//
 // In either case mergeByteMMA concatenates (MMA buffer AFTER the arena) instead
 // of aliasing.  For non-pipelined kernels the arena has neither user and the
 // cheaper offset-0 overlap is kept.
-static bool concurrentWithMMAScratch(Value *V, SmallPtrSetImpl<Value *> &Seen) {
+static bool concurrentWithMMAScratch(Value *V, SmallPtrSetImpl<Value *> &Seen,
+                                     bool SawDynGEP) {
   if (!Seen.insert(V).second)
     return false;
   for (User *U : V->users()) {
@@ -614,8 +626,19 @@ static bool concurrentWithMMAScratch(Value *V, SmallPtrSetImpl<Value *> &Seen) {
             return true;
         }
       }
-    } else if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U)) {
-      if (concurrentWithMMAScratch(U, Seen))
+    } else if (auto *SI = dyn_cast<StoreInst>(U)) {
+      // Sync rotating-slot prefetch store: a plain store into the arena through
+      // a dynamic-index GEP is the live-arena signal that mirrors the
+      // async-copy destination above.  Constant-offset stores (scan/conv
+      // overlays) keep SawDynGEP false and stay on the offset-0 overlay.
+      if (SawDynGEP && SI->getPointerOperand() == V)
+        return true;
+    } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      if (concurrentWithMMAScratch(GEP, Seen,
+                                   SawDynGEP || !GEP->hasAllConstantIndices()))
+        return true;
+    } else if (isa<BitCastInst>(U)) {
+      if (concurrentWithMMAScratch(U, Seen, SawDynGEP))
         return true;
     }
   }
@@ -780,7 +803,7 @@ static bool mergeByteMMA(Module &M,
   // element offset is harmless.  Non-pipelined kernels keep the cheaper
   // offset-0 overlap.
   SmallPtrSet<Value *, 16> SeenMMA;
-  bool ByteIsMMA = concurrentWithMMAScratch(ByteGV, SeenMMA);
+  bool ByteIsMMA = concurrentWithMMAScratch(ByteGV, SeenMMA, false);
   uint64_t ByteElemCount = (ByteBytes + MergeElemSize - 1) / MergeElemSize;
   uint64_t MMAElemCount = (MMABytes + MergeElemSize - 1) / MergeElemSize;
   uint64_t ByteOffset = ByteIsMMA ? MMAElemCount : 0;

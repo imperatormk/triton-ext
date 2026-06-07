@@ -2438,12 +2438,17 @@ struct AsyncCopyPtrInfo {
 // Returns true
 // + sets `out` on success; false when the offset is not a folded constant (the
 // caller then falls back to the SSA-scalar extractFirstElemScalar path).
-static bool extractFirstElemConst(Value tensor, int64_t &out) {
+static bool extractFirstElemConst(Value tensor, int64_t &out,
+                                  bool peelModulo = false) {
   auto *defOp = tensor.getDefiningOp();
   if (!defOp)
     return false;
   if (isa<triton::ExpandDimsOp>(defOp))
-    return extractFirstElemConst(defOp->getOperand(0), out);
+    return extractFirstElemConst(defOp->getOperand(0), out, peelModulo);
+  // See extractFirstElemScalar: peel a proven-no-op boundary modulo so a
+  // constant row origin survives the wrap instead of folding to 0.
+  if (peelModulo && isa<arith::RemSIOp, arith::RemUIOp>(defOp))
+    return extractFirstElemConst(defOp->getOperand(0), out, peelModulo);
   if (isa<triton::MakeRangeOp>(defOp)) {
     out = 0;
     return true;
@@ -2458,8 +2463,8 @@ static bool extractFirstElemConst(Value tensor, int64_t &out) {
   }
   if (isa<arith::AddIOp>(defOp)) {
     int64_t a, b;
-    if (extractFirstElemConst(defOp->getOperand(0), a) &&
-        extractFirstElemConst(defOp->getOperand(1), b)) {
+    if (extractFirstElemConst(defOp->getOperand(0), a, peelModulo) &&
+        extractFirstElemConst(defOp->getOperand(1), b, peelModulo)) {
       out = a + b;
       return true;
     }
@@ -2474,14 +2479,23 @@ static bool extractFirstElemConst(Value tensor, int64_t &out) {
 //   splat(scalar) → scalar
 //   make_range(0, N) → nullptr (first element is 0)
 //   expand_dims(inner_1d, axis) → recurse on inner_1d
-static Value extractFirstElemScalar(Value tensor) {
+static Value extractFirstElemScalar(Value tensor, bool peelModulo = false) {
   auto *defOp = tensor.getDefiningOp();
   if (!defOp)
     return nullptr;
 
   // Peel through expand_dims
   if (isa<triton::ExpandDimsOp>(defOp))
-    return extractFirstElemScalar(defOp->getOperand(0));
+    return extractFirstElemScalar(defOp->getOperand(0), peelModulo);
+
+  // Peel through a boundary-wrap modulo to its dividend. The caller sets
+  // peelModulo ONLY when the wrap was already proven block-aligned (a no-op
+  // over the tile), so the first element of (dividend % M) equals the first
+  // element of the dividend. Without this, a program-id-dependent row origin
+  // such as (pid_m*BLOCK_M + arange) % M_total is dropped to 0 and the async
+  // DMA reads every program's tile from row 0 (correct only for pid_m == 0).
+  if (peelModulo && isa<arith::RemSIOp, arith::RemUIOp>(defOp))
+    return extractFirstElemScalar(defOp->getOperand(0), peelModulo);
 
   // addi(splat(scalar), make_range(0, N)) → first elem = scalar + 0 = scalar
   if (isa<arith::AddIOp>(defOp)) {
@@ -2761,9 +2775,12 @@ static bool extractFlatAsyncCopyPtrInfo(triton::AddPtrOp addptrOp,
 
   info.basePtr = baseSplatOp->getOperand(0);
   info.stride = strideVal;
-  info.rowStart = extractFirstElemScalar(rowRange);
+  // The row range may pass through a boundary-wrap modulo. When the wrap was
+  // proven block-aligned (allowModulo), peel it so the program-id-dependent row
+  // origin is preserved; otherwise the DMA reads from row 0 for every program.
+  info.rowStart = extractFirstElemScalar(rowRange, allowModulo);
   if (!info.rowStart)
-    extractFirstElemConst(rowRange, info.rowStartConst);
+    extractFirstElemConst(rowRange, info.rowStartConst, allowModulo);
 
   if (!allowModulo && defChainContainsModulo(colTerm))
     return false;
@@ -2844,9 +2861,9 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info,
 
   // Extract first-row scalar from expand_dims(row_offs_1d)
   if (expandDimsVal) {
-    info.rowStart = extractFirstElemScalar(expandDimsVal);
+    info.rowStart = extractFirstElemScalar(expandDimsVal, allowModulo);
     if (!info.rowStart)
-      extractFirstElemConst(expandDimsVal, info.rowStartConst);
+      extractFirstElemConst(expandDimsVal, info.rowStartConst, allowModulo);
   }
   // nullptr (and rowStartConst 0) means first row = 0
 
@@ -3378,16 +3395,9 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       bool innerUnit = innerDimIsUnitStride(op.getSrc());
       bool runtimeSafe = (shape.size() == 2) && funcModuloSafe &&
                          noLiveBoundary && innerUnit;
-      if (std::getenv("TRITON_DMA_DEBUG"))
-        llvm::errs() << "[dmadbg] runtime-path candidate: innerUnit="
-                     << innerUnit << " funcModuloSafe=" << funcModuloSafe
-                     << " noLiveBoundary=" << noLiveBoundary
-                     << " shape2d=" << (shape.size() == 2) << "\n";
       {
         const char *e = std::getenv("TRITON_DMA_DISABLE");
         if (e && std::string(e) == "1")
-          runtimeSafe = false;
-        if (std::getenv("TRITON_DMA_NORUNTIME"))
           runtimeSafe = false;
       }
       if (runtimeSafe) {
@@ -3398,13 +3408,6 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     }
 
     // ── Async DMA path via air.simdgroup_async_copy_2d ──
-
-    if (std::getenv("TRITON_DMA_DEBUG"))
-      llvm::errs() << "[dmadbg] MAIN async path taken, innerUnit="
-                   << innerDimIsUnitStride(op.getSrc()) << "\n";
-
-    if (std::getenv("TRITON_DMA_NOMAIN"))
-      return lowerSyncCopy(op, adaptor, rewriter);
 
     auto i32Ty = IntegerType::get(ctx, 32);
     auto i64Ty = IntegerType::get(ctx, 64);

@@ -1748,8 +1748,39 @@ struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
     auto masks = maskOperand ? unpackElems(maskOperand, rewriter, loc)
                              : SmallVector<Value>{};
 
+    // When the stored tensor is replicated across lanes/warps (the threadgroup
+    // has more threads than the tensor has elements — e.g. a 64-thread group
+    // writing a 1-element reduction result), every redundant thread computes
+    // the same destination pointer. Without predication they all race-store to
+    // that address, and a thread holding a stale/zeroed replica can win, so the
+    // result is corrupted (observed as ~all-but-one programs storing 0). Emit a
+    // redundant-thread predicate so only the canonical owner of each element
+    // stores, and skip redundant register-replicated copies entirely.
+    Value threadPred;
+    uint32_t regMask = 0;
+    if (isa<RankedTensorType>(op.getPtr().getType())) {
+      auto mod = op->getParentOfType<ModuleOp>();
+      auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
+      threadPred =
+          emitAppleRedundantThreadPredicate(freeVarMasks, rewriter, loc, mod);
+      regMask = freeVarMasks[StringAttr::get(rewriter.getContext(), "reg")];
+    }
+
     for (size_t i = 0; i < ptrs.size(); ++i) {
-      if (!masks.empty() && masks[i]) {
+      // Skip redundant register-replicated elements: a non-canonical register
+      // index holds the same value as its canonical sibling and addresses the
+      // same location, so storing it is just a duplicate write.
+      if (!isCanonicalIndex(i, regMask))
+        continue;
+
+      // Combine the redundant-thread predicate with the per-element store mask.
+      Value mask;
+      if (!masks.empty() && masks[i])
+        mask = maybeAnd(rewriter, loc, threadPred, masks[i]);
+      else
+        mask = threadPred;
+
+      if (mask) {
         // Use conditional branch: if (mask) store(val, ptr)
         // This avoids the read-modify-write of LoadStoreToLLVM which
         // causes data corruption when masked-out pointers alias valid data.
@@ -1758,7 +1789,7 @@ struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
         auto *endBlock = curBlock->splitBlock(curPoint);
         auto *thenBlock = rewriter.createBlock(endBlock);
         rewriter.setInsertionPointToEnd(curBlock);
-        LLVM::CondBrOp::create(rewriter, loc, masks[i], thenBlock, endBlock);
+        LLVM::CondBrOp::create(rewriter, loc, mask, thenBlock, endBlock);
         rewriter.setInsertionPointToEnd(thenBlock);
         LLVM::StoreOp::create(rewriter, loc, vals[i], ptrs[i]);
         LLVM::BrOp::create(rewriter, loc, endBlock);
@@ -3347,9 +3378,16 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       bool innerUnit = innerDimIsUnitStride(op.getSrc());
       bool runtimeSafe = (shape.size() == 2) && funcModuloSafe &&
                          noLiveBoundary && innerUnit;
+      if (std::getenv("TRITON_DMA_DEBUG"))
+        llvm::errs() << "[dmadbg] runtime-path candidate: innerUnit="
+                     << innerUnit << " funcModuloSafe=" << funcModuloSafe
+                     << " noLiveBoundary=" << noLiveBoundary
+                     << " shape2d=" << (shape.size() == 2) << "\n";
       {
         const char *e = std::getenv("TRITON_DMA_DISABLE");
         if (e && std::string(e) == "1")
+          runtimeSafe = false;
+        if (std::getenv("TRITON_DMA_NORUNTIME"))
           runtimeSafe = false;
       }
       if (runtimeSafe) {
@@ -3360,6 +3398,13 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     }
 
     // ── Async DMA path via air.simdgroup_async_copy_2d ──
+
+    if (std::getenv("TRITON_DMA_DEBUG"))
+      llvm::errs() << "[dmadbg] MAIN async path taken, innerUnit="
+                   << innerDimIsUnitStride(op.getSrc()) << "\n";
+
+    if (std::getenv("TRITON_DMA_NOMAIN"))
+      return lowerSyncCopy(op, adaptor, rewriter);
 
     auto i32Ty = IntegerType::get(ctx, 32);
     auto i64Ty = IntegerType::get(ctx, 64);

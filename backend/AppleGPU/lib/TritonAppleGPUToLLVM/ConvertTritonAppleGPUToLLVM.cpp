@@ -2785,9 +2785,15 @@ static bool extractFlatAsyncCopyPtrInfo(triton::AddPtrOp addptrOp,
   if (!allowModulo && defChainContainsModulo(colTerm))
     return false;
   Value colInner = peelBroadcast(colTerm);
-  info.colStart = extractFirstElemScalar(colInner);
+  // The column index may pass through a proven-no-op boundary wrap (rn % N),
+  // exactly like the row index above. Peel it under allowModulo so the
+  // program-id-dependent column origin (pid_n * BLOCK_N) is preserved; without
+  // this the wrap defeats scalar/const extraction and colStart silently drops
+  // to 0, so every N-block's DMA reads B from column 0 -> only pid_n == 0 is
+  // correct and the right output half is wrong.
+  info.colStart = extractFirstElemScalar(colInner, allowModulo);
   if (!info.colStart)
-    extractFirstElemConst(colInner, info.colStartConst);
+    extractFirstElemConst(colInner, info.colStartConst, allowModulo);
   // With a contiguity-proven no-op modulo, the tile origin is the unwrapped
   // first index; the wrap contributes nothing, so default start = 0.
   return true;

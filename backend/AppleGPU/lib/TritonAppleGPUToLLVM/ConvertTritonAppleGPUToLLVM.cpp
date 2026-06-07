@@ -2414,6 +2414,45 @@ static Value createCompletedEventSlot(Operation *op, RewriterBase &rewriter) {
   return createEventAlloca(op, rewriter);
 }
 
+// air.simdgroup_async_copy_2d is a SIMDGROUP-cooperative DMA: each warp issues
+// its own copy with a single WARP-UNIFORM tile origin and waits its own event.
+// When warpsPerCTA[outerDim] > 1 the staged pipeline buffer's outer (slowest)
+// dim is split across warps, but the warp-uniform origin makes every warp
+// redundantly DMA the WHOLE tile into the same shared region. Those concurrent
+// copies write-write race: a per-simdgroup air.wait_simdgroup_events only
+// drains the issuing warp's own copy, and the threadgroup barrier after the
+// wait fences regular threadgroup stores, not the async DMA engine's writes, so
+// a sibling warp can read the buffer before another warp's still-in-flight copy
+// has finished (verified: both the partitioned A operand and the replicated B
+// operand of the matmul_layer_norm 32x64x16 nw4 kernel corrupt nondeterminis-
+// tically). The AIR JIT has no cooperative-copy lowering that merges/serializes
+// them. Keep any such multi-warp-outer-dim copy on the layout-exact synchronous
+// copy (real threadgroup stores, which the membar passes order correctly).
+// Single-warp-per-outer-dim copies (warpsPerCTA[outerDim] == 1) are race-free
+// and stay on the fast async DMA path.
+//
+// CAVEAT: this predicate is deliberately BROAD: it also routes correct nw>=2
+// GEMM operand copies to the sync path, a PERF (not correctness) regression on
+// those configs, because a tighter race-vs-safe discriminator could not be
+// proven sound here. The proper fix is a cooperative multi-warp async copy (or
+// a narrower predicate); tracked as the async-vs-sync path unification rework.
+static bool asyncCopyOuterDimCrossWarp(ttg::AsyncCopyGlobalToLocalOp op) {
+  auto srcTy = op.getSrc().getType();
+  auto enc = srcTy.getEncoding();
+  auto blocked = dyn_cast_or_null<ttg::BlockedEncodingAttr>(enc);
+  if (!blocked)
+    return false;
+  auto warpsPerCTA = blocked.getWarpsPerCTA();
+  auto order = blocked.getOrder();
+  if (warpsPerCTA.empty() || order.empty())
+    return false;
+  // Outer (slowest-varying) dim is the last entry of order.
+  unsigned outerDim = order.back();
+  if (outerDim >= warpsPerCTA.size())
+    return false;
+  return warpsPerCTA[outerDim] > 1;
+}
+
 // Struct to hold all components extracted from the async_copy pointer chain.
 struct AsyncCopyPtrInfo {
   Value stride;   // Row stride scalar (MLIR, in elements)
@@ -2700,13 +2739,14 @@ static bool extractFlatAsyncCopyPtrInfo(triton::AddPtrOp addptrOp,
   };
   // Recover the expand_dims axis of an index term, i.e. which logical tensor
   // dimension this index varies along. The DMA copies a row-major tile (rows
-  // `stride` apart, each row `tileCols` CONTIGUOUS elements). That is only valid
-  // when the strided term indexes the OUTER dim (axis-1 expand -> Nx1 column
-  // vector broadcast across columns) and the unit term indexes the INNER dim
-  // (axis-0 expand -> 1xM broadcast across rows). A TRANSPOSED operand swaps
-  // these (the strided term indexes the inner dim), which would make the DMA
-  // read the tile transposed -> silent miscompile. Returns the varying logical
-  // dim (0 = outer/row, 1 = inner/col) or -1 if it cannot be determined.
+  // `stride` apart, each row `tileCols` CONTIGUOUS elements). That is only
+  // valid when the strided term indexes the OUTER dim (axis-1 expand -> Nx1
+  // column vector broadcast across columns) and the unit term indexes the INNER
+  // dim (axis-0 expand -> 1xM broadcast across rows). A TRANSPOSED operand
+  // swaps these (the strided term indexes the inner dim), which would make the
+  // DMA read the tile transposed -> silent miscompile. Returns the varying
+  // logical dim (0 = outer/row, 1 = inner/col) or -1 if it cannot be
+  // determined.
   auto termVaryingDim = [&](Value term) -> int {
     Value inner = peelBroadcast(term);
     // Peel a muli(expand_dims, stride) to reach the expand_dims, or take the
@@ -2857,9 +2897,9 @@ static bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info,
     return false;
 
   // The strided (row) offset must index the OUTER dim (expand_dims axis 1 ->
-  // Nx1 column vector). A transposed operand instead puts the explicit stride on
-  // the INNER dim (expand_dims axis 0), and the contiguous-row DMA would then
-  // read the tile transposed -> silent miscompile. Bail to the sync copy.
+  // Nx1 column vector). A transposed operand instead puts the explicit stride
+  // on the INNER dim (expand_dims axis 0), and the contiguous-row DMA would
+  // then read the tile transposed -> silent miscompile. Bail to the sync copy.
   if (expandDimsVal)
     if (auto exp = expandDimsVal.getDefiningOp<triton::ExpandDimsOp>())
       if (exp.getAxis() != 1)
@@ -3265,13 +3305,11 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       if (e && std::string(e) == "1")
         canAsyncDMA = false;
     }
-    // NOTE: the shared-direct MMA path (TRITON_SHARED_MMA=1) reads the pipeline
-    // threadgroup buffer with air.simdgroup_matrix_8x8_load.  That used to fail
-    // Metal PSO creation ("Failed to materializeAll") when the buffer was also
-    // written by air.simdgroup_async_copy.  metal-llc now lowers exactly those
-    // async copies to a cooperative threadgroup copy
-    // (MetalAsyncCopyToCooperative), so the async DMA path is kept here and the
-    // trap is handled at the backend.
+    // A staged buffer read across warps cannot use the per-simdgroup
+    // cooperative async DMA without races; keep it on the synchronous copy.
+    bool outerCrossWarp = asyncCopyOuterDimCrossWarp(op);
+    if (outerCrossWarp)
+      canAsyncDMA = false;
 
     // A non-uniform per-element mask is a real boundary predicate that zeros
     // out-of-range rows/cols of a PARTIAL tile. Our async 2D copy reads the
@@ -3400,7 +3438,7 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       // unit-inner-stride proof; otherwise use the layout-exact sync copy.
       bool innerUnit = innerDimIsUnitStride(op.getSrc());
       bool runtimeSafe = (shape.size() == 2) && funcModuloSafe &&
-                         noLiveBoundary && innerUnit;
+                         noLiveBoundary && innerUnit && !outerCrossWarp;
       {
         const char *e = std::getenv("TRITON_DMA_DISABLE");
         if (e && std::string(e) == "1")
@@ -3647,9 +3685,9 @@ struct AsyncWaitOpAppleConversion
       // AsyncToken type conversion and the async_copy lowering. The token is a
       // scf.for iter_arg, so the loop-carried value selects the correct
       // alternating (double/triple-buffered) buffer each iteration: this is the
-      // num_stages>=3 correctness fix. A separate wait_simdgroup_events(1, slot)
-      // per token keeps the slot scalar (Metal v1 bitcode handles arrays of
-      // typed pointers poorly). Each slot is zero-initialized in the entry
+      // num_stages>=3 correctness fix. A separate wait_simdgroup_events(1,
+      // slot) per token keeps the slot scalar (Metal v1 bitcode handles arrays
+      // of typed pointers poorly). Each slot is zero-initialized in the entry
       // block, so a token from a sync/skip path holds a complete event and the
       // wait is a real no-op, never a read of an uninitialized pointer.
       auto waitFn = getOrCreateFn(mod, rewriter, "air.wait_simdgroup_events",
@@ -3657,8 +3695,7 @@ struct AsyncWaitOpAppleConversion
       Value oneI32 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
                                               rewriter.getI32IntegerAttr(1));
       for (Value evSlot : adaptor.getAsyncToken())
-        LLVM::CallOp::create(rewriter, loc, waitFn,
-                             ValueRange{oneI32, evSlot});
+        LLVM::CallOp::create(rewriter, loc, waitFn, ValueRange{oneI32, evSlot});
     }
 
     // Always emit TG barrier (needed for both sync and async paths

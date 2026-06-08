@@ -46,16 +46,39 @@ AppleMmaEncodingAttr::toLinearLayout(llvm::ArrayRef<int64_t> shape) const {
   //   lane bit 2     → col bit 2
   //   lane bit 3     → row bit 0
   //   lane bit 4     → row bit 1
-  std::vector<std::vector<int32_t>> registerBases = {
-      {4, 0} // reg bit 0 → row=4, col=0
-  };
-  std::vector<std::vector<int32_t>> laneBases = {
-      {0, 1}, // lane bit 0 → row=0, col=1
-      {0, 2}, // lane bit 1 → row=0, col=2
-      {0, 4}, // lane bit 2 → row=0, col=4
-      {1, 0}, // lane bit 3 → row=1, col=0
-      {2, 0}, // lane bit 4 → row=2, col=0
-  };
+  // PHYSICAL layout (TRITON_C_LIVE_KLOOP): match the simdgroup_matrix hardware
+  // per-lane storage so the #mma<->simdgroup_matrix bridge is lane-local
+  // (insertelement/extractelement at indices 0,1), eliminating the per-K-step
+  // TG round-trip for the C accumulator. Derived from the Phase-4 device-path
+  // doc:
+  //   phys_row = L[1] | (L[2]<<1) | (L[4]<<2)
+  //   phys_col = (L[0]<<1) | (L[3]<<2) | R
+  // LOGICAL layout (historical): row = (T>>3)+R*4, col = T&7.
+  // The physical layout is now UNCONDITIONAL: every C-accumulator bridge site
+  // (device, batchStrips, per-strip) is lane-local against this layout, so the
+  // old TRITON_C_LIVE_KLOOP opt-out is gone (forcing logical here would miscompile
+  // those bridges). The logical bases below are kept only for reference.
+  bool physLayout = true;
+  std::vector<std::vector<int32_t>> registerBases =
+      physLayout ? std::vector<std::vector<int32_t>>{{0, 1}}
+                 : std::vector<std::vector<int32_t>>{
+                       {4, 0} // reg bit 0 → row=4, col=0
+                   };
+  std::vector<std::vector<int32_t>> laneBases =
+      physLayout ? std::vector<std::vector<int32_t>>{
+                       {0, 2}, // L0 -> col bit1
+                       {1, 0}, // L1 -> row bit0
+                       {2, 0}, // L2 -> row bit1
+                       {0, 4}, // L3 -> col bit2
+                       {4, 0}, // L4 -> row bit2
+                   }
+                 : std::vector<std::vector<int32_t>>{
+                       {0, 1}, // lane bit 0 → row=0, col=1
+                       {0, 2}, // lane bit 1 → row=0, col=2
+                       {0, 4}, // lane bit 2 → row=0, col=4
+                       {1, 0}, // lane bit 3 → row=1, col=0
+                       {2, 0}, // lane bit 4 → row=2, col=0
+                   };
   LinearLayout ctaLayout(
       SmallVector<std::pair<StringAttr, std::vector<std::vector<int32_t>>>>{
           {S("register"), registerBases}, {S("lane"), laneBases}},

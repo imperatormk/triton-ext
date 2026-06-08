@@ -74,14 +74,17 @@ struct ConvertLayoutOpAppleConversion
       return success();
     }
 
-    // blocked→blocked redistribution via TG scatter/gather
+    // blocked→blocked redistribution via TG scatter/gather, plus the
+    // #mma (AppleMma) → #blocked C-output conversion (see mma branch below).
     auto srcEnc = dyn_cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
+    auto srcMmaEnc = dyn_cast<AppleMmaEncodingAttr>(srcTy.getEncoding());
     auto dstEnc = dyn_cast<ttg::BlockedEncodingAttr>(dstTy.getEncoding());
-    if (!srcEnc || !dstEnc)
+    // Destination must be blocked; source must be blocked OR AppleMma.
+    if (!dstEnc || (!srcEnc && !srcMmaEnc))
       return failure();
 
-    // Same encoding — identity
-    if (srcEnc == dstEnc) {
+    // Same encoding — identity (blocked→blocked only)
+    if (srcEnc && srcEnc == dstEnc) {
       rewriter.replaceOp(op, adaptor.getSrc());
       return success();
     }
@@ -295,8 +298,62 @@ struct ConvertLayoutOpAppleConversion
       return {bR, bC, pred};
     };
 
-    // Use LinearLayout-based offsets (matches upstream element ordering)
-    auto srcOffsets = emitOffsetForLayout(srcEnc, srcTy);
+    // Per-lane base (row,col) for an AppleMma source under the PHYSICAL
+    // toLinearLayout (AppleMmaLayoutConversions.cpp). emitOffsetForLayout fixes
+    // lane=0, warp=0 and enumerates only the register in-dim, so the lane+warp
+    // contribution to the absolute (row,col) must be added here. The physical
+    // per-lane storage is:
+    //   phys_row = L1 | (L2<<1) | (L4<<2)
+    //   phys_col = (L0<<1) | (L3<<2)        (register supplies col bit 0)
+    // with column-major warp tiling (warpRow = warpId/wN, warpCol = warpId%wN,
+    // warpOrder={1,0}), each warp owning an 8-row/8-col simdgroup tile step.
+    // The owned offsets enumerated by emitOffsetForLayout already cover exactly
+    // the in-bounds MxN tensor positions, so the predicate is always true.
+    auto makeBaseMma =
+        [&](AppleMmaEncodingAttr enc) -> std::tuple<Value, Value, Value> {
+      auto wpc = enc.getWarpsPerCTA();
+      int64_t wN = wpc[cd];
+      auto bit = [&](Value v, int64_t shift) -> Value {
+        Value s = arith::ShRUIOp::create(
+            rewriter, loc, v,
+            arith::ConstantIntOp::create(rewriter, loc, shift, 32));
+        return arith::AndIOp::create(
+            rewriter, loc, s,
+            arith::ConstantIntOp::create(rewriter, loc, 1, 32));
+      };
+      auto shl = [&](Value v, int64_t shift) -> Value {
+        return arith::ShLIOp::create(
+            rewriter, loc, v,
+            arith::ConstantIntOp::create(rewriter, loc, shift, 32));
+      };
+      // phys_row = L1 | (L2<<1) | (L4<<2)
+      Value physRow = arith::OrIOp::create(
+          rewriter, loc,
+          arith::OrIOp::create(rewriter, loc, bit(laneId, 1),
+                               shl(bit(laneId, 2), 1)),
+          shl(bit(laneId, 4), 2));
+      // phys_col = (L0<<1) | (L3<<2)
+      Value physCol = arith::OrIOp::create(
+          rewriter, loc, shl(bit(laneId, 0), 1), shl(bit(laneId, 3), 2));
+      Value c8 = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+      Value wN_v = arith::ConstantIntOp::create(rewriter, loc, wN, 32);
+      Value warpRow = arith::DivUIOp::create(rewriter, loc, warpId, wN_v);
+      Value warpCol = arith::RemUIOp::create(rewriter, loc, warpId, wN_v);
+      Value bR = arith::AddIOp::create(
+          rewriter, loc, arith::MulIOp::create(rewriter, loc, warpRow, c8),
+          physRow);
+      Value bC = arith::AddIOp::create(
+          rewriter, loc, arith::MulIOp::create(rewriter, loc, warpCol, c8),
+          physCol);
+      Value truePred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+      return {bR, bC, truePred};
+    };
+
+    // Use LinearLayout-based offsets (matches upstream element ordering).
+    // The source may be blocked or AppleMma; both expose toLinearLayout, so
+    // emitOffsetForLayout enumerates this lane's owned per-register offsets.
+    Attribute srcEncAttr = srcMmaEnc ? Attribute(srcMmaEnc) : Attribute(srcEnc);
+    auto srcOffsets = emitOffsetForLayout(srcEncAttr, srcTy);
     auto dstOffsets = emitOffsetForLayout(dstEnc, dstTy);
 
     // Convert to (row, col) pairs
@@ -321,7 +378,8 @@ struct ConvertLayoutOpAppleConversion
     if (srcElems.size() != srcCoords.size())
       return failure();
 
-    auto [srcBaseRow, srcBaseCol, srcPred] = makeBase(srcEnc);
+    auto [srcBaseRow, srcBaseCol, srcPred] =
+        srcMmaEnc ? makeBaseMma(srcMmaEnc) : makeBase(srcEnc);
     auto [dstBaseRow, dstBaseCol, dstPred] = makeBase(dstEnc);
 
     // Strip flat index: row offset relative to strip start

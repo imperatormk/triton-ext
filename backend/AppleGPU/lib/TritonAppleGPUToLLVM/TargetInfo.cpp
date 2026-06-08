@@ -95,7 +95,11 @@ void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
   LLVM::CallOp::create(rewriter, loc, fn, ValueRange{flags, scope});
 }
 
-void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter) const {
+void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter,
+                                Operation *sourceOp) const {
+  // Apple has no cluster/CGA level; a cluster barrier degenerates to a CTA
+  // (threadgroup) barrier. sourceOp is unused (upstream uses it only for
+  // multi-CTA cluster lowering).
   barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
 }
 

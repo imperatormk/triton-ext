@@ -2854,14 +2854,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       matC_tiles[tm].resize(tilesN);
 
     // LANE-LOCAL C bridge (physical AppleMma layout), shared by every MMA path.
-    // With the physical toLinearLayout active, each lane's #mma C scalars sit at
-    // exactly the simdgroup_matrix per-lane storage (vector indices 0,1), so the
-    // C accumulator-in is a register pack (insertelement) and the C-out is the
-    // inverse (extractelement) at vecIdx = colOff%2 (physical register bit = col
-    // bit0). No TG round-trip, no cross-lane shuffle: same correct bridge the
-    // batchStrips path uses, applied uniformly so every path matches the global
-    // physical layout. owM/owN are the per-warp owned tile counts; wM/wN the
-    // warp grid (single-warp grids degenerate to the full absolute grid).
+    // With the physical toLinearLayout active, each lane's #mma C scalars sit
+    // at exactly the simdgroup_matrix per-lane storage (vector indices 0,1), so
+    // the C accumulator-in is a register pack (insertelement) and the C-out is
+    // the inverse (extractelement) at vecIdx = colOff%2 (physical register bit
+    // = col bit0). No TG round-trip, no cross-lane shuffle: same correct bridge
+    // the batchStrips path uses, applied uniformly so every path matches the
+    // global physical layout. owM/owN are the per-warp owned tile counts; wM/wN
+    // the warp grid (single-warp grids degenerate to the full absolute grid).
     auto laneLocalCIn = [&](int64_t wM, int64_t wN, int64_t owM, int64_t owN) {
       auto matTyL = getSimdgroupMatrixType(ctx);
       auto initFnL = getOrInsertIntrinsic(
@@ -2933,12 +2933,13 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // wall).
     bool deviceCIn = useDeviceA && useDeviceB && !buildCInRegs;
     if (deviceCIn) {
-      // LANE-LOCAL C-in (physical AppleMma layout). The device MMA (Phase 2) and
-      // the Phase-4 extract read each warp's owned tiles matC_tiles[k][j]; the C
-      // accumulator-in must land in the SAME owned slots. Under the physical
-      // toLinearLayout cOffsets are physical coords, so this is a plain register
-      // pack (insertelement) with no TG round-trip, replacing the old logical
-      // TG scatter/SG-gather (which double-permuted under the physical layout).
+      // LANE-LOCAL C-in (physical AppleMma layout). The device MMA (Phase 2)
+      // and the Phase-4 extract read each warp's owned tiles matC_tiles[k][j];
+      // the C accumulator-in must land in the SAME owned slots. Under the
+      // physical toLinearLayout cOffsets are physical coords, so this is a
+      // plain register pack (insertelement) with no TG round-trip, replacing
+      // the old logical TG scatter/SG-gather (which double-permuted under the
+      // physical layout).
       laneLocalCIn(cWarpsM, cWarpsN, ownM, ownN);
     } else if (buildCInRegs) {
       auto i16Ty = IntegerType::get(ctx, 16);
@@ -3073,13 +3074,13 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         }
     } else if (batchStrips) {
       // ── LANE-LOCAL C-in (physical AppleMma layout) ───────────────────────
-      // With the physical toLinearLayout active, each lane's #mma scalars sit at
-      // exactly the simdgroup_matrix per-lane storage (vector indices 0,1), so
-      // the C accumulator-in is a register pack (insertelement) with no TG
-      // round-trip and no cross-lane shuffle.  vecIndex = colOff%2 (the register
-      // bit = col bit0); owned local tile = (rowOff/8 - warpRowOff, colOff/8 -
-      // warpColOff) but since cOffsets are warp-relative the local tile is
-      // (rowOff/8, colOff/8) folded into ownership below.
+      // With the physical toLinearLayout active, each lane's #mma scalars sit
+      // at exactly the simdgroup_matrix per-lane storage (vector indices 0,1),
+      // so the C accumulator-in is a register pack (insertelement) with no TG
+      // round-trip and no cross-lane shuffle.  vecIndex = colOff%2 (the
+      // register bit = col bit0); owned local tile = (rowOff/8 - warpRowOff,
+      // colOff/8 - warpColOff) but since cOffsets are warp-relative the local
+      // tile is (rowOff/8, colOff/8) folded into ownership below.
       auto matTyL = getSimdgroupMatrixType(ctx);
       auto initFnL = getOrInsertIntrinsic(
           rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
@@ -3112,13 +3113,15 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       }
     } else {
       // ── LANE-LOCAL C-in (physical AppleMma layout), per-strip path ──────
-      // This path computes the FULL absolute grid redundantly in every warp, but
-      // only THIS warp's OWNED output positions (its cOffsets) survive the
+      // This path computes the FULL absolute grid redundantly in every warp,
+      // but only THIS warp's OWNED output positions (its cOffsets) survive the
       // convert back to #blocked, so the accumulator only needs the C seed for
-      // this lane's owned positions: a register pack, no cross-warp TG round-trip.
-      // Zero-init every absolute tile, then insert this lane's elemsC at the
-      // physical vecIdx (colOff%2) of the RUNTIME owning absolute tile
-      // ((cBaseRow+rowOff)/8, (cBaseCol+colOff)/8), inverse of the Phase-4 extract.
+      // this lane's owned positions: a register pack, no cross-warp TG
+      // round-trip. Zero-init every absolute tile, then insert this lane's
+      // elemsC at the physical vecIdx (colOff%2) of the RUNTIME owning absolute
+      // tile
+      // ((cBaseRow+rowOff)/8, (cBaseCol+colOff)/8), inverse of the Phase-4
+      // extract.
       auto matTyP = getSimdgroupMatrixType(ctx);
       auto initFnP = getOrInsertIntrinsic(
           rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
@@ -3446,14 +3449,16 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // Under the physical AppleMma toLinearLayout the #mma C scalars sit at the
     // simdgroup_matrix per-lane storage (vector indices 0,1), so the C-out is a
     // lane-local extractelement for every register-resident path (device and
-    // batchStrips). The shared/per-strip TG-store paths handle the bridge below.
+    // batchStrips). The shared/per-strip TG-store paths handle the bridge
+    // below.
     if (useDeviceA && useDeviceB) {
       // ── LANE-LOCAL C-out (physical AppleMma layout) ───
       // Inverse of the lane-local device C-in: each lane's owned tile holds its
       // two physical C scalars at vector indices {0,1}, indexed by colOff%2.
       // Under the physical toLinearLayout cOffsets are physical coords, so this
       // is a direct extractelement, replacing the old logical->physical shuffle
-      // network (which double-permuted now that the layout is already physical).
+      // network (which double-permuted now that the layout is already
+      // physical).
       laneLocalCOut(cWarpsM, cWarpsN, ownM, ownN, outElemTy, resultElems);
     } else if (batchStrips) {
       // ── LANE-LOCAL C-out (physical AppleMma layout) ──────────────────────
@@ -3478,14 +3483,15 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // ── LANE-LOCAL C-out (physical AppleMma layout), per-strip path ─────
       // The per-strip path computes the FULL absolute grid redundantly in every
       // warp, so matC_tiles[tm][tn] for every absolute (tm,tn) is resident in
-      // THIS lane's registers. Under the physical toLinearLayout, this lane owns
-      // exactly its cOffsets entries: element idx lives at vector index colOff%2
-      // of the absolute owning tile ((cBaseRow+rowOff)/8, (cBaseCol+colOff)/8).
-      // The owning tile is RUNTIME (depends on cBaseRow/cBaseCol), so select the
-      // matching compile-time matC_tiles[tm][tn] by a runtime equality chain,
-      // then extractelement at the physical vecIdx. No TG round-trip, no shuffle:
-      // correct under the physical layout (the old simdgroup-store + row-major
-      // gather indexed row-major memory with physical coords -> double-permute).
+      // THIS lane's registers. Under the physical toLinearLayout, this lane
+      // owns exactly its cOffsets entries: element idx lives at vector index
+      // colOff%2 of the absolute owning tile ((cBaseRow+rowOff)/8,
+      // (cBaseCol+colOff)/8). The owning tile is RUNTIME (depends on
+      // cBaseRow/cBaseCol), so select the matching compile-time
+      // matC_tiles[tm][tn] by a runtime equality chain, then extractelement at
+      // the physical vecIdx. No TG round-trip, no shuffle: correct under the
+      // physical layout (the old simdgroup-store + row-major gather indexed
+      // row-major memory with physical coords -> double-permute).
       Value c8 = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
       Value absTileRow = arith::DivUIOp::create(rewriter, loc, cBaseRow, c8);
       Value absTileCol = arith::DivUIOp::create(rewriter, loc, cBaseCol, c8);

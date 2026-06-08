@@ -56,8 +56,9 @@ AppleMmaEncodingAttr::toLinearLayout(llvm::ArrayRef<int64_t> shape) const {
   // LOGICAL layout (historical): row = (T>>3)+R*4, col = T&7.
   // The physical layout is now UNCONDITIONAL: every C-accumulator bridge site
   // (device, batchStrips, per-strip) is lane-local against this layout, so the
-  // old TRITON_C_LIVE_KLOOP opt-out is gone (forcing logical here would miscompile
-  // those bridges). The logical bases below are kept only for reference.
+  // old TRITON_C_LIVE_KLOOP opt-out is gone (forcing logical here would
+  // miscompile those bridges). The logical bases below are kept only for
+  // reference.
   bool physLayout = true;
   std::vector<std::vector<int32_t>> registerBases =
       physLayout ? std::vector<std::vector<int32_t>>{{0, 1}}

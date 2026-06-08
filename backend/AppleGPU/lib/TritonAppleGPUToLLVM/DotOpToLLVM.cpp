@@ -2853,6 +2853,63 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     for (int64_t tm = 0; tm < tilesM; ++tm)
       matC_tiles[tm].resize(tilesN);
 
+    // LANE-LOCAL C bridge (physical AppleMma layout), shared by every MMA path.
+    // With the physical toLinearLayout active, each lane's #mma C scalars sit at
+    // exactly the simdgroup_matrix per-lane storage (vector indices 0,1), so the
+    // C accumulator-in is a register pack (insertelement) and the C-out is the
+    // inverse (extractelement) at vecIdx = colOff%2 (physical register bit = col
+    // bit0). No TG round-trip, no cross-lane shuffle: same correct bridge the
+    // batchStrips path uses, applied uniformly so every path matches the global
+    // physical layout. owM/owN are the per-warp owned tile counts; wM/wN the
+    // warp grid (single-warp grids degenerate to the full absolute grid).
+    auto laneLocalCIn = [&](int64_t wM, int64_t wN, int64_t owM, int64_t owN) {
+      auto matTyL = getSimdgroupMatrixType(ctx);
+      auto initFnL = getOrInsertIntrinsic(
+          rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
+          LLVMFunctionType::get(matTyL, {f32Ty}, false));
+      Value fzL =
+          arith::ConstantOp::create(rewriter, loc, rewriter.getZeroAttr(f32Ty));
+      Value zMatL =
+          LLVM::CallOp::create(rewriter, loc, initFnL, ValueRange{fzL})
+              .getResult();
+      for (int64_t k = 0; k < owM; ++k)
+        for (int64_t j = 0; j < owN; ++j)
+          matC_tiles[k][j] = zMatL;
+      for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
+        int64_t rowOff = cOffsets[idx][0];
+        int64_t colOff = cOffsets[idx][1];
+        int64_t localTm = (rowOff / 8) / std::max<int64_t>(1, wM);
+        int64_t localTn = (colOff / 8) / std::max<int64_t>(1, wN);
+        if (localTm >= owM || localTn >= owN)
+          continue;
+        int64_t vecIdx = colOff % 2;
+        Value v = elemsC[idx];
+        if (v.getType() != f32Ty)
+          v = toF32(rewriter, loc, v, f32Ty);
+        Value vIdxC = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+        matC_tiles[localTm][localTn] = InsertElementOp::create(
+            rewriter, loc, matTyL, matC_tiles[localTm][localTn], v, vIdxC);
+      }
+    };
+    auto laneLocalCOut = [&](int64_t wM, int64_t wN, int64_t owM, int64_t owN,
+                             Type outElemTy, SmallVector<Value> &resultElems) {
+      for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
+        int64_t rowOff = cOffsets[idx][0];
+        int64_t colOff = cOffsets[idx][1];
+        int64_t localTm = (rowOff / 8) / std::max<int64_t>(1, wM);
+        int64_t localTn = (colOff / 8) / std::max<int64_t>(1, wN);
+        if (localTm >= owM || localTn >= owN)
+          continue;
+        int64_t vecIdx = colOff % 2;
+        Value vIdxC = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+        Value val = ExtractElementOp::create(
+            rewriter, loc, matC_tiles[localTm][localTn], vIdxC);
+        if (val.getType() != outElemTy)
+          val = fromF32(rewriter, loc, val, outElemTy);
+        resultElems[idx] = val;
+      }
+    };
+
     // Shared-direct path: build the MMA accumulator straight from the incoming
     // C registers via a simd_shuffle, skipping the per-K-step C scatter/gather
     // through threadgroup memory.  Inverse of the Phase-4 extract.  The base
@@ -2876,54 +2933,13 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // wall).
     bool deviceCIn = useDeviceA && useDeviceB && !buildCInRegs;
     if (deviceCIn) {
-      auto dWpc = cMmaEnc.getWarpsPerCTA();
-      int64_t warpsM = dWpc[0];
-      int64_t warpsN = dWpc[1];
-      unsigned dwN = dWpc[1];
-      int64_t ownM = std::max<int64_t>(1, tilesM / warpsM);
-      int64_t ownN = std::max<int64_t>(1, tilesN / warpsN);
-      Value dWarpRow = divByConst(rewriter, loc, warpId, dwN);
-      Value dWarpCol = remByConst(rewriter, loc, warpId, dwN);
-      Value c8i = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
-      Value warpRowElem = arith::MulIOp::create(rewriter, loc, dWarpRow, c8i);
-      Value warpColElem = arith::MulIOp::create(rewriter, loc, dWarpCol, c8i);
-      // Scatter every lane's C-in (logical cOffsets) into the TG buffer at its
-      // absolute position, then SG-load each owned tile by runtime absolute
-      // offset. Scatter the FULL element set into each absolute strip (the
-      // runtime inStrip check keeps only the matching rows) so no warpRow>0
-      // element is dropped by static bucket filtering.
-      SmallVector<size_t> allIdx;
-      for (size_t i = 0; i < cOffsets.size(); ++i)
-        allIdx.push_back(i);
-      for (int64_t tm = 0; tm < tilesM; ++tm)
-        filteredScatter(ptrTG, garbageIdx, cBaseRow, cBaseCol, elemsC, cOffsets,
-                        allIdx, Npad, tm * 8, f32Ty, tm);
-      LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                           ValueRange{fenceTG, execMod});
-      // The simdgroup_matrix TG load addresses correctly only from a CONSTANT
-      // tile offset (a runtime `off` mis-lowers, same constraint as the shared
-      // base in resolveSharedOperand). So fold the runtime owned-tile origin
-      // into the BASE POINTER via a GEP (flat index warpRow*Npad*8 + warpCol*8)
-      // and load at constant zero offset.
-      Value NpadV = arith::ConstantIntOp::create(rewriter, loc, Npad, 32);
-      Value warpFlatBase = arith::AddIOp::create(
-          rewriter, loc,
-          arith::MulIOp::create(rewriter, loc, warpRowElem, NpadV),
-          warpColElem);
-      Value warpFlatBase64 =
-          arith::ExtUIOp::create(rewriter, loc, i64Ty, warpFlatBase);
-      Value ptrTGWarp =
-          LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32Ty, ptrTG,
-                              ArrayRef<LLVM::GEPArg>{warpFlatBase64});
-      for (int64_t k = 0; k < ownM; ++k)
-        for (int64_t j = 0; j < ownN; ++j) {
-          // Constant tile offset relative to the warp base pointer.
-          Value cOff =
-              makeI64Vec2(rewriter, loc, j * warpsN * 8, k * warpsM * 8);
-          matC_tiles[k][j] = emitSGLoad(loadFn, ptrTGWarp, Npad, Npad, cOff);
-        }
-      LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                           ValueRange{fenceTG, execMod});
+      // LANE-LOCAL C-in (physical AppleMma layout). The device MMA (Phase 2) and
+      // the Phase-4 extract read each warp's owned tiles matC_tiles[k][j]; the C
+      // accumulator-in must land in the SAME owned slots. Under the physical
+      // toLinearLayout cOffsets are physical coords, so this is a plain register
+      // pack (insertelement) with no TG round-trip, replacing the old logical
+      // TG scatter/SG-gather (which double-permuted under the physical layout).
+      laneLocalCIn(cWarpsM, cWarpsN, ownM, ownN);
     } else if (buildCInRegs) {
       auto i16Ty = IntegerType::get(ctx, 16);
       auto matVecTy = getSimdgroupMatrixType(ctx);
@@ -3056,47 +3072,99 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           matC_tiles[tm][tn] = vec;
         }
     } else if (batchStrips) {
-      // Scatter all M strips into distinct TG blocks (each warp's C-in lands at
-      // its ABSOLUTE row via the inStrip runtime filter), one barrier, then
-      // load tiles back, one barrier.
-      for (int64_t tm = 0; tm < tilesM; ++tm)
-        filteredScatter(ptrTG, garbageIdx, cBaseRow, cBaseCol, elemsC, cOffsets,
-                        cBuckets[tm], Npad, tm * 8, f32Ty, tm);
-      LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                           ValueRange{fenceTG, execMod});
-      // PER-WARP (TASK #57): load ONLY this warp's owned tiles by absolute
-      // origin (warp-base C pointer + constant owned offset).
-      // matC_tiles[k][j] = owned absolute tile (warpRow+k*warpsM,
-      // warpCol+j*warpsN). For a single-warp grid this degenerates to the full
-      // absolute grid (ownM=tilesM, warp origin 0), so it is unconditional.
+      // ── LANE-LOCAL C-in (physical AppleMma layout) ───────────────────────
+      // With the physical toLinearLayout active, each lane's #mma scalars sit at
+      // exactly the simdgroup_matrix per-lane storage (vector indices 0,1), so
+      // the C accumulator-in is a register pack (insertelement) with no TG
+      // round-trip and no cross-lane shuffle.  vecIndex = colOff%2 (the register
+      // bit = col bit0); owned local tile = (rowOff/8 - warpRowOff, colOff/8 -
+      // warpColOff) but since cOffsets are warp-relative the local tile is
+      // (rowOff/8, colOff/8) folded into ownership below.
+      auto matTyL = getSimdgroupMatrixType(ctx);
+      auto initFnL = getOrInsertIntrinsic(
+          rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
+          LLVMFunctionType::get(matTyL, {f32Ty}, false));
+      Value fzL =
+          arith::ConstantOp::create(rewriter, loc, rewriter.getZeroAttr(f32Ty));
+      Value zMatL =
+          LLVM::CallOp::create(rewriter, loc, initFnL, ValueRange{fzL})
+              .getResult();
       for (int64_t k = 0; k < ownM; ++k)
-        for (int64_t j = 0; j < ownN; ++j) {
-          Value cOff =
-              makeI64Vec2(rewriter, loc, j * cWarpsN * 8, k * cWarpsM * 8);
-          matC_tiles[k][j] = emitSGLoad(loadFn, ptrTGcWarp, Npad, Npad, cOff);
-        }
-      LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                           ValueRange{fenceTG, execMod});
-    } else
-      // Per-strip C-in (grid does not fit a single resident buffer, so no
-      // per-warp owned addressing): scatter absolute strip tm into the
-      // single-strip buffer, barrier, load that strip's N tiles into the full
-      // absolute grid, barrier. This path keeps the full-grid compute.
-      for (int64_t tm = 0; tm < tilesM; ++tm) {
-        int64_t rowStart = tm * 8;
-
-        filteredScatter(ptrTG, garbageIdx, cBaseRow, cBaseCol, elemsC, cOffsets,
-                        cBuckets[tm], Npad, rowStart, f32Ty);
-        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                             ValueRange{fenceTG, execMod});
-
-        for (int64_t tn = 0; tn < tilesN; ++tn) {
-          Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-          matC_tiles[tm][tn] = emitSGLoad(loadFn, ptrTG, Npad, Npad, cOff);
-        }
-        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                             ValueRange{fenceTG, execMod});
+        for (int64_t j = 0; j < ownN; ++j)
+          matC_tiles[k][j] = zMatL;
+      // cOffsets enumerate this lane's owned positions across the full tensor
+      // tile grid; for per-warp ownership the entry's absolute tile maps to a
+      // local owned slot. Single-warp grids (ownM=tilesM) map identically.
+      for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
+        int64_t rowOff = cOffsets[idx][0];
+        int64_t colOff = cOffsets[idx][1];
+        int64_t localTm = (rowOff / 8) / std::max<int64_t>(1, cWarpsM);
+        int64_t localTn = (colOff / 8) / std::max<int64_t>(1, cWarpsN);
+        if (localTm >= ownM || localTn >= ownN)
+          continue;
+        int64_t vecIdx = colOff % 2;
+        Value v = elemsC[idx];
+        if (v.getType() != f32Ty)
+          v = toF32(rewriter, loc, v, f32Ty);
+        Value vIdxC = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+        matC_tiles[localTm][localTn] = InsertElementOp::create(
+            rewriter, loc, matTyL, matC_tiles[localTm][localTn], v, vIdxC);
       }
+    } else {
+      // ── LANE-LOCAL C-in (physical AppleMma layout), per-strip path ──────
+      // This path computes the FULL absolute grid redundantly in every warp, but
+      // only THIS warp's OWNED output positions (its cOffsets) survive the
+      // convert back to #blocked, so the accumulator only needs the C seed for
+      // this lane's owned positions: a register pack, no cross-warp TG round-trip.
+      // Zero-init every absolute tile, then insert this lane's elemsC at the
+      // physical vecIdx (colOff%2) of the RUNTIME owning absolute tile
+      // ((cBaseRow+rowOff)/8, (cBaseCol+colOff)/8), inverse of the Phase-4 extract.
+      auto matTyP = getSimdgroupMatrixType(ctx);
+      auto initFnP = getOrInsertIntrinsic(
+          rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
+          LLVMFunctionType::get(matTyP, {f32Ty}, false));
+      Value fzP =
+          arith::ConstantOp::create(rewriter, loc, rewriter.getZeroAttr(f32Ty));
+      Value zMatP =
+          LLVM::CallOp::create(rewriter, loc, initFnP, ValueRange{fzP})
+              .getResult();
+      for (int64_t tm = 0; tm < tilesM; ++tm)
+        for (int64_t tn = 0; tn < tilesN; ++tn)
+          matC_tiles[tm][tn] = zMatP;
+      Value c8p = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+      Value absTileRowP = arith::DivUIOp::create(rewriter, loc, cBaseRow, c8p);
+      Value absTileColP = arith::DivUIOp::create(rewriter, loc, cBaseCol, c8p);
+      for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
+        int64_t rowOff = cOffsets[idx][0];
+        int64_t colOff = cOffsets[idx][1];
+        Value wantTm = arith::AddIOp::create(
+            rewriter, loc, absTileRowP,
+            arith::ConstantIntOp::create(rewriter, loc, rowOff / 8, 32));
+        Value wantTn = arith::AddIOp::create(
+            rewriter, loc, absTileColP,
+            arith::ConstantIntOp::create(rewriter, loc, colOff / 8, 32));
+        int64_t vecIdx = colOff % 2;
+        Value vIdxC = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+        Value v = elemsC[idx];
+        if (v.getType() != f32Ty)
+          v = toF32(rewriter, loc, v, f32Ty);
+        for (int64_t tm = 0; tm < tilesM; ++tm)
+          for (int64_t tn = 0; tn < tilesN; ++tn) {
+            Value tmEq = arith::CmpIOp::create(
+                rewriter, loc, arith::CmpIPredicate::eq, wantTm,
+                arith::ConstantIntOp::create(rewriter, loc, tm, 32));
+            Value tnEq = arith::CmpIOp::create(
+                rewriter, loc, arith::CmpIPredicate::eq, wantTn,
+                arith::ConstantIntOp::create(rewriter, loc, tn, 32));
+            Value match = arith::AndIOp::create(rewriter, loc, tmEq, tnEq);
+            Value cur = ExtractElementOp::create(rewriter, loc,
+                                                 matC_tiles[tm][tn], vIdxC);
+            Value nv = arith::SelectOp::create(rewriter, loc, match, v, cur);
+            matC_tiles[tm][tn] = InsertElementOp::create(
+                rewriter, loc, matTyP, matC_tiles[tm][tn], nv, vIdxC);
+          }
+      }
+    }
 
     // ── Phase 2: A/B loads + MMA ──────────────────────────────────
     if (useSharedA || useSharedB) {
@@ -3375,255 +3443,83 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       resultElems[i] = arith::ConstantOp::create(
           rewriter, loc, rewriter.getZeroAttr(outElemTy));
 
-    // C-out via register shuffle is correct for register-resident MMA tiles but
-    // measured SLOWER than the threadgroup gather on Apple (the per-lane
-    // shuffle network costs more than the TG round-trip), so the shared path
-    // keeps the TG C-out; only the device path uses the shuffle.
+    // Under the physical AppleMma toLinearLayout the #mma C scalars sit at the
+    // simdgroup_matrix per-lane storage (vector indices 0,1), so the C-out is a
+    // lane-local extractelement for every register-resident path (device and
+    // batchStrips). The shared/per-strip TG-store paths handle the bridge below.
     if (useDeviceA && useDeviceB) {
-      // ── Shuffle-based MMA extract (no TG round-trip) ───
-      //
-      // The MMA hardware register layout differs from the logical layout
-      // defined by toLinearLayout:
-      //
-      // PHYSICAL layout (extractelement indices 0, 1):
-      //   phys_row = L[1] | (L[2]<<1) | (L[4]<<2)
-      //   phys_col = (L[0]<<1) | (L[3]<<2) | R   (R = extract index 0 or 1)
-      //
-      // LOGICAL layout (toLinearLayout / cOffsets):
-      //   log_row = L[3] | (L[4]<<1)   + (logReg ? 4 : 0)
-      //   log_col = L[0] | (L[1]<<1) | (L[2]<<2)
-      //
-      // To extract the value at logical position (log_row, log_col) from
-      // the MMA tile, we need to:
-      //   1. Find source lane S that physically holds (log_row, log_col):
-      //      S = log_col[1] | (log_row[0]<<1) | (log_row[1]<<2) |
-      //      (log_col[2]<<3) | (log_row[2]<<4) In terms of lane bits:
-      //        S = L[1] | (L[3]<<1) | (L[4]<<2) | (L[2]<<3)  (+ 16 for
-      //        logReg=1)
-      //   2. Physical register R = log_col[0] = L[0] = laneId & 1
-      //   3. simd_shuffle(phys_reg_R, S) gives the value
-
-      auto cWpc = cMmaEnc.getWarpsPerCTA();
-      int64_t warpsM = cWpc[0];
-      int64_t warpsN = cWpc[1];
-      int64_t ownM = std::max<int64_t>(1, tilesM / warpsM);
-      int64_t ownN = std::max<int64_t>(1, tilesN / warpsN);
-
-      // Declare shuffle intrinsic: air.simd_shuffle.f32(float, i16) -> float
-      auto i16Ty = IntegerType::get(ctx, 16);
-      auto shuffleFn = getOrInsertIntrinsic(
-          rewriter, mod, "air.simd_shuffle.f32",
-          LLVMFunctionType::get(f32Ty, {f32Ty, i16Ty}, false));
-
-      // Compute shuffle source lane for logical reg 0:
-      // S0 = L[1] | (L[3]<<1) | (L[4]<<2) | (L[2]<<3)
-      // Bit extraction from laneId (i32):
-      auto extractBit = [&](Value v, int bit) -> Value {
-        Value shifted =
-            (bit > 0) ? arith::ShRUIOp::create(rewriter, loc, v,
-                                               arith::ConstantIntOp::create(
-                                                   rewriter, loc, bit, 32))
-                      : v;
-        return arith::AndIOp::create(
-            rewriter, loc, shifted,
-            arith::ConstantIntOp::create(rewriter, loc, 1, 32));
-      };
-
-      // S0 = L[1] | (L[3]<<1) | (L[4]<<2) | (L[2]<<3)
-      Value bit1 = extractBit(laneId, 1);
-      Value bit2 = extractBit(laneId, 2);
-      Value bit3 = extractBit(laneId, 3);
-      Value bit4 = extractBit(laneId, 4);
-
-      Value S0 = bit1; // L[1] at position 0
-      S0 = arith::OrIOp::create(
-          rewriter, loc, S0,
-          arith::ShLIOp::create(
-              rewriter, loc, bit3,
-              arith::ConstantIntOp::create(rewriter, loc, 1,
-                                           32))); // L[3] at position 1
-      S0 = arith::OrIOp::create(
-          rewriter, loc, S0,
-          arith::ShLIOp::create(
-              rewriter, loc, bit4,
-              arith::ConstantIntOp::create(rewriter, loc, 2,
-                                           32))); // L[4] at position 2
-      S0 = arith::OrIOp::create(
-          rewriter, loc, S0,
-          arith::ShLIOp::create(
-              rewriter, loc, bit2,
-              arith::ConstantIntOp::create(rewriter, loc, 3,
-                                           32))); // L[2] at position 3
-
-      // S1 = S0 | 16 (for logical register 1, target_row has bit 2 set)
-      Value S1 = arith::OrIOp::create(
-          rewriter, loc, S0,
-          arith::ConstantIntOp::create(rewriter, loc, 16, 32));
-
-      Value S0_i16 = arith::TruncIOp::create(rewriter, loc, i16Ty, S0);
-      Value S1_i16 = arith::TruncIOp::create(rewriter, loc, i16Ty, S1);
-
-      // Physical register selector: R = laneId & 1
-      Value physReg = arith::AndIOp::create(
-          rewriter, loc, laneId,
-          arith::ConstantIntOp::create(rewriter, loc, 1, 32));
-      Value isOddCol = arith::CmpIOp::create(
-          rewriter, loc, arith::CmpIPredicate::ne, physReg,
-          arith::ConstantIntOp::create(rewriter, loc, 0, 32));
-
-      // Pre-extract physical registers and shuffle for ALL tiles
-      // For each tile, compute 4 shuffled values:
-      //   shufReg0_S0, shufReg1_S0 (for logical reg 0)
-      //   shufReg0_S1, shufReg1_S1 (for logical reg 1)
-      // Then select based on isOddCol:
-      //   logReg0_val = isOddCol ? shufReg1_S0 : shufReg0_S0
-      //   logReg1_val = isOddCol ? shufReg1_S1 : shufReg0_S1
-
-      Value extractIdx0 = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
-      Value extractIdx1 = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
-
-      // Pre-compute shuffled logical values per OWNED tile (k,j):
-      // matC_tiles[k][j] holds this warp's owned tile, k in [0,ownM),
-      // j in [0,ownN). Indexed by ownFlat = k*ownN + j.
-      SmallVector<Value> tileLogReg0(ownM * ownN);
-      SmallVector<Value> tileLogReg1(ownM * ownN);
-      for (int64_t k = 0; k < ownM; ++k)
-        for (int64_t j = 0; j < ownN; ++j) {
-          int64_t flat = k * ownN + j;
-          Value pr0 = LLVM::ExtractElementOp::create(
-              rewriter, loc, f32Ty, matC_tiles[k][j], extractIdx0);
-          Value pr1 = LLVM::ExtractElementOp::create(
-              rewriter, loc, f32Ty, matC_tiles[k][j], extractIdx1);
-
-          // Shuffle for logical reg 0 (S0)
-          Value shR0_S0 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
-                                               ValueRange{pr0, S0_i16})
-                              .getResult();
-          Value shR1_S0 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
-                                               ValueRange{pr1, S0_i16})
-                              .getResult();
-          tileLogReg0[flat] = arith::SelectOp::create(rewriter, loc, isOddCol,
-                                                      shR1_S0, shR0_S0);
-
-          // Shuffle for logical reg 1 (S1)
-          Value shR0_S1 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
-                                               ValueRange{pr0, S1_i16})
-                              .getResult();
-          Value shR1_S1 = LLVM::CallOp::create(rewriter, loc, shuffleFn,
-                                               ValueRange{pr1, S1_i16})
-                              .getResult();
-          tileLogReg1[flat] = arith::SelectOp::create(rewriter, loc, isOddCol,
-                                                      shR1_S1, shR0_S1);
-        }
-
+      // ── LANE-LOCAL C-out (physical AppleMma layout) ───
+      // Inverse of the lane-local device C-in: each lane's owned tile holds its
+      // two physical C scalars at vector indices {0,1}, indexed by colOff%2.
+      // Under the physical toLinearLayout cOffsets are physical coords, so this
+      // is a direct extractelement, replacing the old logical->physical shuffle
+      // network (which double-permuted now that the layout is already physical).
+      laneLocalCOut(cWarpsM, cWarpsN, ownM, ownN, outElemTy, resultElems);
+    } else if (batchStrips) {
+      // ── LANE-LOCAL C-out (physical AppleMma layout) ──────────────────────
+      // Inverse of the lane-local C-in: extractelement at the same vecIdx, no
+      // TG round-trip, no shuffle.
       for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
         int64_t rowOff = cOffsets[idx][0];
         int64_t colOff = cOffsets[idx][1];
-        int64_t logRegIdx = (rowOff % 8 >= 4) ? 1 : 0;
-
-        // cOffsets are warp-relative: rowOff/8 enumerates this warp's owned
-        // absolute tile rows {warpRow, warpRow+warpsM, ...} as {0, warpsM,
-        // ...}, so the owned local index is k = (rowOff/8)/warpsM, j =
-        // (colOff/8)/ warpsN. matC_tiles[k][j] is exactly the accumulator for
-        // this element, a COMPILE-TIME index: the prior runtime select-chain
-        // over the full tile grid (and the full-grid redundant MMA that fed it)
-        // is gone.
-        int64_t k = (rowOff / 8) / warpsM;
-        int64_t j = (colOff / 8) / warpsN;
-        int64_t ownFlat = k * ownN + j;
-
-        auto &logRegVals = (logRegIdx == 0) ? tileLogReg0 : tileLogReg1;
-        Value val = logRegVals[ownFlat];
-
+        int64_t localTm = (rowOff / 8) / std::max<int64_t>(1, cWarpsM);
+        int64_t localTn = (colOff / 8) / std::max<int64_t>(1, cWarpsN);
+        if (localTm >= ownM || localTn >= ownN)
+          continue;
+        int64_t vecIdx = colOff % 2;
+        Value vIdxC = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+        Value val = ExtractElementOp::create(
+            rewriter, loc, matC_tiles[localTm][localTn], vIdxC);
         if (val.getType() != outElemTy)
           val = fromF32(rewriter, loc, val, outElemTy);
         resultElems[idx] = val;
       }
-    } else if (batchStrips) {
-      // ── TG PATH (batched), PER-WARP store-back (TASK #57): each warp stores
-      // ONLY its owned tiles matC_tiles[k][j] to their ABSOLUTE TG position
-      // (warp-base C pointer + constant owned offset). Exactly one warp owns
-      // (writes) each absolute tile, so there is no store race; the
-      // absolute-row-filtered gather below then reads each warp's elements back
-      // unchanged. One barrier, gather all, one barrier. ──
-      for (int64_t k = 0; k < ownM; ++k)
-        for (int64_t j = 0; j < ownN; ++j) {
-          Value cOff =
-              makeI64Vec2(rewriter, loc, j * cWarpsN * 8, k * cWarpsM * 8);
-          emitSGStore(storeFn, matC_tiles[k][j], ptrTGcWarp, Npad, Npad, cOff);
-        }
-      LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                           ValueRange{fenceTG, execMod});
-
-      for (int64_t tm = 0; tm < tilesM; ++tm) {
-        int64_t rowStart = tm * 8;
-        for (size_t idx : cBuckets[tm]) {
-          int64_t rowOff = cOffsets[idx][0];
-          int64_t colOff = cOffsets[idx][1];
-          Value actualRow = arith::AddIOp::create(
-              rewriter, loc, cBaseRow,
-              arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
-          Value inStrip = arith::AndIOp::create(
-              rewriter, loc,
-              arith::CmpIOp::create(
-                  rewriter, loc, arith::CmpIPredicate::uge, actualRow,
-                  arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
-              arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
-                                    actualRow,
-                                    arith::ConstantIntOp::create(
-                                        rewriter, loc, rowStart + 8, 32)));
-          Value sIdx = stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, Npad,
-                                    rowStart, tm);
-          Value safeIdx =
-              arith::SelectOp::create(rewriter, loc, inStrip, sIdx, garbageIdx);
-          Value val = gather1(ptrTG, safeIdx);
-          if (val.getType() != outElemTy)
-            val = fromF32(rewriter, loc, val, outElemTy);
-          resultElems[idx] = arith::SelectOp::create(rewriter, loc, inStrip,
-                                                     val, resultElems[idx]);
-        }
-      }
-      LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                           ValueRange{fenceTG, execMod});
     } else {
-      // ── TG PATH: Store C tiles -> TG, gather (original) ─────────
-      for (int64_t tm = 0; tm < tilesM; ++tm) {
-        int64_t rowStart = tm * 8;
-
-        for (int64_t tn = 0; tn < tilesN; ++tn) {
-          Value cOff = makeI64Vec2(rewriter, loc, tn * 8, 0);
-          emitSGStore(storeFn, matC_tiles[tm][tn], ptrTG, Npad, Npad, cOff);
-        }
-        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                             ValueRange{fenceTG, execMod});
-
-        for (size_t idx : cBuckets[tm]) {
-          int64_t rowOff = cOffsets[idx][0];
-          int64_t colOff = cOffsets[idx][1];
-          Value actualRow = arith::AddIOp::create(
-              rewriter, loc, cBaseRow,
-              arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
-          Value inStrip = arith::AndIOp::create(
-              rewriter, loc,
-              arith::CmpIOp::create(
-                  rewriter, loc, arith::CmpIPredicate::uge, actualRow,
-                  arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
-              arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult,
-                                    actualRow,
-                                    arith::ConstantIntOp::create(
-                                        rewriter, loc, rowStart + 8, 32)));
-          Value sIdx =
-              stripFlatIdx(cBaseRow, cBaseCol, rowOff, colOff, Npad, rowStart);
-          Value safeIdx =
-              arith::SelectOp::create(rewriter, loc, inStrip, sIdx, garbageIdx);
-          Value val = gather1(ptrTG, safeIdx);
-          if (val.getType() != outElemTy)
-            val = fromF32(rewriter, loc, val, outElemTy);
-          resultElems[idx] = arith::SelectOp::create(rewriter, loc, inStrip,
-                                                     val, resultElems[idx]);
-        }
-        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                             ValueRange{fenceTG, execMod});
+      // ── LANE-LOCAL C-out (physical AppleMma layout), per-strip path ─────
+      // The per-strip path computes the FULL absolute grid redundantly in every
+      // warp, so matC_tiles[tm][tn] for every absolute (tm,tn) is resident in
+      // THIS lane's registers. Under the physical toLinearLayout, this lane owns
+      // exactly its cOffsets entries: element idx lives at vector index colOff%2
+      // of the absolute owning tile ((cBaseRow+rowOff)/8, (cBaseCol+colOff)/8).
+      // The owning tile is RUNTIME (depends on cBaseRow/cBaseCol), so select the
+      // matching compile-time matC_tiles[tm][tn] by a runtime equality chain,
+      // then extractelement at the physical vecIdx. No TG round-trip, no shuffle:
+      // correct under the physical layout (the old simdgroup-store + row-major
+      // gather indexed row-major memory with physical coords -> double-permute).
+      Value c8 = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+      Value absTileRow = arith::DivUIOp::create(rewriter, loc, cBaseRow, c8);
+      Value absTileCol = arith::DivUIOp::create(rewriter, loc, cBaseCol, c8);
+      for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
+        int64_t rowOff = cOffsets[idx][0];
+        int64_t colOff = cOffsets[idx][1];
+        // Runtime owning absolute tile = base tile + warp-relative tile offset.
+        Value wantTm = arith::AddIOp::create(
+            rewriter, loc, absTileRow,
+            arith::ConstantIntOp::create(rewriter, loc, rowOff / 8, 32));
+        Value wantTn = arith::AddIOp::create(
+            rewriter, loc, absTileCol,
+            arith::ConstantIntOp::create(rewriter, loc, colOff / 8, 32));
+        int64_t vecIdx = colOff % 2;
+        Value vIdxC = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+        Value sel = arith::ConstantOp::create(rewriter, loc,
+                                              rewriter.getZeroAttr(f32Ty));
+        for (int64_t tm = 0; tm < tilesM; ++tm)
+          for (int64_t tn = 0; tn < tilesN; ++tn) {
+            Value tmEq = arith::CmpIOp::create(
+                rewriter, loc, arith::CmpIPredicate::eq, wantTm,
+                arith::ConstantIntOp::create(rewriter, loc, tm, 32));
+            Value tnEq = arith::CmpIOp::create(
+                rewriter, loc, arith::CmpIPredicate::eq, wantTn,
+                arith::ConstantIntOp::create(rewriter, loc, tn, 32));
+            Value match = arith::AndIOp::create(rewriter, loc, tmEq, tnEq);
+            Value v = ExtractElementOp::create(rewriter, loc,
+                                               matC_tiles[tm][tn], vIdxC);
+            sel = arith::SelectOp::create(rewriter, loc, match, v, sel);
+          }
+        Value val = sel;
+        if (val.getType() != outElemTy)
+          val = fromF32(rewriter, loc, val, outElemTy);
+        resultElems[idx] = val;
       }
     }
 

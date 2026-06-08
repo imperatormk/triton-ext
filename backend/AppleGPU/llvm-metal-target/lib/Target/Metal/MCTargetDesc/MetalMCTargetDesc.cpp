@@ -98,8 +98,8 @@ public:
 
 class MetalMCAsmInfo : public MCAsmInfo {
 public:
-  explicit MetalMCAsmInfo(const Triple &, const MCTargetOptions &)
-      : MCAsmInfo() {
+  explicit MetalMCAsmInfo(const Triple &, const MCTargetOptions &Options)
+      : MCAsmInfo(Options) {
     // AIR has no textual assembly form; disable every assembly-language
     // feature so MC never tries to print or parse one.
     HasSingleParameterDotFile = false;

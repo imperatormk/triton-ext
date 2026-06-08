@@ -2453,6 +2453,87 @@ static bool asyncCopyOuterDimCrossWarp(ttg::AsyncCopyGlobalToLocalOp op) {
   return warpsPerCTA[outerDim] > 1;
 }
 
+// Partition factor for a multi-warp-outer async copy. Returns the number of
+// warps along the tile's outer (row) dim when the row dim divides evenly across
+// them (so the tile splits into that many disjoint per-warp row bands), else 0
+// (not cleanly partitionable;
+// caller keeps the sync bail). When >0 the copy is split into that many
+// disjoint horizontal bands, one per outer-dim warp, so the warps no longer
+// write-write race on a shared region.
+static unsigned asyncCopyOuterPartition(ttg::AsyncCopyGlobalToLocalOp op) {
+  auto srcTy = op.getSrc().getType();
+  auto blocked =
+      dyn_cast_or_null<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
+  if (!blocked)
+    return 0;
+  auto warpsPerCTA = blocked.getWarpsPerCTA();
+  auto order = blocked.getOrder();
+  auto shape = srcTy.getShape();
+  if (warpsPerCTA.empty() || order.empty() || shape.size() != 2)
+    return 0;
+  unsigned outerDim = order.back();
+  if (outerDim >= warpsPerCTA.size())
+    return 0;
+  unsigned nWarpsOuter = warpsPerCTA[outerDim];
+  if (nWarpsOuter <= 1)
+    return 0;
+  if (shape[0] % nWarpsOuter != 0) // row dim must split evenly into bands
+    return 0;
+  return nWarpsOuter;
+}
+
+// Emit the outer-dim warp index wR for the partitioned copy: warpId = tid/32
+// decomposed against the layout's warp order so wR selects which row band this
+// warp owns. Mirrors the wR decomposition at the MMA index emitters.
+static Value emitOuterWarpIndex(ttg::AsyncCopyGlobalToLocalOp op,
+                                ConversionPatternRewriter &rewriter,
+                                Location loc) {
+  auto *ctx = op.getContext();
+  auto mod = op->getParentOfType<ModuleOp>();
+  auto i32Ty = IntegerType::get(ctx, 32);
+  auto srcTy = op.getSrc().getType();
+  auto blocked = cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
+  auto warpsPerCTA = blocked.getWarpsPerCTA();
+  auto order = blocked.getOrder();
+  unsigned outerDim = order.back();
+  unsigned innerDim = order.front();
+  // colFastest: inner (fastest) dim is order[0]; outer warps are the SLOW
+  // factor of warpId (wR = warpId / warpsInner). Otherwise wR = warpId %
+  // warpsOuter.
+  bool colFastest = (order[0] == innerDim) && (innerDim != outerDim);
+  unsigned warpsOuter = warpsPerCTA[outerDim];
+  unsigned warpsInner = warpsPerCTA[innerDim];
+
+  // tid = thread_position_in_threadgroup[0].
+  auto arrI32x3Ty = LLVM::LLVMArrayType::get(i32Ty, 3);
+  auto tidFnTy = LLVMFunctionType::get(arrI32x3Ty, {}, false);
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(mod.getBody());
+    if (!mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup"))
+      LLVMFuncOp::create(rewriter, mod.getLoc(),
+                         "air.thread_position_in_threadgroup", tidFnTy,
+                         Linkage::External);
+  }
+  auto tidFn =
+      mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup");
+  Value tidStruct =
+      LLVM::CallOp::create(rewriter, loc, tidFn, ValueRange{}).getResult();
+  Value tid = LLVM::ExtractValueOp::create(rewriter, loc, i32Ty, tidStruct,
+                                           ArrayRef<int64_t>{0});
+  Value c32 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                       rewriter.getI32IntegerAttr(32));
+  Value warpId = LLVM::UDivOp::create(rewriter, loc, tid, c32);
+  if (colFastest) {
+    Value wIn = LLVM::ConstantOp::create(
+        rewriter, loc, i32Ty, rewriter.getI32IntegerAttr(warpsInner));
+    return LLVM::UDivOp::create(rewriter, loc, warpId, wIn);
+  }
+  Value wOut = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                        rewriter.getI32IntegerAttr(warpsOuter));
+  return LLVM::URemOp::create(rewriter, loc, warpId, wOut);
+}
+
 // Struct to hold all components extracted from the async_copy pointer chain.
 struct AsyncCopyPtrInfo {
   Value stride;   // Row stride scalar (MLIR, in elements)
@@ -3235,10 +3316,17 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
 
     Value dstStrideBytes = LLVM::ConstantOp::create(
         rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileWidthBytes));
+
+    // (The runtime-ptr path carries only NON-cross-warp-partitioned async
+    // copies: a cross-warp-consumed operand is routed to the sync copy, so no
+    // per-warp band partition is applied here. The exclusive-consumption
+    // partition is done in the inline emitter below.)
+    int64_t bandRows = tileRows;
+
     Value widthVal = LLVM::ConstantOp::create(
         rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileWidthBytes));
     Value heightVal = LLVM::ConstantOp::create(
-        rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileRows));
+        rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(bandRows));
 
     Value idx0 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
                                           rewriter.getI32IntegerAttr(0));
@@ -3305,10 +3393,18 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       if (e && std::string(e) == "1")
         canAsyncDMA = false;
     }
-    // A staged buffer read across warps cannot use the per-simdgroup
-    // cooperative async DMA without races; keep it on the synchronous copy.
+    // A multi-warp-outer staged copy (warpsPerCTA[outer]>1) cannot use the
+    // per-simdgroup async DMA with a single warp-uniform origin: every warp
+    // would DMA the WHOLE tile into the same shared region (same-byte
+    // write-write race; no fence resolves it, the discriminator is the layout
+    // which only exists here). The fix is to PARTITION the tile into one
+    // disjoint row band per outer warp (each warp DMAs band rows
+    // [wR*bandRows, (wR+1)*bandRows) -> disjoint regions, race-free). When the
+    // row dim divides evenly across the outer warps partitionFactor>0 and the
+    // copy stays async (partitioned); otherwise it bails to the sync copy.
     bool outerCrossWarp = asyncCopyOuterDimCrossWarp(op);
-    if (outerCrossWarp)
+    unsigned partitionFactor = outerCrossWarp ? asyncCopyOuterPartition(op) : 0;
+    if (outerCrossWarp && partitionFactor == 0)
       canAsyncDMA = false;
 
     // A non-uniform per-element mask is a real boundary predicate that zeros
@@ -3437,6 +3533,18 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       // contiguous-row copy reads the tile transposed. Require a positive
       // unit-inner-stride proof; otherwise use the layout-exact sync copy.
       bool innerUnit = innerDimIsUnitStride(op.getSrc());
+      // A multi-warp-outer copy on the runtime-ptr path is safe only when it is
+      // partitioned (partitionFactor>0): each warp DMAs a disjoint row band.
+      // The runtime-ptr path is NOT given the partition. It carries operands
+      // whose partitioned (outer) dim is the CONTRACTION (K) dim, read IN FULL
+      // by every warp. Partitioning into per-warp K-bands then needs a sibling
+      // warp to see another warp's async-DMA band: air.wait_simdgroup_events
+      // drains only the issuing simdgroup, and even a device-memory fence at
+      // the barrier only REDUCES (not eliminates, ~7% residual at 100x) the
+      // cross-simdgroup DMA visibility race. So a cross-warp-consumed operand
+      // stays on the layout-exact sync copy. Only the inline emitter
+      // partitions, and only the operand whose outer dim is consumed
+      // exclusively per-warp (the M dim, where warp w reads only its own band).
       bool runtimeSafe = (shape.size() == 2) && funcModuloSafe &&
                          noLiveBoundary && innerUnit && !outerCrossWarp;
       {
@@ -3529,11 +3637,43 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
         LLVM::getSharedMemoryObjectFromStruct(loc, llDst, elemTy, rewriter);
     Value dstBase = smemObj.getBase();
 
-    // Build tile size vectors: <width_bytes, height_rows>
+    // PARTITIONED multi-warp copy: split the tile's row
+    // (outer) dim into partitionFactor disjoint horizontal bands, one per outer
+    // warp. Warp wR copies rows [wR*bandRows, (wR+1)*bandRows) from a per-warp
+    // source/dest origin -> warps write DISJOINT regions, so the per-simdgroup
+    // wait correctly drains each warp's own copy and there is no write-write
+    // race. bandRows = tileRows / partitionFactor (exact by asyncCopyOuter-
+    // Partition). srcBase/dstBase are typed elemTy* pointers, so offset in
+    // ELEMENTS: src by bandStart*stride, dst by bandStart*tileCols (TG packed).
+    int64_t bandRows = tileRows;
+    if (partitionFactor > 1) {
+      bandRows = tileRows / partitionFactor;
+      Value wR = emitOuterWarpIndex(op, rewriter, loc);
+      Value bandRowsV = LLVM::ConstantOp::create(
+          rewriter, loc, wR.getType(),
+          rewriter.getIntegerAttr(wR.getType(), bandRows));
+      Value bandStart = LLVM::MulOp::create(rewriter, loc, wR, bandRowsV);
+      // src += bandStart * stride (elements).
+      Value srcRowOff = LLVM::MulOp::create(rewriter, loc, bandStart.getType(),
+                                            bandStart, llvmStride);
+      srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(), elemTy,
+                                    srcBase, ArrayRef<LLVM::GEPArg>{srcRowOff});
+      // dst += bandStart * tileCols (elements; TG rows are packed, width=cols).
+      Value tileColsV = LLVM::ConstantOp::create(
+          rewriter, loc, bandStart.getType(),
+          rewriter.getIntegerAttr(bandStart.getType(), tileCols));
+      Value dstRowOff = LLVM::MulOp::create(rewriter, loc, bandStart.getType(),
+                                            bandStart, tileColsV);
+      dstBase = LLVM::GEPOp::create(rewriter, loc, dstBase.getType(), elemTy,
+                                    dstBase, ArrayRef<LLVM::GEPArg>{dstRowOff});
+    }
+
+    // Build tile size vectors: <width_bytes, height_rows>. height = bandRows so
+    // each warp copies only its own band (== tileRows when not partitioned).
     Value widthVal = LLVM::ConstantOp::create(
         rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileWidthBytes));
     Value heightVal = LLVM::ConstantOp::create(
-        rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileRows));
+        rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(bandRows));
 
     // Source tile = <tileWidthBytes, tileRows>
     Value tileVec = LLVM::UndefOp::create(rewriter, loc, vec2i64Ty);
@@ -3699,7 +3839,13 @@ struct AsyncWaitOpAppleConversion
     }
 
     // Always emit TG barrier (needed for both sync and async paths
-    // to ensure shared memory visibility across all threads)
+    // to ensure shared memory visibility across all threads).
+    // NOTE: flag 2 (threadgroup fence) suffices here because the only async
+    // copies that reach a consumer are single-simdgroup or per-warp-EXCLUSIVE
+    // partitioned (warp w reads only its own band). A device fence (flag 3)
+    // would be required for a CROSS-warp-consumed async band, but those are
+    // routed to the sync copy instead (see runtimeSafe), since even flag 3 only
+    // reduces (~7% residual) the cross-simdgroup DMA visibility race.
     auto barrFn =
         getOrCreateFn(mod, rewriter, "air.wg.barrier", voidTy, {i32Ty, i32Ty});
     Value barrFlag = LLVM::ConstantOp::create(rewriter, loc, i32Ty,

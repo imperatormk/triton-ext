@@ -1,4 +1,4 @@
-// LoadStoreToLLVM.cpp — Lower tt.load/tt.store/tt.addptr to LLVM IR
+// LoadStoreToLLVM.cpp — Lower tt.addptr to LLVM IR
 //
 // Handles both scalar and blocked-tensor (struct-of-pointers) paths.
 
@@ -113,110 +113,12 @@ struct AddPtrOpConversion : public ConvertOpToLLVMPattern<triton::AddPtrOp> {
   }
 };
 
-// tt.load %ptr → load per element (scalar or struct-of-pointers)
-struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-    Value ptr = adaptor.getPtr();
-    Type resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy)
-      return failure();
-
-    // Scalar load: ptr is a bare LLVM pointer, result is a scalar type.
-    if (!isa<LLVMStructType>(ptr.getType())) {
-      Value val = LLVM::LoadOp::create(rewriter, loc, resultTy, ptr);
-      Value maskOperand = adaptor.getMask();
-      Value otherOperand = adaptor.getOther();
-      if (maskOperand) {
-        Value other = otherOperand
-                          ? otherOperand
-                          : LLVM::ZeroOp::create(rewriter, loc, resultTy);
-        val = LLVM::SelectOp::create(rewriter, loc, maskOperand, val, other);
-      }
-      rewriter.replaceOp(op, val);
-      return success();
-    }
-
-    auto ptrs = unpackElems(ptr, rewriter, loc);
-
-    // Tensor load: resultTy is a struct (even 1-element tensors →
-    // struct<(f32)>).
-    auto sTy = dyn_cast<LLVMStructType>(resultTy);
-    if (!sTy || sTy.getBody().size() != ptrs.size())
-      return failure();
-    Value maskOperand = adaptor.getMask();
-    Value otherOperand = adaptor.getOther();
-    auto masks = maskOperand ? unpackElems(maskOperand, rewriter, loc)
-                             : SmallVector<Value>{};
-    auto others = otherOperand ? unpackElems(otherOperand, rewriter, loc)
-                               : SmallVector<Value>{};
-
-    SmallVector<Value> loaded;
-    for (size_t i = 0; i < ptrs.size(); ++i) {
-      Value val =
-          LLVM::LoadOp::create(rewriter, loc, sTy.getBody()[i], ptrs[i]);
-      if (!masks.empty()) {
-        Value other = others.empty() ? LLVM::ZeroOp::create(rewriter, loc,
-                                                            sTy.getBody()[i])
-                                     : others[i];
-        val = LLVM::SelectOp::create(rewriter, loc, masks[i], val, other);
-      }
-      loaded.push_back(val);
-    }
-    rewriter.replaceOp(op, packElems(loaded, rewriter, loc));
-    return success();
-  }
-};
-
-// tt.store %ptr, %val → store per element
-struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-
-    Value ptr = adaptor.getPtr();
-    Value val = adaptor.getValue();
-
-    auto ptrs = unpackElems(ptr, rewriter, loc);
-    auto vals = unpackElems(val, rewriter, loc);
-
-    if (ptrs.size() != vals.size())
-      return failure();
-
-    Value maskOperand = adaptor.getMask();
-    auto masks = maskOperand ? unpackElems(maskOperand, rewriter, loc)
-                             : SmallVector<Value>{};
-
-    for (size_t i = 0; i < ptrs.size(); ++i) {
-      if (!masks.empty() && masks[i]) {
-        Value cur =
-            LLVM::LoadOp::create(rewriter, loc, vals[i].getType(), ptrs[i]);
-        Value picked =
-            LLVM::SelectOp::create(rewriter, loc, masks[i], vals[i], cur);
-        LLVM::StoreOp::create(rewriter, loc, picked, ptrs[i]);
-      } else {
-        LLVM::StoreOp::create(rewriter, loc, vals[i], ptrs[i]);
-      }
-    }
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
 } // anonymous namespace
 
 void populateLoadStoreToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                      RewritePatternSet &patterns,
                                      PatternBenefit benefit) {
-  patterns.add<AddPtrOpConversion, LoadOpConversion, StoreOpConversion>(
-      typeConverter, benefit);
+  patterns.add<AddPtrOpConversion>(typeConverter, benefit);
 }
 
 } // namespace mlir::triton::applegpu

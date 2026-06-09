@@ -442,9 +442,21 @@ struct ConvertLayoutOpAppleConversion
       int64_t rowStart = strip * stripRows;
       int64_t rowEnd = std::min(rowStart + stripRows, rows);
 
-      // Scatter source elements for this strip (garbage-bin for out-of-strip)
+      // Scatter source elements for this strip (skip out-of-strip via a
+      // predicated store). pred = srcPred && inStrip(rOff); srcPred is a single
+      // shared in-bounds value and inStrip depends only on rOff, so all
+      // elements in a row share one predicate. Group by rOff and emit one
+      // conditional block per distinct row instead of per element, keeping the
+      // block count proportional to strip rows rather than the full tile.
+      std::map<int64_t, SmallVector<size_t>> srcByRow;
+      SmallVector<int64_t> srcRowOrder;
       for (size_t i = 0; i < srcElems.size(); ++i) {
-        auto [rOff, cOff] = srcCoords[i];
+        int64_t rOff = srcCoords[i].first;
+        if (srcByRow.find(rOff) == srcByRow.end())
+          srcRowOrder.push_back(rOff);
+        srcByRow[rOff].push_back(i);
+      }
+      for (int64_t rOff : srcRowOrder) {
         Value actualRow = arith::AddIOp::create(
             rewriter, loc, srcBaseRow,
             arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
@@ -456,14 +468,7 @@ struct ConvertLayoutOpAppleConversion
             arith::CmpIOp::create(
                 rewriter, loc, arith::CmpIPredicate::ult, actualRow,
                 arith::ConstantIntOp::create(rewriter, loc, rowEnd, 32)));
-        // Combine with in-bounds predicate
         Value pred = arith::AndIOp::create(rewriter, loc, srcPred, inStrip);
-        Value idx = stripFlatIdx(srcBaseRow, srcBaseCol, rOff, cOff, rowStart);
-        Value gep = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, tgElemTy, tgPtr,
-                                        ArrayRef<LLVM::GEPArg>{idx});
-        Value toStore = srcElems[i];
-        if (isPointerElem)
-          toStore = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, toStore);
         auto *curBlock = rewriter.getInsertionBlock();
         auto curPoint = rewriter.getInsertionPoint();
         auto *endBlock = curBlock->splitBlock(curPoint);
@@ -471,7 +476,17 @@ struct ConvertLayoutOpAppleConversion
         rewriter.setInsertionPointToEnd(curBlock);
         LLVM::CondBrOp::create(rewriter, loc, pred, thenBlock, endBlock);
         rewriter.setInsertionPointToEnd(thenBlock);
-        LLVM::StoreOp::create(rewriter, loc, toStore, gep);
+        for (size_t i : srcByRow[rOff]) {
+          int64_t cOff = srcCoords[i].second;
+          Value idx =
+              stripFlatIdx(srcBaseRow, srcBaseCol, rOff, cOff, rowStart);
+          Value gep = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, tgElemTy,
+                                          tgPtr, ArrayRef<LLVM::GEPArg>{idx});
+          Value toStore = srcElems[i];
+          if (isPointerElem)
+            toStore = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, toStore);
+          LLVM::StoreOp::create(rewriter, loc, toStore, gep);
+        }
         LLVM::BrOp::create(rewriter, loc, endBlock);
         rewriter.setInsertionPointToStart(endBlock);
       }
@@ -484,8 +499,19 @@ struct ConvertLayoutOpAppleConversion
       // Use wrapped dstBaseRow (already < rows) for strip check — do NOT
       // gate by dstPred. When tileM > rows, multiple threads wrap to the
       // same row; all need the correct TG value regardless of dstPred.
+      // inStrip depends only on rOff, so compute it once per distinct row and
+      // reuse it across that row's elements instead of recomputing the strip
+      // compare per element.
+      std::map<int64_t, SmallVector<size_t>> dstByRow;
+      SmallVector<int64_t> dstRowOrder;
       for (size_t i = 0; i < dstCoords.size(); ++i) {
-        auto [rOff, cOff] = dstCoords[i];
+        int64_t rOff = dstCoords[i].first;
+        if (dstByRow.find(rOff) == dstByRow.end())
+          dstRowOrder.push_back(rOff);
+        dstByRow[rOff].push_back(i);
+      }
+      Value zeroIdx = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
+      for (int64_t rOff : dstRowOrder) {
         Value actualRow = arith::AddIOp::create(
             rewriter, loc, dstBaseRow,
             arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
@@ -497,19 +523,24 @@ struct ConvertLayoutOpAppleConversion
             arith::CmpIOp::create(
                 rewriter, loc, arith::CmpIPredicate::ult, actualRow,
                 arith::ConstantIntOp::create(rewriter, loc, rowEnd, 32)));
-        Value idx = stripFlatIdx(dstBaseRow, dstBaseCol, rOff, cOff, rowStart);
-        Value zeroIdx = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
-        Value safeIdx =
-            arith::SelectOp::create(rewriter, loc, inStrip, idx, zeroIdx);
-        Value gep = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, tgElemTy, tgPtr,
-                                        ArrayRef<LLVM::GEPArg>{safeIdx});
-        Value gathered =
-            LLVM::LoadOp::create(rewriter, loc, tgElemTy, gep).getResult();
-        if (isPointerElem)
-          gathered = LLVM::IntToPtrOp::create(rewriter, loc, elemTy, gathered);
-        // Use gathered value if in strip, keep previous otherwise
-        dstElems[i] = arith::SelectOp::create(rewriter, loc, inStrip, gathered,
-                                              dstElems[i]);
+        for (size_t i : dstByRow[rOff]) {
+          int64_t cOff = dstCoords[i].second;
+          Value idx =
+              stripFlatIdx(dstBaseRow, dstBaseCol, rOff, cOff, rowStart);
+          Value safeIdx =
+              arith::SelectOp::create(rewriter, loc, inStrip, idx, zeroIdx);
+          Value gep =
+              LLVM::GEPOp::create(rewriter, loc, tgPtrTy, tgElemTy, tgPtr,
+                                  ArrayRef<LLVM::GEPArg>{safeIdx});
+          Value gathered =
+              LLVM::LoadOp::create(rewriter, loc, tgElemTy, gep).getResult();
+          if (isPointerElem)
+            gathered =
+                LLVM::IntToPtrOp::create(rewriter, loc, elemTy, gathered);
+          // Use gathered value if in strip, keep previous otherwise
+          dstElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
+                                                gathered, dstElems[i]);
+        }
       }
 
       // Barrier: all threads done gathering before next strip's scatter

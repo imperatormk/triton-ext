@@ -253,7 +253,7 @@ static void fixMMAPointerSuffixMismatch(Module &M, PointeeTypeMap &PTM) {
         Value *Op = CI->getArgOperand(J);
         if (!Op->getType()->isPointerTy())
           continue;
-        if (Elem->isFloatTy())
+        if (Elem->isFloatTy() && !isa<Constant>(Op))
           continue;
         if (isa<BitCastInst>(Op) || isa<AllocaInst>(Op))
           continue;

@@ -311,6 +311,45 @@ static LLVM::GlobalOp getOrCreateTGGlobal(ConversionPatternRewriter &rewriter,
                                 /*addrspace=*/3u);
 }
 
+// Alias a dot's TG scatter buffer into the module-wide global_smem arena
+// (created by ConvertTritonAppleGPUToLLVM from the allocate-shared-memory
+// pass) instead of allocating a fresh __tg_dot_ab global on top of it. The
+// convert_layout scratch held in global_smem is live only before and after a
+// dot (q/k operand converts feed the dot in registers; the output convert runs
+// after), so the dot's transient scatter buffer can safely overlap it. Sharing
+// the arena keeps the addrspace(3) footprint at max(convert, dot) instead of
+// their sum, which is what overflowed the 32KB cap for batched int8 dot3d. If
+// the dot needs more bytes than global_smem currently holds, grow it (and the
+// ttg.shared attribute the convert budgeter reads). Returns a addrspace(3)
+// pointer to the arena, or null if global_smem is unavailable.
+static Value getOrGrowSharedArena(ConversionPatternRewriter &rewriter,
+                                  Location loc, ModuleOp mod,
+                                  int64_t neededBytes) {
+  auto ctx = mod.getContext();
+  auto g = mod.lookupSymbol<LLVM::GlobalOp>("global_smem");
+  if (!g)
+    return Value();
+  auto arrTy = dyn_cast<LLVMArrayType>(g.getGlobalType());
+  if (!arrTy)
+    return Value();
+  int64_t haveBytes = (int64_t)arrTy.getNumElements() *
+                      (arrTy.getElementType().getIntOrFloatBitWidth() / 8);
+  if (haveBytes < neededBytes) {
+    auto i8Ty = IntegerType::get(ctx, 8);
+    g.setGlobalTypeAttr(TypeAttr::get(LLVMArrayType::get(i8Ty, neededBytes)));
+    if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.shared")) {
+      if (attr.getValue().getZExtValue() < (uint64_t)neededBytes)
+        mod->setAttr("ttg.shared",
+                     IntegerAttr::get(IntegerType::get(ctx, 64), neededBytes));
+    } else {
+      mod->setAttr("ttg.shared",
+                   IntegerAttr::get(IntegerType::get(ctx, 64), neededBytes));
+    }
+  }
+  return LLVM::AddressOfOp::create(rewriter, loc, LLVMPointerType::get(ctx, 3),
+                                   g.getName());
+}
+
 // Create a TG global with the specified element type.
 // For bf16/f16, the array has 2x as many elements as f32 (same byte footprint
 // since f32 is 4 bytes and bf16/f16 are 2 bytes).
@@ -1039,11 +1078,26 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     int64_t phase3Strips = useDoubleBufB ? 2 : 1;
     int64_t tgSizeNeeded = std::max(tgStripSize, phase3Strips * 8 * Npad);
     int64_t tgSize = tgSizeNeeded * batchSize;
-    auto tgBuf = getOrCreateTGGlobal(
-        rewriter, mod, ("__tg_dot_ab_" + llvm::Twine(id)).str(), tgSize);
-
-    Value ptrTG =
-        LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy, tgBuf.getName());
+    // Prefer aliasing the scatter buffer into the shared global_smem arena so
+    // the dot's transient TG footprint overlaps the convert_layout scratch
+    // instead of stacking on top of it (the batched int8 dot3d 32KB overflow).
+    // Restrict the alias to integer-element dots: those are the OOR cases, and
+    // an int8 matmul kernel's only other threadgroup consumer is its own
+    // #mma/#blocked convert (a SEPARATE __tg_cvt pool), so global_smem carries
+    // only this dot's f32 GEPs and the Metal typed-pointer reader stays
+    // consistent. Float dots can share global_smem with reductions/standard
+    // converts that GEP it at a different element type; mixing element-typed
+    // GEPs on one typed global trips the metallib reader, so they keep their
+    // own typed __tg_dot_ab global.
+    Value ptrTG;
+    if (isa<IntegerType>(aElemTy))
+      ptrTG = getOrGrowSharedArena(rewriter, loc, mod, tgSize * 4);
+    if (!ptrTG) {
+      auto tgBuf = getOrCreateTGGlobal(
+          rewriter, mod, ("__tg_dot_ab_" + llvm::Twine(id)).str(), tgSize);
+      ptrTG =
+          LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy, tgBuf.getName());
+    }
 
     // ── Async copy intrinsics (when device pointers available) ────────
     auto devPtrTy = LLVMPointerType::get(ctx, 1);

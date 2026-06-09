@@ -198,8 +198,12 @@ struct ConvertLayoutOpAppleConversion
     // MMA dot TG buffers (from tt.dot pre-scan) in the 32KB TG budget.
     constexpr int64_t tgBudgetBytes = 32 * 1024;
     int64_t smemBytes = 0;
-    if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.shared"))
-      smemBytes = attr.getValue().getZExtValue();
+    bool smemLive = true;
+    if (auto attr = mod->getAttrOfType<BoolAttr>("applegpu.smem_live"))
+      smemLive = attr.getValue();
+    if (smemLive)
+      if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.shared"))
+        smemBytes = attr.getValue().getZExtValue();
     int64_t mmaBytes = 0;
     if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.mma_shared"))
       mmaBytes = attr.getValue().getZExtValue();
@@ -480,19 +484,27 @@ struct ConvertLayoutOpAppleConversion
           srcRowOrder.push_back(rOff);
         srcByRow[rOff].push_back(i);
       }
+      bool singleStripSrc = (numStrips == 1);
       for (int64_t rOff : srcRowOrder) {
-        Value actualRow = arith::AddIOp::create(
-            rewriter, loc, srcBaseRow,
-            arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
-        Value inStrip = arith::AndIOp::create(
-            rewriter, loc,
-            arith::CmpIOp::create(
-                rewriter, loc, arith::CmpIPredicate::uge, actualRow,
-                arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
-            arith::CmpIOp::create(
-                rewriter, loc, arith::CmpIPredicate::ult, actualRow,
-                arith::ConstantIntOp::create(rewriter, loc, rowEnd, 32)));
-        Value pred = arith::AndIOp::create(rewriter, loc, srcPred, inStrip);
+        // Single strip => every row is in-strip, so pred collapses to srcPred
+        // and the row-range compare is dropped.
+        Value pred;
+        if (singleStripSrc) {
+          pred = srcPred;
+        } else {
+          Value actualRow = arith::AddIOp::create(
+              rewriter, loc, srcBaseRow,
+              arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
+          Value inStrip = arith::AndIOp::create(
+              rewriter, loc,
+              arith::CmpIOp::create(
+                  rewriter, loc, arith::CmpIPredicate::uge, actualRow,
+                  arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
+              arith::CmpIOp::create(
+                  rewriter, loc, arith::CmpIPredicate::ult, actualRow,
+                  arith::ConstantIntOp::create(rewriter, loc, rowEnd, 32)));
+          pred = arith::AndIOp::create(rewriter, loc, srcPred, inStrip);
+        }
         auto *curBlock = rewriter.getInsertionBlock();
         auto curPoint = rewriter.getInsertionPoint();
         auto *endBlock = curBlock->splitBlock(curPoint);
@@ -534,25 +546,40 @@ struct ConvertLayoutOpAppleConversion
           dstRowOrder.push_back(rOff);
         dstByRow[rOff].push_back(i);
       }
+      // Single-strip fast path: the whole tile fits one TG pass, so every
+      // destination row is unconditionally in-strip (rowStart=0, rowEnd=rows,
+      // dstBaseRow already wrapped < rows). The per-element safeIdx select and
+      // the merge select then both reduce to the gathered value, so emit a
+      // plain GEP+load+assign and drop the two selects and the per-row strip
+      // compare. This is the dominant cost of the #mma->#blocked output convert
+      // (its select/icmp chain is ~99% of a 128x128x64 dot's LLVM IR), so the
+      // single-strip elision shrinks that IR by roughly half.
+      bool singleStrip = (numStrips == 1);
       Value zeroIdx = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
       for (int64_t rOff : dstRowOrder) {
-        Value actualRow = arith::AddIOp::create(
-            rewriter, loc, dstBaseRow,
-            arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
-        Value inStrip = arith::AndIOp::create(
-            rewriter, loc,
-            arith::CmpIOp::create(
-                rewriter, loc, arith::CmpIPredicate::uge, actualRow,
-                arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
-            arith::CmpIOp::create(
-                rewriter, loc, arith::CmpIPredicate::ult, actualRow,
-                arith::ConstantIntOp::create(rewriter, loc, rowEnd, 32)));
+        Value inStrip;
+        if (!singleStrip) {
+          Value actualRow = arith::AddIOp::create(
+              rewriter, loc, dstBaseRow,
+              arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
+          inStrip = arith::AndIOp::create(
+              rewriter, loc,
+              arith::CmpIOp::create(
+                  rewriter, loc, arith::CmpIPredicate::uge, actualRow,
+                  arith::ConstantIntOp::create(rewriter, loc, rowStart, 32)),
+              arith::CmpIOp::create(
+                  rewriter, loc, arith::CmpIPredicate::ult, actualRow,
+                  arith::ConstantIntOp::create(rewriter, loc, rowEnd, 32)));
+        }
         for (size_t i : dstByRow[rOff]) {
           int64_t cOff = dstCoords[i].second;
           Value idx =
               stripFlatIdx(dstBaseRow, dstBaseCol, rOff, cOff, rowStart);
-          Value safeIdx =
-              arith::SelectOp::create(rewriter, loc, inStrip, idx, zeroIdx);
+          Value safeIdx = singleStrip
+                              ? idx
+                              : arith::SelectOp::create(rewriter, loc, inStrip,
+                                                        idx, zeroIdx)
+                                    .getResult();
           Value gep =
               LLVM::GEPOp::create(rewriter, loc, tgPtrTy, tgElemTy, tgPtr,
                                   ArrayRef<LLVM::GEPArg>{safeIdx});
@@ -562,8 +589,11 @@ struct ConvertLayoutOpAppleConversion
             gathered =
                 LLVM::IntToPtrOp::create(rewriter, loc, elemTy, gathered);
           // Use gathered value if in strip, keep previous otherwise
-          dstElems[i] = arith::SelectOp::create(rewriter, loc, inStrip,
-                                                gathered, dstElems[i]);
+          dstElems[i] = singleStrip
+                            ? gathered
+                            : arith::SelectOp::create(rewriter, loc, inStrip,
+                                                      gathered, dstElems[i])
+                                  .getResult();
         }
       }
 
@@ -4132,6 +4162,25 @@ struct ConvertTritonAppleGPUToLLVMPass
       if (maxMmaBytes > 0)
         mod->setAttr("ttg.mma_shared",
                      IntegerAttr::get(IntegerType::get(ctx, 64), maxMmaBytes));
+    }
+
+    // ttg.shared reserves global_smem for whatever the kernel's standard shared
+    // path needs (reductions, scans, gathers, histograms). The AppleMma
+    // convert_layout lowering allocates its own __tg_cvt_ buffers instead of
+    // using global_smem, so in a kernel with no such consumer the reservation
+    // is dead (llc strips it via use_empty), yet it would otherwise be
+    // subtracted from the convert's TG budget and force it into many tiny
+    // strips. Detect the live consumers once here (the ops are lowered by
+    // sibling patterns in the same conversion run, so checking after would
+    // race) and record whether global_smem is actually needed.
+    {
+      bool smemLive = false;
+      mod.walk([&](Operation *o) {
+        if (isa<mlir::triton::ReduceOp, mlir::triton::ScanOp,
+                mlir::triton::GatherOp, mlir::triton::HistogramOp>(o))
+          smemLive = true;
+      });
+      mod->setAttr("applegpu.smem_live", BoolAttr::get(ctx, smemLive));
     }
 
     RewritePatternSet patterns(ctx);

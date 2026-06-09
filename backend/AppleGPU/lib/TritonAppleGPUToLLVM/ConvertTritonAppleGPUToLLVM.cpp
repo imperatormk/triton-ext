@@ -103,7 +103,10 @@ struct ConvertLayoutOpAppleConversion
     // below stays as the fallback for the cross-warp converts that genuinely
     // need shared memory (the upstream smem path miscompiles some replicated
     // fp16/bf16 cases, which is exactly why those route through here instead).
-    if (!cvtNeedsSharedMemory(srcTy, dstTy))
+    // Pointer-element tensors stay on the TG path: the upstream shuffle
+    // pattern cannot move !tt.ptr elements.
+    if (!isa<triton::PointerType>(srcTy.getElementType()) &&
+        !cvtNeedsSharedMemory(srcTy, dstTy))
       return failure();
 
     // Same encoding — identity (blocked→blocked only)

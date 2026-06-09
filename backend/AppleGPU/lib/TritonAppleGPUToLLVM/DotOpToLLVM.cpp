@@ -1048,7 +1048,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // Phase 3 (1 or 2 B strips), Phase 4 (C strip).
     int64_t phase3Strips = useDoubleBufB ? 2 : 1;
     int64_t tgSizeNeeded = std::max(tgStripSize, phase3Strips * 8 * Npad);
-    int64_t tgSize = tgSizeNeeded * batchSize + 1; // +1 garbage slot
+    int64_t tgSize = tgSizeNeeded * batchSize;
     auto tgBuf = getOrCreateTGGlobal(
         rewriter, mod, ("__tg_dot_ab_" + llvm::Twine(id)).str(), tgSize);
 
@@ -1283,10 +1283,10 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     int64_t tilesN = N / 8;
     int64_t tilesK = K / 8;
 
-    // Garbage bin index -- last slot in TG, used for out-of-strip stores.
-    // Points to the very last slot in the full (batch-expanded) TG buffer.
-    Value garbageIdx = arith::ConstantIntOp::create(
-        rewriter, loc, tgStripSize * batchSize, 64);
+    // Out-of-strip gather sink: a valid in-bounds slot (0). Gather results from
+    // this slot are always discarded by the inStrip select, and scatter stores
+    // are predicated so out-of-strip lanes never write here.
+    Value garbageIdx = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
 
     // Determine if an operand has batch warps (runtime batch component).
     // If wpc[0] == 1, all batches are in compile-time offsets (no runtime
@@ -1423,25 +1423,28 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         Value val = (scatterTy == f32Ty)
                         ? toF32(rewriter, loc, elems[i], f32Ty)
                         : toMmaInputType(rewriter, loc, elems[i], scatterTy);
+        Value storeIdx;
         if (curBatchRound >= 0) {
           // Sequential mode: all data goes to TG base.
-          Value safeIdx =
-              arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
-          Value gep =
-              LLVM::GEPOp::create(rewriter, loc, tgPtrTy, scatterTy, ptrTG,
-                                  ArrayRef<LLVM::GEPArg>{safeIdx});
-          LLVM::StoreOp::create(rewriter, loc, val, gep);
+          storeIdx = idx;
         } else {
           // Warp-distributed mode: add per-element batch TG offset.
           Value batchOff = elemBatchTGOffset(offsets, i, mixed);
-          Value batchIdx = arith::AddIOp::create(rewriter, loc, idx, batchOff);
-          Value safeIdx = arith::SelectOp::create(rewriter, loc, inStrip,
-                                                  batchIdx, garbageIdx);
-          Value gep =
-              LLVM::GEPOp::create(rewriter, loc, tgPtrTy, scatterTy, ptrTG,
-                                  ArrayRef<LLVM::GEPArg>{safeIdx});
-          LLVM::StoreOp::create(rewriter, loc, val, gep);
+          storeIdx = arith::AddIOp::create(rewriter, loc, idx, batchOff);
         }
+        Value gep =
+            LLVM::GEPOp::create(rewriter, loc, tgPtrTy, scatterTy, ptrTG,
+                                ArrayRef<LLVM::GEPArg>{storeIdx});
+        auto *curBlock = rewriter.getInsertionBlock();
+        auto curPoint = rewriter.getInsertionPoint();
+        auto *endBlock = curBlock->splitBlock(curPoint);
+        auto *thenBlock = rewriter.createBlock(endBlock);
+        rewriter.setInsertionPointToEnd(curBlock);
+        LLVM::CondBrOp::create(rewriter, loc, inStrip, thenBlock, endBlock);
+        rewriter.setInsertionPointToEnd(thenBlock);
+        LLVM::StoreOp::create(rewriter, loc, val, gep);
+        LLVM::BrOp::create(rewriter, loc, endBlock);
+        rewriter.setInsertionPointToStart(endBlock);
       }
     };
 

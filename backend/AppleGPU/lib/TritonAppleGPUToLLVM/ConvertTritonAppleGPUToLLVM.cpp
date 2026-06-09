@@ -196,13 +196,16 @@ struct ConvertLayoutOpAppleConversion
       mmaBytes = attr.getValue().getZExtValue();
     int64_t availBytes = tgBudgetBytes - smemBytes - mmaBytes;
     int64_t elemBytes = isPointerElem ? 8 : elemTy.getIntOrFloatBitWidth() / 8;
-    // Reserve 1 slot for garbage bin, then fit as many rows as possible
-    int64_t maxStripRows = (availBytes / elemBytes - 1) / cols;
-    maxStripRows = std::max<int64_t>(maxStripRows - (maxStripRows % 8),
-                                     8); // round down to 8, min 8
+    // Fit as many rows as possible within the remaining TG budget.
+    int64_t capRows = (availBytes / elemBytes) / cols;
+    int64_t maxStripRows;
+    if (capRows >= 8)
+      maxStripRows = capRows - (capRows % 8); // round down to 8
+    else
+      maxStripRows = std::max<int64_t>(capRows, 1); // budget below 8 rows
     int64_t stripRows = std::min(maxStripRows, rows);
     int64_t tgStripSize = stripRows * cols;
-    int64_t tgSize = tgStripSize + 1; // +1 garbage bin slot
+    int64_t tgSize = tgStripSize;
     unsigned id = getCounter(ctx)++;
     std::string tgName = ("__tg_cvt_" + llvm::Twine(id)).str();
     {
@@ -403,8 +406,6 @@ struct ConvertLayoutOpAppleConversion
 
     Value fenceTG = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
     Value execMod = arith::ConstantIntOp::create(rewriter, loc, 4, 32);
-    Value garbageIdx =
-        arith::ConstantIntOp::create(rewriter, loc, tgStripSize, 64);
 
     // Initialize destination elements with undef (will be filled strip by
     // strip)
@@ -458,14 +459,21 @@ struct ConvertLayoutOpAppleConversion
         // Combine with in-bounds predicate
         Value pred = arith::AndIOp::create(rewriter, loc, srcPred, inStrip);
         Value idx = stripFlatIdx(srcBaseRow, srcBaseCol, rOff, cOff, rowStart);
-        Value safeIdx =
-            arith::SelectOp::create(rewriter, loc, pred, idx, garbageIdx);
         Value gep = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, tgElemTy, tgPtr,
-                                        ArrayRef<LLVM::GEPArg>{safeIdx});
+                                        ArrayRef<LLVM::GEPArg>{idx});
         Value toStore = srcElems[i];
         if (isPointerElem)
           toStore = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, toStore);
+        auto *curBlock = rewriter.getInsertionBlock();
+        auto curPoint = rewriter.getInsertionPoint();
+        auto *endBlock = curBlock->splitBlock(curPoint);
+        auto *thenBlock = rewriter.createBlock(endBlock);
+        rewriter.setInsertionPointToEnd(curBlock);
+        LLVM::CondBrOp::create(rewriter, loc, pred, thenBlock, endBlock);
+        rewriter.setInsertionPointToEnd(thenBlock);
         LLVM::StoreOp::create(rewriter, loc, toStore, gep);
+        LLVM::BrOp::create(rewriter, loc, endBlock);
+        rewriter.setInsertionPointToStart(endBlock);
       }
 
       // Barrier: all threads done scattering this strip
@@ -490,8 +498,9 @@ struct ConvertLayoutOpAppleConversion
                 rewriter, loc, arith::CmpIPredicate::ult, actualRow,
                 arith::ConstantIntOp::create(rewriter, loc, rowEnd, 32)));
         Value idx = stripFlatIdx(dstBaseRow, dstBaseCol, rOff, cOff, rowStart);
+        Value zeroIdx = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
         Value safeIdx =
-            arith::SelectOp::create(rewriter, loc, inStrip, idx, garbageIdx);
+            arith::SelectOp::create(rewriter, loc, inStrip, idx, zeroIdx);
         Value gep = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, tgElemTy, tgPtr,
                                         ArrayRef<LLVM::GEPArg>{safeIdx});
         Value gathered =

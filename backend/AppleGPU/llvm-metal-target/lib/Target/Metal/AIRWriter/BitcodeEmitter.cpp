@@ -420,6 +420,71 @@ static void removeRedundantBitcasts(Module &M, PointeeTypeMap &PTM) {
   }
 }
 
+// Normalize single-index element GEPs on array globals into 2-index array
+// GEPs. A global variable's typed-pointer pointee is its array value type
+// (e.g. [2 x i32]); a GEP that indexes it as `gep i32, @GV, %idx` carries an
+// explicit source element type (i32) that disagrees with that pointee, which
+// the Metal AIR reader rejects with "Explicit gep type does not match pointee
+// type of pointer operand". Rewriting to `gep [N x i32], @GV, 0, %idx` makes
+// the GEP source element type equal the global pointee. Handles both the
+// element-typed index (stride = element size) and the byte-typed constant
+// index (i8 source with a constant byte offset that is a multiple of the
+// element size). Runs after lowerConstantExprs so constant-expr GEPs that
+// were materialized as instructions are covered too.
+static void normalizeArrayGlobalGEPs(Module &M) {
+  Type *I64Ty = Type::getInt64Ty(M.getContext());
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<GetElementPtrInst *, 8> ToFix;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+          if (GEP->getNumIndices() != 1)
+            continue;
+          auto *GV = dyn_cast<GlobalVariable>(GEP->getPointerOperand());
+          if (!GV)
+            continue;
+          auto *AT = dyn_cast<ArrayType>(GV->getValueType());
+          if (!AT)
+            continue;
+          if (GEP->getSourceElementType() == AT)
+            continue;
+          ToFix.push_back(GEP);
+        }
+
+    for (auto *GEP : ToFix) {
+      auto *GV = cast<GlobalVariable>(GEP->getPointerOperand());
+      auto *AT = cast<ArrayType>(GV->getValueType());
+      Type *ElemTy = AT->getElementType();
+      Type *SrcTy = GEP->getSourceElementType();
+      Value *Idx = GEP->idx_begin()->get();
+
+      Value *ElemIdx = nullptr;
+      if (SrcTy == ElemTy) {
+        ElemIdx = Idx;
+      } else {
+        uint64_t SrcSize = M.getDataLayout().getTypeAllocSize(SrcTy);
+        uint64_t ElemSize = M.getDataLayout().getTypeAllocSize(ElemTy);
+        auto *CI = dyn_cast<ConstantInt>(Idx);
+        if (!CI || ElemSize == 0)
+          continue;
+        uint64_t ByteOff = CI->getZExtValue() * SrcSize;
+        if (ByteOff % ElemSize != 0)
+          continue;
+        ElemIdx = ConstantInt::get(I64Ty, ByteOff / ElemSize);
+      }
+
+      auto *NewGEP = GetElementPtrInst::Create(
+          AT, GV, {ConstantInt::get(I64Ty, 0), ElemIdx}, "",
+          GEP->getIterator());
+      NewGEP->setIsInBounds(GEP->isInBounds());
+      GEP->replaceAllUsesWith(NewGEP);
+      GEP->eraseFromParent();
+    }
+  }
+}
+
 std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
   SmallVector<char, 0> Buf;
   // Scope the writer so its destructor runs FlushToWord() before Buf is read.
@@ -450,6 +515,10 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
 
     // Lower ConstantExpr operands to real instructions before enumeration.
     lowerConstantExprs(M);
+
+    // Normalize element-typed GEPs on array globals to 2-index array GEPs so
+    // the GEP source type matches the global's typed-pointer pointee.
+    normalizeArrayGlobalGEPs(M);
 
     // Fix kernel argument metadata to match actual pointee types.
     fixKernelArgMetadata(M, PTM);

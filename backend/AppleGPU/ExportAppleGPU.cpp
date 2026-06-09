@@ -1,5 +1,5 @@
 /// Export Apple GPU backend passes and dialect via the Triton plugin API.
-/// Registers 5 passes + 1 dialect in a single shared library.
+/// Registers 6 passes + 1 dialect in a single shared library.
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
@@ -18,6 +18,10 @@ static void addAccelerateMatmul(mlir::PassManager *pm,
 static void addSimplifyGather(mlir::PassManager *pm,
                               const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createSimplifyGatherLayoutPass());
+}
+static void addStoreShuffleLayout(mlir::PassManager *pm,
+                                  const std::vector<std::string> &) {
+  pm->addPass(mlir::triton::applegpu::createStoreShuffleLayoutPass());
 }
 static void addToLLVMIR(mlir::PassManager *pm,
                         const std::vector<std::string> &) {
@@ -44,6 +48,11 @@ static void registerAccelerateMatmul() {
 static void registerSimplifyGather() {
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return mlir::triton::applegpu::createSimplifyGatherLayoutPass();
+  });
+}
+static void registerStoreShuffleLayout() {
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::triton::applegpu::createStoreShuffleLayoutPass();
   });
 }
 static void registerToLLVMIR() {
@@ -82,6 +91,8 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
        registerAccelerateMatmul},
       {"add_simplify_gather", "0.1.0", addSimplifyGather,
        registerSimplifyGather},
+      {"add_store_shuffle_layout", "0.1.0", addStoreShuffleLayout,
+       registerStoreShuffleLayout},
       {"add_to_llvmir", "0.1.0", addToLLVMIR, registerToLLVMIR},
       {"add_lower_gpu_to_air", "0.1.0", addLowerGPUToAIR,
        registerLowerGPUToAIR},
@@ -98,7 +109,7 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       "TritonAppleGPUBackend",
       "0.1.0",
       passes,
-      5, // numPasses
+      6, // numPasses
       dialects,
       1, // numDialects
       nullptr,

@@ -410,6 +410,15 @@ class MPSBackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
 
+        # Re-lay MMA epilogue stores into the simdgroup-shuffle blocked layout so
+        # the #mma -> #blocked C-output convert becomes a within-simdgroup
+        # shuffle (no threadgroup round-trip). Runs after the final
+        # remove_layout_conversions so it is not reverted to the coalesced store
+        # layout; CSE/DCE clean up the dropped address-math chain afterward.
+        _plugin.add_store_shuffle_layout(pm)
+        passes.common.add_cse(pm)
+        passes.common.add_symbol_dce(pm)
+
         # Fuse nested loops marked with tt.flatten (tl.range(flatten=True))
         passes.ttgpuir.add_fuse_nested_loops(pm)
         passes.common.add_canonicalizer(pm)

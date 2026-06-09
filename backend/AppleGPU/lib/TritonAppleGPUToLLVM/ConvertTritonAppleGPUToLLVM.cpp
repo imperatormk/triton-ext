@@ -23,6 +23,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
@@ -90,6 +91,19 @@ struct ConvertLayoutOpAppleConversion
     auto dstEnc = dyn_cast<ttg::BlockedEncodingAttr>(dstTy.getEncoding());
     // Destination must be blocked; source must be blocked OR AppleMma.
     if (!dstEnc || (!srcEnc && !srcMmaEnc))
+      return failure();
+
+    // When the conversion is within a single simdgroup (or a pure register
+    // shuffle) it needs no shared memory: hand it to the shared upstream
+    // ConvertLayout pattern, which moves the values with simd_shuffle (Apple
+    // TargetInfo implements shuffleIdx/shuffleXor/permute). This is what turns
+    // the #mma -> #blocked C-output convert into a register+shuffle epilogue
+    // (no __tg_cvt buffer, no barriers) once StoreShuffleLayout has re-laid the
+    // store into the simdgroup-shuffle layout. The threadgroup scatter/gather
+    // below stays as the fallback for the cross-warp converts that genuinely
+    // need shared memory (the upstream smem path miscompiles some replicated
+    // fp16/bf16 cases, which is exactly why those route through here instead).
+    if (!cvtNeedsSharedMemory(srcTy, dstTy))
       return failure();
 
     // Same encoding — identity (blocked→blocked only)

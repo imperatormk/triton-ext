@@ -25,6 +25,29 @@ def AccelerateAppleMatmul : Pass<"triton-apple-accelerate-matmul", "mlir::Module
   ];
 }
 
+def StoreShuffleLayout : Pass<"triton-apple-store-shuffle-layout", "mlir::ModuleOp"> {
+  let summary = "Re-lay MMA epilogue stores into the simdgroup-shuffle layout";
+
+  let description = [{
+    The AppleMma C result and the natural coalesced store layout use different
+    warp tilings, so the #mma -> #blocked C-output convert_layout is cross-warp
+    and spills through threadgroup memory + barriers (the dominant epilogue cost
+    for large GEMM tiles). For stores whose value is an #mma -> #blocked convert,
+    this pass re-lays the store (value, pointer, and mask address math) into the
+    one blocked layout that shares the mma warp tiling and maps every C element
+    to a lane in the same simdgroup, making the convert a within-simdgroup
+    register+shuffle move with no shared memory. Stores whose address math uses
+    ops outside a fixed relayable allowlist are left untouched (the threadgroup
+    convert path stays as the always-correct fallback).
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::applegpu::TritonAppleGPUDialect"
+  ];
+}
+
 def SimplifyGatherLayout : Pass<"triton-apple-simplify-gather", "mlir::ModuleOp"> {
   let summary = "Strip efficient_layout from large gather ops to avoid IR explosion";
 

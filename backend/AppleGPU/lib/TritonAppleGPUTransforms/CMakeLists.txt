@@ -2,6 +2,7 @@ add_triton_library(TritonAppleGPUTransforms
   AppleMmaGroup.cpp
   AccelerateAppleMatmul.cpp
   SimplifyGatherLayout.cpp
+  StoreShuffleLayout.cpp
 
   DEPENDS
   TritonAppleGPUDialectIncGen

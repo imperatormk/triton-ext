@@ -55,6 +55,15 @@ struct ConvertLayoutOpAppleConversion
     return counters[ctx];
   }
 
+  // Stable pool key for a shared convert TG global. Conversions with the same
+  // TG element type alias one buffer (their live ranges are barrier-disjoint),
+  // so the key only needs to distinguish element widths and pointer storage.
+  static std::string getCvtPoolKey(Type tgElemTy) {
+    if (isa<LLVMPointerType>(tgElemTy))
+      return "p";
+    return ("i" + llvm::Twine(tgElemTy.getIntOrFloatBitWidth())).str();
+  }
+
   LogicalResult
   matchAndRewrite(ttg::ConvertLayoutOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -206,15 +215,30 @@ struct ConvertLayoutOpAppleConversion
     int64_t stripRows = std::min(maxStripRows, rows);
     int64_t tgStripSize = stripRows * cols;
     int64_t tgSize = tgStripSize;
-    unsigned id = getCounter(ctx)++;
-    std::string tgName = ("__tg_cvt_" + llvm::Twine(id)).str();
+    // Pool every 2D convert scatter/gather into ONE shared TG global per
+    // (element-type) key, sized to the running max, instead of a fresh
+    // counter-numbered buffer per conversion. Each convert round-trips
+    // through this buffer fully fenced (scatter, barrier, gather, barrier),
+    // so distinct conversions never have overlapping live TG ranges and can
+    // safely alias the same storage. Sharing one buffer keeps the addrspace(3)
+    // footprint at a single tile instead of N tiles, which is what kept the
+    // fused fp16 epilogue (3 separate 64x64 half buffers) under the 32KB cap.
+    std::string tgName =
+        ("__tg_cvt_" + llvm::Twine(getCvtPoolKey(tgElemTy))).str();
     {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(mod.getBody());
-      auto arrTy = LLVMArrayType::get(tgElemTy, tgSize);
-      LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy, false,
-                             Linkage::Internal, tgName, Attribute(),
-                             isPointerElem ? 8 : 4, 3u);
+      auto existing = mod.lookupSymbol<LLVM::GlobalOp>(tgName);
+      if (!existing) {
+        auto arrTy = LLVMArrayType::get(tgElemTy, tgSize);
+        LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy, false,
+                               Linkage::Internal, tgName, Attribute(),
+                               isPointerElem ? 8 : 4, 3u);
+      } else if (auto exAT = dyn_cast<LLVMArrayType>(existing.getGlobalType());
+                 exAT && (int64_t)exAT.getNumElements() < tgSize) {
+        existing.setGlobalTypeAttr(
+            TypeAttr::get(LLVMArrayType::get(tgElemTy, tgSize)));
+      }
     }
     auto tgGlobal = mod.lookupSymbol<LLVM::GlobalOp>(tgName);
     Value tgPtr =
@@ -640,16 +664,25 @@ struct ConvertLayoutOpAppleConversion
     Value c32 = arith::ConstantIntOp::create(rewriter, loc, 32, 32);
     Value warpId = arith::DivUIOp::create(rewriter, loc, tid32, c32);
 
-    // Create TG global
-    unsigned id = getCounter(ctx)++;
-    std::string tgName = ("__tg_cvt_" + llvm::Twine(id)).str();
+    // Create TG global (pooled per element type, sized to running max). The
+    // 1D scatter/gather is fully fenced like the 2D path, so distinct
+    // conversions of the same element type share one barrier-disjoint buffer.
+    std::string tgName =
+        ("__tg_cvt_" + llvm::Twine(getCvtPoolKey(tgElemTy))).str();
     {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(mod.getBody());
-      auto arrTy = LLVMArrayType::get(tgElemTy, numElems);
-      LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy, false,
-                             Linkage::Internal, tgName, Attribute(),
-                             isPointerElem ? 8 : 4, 3u);
+      auto existing = mod.lookupSymbol<LLVM::GlobalOp>(tgName);
+      if (!existing) {
+        auto arrTy = LLVMArrayType::get(tgElemTy, numElems);
+        LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy, false,
+                               Linkage::Internal, tgName, Attribute(),
+                               isPointerElem ? 8 : 4, 3u);
+      } else if (auto exAT = dyn_cast<LLVMArrayType>(existing.getGlobalType());
+                 exAT && (int64_t)exAT.getNumElements() < numElems) {
+        existing.setGlobalTypeAttr(
+            TypeAttr::get(LLVMArrayType::get(tgElemTy, numElems)));
+      }
     }
     auto tgGlobal = mod.lookupSymbol<LLVM::GlobalOp>(tgName);
     Value tgPtr =
@@ -3486,11 +3519,6 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     // Mask must be absent or a uniform splat (scalar boolean).
     auto shape = srcTy.getShape();
     bool canAsyncDMA = (shape.size() == 2);
-    {
-      const char *e = std::getenv("TRITON_DMA_DISABLE");
-      if (e && std::string(e) == "1")
-        canAsyncDMA = false;
-    }
     // A multi-warp-outer staged copy (warpsPerCTA[outer]>1) cannot use the
     // per-simdgroup async DMA with a single warp-uniform origin: every warp
     // would DMA the WHOLE tile into the same shared region (same-byte
@@ -3645,11 +3673,6 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       // exclusively per-warp (the M dim, where warp w reads only its own band).
       bool runtimeSafe = (shape.size() == 2) && funcModuloSafe &&
                          noLiveBoundary && innerUnit && !outerCrossWarp;
-      {
-        const char *e = std::getenv("TRITON_DMA_DISABLE");
-        if (e && std::string(e) == "1")
-          runtimeSafe = false;
-      }
       if (runtimeSafe) {
         if (succeeded(lowerAsyncFromRuntimePtrs(op, adaptor, rewriter)))
           return success();

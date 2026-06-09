@@ -2131,18 +2131,29 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       useDeviceB = false;
     }
 
-    // The device path stages the per-warp C accumulator-in through a TG buffer
-    // holding the full M/8-strip C grid (see Phase 1 deviceCIn). When that grid
-    // does not fit the 16KB budget AND M spans more than one strip, decline to
-    // the (correct) TG path so we never overflow the single-strip buffer. The
-    // estimate mirrors the exact Npad/batchedCSize computation below.
+    // The device path keeps the per-warp C accumulator in registers
+    // (laneLocalCIn / laneLocalCOut) and loads A and B straight from device
+    // memory, so it never scatters operands through threadgroup memory. The TG
+    // (batchStrips / per-strip) path coalesces its dot buffer with the
+    // surrounding #mma<->#blocked convert_layout scratch and is preferred when
+    // the whole operand grid fits the 32KB budget; for shapes whose resident
+    // grid would overflow that budget (e.g. 128x128 single-CTA), the device
+    // path is the only one that fits, so keep it there. This estimate mirrors
+    // the batchedAB/batchedC sizing computed below.
     if (useDeviceA && useDeviceB && (M / 8) > 1) {
       int64_t padEst = tgPadForType(aElemTy);
-      int64_t unpaddedC = 8 * N + 1;
-      bool canPadC = (padEst > 0) && ((unpaddedC + 8 * padEst) * 4 <= 16384);
-      int64_t NpadEst = canPadC ? N + padEst : N;
-      int64_t batchedCEst = (M / 8) * (8 * NpadEst) + 1;
-      if (batchedCEst * 4 > 16384) {
+      int64_t maxStrideEst = std::max(K, N);
+      int64_t unpaddedEst = 8 * maxStrideEst;
+      bool canPadEst =
+          (padEst > 0) && ((unpaddedEst + 8 * padEst) * 4 <= 16384);
+      int64_t KpadEst = canPadEst ? K + padEst : K;
+      int64_t NpadEst = canPadEst ? N + padEst : N;
+      int64_t maxStripsEst = std::max(M / 8, K / 8);
+      int64_t residentEst =
+          std::max(maxStripsEst * 8 * std::max(KpadEst, NpadEst),
+                   (M / 8) * 8 * NpadEst) *
+          4;
+      if (residentEst <= 30720) {
         useDeviceA = false;
         useDeviceB = false;
       }
@@ -2645,8 +2656,11 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // hogging the budget.)
     bool tgPath = !(useDeviceA && useDeviceB);
     int64_t maxStripsAB = std::max(M / 8, K / 8);
-    int64_t batchedABSize = maxStripsAB * tgABStripSize + 1;
-    int64_t batchedCSize = (M / 8) * tgCStripSize + 1;
+    // No garbage sink: the batchStrips and device paths scatter every element
+    // to its absolute offset (directScatter) or keep C register-resident, so
+    // the buffer holds only live data (no reserved out-of-strip slot).
+    int64_t batchedABSize = maxStripsAB * tgABStripSize;
+    int64_t batchedCSize = (M / 8) * tgCStripSize;
     // Gate the resident-grid path on its REAL combined footprint vs Metal's
     // 32KB threadgroup cap, not a bare grid bound: a sub-f32 dot also keeps two
     // half-typed convert_layout buffers (__tg_cvt_*, the #mma<->#blocked round
@@ -2660,13 +2674,6 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     int64_t tgSize = tgStripSize + 1;
     if (batchStrips)
       tgSize = std::max(batchedABSize, batchedCSize);
-    // The device path (A/B direct from device) round-trips ONLY C through TG.
-    // The per-warp C-accumulator-in gathers each warp's owned tiles by ABSOLUTE
-    // row, so when M spans more than one 8-row strip the whole C grid must be
-    // resident at once. The device path is only selected (above) when that grid
-    // fits the budget, so just enlarge to the batched C size here.
-    if ((useDeviceA && useDeviceB) && (M / 8) > 1)
-      tgSize = std::max(tgSize, batchedCSize);
     auto tgBuf = getOrCreateTGGlobal(
         rewriter, mod, ("__tg_dot_ab_" + llvm::Twine(id)).str(), tgSize);
 
@@ -2811,6 +2818,47 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy, ptrTG,
                             ArrayRef<LLVM::GEPArg>{bWarpFlat64});
 
+    // Direct scatter: write every operand element to its absolute threadgroup
+    // offset (baseRow+rowOff)*stride + (baseCol+colOff) with a plain
+    // unconditional store. baseRow/baseCol are the runtime warp/lane origin and
+    // rowOff/colOff are the compile-time layout offsets, so this offset is the
+    // closed-form distributed->shared mapping (the invertAndCompose result for
+    // the row-major TG strip): no predicate, no garbage sink, no per-strip
+    // replication. The matching SG-load reads each 8x8 tile back from the same
+    // absolute coordinates.
+    auto directScatter = [&](Value ptr, Value baseRow, Value baseCol,
+                             SmallVector<Value> &elems,
+                             SmallVector<SmallVector<unsigned>> &offsets,
+                             int64_t stride, Type scatterTy) {
+      for (size_t idx = 0; idx < elems.size(); ++idx) {
+        int64_t rowOff = offsets[idx][0];
+        int64_t colOff = offsets[idx][1];
+        Value row32 = arith::AddIOp::create(
+            rewriter, loc, baseRow,
+            arith::ConstantIntOp::create(rewriter, loc, rowOff, 32));
+        Value col32 = arith::AddIOp::create(
+            rewriter, loc, baseCol,
+            arith::ConstantIntOp::create(rewriter, loc, colOff, 32));
+        Value flat32 = arith::AddIOp::create(
+            rewriter, loc,
+            arith::MulIOp::create(
+                rewriter, loc, row32,
+                arith::ConstantIntOp::create(rewriter, loc, stride, 32)),
+            col32);
+        Value flat64 = arith::ExtUIOp::create(rewriter, loc, i64Ty, flat32);
+        Value val = elems[idx];
+        if (scatterTy == f32Ty) {
+          if (val.getType() != f32Ty)
+            val = toF32(rewriter, loc, val, f32Ty);
+        } else {
+          val = toMmaInputType(rewriter, loc, val, scatterTy);
+        }
+        Value gep = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, scatterTy, ptr,
+                                        ArrayRef<LLVM::GEPArg>{flat64});
+        LLVM::StoreOp::create(rewriter, loc, val, gep);
+      }
+    };
+
     auto filteredScatter = [&](Value ptr, Value garbIdx, Value baseRow,
                                Value baseCol, SmallVector<Value> &elems,
                                SmallVector<SmallVector<unsigned>> &offsets,
@@ -2847,6 +2895,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         LLVM::StoreOp::create(rewriter, loc, val, gep);
       }
     };
+    (void)filteredScatter;
 
     // ── Phase 1: Load C tiles (filtered strip scatter via TG) ──────────
     SmallVector<SmallVector<Value>> matC_tiles(tilesM);
@@ -3337,15 +3386,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // one barrier; then the same for B, fused with MMA. This collapses the
       // per-strip / per-k barrier pairs (O(tilesK*tilesM)) down to 4 barriers
       // for the entire dot, which is the dominant per-K-step cost. ──
-      int64_t aMaxBase = maxBaseRow(aSrcEnc);
-      int64_t bMaxBase = maxBaseRow(bSrcEnc);
-      auto aBuckets = bucketElements(aOffsets, aMaxBase, tilesM, 0);
-      auto bBuckets = bucketElements(bOffsets, bMaxBase, tilesK, 0);
-
-      // A: scatter all M strips (each holds the full K row), one barrier.
-      for (int64_t tm = 0; tm < tilesM; ++tm)
-        filteredScatter(ptrTG, garbageIdx, aBaseRow, aBaseCol, elemsA, aOffsets,
-                        aBuckets[tm], Kpad, tm * 8, abTgScatterTy, tm);
+      // A: scatter every element to its absolute (row, col) once, one barrier.
+      directScatter(ptrTG, aBaseRow, aBaseCol, elemsA, aOffsets, Kpad,
+                    abTgScatterTy);
       LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                            ValueRange{fenceTG, execMod});
 
@@ -3365,10 +3408,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                            ValueRange{fenceTG, execMod});
 
-      // B: scatter all K strips (each holds the full N row), one barrier.
-      for (int64_t tk = 0; tk < tilesK; ++tk)
-        filteredScatter(ptrTG, garbageIdx, bBaseRow, bBaseCol, elemsB, bOffsets,
-                        bBuckets[tk], Npad, tk * 8, abTgScatterTy, tk);
+      // B: scatter every element to its absolute (row, col) once, one barrier.
+      directScatter(ptrTG, bBaseRow, bBaseCol, elemsB, bOffsets, Npad,
+                    abTgScatterTy);
       LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                            ValueRange{fenceTG, execMod});
 

@@ -42,7 +42,7 @@ namespace metal {
 // converts to float-element GEPs (gep float, @base, i64 float_index)
 // because Metal v1 typed-pointer bitcode requires GEP source type to match
 // the pointer's pointee type.
-static void lowerConstantExprs(Module &M) {
+void lowerConstantExprs(Module &M) {
   auto &Ctx = M.getContext();
   Type *FloatTy = Type::getFloatTy(Ctx);
   Type *I64Ty = Type::getInt64Ty(Ctx);
@@ -522,6 +522,9 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
 
     // Fix kernel argument metadata to match actual pointee types.
     fixKernelArgMetadata(M, PTM);
+
+    if (getenv("METAL_DUMP_PREWRITE"))
+      M.print(llvm::errs(), nullptr);
 
     ValueEnumerator E(M, PTM);
 

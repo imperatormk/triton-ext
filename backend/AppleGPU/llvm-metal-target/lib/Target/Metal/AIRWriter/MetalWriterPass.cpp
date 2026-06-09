@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MetalWriterPass.h"
+#include "BitcodeEmitter.h"
 #include "MetallibWriter.h"
 #include "PointeeTypeMap.h"
 #include "llvm/IR/Module.h"
@@ -17,6 +18,9 @@
 using namespace llvm;
 
 static void writeMetallibImpl(Module &M, raw_pwrite_stream &OS) {
+  // Constexprs must become instructions before the PTM walk so the GEPs
+  // they materialize get typed-pointer entries.
+  metal::lowerConstantExprs(M);
   // Reconstruct typed-pointer info into a side table (AIR v1 bitcode needs
   // typed pointers; the module itself stays opaque).
   metal::PointeeTypeMap PTM = metal::buildPointeeTypeMap(M);

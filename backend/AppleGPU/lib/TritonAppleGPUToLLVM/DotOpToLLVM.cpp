@@ -896,10 +896,10 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // Whether a given operand actually uses async copy is gated further below
     // (batch==1, ptr/elem counts match, row-major encoding, computable
     // strides).
-    int64_t dmaPartitionWarps = (matWarpsCEarly == 2 || matWarpsCEarly == 4 ||
-                                 matWarpsCEarly == 8)
-                                    ? matWarpsCEarly
-                                    : 1;
+    int64_t dmaPartitionWarps =
+        (matWarpsCEarly == 2 || matWarpsCEarly == 4 || matWarpsCEarly == 8)
+            ? matWarpsCEarly
+            : 1;
     int64_t dmaBandRows = 8 / dmaPartitionWarps;
     bool asyncCopyEnabled =
         !isa<IntegerType>(aElemTy) &&
@@ -1074,15 +1074,10 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     int64_t bStripBytes = 8 * Npad * 4; // one B strip in bytes (f32)
     int64_t tilesKEarly = K / 8;
     // Also require matWarpsCEarly > 1: single-warp configs can't overlap
-    // load+compute (one simdgroup), and the doubled TG global gets trimmed
-    // by the IR pipeline's dead-GEP elimination, causing PSO crashes.
-    // Partitioned multi-warp DMA keeps the single-buffer path: each warp's
-    // band copy makes the double-buffer prefetch ordering depend on cross-warp
-    // event timing, and the doubled TG global has historically crashed PSO
-    // creation when its GEPs get trimmed.
+    // load+compute (one simdgroup).
     bool useDoubleBufB = useAsyncB && (tilesKEarly > 1) &&
                          (2 * bStripBytes <= 16384) && (batchSize == 1) &&
-                         (matWarpsCEarly > 1) && (dmaPartitionWarps == 1);
+                         (matWarpsCEarly > 1);
 
     // Each batch slice needs its own TG region so MMA ops don't
     // cross-contaminate between warps assigned to different batches.
@@ -1219,9 +1214,9 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             arith::ConstantIntOp::create(rewriter, loc, dmaBandRows, 64));
         Value srcOff =
             arith::MulIOp::create(rewriter, loc, bandRow, rowStrideElems);
-        stripDevPtr = LLVM::GEPOp::create(rewriter, loc, devPtrTy, elemTy,
-                                          stripDevPtr,
-                                          ArrayRef<LLVM::GEPArg>{srcOff});
+        stripDevPtr =
+            LLVM::GEPOp::create(rewriter, loc, devPtrTy, elemTy, stripDevPtr,
+                                ArrayRef<LLVM::GEPArg>{srcOff});
         Value dstOff = arith::MulIOp::create(
             rewriter, loc, bandRow,
             arith::ConstantIntOp::create(rewriter, loc, tgPadStride, 64));
@@ -2187,7 +2182,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // from the buffer the local_load reads. Returns {base ptr (addrspace 3),
     // row pitch elems}; null base means unprovable -> registers fallback.
     auto resolveSmemOperand =
-        [&](Value tritonVal, RankedTensorType opTy) -> std::pair<Value, int64_t> {
+        [&](Value tritonVal,
+            RankedTensorType opTy) -> std::pair<Value, int64_t> {
       Value src = tritonVal;
       if (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
         src = cvt.getSrc();
@@ -2771,8 +2767,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     int64_t Npad = canPadMma ? N + pad : N;
     int64_t tgCStripSize = 8 * Npad;
     int64_t tgABStripSize = 8 * std::max(Kpad, Npad);
-    int64_t tgStripSize =
-        (fastPath) ? tgCStripSize : tgABStripSize;
+    int64_t tgStripSize = (fastPath) ? tgCStripSize : tgABStripSize;
     // Multi-strip batching: give each 8-row strip its own TG block so all
     // strips scatter and read back under one barrier pair instead of one pair
     // per strip. Trades threadgroup memory for fewer barriers. The batched
@@ -3282,15 +3277,15 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         Value flat = arith::ExtUIOp::create(
             rewriter, loc, i64Ty,
             arith::MulIOp::create(rewriter, loc, warpRowElem, pitchA));
-        ptrSmemAWarp = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy,
-                                           aSmemBase,
-                                           ArrayRef<LLVM::GEPArg>{flat});
+        ptrSmemAWarp =
+            LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy,
+                                aSmemBase, ArrayRef<LLVM::GEPArg>{flat});
       }
       if (useSmemB) {
         Value flat = arith::ExtUIOp::create(rewriter, loc, i64Ty, warpColElem);
-        ptrSmemBWarp = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy,
-                                           bSmemBase,
-                                           ArrayRef<LLVM::GEPArg>{flat});
+        ptrSmemBWarp =
+            LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy,
+                                bSmemBase, ArrayRef<LLVM::GEPArg>{flat});
       }
 
       // Tile loaders dispatch per operand: pipelined SMEM strips load with the

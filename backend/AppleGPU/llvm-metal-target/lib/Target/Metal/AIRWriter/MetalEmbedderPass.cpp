@@ -14,6 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MetalEmbedderPass.h"
+#include "BitcodeEmitter.h"
 #include "MetallibWriter.h"
 #include "PointeeTypeMap.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -32,6 +33,7 @@
 using namespace llvm;
 
 static void embedMetallibImpl(Module &M) {
+  metal::lowerConstantExprs(M);
   metal::PointeeTypeMap PTM = metal::buildPointeeTypeMap(M);
   std::vector<uint8_t> Bytes = metal::serializeMetallib(M, PTM);
 

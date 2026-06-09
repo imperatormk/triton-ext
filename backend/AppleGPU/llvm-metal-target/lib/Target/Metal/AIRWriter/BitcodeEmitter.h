@@ -26,6 +26,12 @@ namespace metal {
 /// This replaces LLVM's WriteBitcodeToFile for Metal targets.
 std::vector<uint8_t> emitMetalBitcode(llvm::Module &M, PointeeTypeMap &PTM);
 
+/// Lower ConstantExpr operands to real instructions. Must run BEFORE
+/// buildPointeeTypeMap: GEPs materialized here need PointeeTypeMap entries,
+/// and a constexpr GEP reaching the typed emitter produces a record the
+/// Metal reader rejects (PSO "Failed to materializeAll").
+void lowerConstantExprs(llvm::Module &M);
+
 } // namespace metal
 } // namespace llvm
 

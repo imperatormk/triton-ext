@@ -66,4 +66,26 @@ def SimplifyGatherLayout : Pass<"triton-apple-simplify-gather", "mlir::ModuleOp"
   ];
 }
 
+def WidenPipelinedStaging : Pass<"triton-apple-widen-staging", "mlir::ModuleOp"> {
+  let summary = "Grow num_stages=2 dot staging from 1 to 2 rotating SMEM slots";
+
+  let description = [{
+    The upstream pipeliner allocates (num_stages - 1) staging slots, so at
+    num_stages=2 every K-step's async copy overwrites the strip the in-flight
+    dot still reads, and the DotOp lowering must keep a per-dot post-load
+    threadgroup barrier. This pass doubles such single-slot staging allocs to
+    2 rotating slots and bumps the pipeliner's already-present rotation
+    counters' wrap bound from 1 to 2, making the IR shape identical to
+    num_stages=3 so the barrier elision fires. Bails when the doubled staging
+    would exceed the 32KB threadgroup budget.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 #endif // TRITON_APPLE_GPU_TRANSFORMS_PASSES

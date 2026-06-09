@@ -175,6 +175,23 @@ static Type *inferElementType(Value *V) {
         return SI->getValueOperand()->getType();
     if (auto *LI = dyn_cast<LoadInst>(U))
       return LI->getType();
+    // A staging arena fed only by async-copy / simdgroup-matrix intrinsics has
+    // no scalar loads or stores at all (the even-K fast path); the AIR pointer
+    // suffix still pins the element type, and leaving it uninferred would skip
+    // retyping while float GEPs index the byte global (PSO materialize fail).
+    if (auto *CI = dyn_cast<CallInst>(U)) {
+      if (Function *F = CI->getCalledFunction()) {
+        StringRef Name = F->getName();
+        if (Name.starts_with("air.simdgroup")) {
+          auto &Ctx = V->getContext();
+          if (Name.contains("bf16"))
+            return Type::getBFloatTy(Ctx);
+          if (Name.contains("f16"))
+            return Type::getHalfTy(Ctx);
+          return Type::getFloatTy(Ctx);
+        }
+      }
+    }
     if (isa<GetElementPtrInst>(U) || isa<GEPOperator>(U) || isa<BitCastInst>(U))
       if (Type *T = inferElementType(U))
         return T;
@@ -974,6 +991,11 @@ static bool retypeByteGlobals(Module &M) {
 
     Changed |= rewriteByteGEPs(GV, NewGV, OldAT, NewAT, ElemTy, ElemSize, Ctx);
 
+    // Dead constant-expression GEPs into the old byte global keep use_empty()
+    // false even though nothing reads through them; without pruning, the raw
+    // global survives next to its .typed twin and double-counts the 32KB
+    // threadgroup budget.
+    GV->removeDeadConstantUsers();
     if (GV->use_empty())
       GV->eraseFromParent();
 

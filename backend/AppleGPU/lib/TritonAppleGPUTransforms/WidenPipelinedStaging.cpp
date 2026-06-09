@@ -206,8 +206,8 @@ struct WidenPipelinedStaging
           std::max(maxStripsEst * 8 * std::max(KpadEst, NpadEst),
                    (M / 8) * 8 * NpadEst) *
           4;
-      if (residentEst <= 30720 || !smemResolvable(dot.getA()) ||
-          !smemResolvable(dot.getB()))
+      if (residentEst <= kTGResidentBudgetBytes ||
+          !smemResolvable(dot.getA()) || !smemResolvable(dot.getB()))
         allFast = false;
     });
     return any && allFast;

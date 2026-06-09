@@ -430,6 +430,11 @@ class MPSBackend(BaseBackend):
             passes.ttgpuir.add_assign_latencies(pm, options.num_stages)
             passes.ttgpuir.add_schedule_loops(pm)
             passes.ttgpuir.add_pipeline(pm, options.num_stages, False)
+            # num_stages=2 gets a single staging slot upstream, which forces a
+            # per-dot post-load TG barrier. Widen to 2 rotating slots (the
+            # num_stages=3 shape) so the barrier elision fires; the pass bails
+            # itself when 2 slots break the 32KB TG budget.
+            _plugin.add_widen_staging(pm)
 
         pm.run(mod, 'make_ttgir')
         # Preliminary shared memory estimate (reduction scratchpad only).

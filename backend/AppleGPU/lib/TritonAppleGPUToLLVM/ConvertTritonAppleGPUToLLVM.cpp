@@ -84,6 +84,30 @@ struct ConvertLayoutOpAppleConversion
       return success();
     }
 
+    // A/B operands of an AppleMma dot never need lowering: the dot pattern
+    // reads operand registers from the convert SOURCE (resolveOperand peels
+    // the cvt) or straight from SMEM/device, so the converted struct is dead
+    // in every dot path. Lowering it anyway burns a __tg_cvt strip plus
+    // stores+barriers DCE cannot strip, which pushes pipelined kernels at
+    // the 32KB staging cap over the TG budget.
+    if (!op->use_empty() &&
+        isa<ttg::BlockedEncodingAttr>(srcTy.getEncoding())) {
+      bool onlyMmaABUses = true;
+      for (OpOperand &use : op->getUses()) {
+        auto dot = dyn_cast<triton::DotOp>(use.getOwner());
+        if (!dot || use.getOperandNumber() >= 2 ||
+            !isa<AppleMmaEncodingAttr>(
+                cast<RankedTensorType>(dot.getType()).getEncoding())) {
+          onlyMmaABUses = false;
+          break;
+        }
+      }
+      if (onlyMmaABUses) {
+        rewriter.replaceOp(op, adaptor.getSrc());
+        return success();
+      }
+    }
+
     // blocked→blocked redistribution via TG scatter/gather, plus the
     // #mma (AppleMma) → #blocked C-output conversion (see mma branch below).
     auto srcEnc = dyn_cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());

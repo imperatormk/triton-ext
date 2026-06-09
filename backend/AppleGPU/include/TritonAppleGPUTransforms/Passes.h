@@ -15,6 +15,9 @@ std::unique_ptr<mlir::Pass> createSimplifyGatherLayoutPass();
 // #mma -> #blocked convert_layout becomes a within-simdgroup shuffle.
 std::unique_ptr<mlir::Pass> createStoreShuffleLayoutPass();
 
+// Grow num_stages=2 pipelined dot staging to 2 rotating SMEM slots
+std::unique_ptr<mlir::Pass> createWidenPipelinedStagingPass();
+
 } // namespace mlir::triton::applegpu
 
 // Generated pass declarations

@@ -1933,6 +1933,16 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     bool isF16Input = aElemTy.isF16();
     bool isBF16Input = aElemTy.isBF16();
 
+    // Integer (int8) inputs have no f32-typed simdgroup load: the
+    // air.simdgroup_matrix_8x8_load intrinsic reads f32 from memory and would
+    // misread 1-byte-packed integers (4x stride mismatch). For these, the
+    // device path byte-loads each i8 element this lane owns, widens it to f32,
+    // and builds the <64 x f32> matrix by hand (emitDevSGLoadInt8), then feeds
+    // the unchanged f32 MMA -- numerically identical to the f32 TG scatter
+    // path.
+    bool isIntInput = isa<IntegerType>(aElemTy);
+    Type intGepElemTy = aElemTy;
+
     // Determine device load intrinsic based on element type
     Type devMatElemTy = f32Ty; // element type for device MMA matrix
     std::string devLoadName = "air.simdgroup_matrix_8x8_load.v64f32.p1f32";
@@ -1940,7 +1950,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                              "v64f32.v64f32.v64f32.v64f32";
     Type devGepElemTy = f32Ty; // GEP element type
 
-    if (isF16Input) {
+    if (isIntInput) {
+      devGepElemTy = intGepElemTy;
+    } else if (isF16Input) {
       devMatElemTy = f16Ty;
       devLoadName = "air.simdgroup_matrix_8x8_load.v64f16.p1f16";
       devMmaName = "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16."
@@ -1971,6 +1983,77 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
     Value laneId =
         LLVM::CallOp::create(rewriter, loc, laneIdFn, ValueRange{}).getResult();
+
+    // Manual device-load + widen for integer (int8) A/B tiles. The f32
+    // air.simdgroup_matrix_8x8_load cannot read 1-byte-packed integers, so each
+    // lane byte-loads exactly the two i8 elements it owns under the PHYSICAL
+    // AppleMma per-lane layout (AppleMmaLayoutConversions.cpp), widens them to
+    // f32, and inserts them at vector indices {0,1} to build the same <64 x
+    // f32> matrix an f32 simdgroup load of the widened data would produce.
+    // Physical per-lane mapping for lane T, register R in {0,1}:
+    //   row = ((T>>1)&1) | (((T>>2)&1)<<1) | (((T>>4)&1)<<2)
+    //   col = R | (((T>>0)&1)<<1) | (((T>>3)&1)<<2)
+    // tilePtr is the i8 device pointer at the tile origin (row 0, col 0);
+    // rowStride/colStride are runtime i64 element strides of the operand.
+    auto emitDevSGLoadInt8 = [&](Value tilePtr, Value rowStride,
+                                 Value colStride) -> Value {
+      auto matIntTy = getSimdgroupMatrixType(ctx); // <64 x f32>
+      auto initFn = getOrInsertIntrinsic(
+          rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
+          LLVMFunctionType::get(matIntTy, {f32Ty}, false));
+      Value fz =
+          arith::ConstantOp::create(rewriter, loc, rewriter.getZeroAttr(f32Ty));
+      Value mat = LLVM::CallOp::create(rewriter, loc, initFn, ValueRange{fz})
+                      .getResult();
+      Value laneId64 = arith::ExtUIOp::create(rewriter, loc, i64Ty, laneId);
+      auto bit = [&](int64_t b) -> Value {
+        Value sh = arith::ShRUIOp::create(
+            rewriter, loc, laneId64,
+            arith::ConstantIntOp::create(rewriter, loc, b, 64));
+        return arith::AndIOp::create(
+            rewriter, loc, sh,
+            arith::ConstantIntOp::create(rewriter, loc, 1, 64));
+      };
+      Value l0 = bit(0), l1 = bit(1), l2 = bit(2), l3 = bit(3), l4 = bit(4);
+      // row = L1 | (L2<<1) | (L4<<2)
+      Value rowIdx = arith::OrIOp::create(
+          rewriter, loc, l1,
+          arith::OrIOp::create(
+              rewriter, loc,
+              arith::ShLIOp::create(
+                  rewriter, loc, l2,
+                  arith::ConstantIntOp::create(rewriter, loc, 1, 64)),
+              arith::ShLIOp::create(
+                  rewriter, loc, l4,
+                  arith::ConstantIntOp::create(rewriter, loc, 2, 64))));
+      // colBase = (L0<<1) | (L3<<2)   (col = colBase | R)
+      Value colBase = arith::OrIOp::create(
+          rewriter, loc,
+          arith::ShLIOp::create(
+              rewriter, loc, l0,
+              arith::ConstantIntOp::create(rewriter, loc, 1, 64)),
+          arith::ShLIOp::create(
+              rewriter, loc, l3,
+              arith::ConstantIntOp::create(rewriter, loc, 2, 64)));
+      Value rowOff = arith::MulIOp::create(rewriter, loc, rowIdx, rowStride);
+      for (int64_t r = 0; r < 2; ++r) {
+        Value colIdx = arith::OrIOp::create(
+            rewriter, loc, colBase,
+            arith::ConstantIntOp::create(rewriter, loc, r, 64));
+        Value elemOff = arith::AddIOp::create(
+            rewriter, loc, rowOff,
+            arith::MulIOp::create(rewriter, loc, colIdx, colStride));
+        Value elemPtr =
+            LLVM::GEPOp::create(rewriter, loc, devPtrTy, devGepElemTy, tilePtr,
+                                ArrayRef<LLVM::GEPArg>{elemOff});
+        Value iVal =
+            LLVM::LoadOp::create(rewriter, loc, aElemTy, elemPtr).getResult();
+        Value fVal = toF32(rewriter, loc, iVal, f32Ty);
+        Value vIdx = arith::ConstantIntOp::create(rewriter, loc, r, 32);
+        mat = InsertElementOp::create(rewriter, loc, matIntTy, mat, fVal, vIdx);
+      }
+      return mat;
+    };
 
     auto arrI32x3Ty = LLVM::LLVMArrayType::get(i32Ty, 3);
     auto tidFn = getOrInsertIntrinsic(
@@ -2079,14 +2162,12 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     bool useDeviceA = (aPtrs.size() == elemsA.size() && !aPtrs.empty());
     bool useDeviceB = (bPtrs.size() == elemsB.size() && !bPtrs.empty());
 
-    // Device MMA loads only support float types (f32, f16, bf16).
-    // For integer element types (e.g. int8), the MMA intrinsic reads f32
-    // from device memory but the actual data is packed at 1 byte/element,
-    // causing a 4x stride mismatch. Force TG scatter path for integers.
-    if (isa<IntegerType>(aElemTy)) {
-      useDeviceA = false;
-      useDeviceB = false;
-    }
+    // Integer (int8) operands take the device path too: the f32
+    // air.simdgroup_matrix_8x8_load cannot read 1-byte-packed integers, so the
+    // device A/B loads are byte-loaded and widened to f32 by emitDevSGLoadInt8,
+    // building the same <64 x f32> matrix the f32 MMA consumes. This drops the
+    // large f32 TG operand buffer (which overflowed the 32KB budget for larger
+    // K, e.g. K=128) entirely.
 
     // The device path keeps the per-warp C accumulator in registers
     // (laneLocalCIn / laneLocalCOut) and loads A and B straight from device
@@ -3092,8 +3173,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         Value aTilePtr = computeTileDevPtr(
             aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
             k * warpsM * 8, 0, warpRowElem, nullptr);
-        matA_cur[k] = emitDevSGLoad(devLoadFn, aTilePtr, mmaShape, aDevStride,
-                                    zeroOff, aDevTranspose);
+        matA_cur[k] = isIntInput
+                          ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
+                          : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
+                                          aDevStride, zeroOff, aDevTranspose);
       }
 
       for (int64_t tk = 0; tk < tilesK; ++tk) {
@@ -3104,8 +3187,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             Value aTilePtr = computeTileDevPtr(
                 aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
                 k * warpsM * 8, (tk + 1) * 8, warpRowElem, nullptr);
-            matA_next[k] = emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
-                                         aDevStride, zeroOff, aDevTranspose);
+            matA_next[k] =
+                isIntInput ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
+                           : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
+                                           aDevStride, zeroOff, aDevTranspose);
           }
         }
 
@@ -3114,8 +3199,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           Value bTilePtr = computeTileDevPtr(
               bPtrs, bOffsets, bRowStride, bColStride, bBaseRow, bBaseCol,
               tk * 8, j * warpsN * 8, nullptr, warpColElem);
-          Value matB = emitDevSGLoad(devLoadFn, bTilePtr, mmaShape, bDevStride,
-                                     zeroOff, bDevTranspose);
+          Value matB = isIntInput
+                           ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
+                           : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape,
+                                           bDevStride, zeroOff, bDevTranspose);
 
           for (int64_t k = 0; k < ownM; ++k) {
             matC_tiles[k][j] =

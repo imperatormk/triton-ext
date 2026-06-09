@@ -4179,6 +4179,18 @@ struct ConvertTritonAppleGPUToLLVMPass
         if (isa<mlir::triton::ReduceOp, mlir::triton::ScanOp,
                 mlir::triton::GatherOp, mlir::triton::HistogramOp>(o))
           smemLive = true;
+        // An integer (int8) dot aliases its A/B scatter buffer into global_smem
+        // (DotOpToLLVM getOrGrowSharedArena), so its GEPs keep the reservation
+        // live and llc cannot strip it. The convert budgeter must subtract that
+        // global_smem from its 32KB threadgroup budget, otherwise the output
+        // convert over-allocates its __tg_cvt strip and the two together
+        // overflow (e.g. 64x128x128 int8: 16KB global_smem + 24KB i32 convert =
+        // 40KB).
+        if (auto dot = dyn_cast<mlir::triton::DotOp>(o)) {
+          auto aTy = cast<RankedTensorType>(dot.getA().getType());
+          if (isa<IntegerType>(aTy.getElementType()))
+            smemLive = true;
+        }
       });
       mod->setAttr("applegpu.smem_live", BoolAttr::get(ctx, smemLive));
     }

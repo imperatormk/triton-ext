@@ -29,6 +29,7 @@
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
+#include "TritonAppleGPUTransforms/Passes.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -907,24 +908,24 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
     bool useAsyncA = false, useAsyncB = false;
     Value aRowStride, bRowStride, aColStride, bColStride;
-    if (asyncCopyEnabled && batchSize == 1 &&
-        (int64_t)aPtrs.size() == (int64_t)elemsA.size() && !aPtrs.empty() &&
-        isRowMajorEncoding(aSrcEnc)) {
-      aRowStride = computeRowStrideBlocked(aPtrs, aOffsets,
-                                           aType.getElementType(), aSrcEnc);
-      aColStride = computeColStrideBlocked(aPtrs, aOffsets,
-                                           aType.getElementType(), aSrcEnc);
-      useAsyncA = (aRowStride != nullptr && aColStride != nullptr);
-    }
-    if (asyncCopyEnabled && batchSize == 1 &&
-        (int64_t)bPtrs.size() == (int64_t)elemsB.size() && !bPtrs.empty() &&
-        isRowMajorEncoding(bSrcEnc)) {
-      bRowStride = computeRowStrideBlocked(bPtrs, bOffsets,
-                                           bType.getElementType(), bSrcEnc);
-      bColStride = computeColStrideBlocked(bPtrs, bOffsets,
-                                           bType.getElementType(), bSrcEnc);
-      useAsyncB = (bRowStride != nullptr && bColStride != nullptr);
-    }
+    auto gateAsyncOperand = [&](SmallVector<Value> &ptrs, int64_t elemCount,
+                                SmallVector<SmallVector<unsigned>> &offsets,
+                                Type elemTy, ttg::BlockedEncodingAttr srcEnc,
+                                Value &rowStride, Value &colStride) -> bool {
+      if (!asyncCopyEnabled || batchSize != 1 ||
+          (int64_t)ptrs.size() != elemCount || ptrs.empty() ||
+          !isRowMajorEncoding(srcEnc))
+        return false;
+      rowStride = computeRowStrideBlocked(ptrs, offsets, elemTy, srcEnc);
+      colStride = computeColStrideBlocked(ptrs, offsets, elemTy, srcEnc);
+      return rowStride != nullptr && colStride != nullptr;
+    };
+    useAsyncA = gateAsyncOperand(aPtrs, (int64_t)elemsA.size(), aOffsets,
+                                 aType.getElementType(), aSrcEnc, aRowStride,
+                                 aColStride);
+    useAsyncB = gateAsyncOperand(bPtrs, (int64_t)elemsB.size(), bOffsets,
+                                 bType.getElementType(), bSrcEnc, bRowStride,
+                                 bColStride);
 
     // ── Compute runtime thread base position ──────────────────────────
     // For 3D+ tensors, use only the last two dims of the encoding for
@@ -2285,7 +2286,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           std::max(maxStripsEst * 8 * std::max(KpadEst, NpadEst),
                    (M / 8) * 8 * NpadEst) *
           4;
-      tgGridFitsBudget = residentEst <= 30720;
+      tgGridFitsBudget = residentEst <= kTGResidentBudgetBytes;
     }
     if (useDeviceA && useDeviceB && (M / 8) > 1 && tgGridFitsBudget) {
       useDeviceA = false;
@@ -2826,7 +2827,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     unsigned aElemBytes = aElemTy.getIntOrFloatBitWidth() / 8;
     int64_t cvtBytes =
         (aElemBytes < 4) ? 2 * batchedCSize * (int64_t)aElemBytes : 0;
-    bool batchStrips = tgPath && (residentGridBytes + cvtBytes <= 30720);
+    bool batchStrips =
+        tgPath && (residentGridBytes + cvtBytes <= kTGResidentBudgetBytes);
     int64_t tgSize = tgStripSize + 1;
     if (batchStrips)
       tgSize = std::max(batchedABSize, batchedCSize);

@@ -887,13 +887,23 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // holds, falling back to the proven per-element scatter:
     //   - integer element type: async copy writes raw bytes to TG while the
     //     MMA loads read as f32, so the int8 byte width mismatch corrupts data.
-    //   - matWarpsCEarly > 1: multiple simdgroups own the same MxN tile and
-    //     issue identical concurrent async copies to the same TG region, which
-    //     races on Apple GPUs and corrupts data.
+    //   - matWarpsCEarly > 1 without a provably disjoint row partition of the
+    //     8-row strip: identical whole-strip copies from multiple simdgroups
+    //     write the same TG bytes, which races on Apple GPUs and corrupts
+    //     data. With matWarpsCEarly in {2,4,8} each warp copies its own
+    //     8/nWarps-row band (disjoint bytes), so the copies cannot race; the
+    //     existing post-stage barrier publishes the strip across warps.
     // Whether a given operand actually uses async copy is gated further below
     // (batch==1, ptr/elem counts match, row-major encoding, computable
     // strides).
-    bool asyncCopyEnabled = !isa<IntegerType>(aElemTy) && matWarpsCEarly <= 1;
+    int64_t dmaPartitionWarps = (matWarpsCEarly == 2 || matWarpsCEarly == 4 ||
+                                 matWarpsCEarly == 8)
+                                    ? matWarpsCEarly
+                                    : 1;
+    int64_t dmaBandRows = 8 / dmaPartitionWarps;
+    bool asyncCopyEnabled =
+        !isa<IntegerType>(aElemTy) &&
+        (matWarpsCEarly <= 1 || dmaPartitionWarps == matWarpsCEarly);
 
     bool useAsyncA = false, useAsyncB = false;
     Value aRowStride, bRowStride, aColStride, bColStride;
@@ -1066,9 +1076,13 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // Also require matWarpsCEarly > 1: single-warp configs can't overlap
     // load+compute (one simdgroup), and the doubled TG global gets trimmed
     // by the IR pipeline's dead-GEP elimination, causing PSO crashes.
+    // Partitioned multi-warp DMA keeps the single-buffer path: each warp's
+    // band copy makes the double-buffer prefetch ordering depend on cross-warp
+    // event timing, and the doubled TG global has historically crashed PSO
+    // creation when its GEPs get trimmed.
     bool useDoubleBufB = useAsyncB && (tilesKEarly > 1) &&
                          (2 * bStripBytes <= 16384) && (batchSize == 1) &&
-                         (matWarpsCEarly > 1);
+                         (matWarpsCEarly > 1) && (dmaPartitionWarps == 1);
 
     // Each batch slice needs its own TG region so MMA ops don't
     // cross-contaminate between warps assigned to different batches.
@@ -1192,6 +1206,28 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                  int64_t tgPadStride, Type elemTy) {
       unsigned elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
       int64_t tileWidthBytes = stripCols * elemBytes;
+      int64_t bandRows = 8;
+
+      // Partitioned multi-warp DMA: warp w copies rows
+      // [w*dmaBandRows, (w+1)*dmaBandRows) of the 8-row strip. Bands are
+      // byte-disjoint, so concurrent per-simdgroup copies cannot overlap.
+      if (dmaPartitionWarps > 1) {
+        bandRows = dmaBandRows;
+        Value warp64 = arith::ExtUIOp::create(rewriter, loc, i64Ty, warpId);
+        Value bandRow = arith::MulIOp::create(
+            rewriter, loc, warp64,
+            arith::ConstantIntOp::create(rewriter, loc, dmaBandRows, 64));
+        Value srcOff =
+            arith::MulIOp::create(rewriter, loc, bandRow, rowStrideElems);
+        stripDevPtr = LLVM::GEPOp::create(rewriter, loc, devPtrTy, elemTy,
+                                          stripDevPtr,
+                                          ArrayRef<LLVM::GEPArg>{srcOff});
+        Value dstOff = arith::MulIOp::create(
+            rewriter, loc, bandRow,
+            arith::ConstantIntOp::create(rewriter, loc, tgPadStride, 64));
+        tgDst = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, elemTy, tgDst,
+                                    ArrayRef<LLVM::GEPArg>{dstOff});
+      }
 
       Value sizeOf = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
       Value alignOf = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
@@ -1200,7 +1236,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       Value dstStrideBytes = arith::ConstantIntOp::create(
           rewriter, loc, tgPadStride * elemBytes, 64);
       Value dstElemStride = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
-      Value dstTile = makeI64Vec2(rewriter, loc, tileWidthBytes, 8);
+      Value dstTile = makeI64Vec2(rewriter, loc, tileWidthBytes, bandRows);
 
       // Source (device): stride in bytes
       Value elemBytesVal =
@@ -1208,7 +1244,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       Value srcStrideBytes =
           arith::MulIOp::create(rewriter, loc, rowStrideElems, elemBytesVal);
       Value srcElemStride = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
-      Value srcTile = makeI64Vec2(rewriter, loc, tileWidthBytes, 8);
+      Value srcTile = makeI64Vec2(rewriter, loc, tileWidthBytes, bandRows);
 
       Value offsetVec = makeI64Vec2(rewriter, loc, 0, 0);
       Value clamp = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
@@ -2141,6 +2177,47 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       return unpack(mappedPtrs);
     };
 
+    // ── Pipelined-SMEM operands: SG-load straight from the staging buffer ──
+    // With num_stages>1 the operand comes from ttg.local_load of the
+    // pipeline's threadgroup staging buffer (resolveDevicePointers fails: the
+    // tt.load is gone and the pipelined copies are masked). The operand bytes
+    // already sit in TG memory as a plain row-major strip (maxPhase==1,
+    // order=[1,0], shape==operand shape), which is exactly the layout
+    // simdgroup_matrix_8x8_load reads at constant pitch, so emit SG loads
+    // from the buffer the local_load reads. Returns {base ptr (addrspace 3),
+    // row pitch elems}; null base means unprovable -> registers fallback.
+    auto resolveSmemOperand =
+        [&](Value tritonVal, RankedTensorType opTy) -> std::pair<Value, int64_t> {
+      Value src = tritonVal;
+      if (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
+        src = cvt.getSrc();
+      auto localLoad = src.getDefiningOp<ttg::LocalLoadOp>();
+      if (!localLoad)
+        return {Value(), 0};
+      auto memTy = dyn_cast<ttg::MemDescType>(localLoad.getSrc().getType());
+      if (!memTy || memTy.getRank() != 2)
+        return {Value(), 0};
+      if (memTy.getShape() != opTy.getShape() ||
+          memTy.getElementType() != opTy.getElementType())
+        return {Value(), 0};
+      if (isa<IntegerType>(memTy.getElementType()))
+        return {Value(), 0};
+      auto shEnc =
+          dyn_cast<ttg::SwizzledSharedEncodingAttr>(memTy.getEncoding());
+      if (!shEnc || shEnc.getMaxPhase() != 1)
+        return {Value(), 0};
+      auto shOrder = shEnc.getOrder();
+      if (shOrder.size() != 2 || shOrder[0] != 1)
+        return {Value(), 0};
+      Value llStruct = rewriter.getRemappedValue(localLoad.getSrc());
+      if (!llStruct)
+        return {Value(), 0};
+      auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, llStruct,
+          getTypeConverter()->convertType(memTy.getElementType()), rewriter);
+      return {smemObj.getBase(), memTy.getShape()[1]};
+    };
+
     auto [elemsA, aOffsets, aSrcEnc] =
         resolveOperand(op.getA(), adaptor.getA(), aType);
     auto [elemsB, bOffsets, bSrcEnc] =
@@ -2178,7 +2255,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // grid would overflow that budget (e.g. 128x128 single-CTA), the device
     // path is the only one that fits, so keep it there. This estimate mirrors
     // the batchedAB/batchedC sizing computed below.
-    if (useDeviceA && useDeviceB && (M / 8) > 1) {
+    bool tgGridFitsBudget = false;
+    {
       int64_t padEst = tgPadForType(aElemTy);
       int64_t maxStrideEst = std::max(K, N);
       int64_t unpaddedEst = 8 * maxStrideEst;
@@ -2191,10 +2269,11 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           std::max(maxStripsEst * 8 * std::max(KpadEst, NpadEst),
                    (M / 8) * 8 * NpadEst) *
           4;
-      if (residentEst <= 30720) {
-        useDeviceA = false;
-        useDeviceB = false;
-      }
+      tgGridFitsBudget = residentEst <= 30720;
+    }
+    if (useDeviceA && useDeviceB && (M / 8) > 1 && tgGridFitsBudget) {
+      useDeviceA = false;
+      useDeviceB = false;
     }
 
     // ── Compute row stride from pointer differences ──────────────────
@@ -2423,6 +2502,27 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       useDeviceA = false;
     if (useDeviceB && (!bRowStride || !bColStride))
       useDeviceB = false;
+
+    // Pipelined-SMEM fallback for operands without device pointers: SG-load
+    // directly from the staging buffer the local_load reads. Combined with the
+    // device path this keeps the whole dot register-resident (no operand
+    // scatter, no per-strip barriers). Gated on the SAME resident-grid budget
+    // as the device path: when the padded TG grid fits, the batched TG path is
+    // faster (the pipeline strips are unpadded, so SG loads from them
+    // bank-conflict at small K pitches like 16/32 f32).
+    Value aSmemBase, bSmemBase;
+    int64_t aSmemPitch = 0, bSmemPitch = 0;
+    if (!tgGridFitsBudget) {
+      if (!useDeviceA)
+        std::tie(aSmemBase, aSmemPitch) = resolveSmemOperand(op.getA(), aType);
+      if (!useDeviceB)
+        std::tie(bSmemBase, bSmemPitch) = resolveSmemOperand(op.getB(), bType);
+    }
+    bool useSmemA = !useDeviceA && static_cast<bool>(aSmemBase);
+    bool useSmemB = !useDeviceB && static_cast<bool>(bSmemBase);
+    bool fastA = useDeviceA || useSmemA;
+    bool fastB = useDeviceB || useSmemB;
+    bool fastPath = fastA && fastB;
 
     // ── Compute device base pointer for each 8x8 MMA tile ───────────
     // tile_base = ptr[0] - (aOffsets[0][0] * rowStride + aOffsets[0][1]) *
@@ -2664,7 +2764,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // TG buffer needed for C scatter/load (always), and A/B scatter (TG path).
     unsigned id = getDotCounter(ctx)++;
     int64_t pad = tgPadForType(aElemTy);
-    int64_t maxStrideMma = (useDeviceA && useDeviceB) ? N : std::max(K, N);
+    int64_t maxStrideMma = (fastPath) ? N : std::max(K, N);
     int64_t unpaddedSizeMma = 8 * maxStrideMma + 1;
     bool canPadMma = (pad > 0) && ((unpaddedSizeMma + 8 * pad) * 4 <= 16384);
     int64_t Kpad = canPadMma ? K + pad : K;
@@ -2672,7 +2772,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     int64_t tgCStripSize = 8 * Npad;
     int64_t tgABStripSize = 8 * std::max(Kpad, Npad);
     int64_t tgStripSize =
-        (useDeviceA && useDeviceB) ? tgCStripSize : tgABStripSize;
+        (fastPath) ? tgCStripSize : tgABStripSize;
     // Multi-strip batching: give each 8-row strip its own TG block so all
     // strips scatter and read back under one barrier pair instead of one pair
     // per strip. Trades threadgroup memory for fewer barriers. The batched
@@ -2692,7 +2792,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // threadgroup cap, and the real post-coalesce footprint is still validated
     // by the compiler.py gatekeeper. (24KB also bounds a single dot from
     // hogging the budget.)
-    bool tgPath = !(useDeviceA && useDeviceB);
+    bool tgPath = !fastPath;
     int64_t maxStripsAB = std::max(M / 8, K / 8);
     // No garbage sink: the batchStrips and device paths scatter every element
     // to its absolute offset (directScatter) or keep C register-resident, so
@@ -3029,7 +3129,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // owned slots, not the full absolute grid, or a nonzero accumulator lands
     // in the wrong tile (invisible when C-in is zero; the add-matrix/rows/cols
     // wall).
-    if (useDeviceA && useDeviceB) {
+    if (fastPath) {
       // LANE-LOCAL C-in (physical AppleMma layout). The device MMA (Phase 2)
       // and the Phase-4 extract read each warp's owned tiles matC_tiles[k][j];
       // the C accumulator-in must land in the SAME owned slots. Under the
@@ -3130,7 +3230,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     }
 
     // ── Phase 2: A/B loads + MMA ──────────────────────────────────
-    if (useDeviceA && useDeviceB) {
+    if (fastPath) {
       // ── DEVICE PATH: Direct MMA loads from device memory ──────────
       // No TG scatter, no barriers for A/B.
       //
@@ -3145,13 +3245,17 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // tile's device origin adds the runtime warp offset (cWarpRow*8 /
       // cWarpCol*8) on top of the strided compile-time step (k*warpsM*8 /
       // j*warpsN*8). Prefetch: A tiles for tk+1 loaded before MMA of tk.
-      Value aDevStride = makeDevMmaStride(aColStride, aRowStride);
-      Value bDevStride = makeDevMmaStride(bColStride, bRowStride);
+      Value aDevStride, bDevStride, aDevTranspose, bDevTranspose;
+      if (useDeviceA) {
+        aDevStride = makeDevMmaStride(aColStride, aRowStride);
+        aDevTranspose = makeDevMmaTranspose(aColStride, aRowStride);
+      }
+      if (useDeviceB) {
+        bDevStride = makeDevMmaStride(bColStride, bRowStride);
+        bDevTranspose = makeDevMmaTranspose(bColStride, bRowStride);
+      }
       Value mmaShape = makeI64Vec2(rewriter, loc, 8, 8);
       Value zeroOff = makeI64Vec2(rewriter, loc, 0, 0);
-      // Per-operand canonical transpose flag (i1 false for the 3-vector path).
-      Value aDevTranspose = makeDevMmaTranspose(aColStride, aRowStride);
-      Value bDevTranspose = makeDevMmaTranspose(bColStride, bRowStride);
 
       auto dWpc = cMmaEnc.getWarpsPerCTA();
       int64_t warpsM = dWpc[0];
@@ -3167,54 +3271,119 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       Value warpRowElem = arith::MulIOp::create(rewriter, loc, dWarpRow, c8i);
       Value warpColElem = arith::MulIOp::create(rewriter, loc, dWarpCol, c8i);
 
-      // Prologue: load this warp's owned A tile-rows for tk=0
-      SmallVector<Value> matA_cur(ownM);
-      for (int64_t k = 0; k < ownM; ++k) {
-        Value aTilePtr = computeTileDevPtr(
-            aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
-            k * warpsM * 8, 0, warpRowElem, nullptr);
-        matA_cur[k] = isIntInput
-                          ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
-                          : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
-                                          aDevStride, zeroOff, aDevTranspose);
+      // SMEM warp-base pointers: fold the runtime warp origin into the base so
+      // the SG loads use constant tile offsets (a runtime SG offset
+      // mis-lowers). A's origin is a row offset (warpRow*8 rows of pitch
+      // aSmemPitch); B's is a pure column offset (warpCol*8).
+      Value ptrSmemAWarp, ptrSmemBWarp;
+      if (useSmemA) {
+        Value pitchA =
+            arith::ConstantIntOp::create(rewriter, loc, aSmemPitch, 32);
+        Value flat = arith::ExtUIOp::create(
+            rewriter, loc, i64Ty,
+            arith::MulIOp::create(rewriter, loc, warpRowElem, pitchA));
+        ptrSmemAWarp = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy,
+                                           aSmemBase,
+                                           ArrayRef<LLVM::GEPArg>{flat});
+      }
+      if (useSmemB) {
+        Value flat = arith::ExtUIOp::create(rewriter, loc, i64Ty, warpColElem);
+        ptrSmemBWarp = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy,
+                                           bSmemBase,
+                                           ArrayRef<LLVM::GEPArg>{flat});
       }
 
-      for (int64_t tk = 0; tk < tilesK; ++tk) {
-        // Prefetch owned A tile-rows for tk+1
-        SmallVector<Value> matA_next(ownM);
-        if (tk + 1 < tilesK) {
-          for (int64_t k = 0; k < ownM; ++k) {
-            Value aTilePtr = computeTileDevPtr(
-                aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
-                k * warpsM * 8, (tk + 1) * 8, warpRowElem, nullptr);
-            matA_next[k] =
-                isIntInput ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
-                           : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
-                                           aDevStride, zeroOff, aDevTranspose);
-          }
+      // Tile loaders dispatch per operand: pipelined SMEM strips load with the
+      // TG simdgroup intrinsic at constant pitch; device operands keep the
+      // device-direct load. Both produce the same v64 matrix type, so they
+      // feed one MMA fn.
+      auto loadATile = [&](int64_t k, int64_t tk) -> Value {
+        if (useSmemA) {
+          Value aOff = makeI64Vec2(rewriter, loc, tk * 8, k * warpsM * 8);
+          return emitSGLoad(abTgLoadFn, ptrSmemAWarp, aSmemPitch, aSmemPitch,
+                            aOff);
         }
-
-        // Load this warp's owned B tile-cols and accumulate
-        for (int64_t j = 0; j < ownN; ++j) {
-          Value bTilePtr = computeTileDevPtr(
-              bPtrs, bOffsets, bRowStride, bColStride, bBaseRow, bBaseCol,
-              tk * 8, j * warpsN * 8, nullptr, warpColElem);
-          Value matB = isIntInput
-                           ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
-                           : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape,
-                                           bDevStride, zeroOff, bDevTranspose);
-
-          for (int64_t k = 0; k < ownM; ++k) {
-            matC_tiles[k][j] =
-                LLVM::CallOp::create(
-                    rewriter, loc, devMmaFn,
-                    ValueRange{matA_cur[k], matB, matC_tiles[k][j]})
-                    .getResult();
-          }
+        Value aTilePtr = computeTileDevPtr(
+            aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
+            k * warpsM * 8, tk * 8, warpRowElem, nullptr);
+        return isIntInput ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
+                          : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
+                                          aDevStride, zeroOff, aDevTranspose);
+      };
+      auto loadBTile = [&](int64_t tk, int64_t j) -> Value {
+        if (useSmemB) {
+          Value bOff = makeI64Vec2(rewriter, loc, j * warpsN * 8, tk * 8);
+          return emitSGLoad(abTgLoadFn, ptrSmemBWarp, bSmemPitch, bSmemPitch,
+                            bOff);
         }
+        Value bTilePtr = computeTileDevPtr(
+            bPtrs, bOffsets, bRowStride, bColStride, bBaseRow, bBaseCol, tk * 8,
+            j * warpsN * 8, nullptr, warpColElem);
+        return isIntInput ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
+                          : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape,
+                                          bDevStride, zeroOff, bDevTranspose);
+      };
 
-        if (tk + 1 < tilesK)
-          matA_cur = matA_next;
+      if (useSmemA || useSmemB) {
+        // SMEM-resident operands: SG-load EVERY owned strip tile upfront, then
+        // one barrier, then the all-register MMA loop. The reads happen AFTER
+        // the local_load the membar pass fenced, so without a barrier the next
+        // pipeline copy can overwrite the staging strip mid-read (silent
+        // corruption, K-iteration-count dependent). Loading first and fencing
+        // once keeps the MMA off the barrier's critical path so the next
+        // copies overlap the math.
+        SmallVector<SmallVector<Value>> matA(ownM);
+        for (int64_t k = 0; k < ownM; ++k) {
+          matA[k].resize(tilesK);
+          for (int64_t tk = 0; tk < tilesK; ++tk)
+            matA[k][tk] = loadATile(k, tk);
+        }
+        SmallVector<SmallVector<Value>> matB(tilesK);
+        for (int64_t tk = 0; tk < tilesK; ++tk) {
+          matB[tk].resize(ownN);
+          for (int64_t j = 0; j < ownN; ++j)
+            matB[tk][j] = loadBTile(tk, j);
+        }
+        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
+                             ValueRange{fenceTG, execMod});
+        for (int64_t tk = 0; tk < tilesK; ++tk)
+          for (int64_t j = 0; j < ownN; ++j)
+            for (int64_t k = 0; k < ownM; ++k)
+              matC_tiles[k][j] =
+                  LLVM::CallOp::create(
+                      rewriter, loc, devMmaFn,
+                      ValueRange{matA[k][tk], matB[tk][j], matC_tiles[k][j]})
+                      .getResult();
+      } else {
+        // Prologue: load this warp's owned A tile-rows for tk=0
+        SmallVector<Value> matA_cur(ownM);
+        for (int64_t k = 0; k < ownM; ++k)
+          matA_cur[k] = loadATile(k, 0);
+
+        for (int64_t tk = 0; tk < tilesK; ++tk) {
+          // Prefetch owned A tile-rows for tk+1
+          SmallVector<Value> matA_next(ownM);
+          if (tk + 1 < tilesK) {
+            for (int64_t k = 0; k < ownM; ++k)
+              matA_next[k] = loadATile(k, tk + 1);
+          }
+
+          // Load this warp's owned B tile-cols and accumulate
+          for (int64_t j = 0; j < ownN; ++j) {
+            Value matB = loadBTile(tk, j);
+
+            for (int64_t k = 0; k < ownM; ++k) {
+              matC_tiles[k][j] =
+                  LLVM::CallOp::create(
+                      rewriter, loc, devMmaFn,
+                      ValueRange{matA_cur[k], matB, matC_tiles[k][j]})
+                      .getResult();
+            }
+          }
+
+          if (tk + 1 < tilesK)
+            matA_cur = matA_next;
+        }
       }
     } else if (batchStrips) {
       // ── TG PATH (batched): scatter the whole A operand into per-strip TG
@@ -3344,7 +3513,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // lane-local extractelement for every register-resident path (device and
     // batchStrips). The shared/per-strip TG-store paths handle the bridge
     // below.
-    if (useDeviceA && useDeviceB) {
+    if (fastPath) {
       // ── LANE-LOCAL C-out (physical AppleMma layout) ───
       // Inverse of the lane-local device C-in: each lane's owned tile holds its
       // two physical C scalars at vector indices {0,1}, indexed by colOff%2.

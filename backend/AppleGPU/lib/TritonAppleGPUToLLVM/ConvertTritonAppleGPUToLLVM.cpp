@@ -4179,6 +4179,15 @@ struct ConvertTritonAppleGPUToLLVMPass
         if (isa<mlir::triton::ReduceOp, mlir::triton::ScanOp,
                 mlir::triton::GatherOp, mlir::triton::HistogramOp>(o))
           smemLive = true;
+        // A software-pipelined float dot stages its A/B operands through a
+        // ttg.local_alloc backed by global_smem (the async-copy buffers the
+        // K-loop reads). Those GEPs keep the reservation live (llc cannot strip
+        // it), so the convert budgeter must subtract that global_smem from its
+        // 32KB threadgroup budget. Otherwise the output convert grants itself a
+        // single full-tile __tg_cvt strip and the two together overflow (e.g.
+        // 128x64x16 fp32: 16KB global_smem + 28KB f32 convert = 45KB).
+        if (isa<ttg::LocalAllocOp>(o))
+          smemLive = true;
         // An integer (int8) dot aliases its A/B scatter buffer into global_smem
         // (DotOpToLLVM getOrGrowSharedArena), so its GEPs keep the reservation
         // live and llc cannot strip it. The convert budgeter must subtract that

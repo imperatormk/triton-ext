@@ -115,6 +115,103 @@ static bool maskIsUniform(Value mask) {
   return false;
 }
 
+// Rectangular boundary mask: and-tree of scalar splats and 2D row/col slt
+// bounds, the shape the LLVM lowering clamps on the DMA path.
+static bool maskIsRect(Value mask) {
+  if (auto sp = mask.getDefiningOp<triton::SplatOp>())
+    return sp.getSrc().getType().isInteger(1);
+  if (auto andOp = mask.getDefiningOp<arith::AndIOp>())
+    return maskIsRect(andOp.getLhs()) && maskIsRect(andOp.getRhs());
+  if (auto bc = mask.getDefiningOp<triton::BroadcastOp>())
+    return maskIsRect(bc.getSrc());
+  auto cmp = mask.getDefiningOp<arith::CmpIOp>();
+  if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt)
+    return false;
+  auto ty = dyn_cast<RankedTensorType>(cmp.getType());
+  if (!ty || ty.getRank() != 2)
+    return false;
+  return (ty.getDimSize(0) == 1) != (ty.getDimSize(1) == 1);
+}
+
+static bool stride64BAligned(Value scalar) {
+  if (auto arg = dyn_cast<BlockArgument>(scalar)) {
+    auto fn = dyn_cast<FunctionOpInterface>(arg.getOwner()->getParentOp());
+    if (!fn)
+      return false;
+    auto attr =
+        fn.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(), "tt.divisibility");
+    return attr && (attr.getInt() * 4) % 64 == 0;
+  }
+  APInt c;
+  if (matchPattern(scalar, m_ConstantInt(&c)))
+    return (c.getSExtValue() * 4) % 64 == 0;
+  return false;
+}
+
+// Flat GEMM pointer with a 64B-aligned row stride (constant or a kernel
+// argument Triton specialized 16-divisible).
+static bool srcStride64BAligned(Value src) {
+  auto addptr = src.getDefiningOp<triton::AddPtrOp>();
+  if (!addptr || !addptr.getPtr().getDefiningOp<triton::SplatOp>())
+    return false;
+  auto addi = addptr.getOffset().getDefiningOp<arith::AddIOp>();
+  if (!addi)
+    return false;
+  for (Value term : {addi.getLhs(), addi.getRhs()}) {
+    if (auto bc = term.getDefiningOp<triton::BroadcastOp>())
+      term = bc.getSrc();
+    auto mul = term.getDefiningOp<arith::MulIOp>();
+    if (!mul)
+      continue;
+    for (Value m : {mul.getLhs(), mul.getRhs()}) {
+      if (auto sp = m.getDefiningOp<triton::SplatOp>())
+        return stride64BAligned(sp.getSrc());
+      if (auto cst = m.getDefiningOp<arith::ConstantOp>())
+        if (auto d = dyn_cast<DenseIntElementsAttr>(cst.getValue()))
+          if (d.isSplat())
+            return (d.getSplatValue<APInt>().getSExtValue() * 4) % 64 == 0;
+    }
+  }
+  return false;
+}
+
+// Copy that the LLVM lowering keeps on the async DMA path with a rect-clamped
+// source tile: rect mask, other = 0, f32, aligned stride, at least 768 staged
+// elements per warp in the loop, and a thin (<=16) staging tile.
+static bool copyIsRectDMA(ttg::AsyncCopyGlobalToLocalOp copy) {
+  if (!copy.getMask() || !maskIsRect(copy.getMask()))
+    return false;
+  auto srcTy = cast<RankedTensorType>(copy.getSrc().getType());
+  if (srcTy.getRank() != 2)
+    return false;
+  auto loop = copy->getParentOfType<scf::ForOp>();
+  if (!loop)
+    return false;
+  int64_t elems = 0;
+  loop->walk([&](ttg::AsyncCopyGlobalToLocalOp cp) {
+    auto ty = cp.getSrc().getType();
+    if (ty.getRank() == 2)
+      elems += ty.getDimSize(0) * ty.getDimSize(1);
+  });
+  int64_t warps = 1;
+  if (auto mod = copy->getParentOfType<ModuleOp>())
+    if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+      warps = std::max<int64_t>(a.getInt(), 1);
+  if (elems / warps < 768 ||
+      std::min(srcTy.getDimSize(0), srcTy.getDimSize(1)) > 16)
+    return false;
+  if (copy.getOther()) {
+    auto cst = copy.getOther().getDefiningOp<arith::ConstantOp>();
+    auto d =
+        cst ? dyn_cast<DenseElementsAttr>(cst.getValue()) : DenseElementsAttr();
+    if (!d || !d.isSplat() || !d.getSplatValue<APFloat>().isZero())
+      return false;
+  }
+  if (!copy.getResult().getType().getElementType().isF32())
+    return false;
+  return srcStride64BAligned(copy.getSrc());
+}
+
 static int64_t slotBytes(ttg::MemDescType ty) {
   int64_t elems = 1;
   for (int64_t d : ty.getShape().drop_front())
@@ -132,12 +229,33 @@ static int64_t totalBytes(ttg::MemDescType ty) {
 struct WidenPipelinedStaging
     : public impl::WidenPipelinedStagingBase<WidenPipelinedStaging> {
   void runOnOperation() override {
+    getOperation().walk([&](scf::ForOp loop) { stampRectCopies(loop); });
     getOperation().walk([&](scf::ForOp loop) {
       if (!dotsTakeSmemFastPath(loop))
         return;
       widenLoopStaging(loop);
       foldStagingLoadConverts(loop);
     });
+  }
+
+  // Rect-masked copies ride the clamped DMA only where its per-step cost
+  // pays: staging small enough to keep more than one threadgroup resident.
+  static void stampRectCopies(scf::ForOp loop) {
+    int64_t slotBytes = 0, minSlot = 0;
+    SmallVector<ttg::AsyncCopyGlobalToLocalOp> rects;
+    loop.getBody()->walk([&](ttg::AsyncCopyGlobalToLocalOp copy) {
+      auto memTy = cast<ttg::MemDescType>(copy.getResult().getType());
+      int64_t b = totalBytes(memTy);
+      slotBytes += b;
+      minSlot = minSlot ? std::min(minSlot, b) : b;
+      if (copy.getMask() && !maskIsUniform(copy.getMask()) &&
+          copyIsRectDMA(copy))
+        rects.push_back(copy);
+    });
+    if (slotBytes == 0 || slotBytes + minSlot > kAsymPreferBytes)
+      return;
+    for (auto copy : rects)
+      copy->setAttr("applegpu.rect_dma", UnitAttr::get(copy.getContext()));
   }
 
   // local_load -> convert_layout(blocked -> blocked) with the load's only

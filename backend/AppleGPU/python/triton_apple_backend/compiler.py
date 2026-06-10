@@ -104,7 +104,7 @@ def _load_metalir():
         """One llc run: metallib bytes plus the post-pipeline threadgroup
         total, emitted by the writer as a standard optimization remark
         (-pass-remarks-output YAML), so the budget needs no second pass."""
-        import yaml
+        import yaml  # type: ignore[import-untyped]
 
         class _Remarks(yaml.SafeLoader):
             pass
@@ -134,8 +134,8 @@ def _load_metalir():
             with open(out_path, 'rb') as f:
                 obj = f.read()
             tg = None
-            with open(remarks_path) as f:
-                for doc in yaml.load_all(f, Loader=_Remarks):
+            with open(remarks_path, 'r') as rf:
+                for doc in yaml.load_all(rf, Loader=_Remarks):
                     if doc and doc.get('Name') == 'TGBytes':
                         for arg in doc.get('Args', []):
                             if 'TGBytes' in arg:

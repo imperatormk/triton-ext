@@ -24,6 +24,7 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -225,6 +226,33 @@ static void fixGEPTypeMismatches(Module &M, PointeeTypeMap &PTM) {
 // passed straight into a p3f16/p1f16 load (or any suffix mismatch) emits an
 // invalid typed record (PSO "Failed to materializeAll"); the identity bitcast
 // plus a PTM entry retypes it, same convention as fixGEPTypeMismatches.
+static void scalarizeAggregateLoads(Module &M) {
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<LoadInst *, 4> Aggs;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+          if (isa<ArrayType>(LI->getType()))
+            Aggs.push_back(LI);
+    for (LoadInst *LI : Aggs) {
+      auto *AT = cast<ArrayType>(LI->getType());
+      Type *ElemTy = AT->getElementType();
+      Value *Ptr = LI->getPointerOperand();
+      Value *Agg = UndefValue::get(AT);
+      IRBuilder<> B(LI);
+      for (uint64_t E = 0; E < AT->getNumElements(); ++E) {
+        Value *EP = B.CreateGEP(ElemTy, Ptr, B.getInt64(E));
+        Value *EV = B.CreateLoad(ElemTy, EP);
+        Agg = B.CreateInsertValue(Agg, EV, {unsigned(E)});
+      }
+      LI->replaceAllUsesWith(Agg);
+      LI->eraseFromParent();
+    }
+  }
+}
+
 static void fixAccessTypeMismatch(Module &M, PointeeTypeMap &PTM) {
   for (auto &F : M) {
     if (F.isDeclaration())
@@ -627,6 +655,7 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
     removeRedundantBitcasts(M, PTM);
     fixGEPTypeMismatches(M, PTM);
     fixMMAPointerSuffixMismatch(M, PTM);
+    scalarizeAggregateLoads(M);
     fixAccessTypeMismatch(M, PTM);
 
     // Lower ConstantExpr operands to real instructions before enumeration.

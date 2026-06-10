@@ -11,19 +11,6 @@
 // The pipeliner already emits rotation counters for both the insert and
 // extract index; with one slot they wrap at bound 1 and fold to 0. Widening
 // is therefore: alloc shape[0] 1 -> 2 and the wrap bound 1 -> 2.
-//
-// Widening both operands doubles the staging footprint, and on big tiles
-// (e.g. 128x128) that caps the core at one resident threadgroup, too few
-// simds to hide SG-load latency. Above kAsymPreferBytes only one operand is
-// widened (the smaller slot) and the other keeps one slot; if even that
-// overflows kAsymPreferBytes the loop is left at single-slot staging, which
-// outruns the 1-TG/core both-widened shape. Both operands share the
-// pipeliner's rotation counters, so the widened operand gets private slot
-// indices derived from the induction variable: i = (iv - lb) / step, read
-// slot = i & 1, write slot = (i & 1) ^ 1, matching the counters' phase
-// (prologue fills slot 0, first in-loop write rotates to slot 1). The other
-// operand keeps the wrap-at-1 counters, which still fold to 0, and the
-// lowering keeps its post-load barrier.
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUTransforms/Passes.h"
@@ -43,7 +30,6 @@ namespace {
 namespace ttg = mlir::triton::gpu;
 
 constexpr int64_t kTGBudgetBytes = 32 * 1024;
-constexpr int64_t kAsymPreferBytes = 16 * 1024;
 
 static std::optional<int64_t> constValue(Value v) {
   APInt val;
@@ -227,53 +213,9 @@ struct WidenPipelinedStaging
     return any && allFast;
   }
 
-  struct StagedAlloc {
-    ttg::LocalAllocOp alloc;
-    llvm::SetVector<arith::CmpIOp> cmps;
-    SmallVector<ttg::MemDescIndexOp> inserts;
-    SmallVector<ttg::MemDescIndexOp> extracts;
-  };
-
-  // The staged alloc feeding every AppleMma dot's A operand in the loop (via
-  // local_load <- memdesc_index <- alloc, optionally through a layout
-  // convert). Null when the dots disagree or A is not staged.
-  static ttg::LocalAllocOp dotAStagingAlloc(scf::ForOp loop) {
-    ttg::LocalAllocOp aAlloc;
-    bool ok = true;
-    loop.getBody()->walk([&](DotOp dot) {
-      if (!isa<AppleMmaEncodingAttr>(
-              cast<RankedTensorType>(dot.getType()).getEncoding()))
-        return;
-      Value src = dot.getA();
-      if (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
-        src = cvt.getSrc();
-      auto load = src.getDefiningOp<ttg::LocalLoadOp>();
-      auto idxOp = load ? load.getSrc().getDefiningOp<ttg::MemDescIndexOp>()
-                        : ttg::MemDescIndexOp();
-      auto alloc = idxOp ? idxOp.getSrc().getDefiningOp<ttg::LocalAllocOp>()
-                         : ttg::LocalAllocOp();
-      if (!alloc || (aAlloc && aAlloc != alloc))
-        ok = false;
-      else
-        aAlloc = alloc;
-    });
-    return ok ? aAlloc : ttg::LocalAllocOp();
-  }
-
-  static void widenAlloc(ttg::LocalAllocOp alloc) {
-    auto ty = cast<ttg::MemDescType>(alloc.getType());
-    SmallVector<int64_t> shape(ty.getShape());
-    shape[0] = 2;
-    SmallVector<int64_t> allocShape(ty.getAllocShape());
-    if (allocShape.size() == shape.size())
-      allocShape[0] = 2;
-    alloc.getResult().setType(ttg::MemDescType::get(
-        shape, ty.getElementType(), ty.getEncoding(), ty.getMemorySpace(),
-        ty.getMutableMemory(), allocShape));
-  }
-
   void widenLoopStaging(scf::ForOp loop) {
-    SmallVector<StagedAlloc> staged;
+    SmallVector<ttg::LocalAllocOp> allocs;
+    llvm::SetVector<arith::CmpIOp> wrapCmps;
     int64_t extraBytes = 0, otherBytes = 0;
 
     auto func = loop->getParentOfType<FunctionOpInterface>();
@@ -290,7 +232,7 @@ struct WidenPipelinedStaging
       }
 
       bool touchesLoop = false, ok = true;
-      StagedAlloc info{alloc, {}, {}, {}};
+      llvm::SetVector<arith::CmpIOp> cmps;
       for (Operation *user : alloc->getUsers()) {
         if (isa<ttg::LocalDeallocOp>(user))
           continue;
@@ -327,13 +269,11 @@ struct WidenPipelinedStaging
         }
         for (Operation *use : idxOp->getUsers()) {
           int64_t wantInit;
-          if (isa<ttg::AsyncCopyGlobalToLocalOp>(use)) {
+          if (isa<ttg::AsyncCopyGlobalToLocalOp>(use))
             wantInit = 0;
-            info.inserts.push_back(idxOp);
-          } else if (isa<ttg::LocalLoadOp>(use)) {
+          else if (isa<ttg::LocalLoadOp>(use))
             wantInit = -1;
-            info.extracts.push_back(idxOp);
-          } else {
+          else {
             ok = false;
             break;
           }
@@ -344,99 +284,36 @@ struct WidenPipelinedStaging
         }
         if (!ok)
           break;
-        info.cmps.insert(cmp);
+        cmps.insert(cmp);
       }
       if (ok && touchesLoop) {
-        staged.push_back(std::move(info));
+        allocs.push_back(alloc);
+        wrapCmps.insert(cmps.begin(), cmps.end());
         extraBytes += 2 * slotBytes(ty);
       } else {
         otherBytes += slotBytes(ty);
       }
     });
 
-    if (staged.empty())
-      return;
-
-    if (extraBytes > kAsymPreferBytes && staged.size() == 2) {
-      switch (widenAsymmetric(loop, staged, otherBytes)) {
-      case AsymResult::Applied:
-      case AsymResult::KeepSingleSlot:
-        return;
-      case AsymResult::Fallback:
-        break;
-      }
-    }
-
-    if (otherBytes + extraBytes > kTGBudgetBytes)
+    if (allocs.empty() || otherBytes + extraBytes > kTGBudgetBytes)
       return;
 
     OpBuilder b(loop.getBody(), loop.getBody()->begin());
     Value two = arith::ConstantIntOp::create(b, loop.getLoc(), 2, 32);
-    for (StagedAlloc &info : staged)
-      for (arith::CmpIOp cmp : info.cmps)
-        cmp.getRhsMutable().assign(two);
-    for (StagedAlloc &info : staged)
-      widenAlloc(info.alloc);
-  }
+    for (arith::CmpIOp cmp : wrapCmps)
+      cmp.getRhsMutable().assign(two);
 
-  enum class AsymResult { Applied, KeepSingleSlot, Fallback };
-
-  // Widen only one operand to 2 slots; the other keeps 1 slot. The rotation
-  // counters are shared between the operands, so the widened operand gets
-  // private slot indices derived from the induction variable (i = (iv - lb) /
-  // step, exact for scf.for): the extract reads slot i & 1 and the insert
-  // writes (i & 1) ^ 1, the same phase as the counters (prologue fills slot
-  // 0). The shared counters keep their wrap-at-1 bound and fold to 0 for the
-  // single-slot operand, whose post-load barrier the lowering keeps.
-  //
-  // The smaller slot is widened (the dot's A operand on a tie) to keep the
-  // total under kAsymPreferBytes; above that the asymmetric copy buys no
-  // occupancy and single-slot staging outruns it, so leave the loop alone.
-  AsymResult widenAsymmetric(scf::ForOp loop, SmallVector<StagedAlloc> &staged,
-                             int64_t otherBytes) {
-    auto aAlloc = dotAStagingAlloc(loop);
-    if (!aAlloc)
-      return AsymResult::Fallback;
-    auto lb = constValue(loop.getLowerBound());
-    auto step = constValue(loop.getStep());
-    if (!lb || *lb < 0 || !step || *step <= 0)
-      return AsymResult::Fallback;
-    Type ivTy = loop.getInductionVar().getType();
-    for (StagedAlloc &info : staged)
-      if (info.inserts.empty() || info.extracts.empty() ||
-          ivTy != info.extracts.front().getIndex().getType())
-        return AsymResult::Fallback;
-
-    auto slot = [](StagedAlloc &info) {
-      return slotBytes(cast<ttg::MemDescType>(info.alloc.getType()));
-    };
-    StagedAlloc *wide = &staged[0];
-    if (slot(staged[1]) < slot(*wide) ||
-        (slot(staged[1]) == slot(*wide) && staged[1].alloc == aAlloc))
-      wide = &staged[1];
-    int64_t total =
-        otherBytes + slot(staged[0]) + slot(staged[1]) + slot(*wide);
-    if (total > kAsymPreferBytes)
-      return AsymResult::KeepSingleSlot;
-
-    Location loc = loop.getLoc();
-    OpBuilder b(loop.getBody(), loop.getBody()->begin());
-    auto cst = [&](int64_t v) {
-      return arith::ConstantOp::create(b, loc, ivTy, IntegerAttr::get(ivTy, v));
-    };
-    Value i = loop.getInductionVar();
-    if (*lb != 0)
-      i = arith::SubIOp::create(b, loc, i, cst(*lb));
-    if (*step != 1)
-      i = arith::DivUIOp::create(b, loc, i, cst(*step));
-    Value readSlot = arith::AndIOp::create(b, loc, i, cst(1));
-    Value writeSlot = arith::XOrIOp::create(b, loc, readSlot, cst(1));
-    for (ttg::MemDescIndexOp idxOp : wide->extracts)
-      idxOp.getIndexMutable().assign(readSlot);
-    for (ttg::MemDescIndexOp idxOp : wide->inserts)
-      idxOp.getIndexMutable().assign(writeSlot);
-    widenAlloc(wide->alloc);
-    return AsymResult::Applied;
+    for (ttg::LocalAllocOp alloc : allocs) {
+      auto ty = cast<ttg::MemDescType>(alloc.getType());
+      SmallVector<int64_t> shape(ty.getShape());
+      shape[0] = 2;
+      SmallVector<int64_t> allocShape(ty.getAllocShape());
+      if (allocShape.size() == shape.size())
+        allocShape[0] = 2;
+      alloc.getResult().setType(ttg::MemDescType::get(
+          shape, ty.getElementType(), ty.getEncoding(), ty.getMemorySpace(),
+          ty.getMutableMemory(), allocShape));
+    }
   }
 };
 

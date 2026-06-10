@@ -519,6 +519,37 @@ static void normalizeArrayGlobalGEPs(Module &M) {
   for (auto &F : M) {
     if (F.isDeclaration())
       continue;
+    // Loads/stores directly through an array global (no GEP, e.g. after a
+    // single-incoming phi folds away) have element access type vs array
+    // pointee; route them through an element-0 GEP.
+    SmallVector<Instruction *, 4> DirectAccess;
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        Value *Ptr = nullptr;
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+          Ptr = LI->getPointerOperand();
+        else if (auto *SI = dyn_cast<StoreInst>(&I))
+          Ptr = SI->getPointerOperand();
+        if (!Ptr)
+          continue;
+        auto *GV = dyn_cast<GlobalVariable>(Ptr);
+        if (!GV || !isa<ArrayType>(GV->getValueType()))
+          continue;
+        DirectAccess.push_back(&I);
+      }
+    for (Instruction *I : DirectAccess) {
+      auto *GV = cast<GlobalVariable>(
+          isa<LoadInst>(I) ? cast<LoadInst>(I)->getPointerOperand()
+                           : cast<StoreInst>(I)->getPointerOperand());
+      auto *Base = GetElementPtrInst::CreateInBounds(
+          GV->getValueType(), GV,
+          {ConstantInt::get(I64Ty, 0), ConstantInt::get(I64Ty, 0)});
+      Base->insertBefore(I->getIterator());
+      if (isa<LoadInst>(I))
+        cast<LoadInst>(I)->setOperand(0, Base);
+      else
+        cast<StoreInst>(I)->setOperand(1, Base);
+    }
     SmallVector<GetElementPtrInst *, 8> ToFix;
     for (auto &BB : F)
       for (auto &I : BB)

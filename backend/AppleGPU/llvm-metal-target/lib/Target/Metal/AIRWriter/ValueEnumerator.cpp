@@ -176,6 +176,17 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
                        ResultPointee);
           }
         }
+        // Pointer PHIs (e.g. LSR loop-carried operand pointers) need their
+        // typed pointer entry in the table before emission.
+        if (auto *PN = dyn_cast<PHINode>(&I)) {
+          if (PN->getType()->isPointerTy()) {
+            unsigned AddrSpace = PN->getType()->getPointerAddressSpace();
+            Type *Pointee = PTM.get(PN);
+            if (!Pointee)
+              Pointee = Type::getFloatTy(M.getContext());
+            ptrTypeIdx(PointerType::get(M.getContext(), AddrSpace), Pointee);
+          }
+        }
         // Bitcast ptr→ptr: in Metal v1 these change typed pointer.
         // Create a separate typed pointer entry from PTM.
         if (auto *BC = dyn_cast<BitCastInst>(&I)) {

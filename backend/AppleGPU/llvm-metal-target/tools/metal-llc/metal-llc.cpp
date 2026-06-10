@@ -60,6 +60,12 @@ static cl::opt<std::string> MTriple("mtriple",
                                     cl::init("air"));
 
 static cl::opt<std::string>
+    TGBytesOut("tg-bytes-out",
+               cl::desc("Write threadgroup memory total (bytes, post-pass) "
+                        "to this file"),
+               cl::init(""));
+
+static cl::opt<std::string>
     FileType("filetype",
              cl::desc("File type to emit: 'obj' (metallib) or 'asm' (LLVM IR "
                       "text after the Metal pre-codegen passes)"),
@@ -158,6 +164,25 @@ int main(int argc, char **argv) {
   }
 
   PM.run(*M);
+
+  if (!TGBytesOut.empty()) {
+    const DataLayout &DL = M->getDataLayout();
+    uint64_t Total = 0;
+    for (const GlobalVariable &GV : M->globals()) {
+      if (GV.getAddressSpace() != 3 || GV.isDeclaration())
+        continue;
+      uint64_t AlignB = GV.getAlign().value_or(llvm::Align(1)).value();
+      if (Total % AlignB)
+        Total += AlignB - (Total % AlignB);
+      Total += DL.getTypeAllocSize(GV.getValueType());
+    }
+    std::error_code TGEC;
+    raw_fd_ostream TGOut(TGBytesOut, TGEC, sys::fs::OF_Text);
+    if (TGEC)
+      return reportError("cannot open tg-bytes-out: " + TGEC.message());
+    TGOut << Total << "\n";
+  }
+
   Out->keep();
   return 0;
 }

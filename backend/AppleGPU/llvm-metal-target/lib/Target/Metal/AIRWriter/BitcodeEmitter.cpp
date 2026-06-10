@@ -225,6 +225,43 @@ static void fixGEPTypeMismatches(Module &M, PointeeTypeMap &PTM) {
 // passed straight into a p3f16/p1f16 load (or any suffix mismatch) emits an
 // invalid typed record (PSO "Failed to materializeAll"); the identity bitcast
 // plus a PTM entry retypes it, same convention as fixGEPTypeMismatches.
+static void fixAccessTypeMismatch(Module &M, PointeeTypeMap &PTM) {
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<Instruction *, 8> Fix;
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        Type *AccessTy = nullptr;
+        Value *Ptr = nullptr;
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          AccessTy = LI->getType();
+          Ptr = LI->getPointerOperand();
+        } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          AccessTy = SI->getValueOperand()->getType();
+          Ptr = SI->getPointerOperand();
+        }
+        if (!AccessTy || !AccessTy->isVectorTy() || isa<BitCastInst>(Ptr))
+          continue;
+        Fix.push_back(&I);
+      }
+    for (Instruction *I : Fix) {
+      Value *Ptr = isa<LoadInst>(I) ? cast<LoadInst>(I)->getPointerOperand()
+                                    : cast<StoreInst>(I)->getPointerOperand();
+      Type *AccessTy = isa<LoadInst>(I)
+                           ? I->getType()
+                           : cast<StoreInst>(I)->getValueOperand()->getType();
+      auto *BC = CastInst::Create(Instruction::BitCast, Ptr, Ptr->getType(), "",
+                                  I->getIterator());
+      if (isa<LoadInst>(I))
+        cast<LoadInst>(I)->setOperand(0, BC);
+      else
+        cast<StoreInst>(I)->setOperand(1, BC);
+      PTM.set(BC, AccessTy);
+    }
+  }
+}
+
 static void fixMMAPointerSuffixMismatch(Module &M, PointeeTypeMap &PTM) {
   auto &Ctx = M.getContext();
   for (auto &F : M) {
@@ -559,6 +596,7 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
     removeRedundantBitcasts(M, PTM);
     fixGEPTypeMismatches(M, PTM);
     fixMMAPointerSuffixMismatch(M, PTM);
+    fixAccessTypeMismatch(M, PTM);
 
     // Lower ConstantExpr operands to real instructions before enumeration.
     lowerConstantExprs(M);

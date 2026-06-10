@@ -4388,29 +4388,27 @@ struct AsyncWaitOpAppleConversion
     auto voidTy = LLVMVoidType::get(ctx);
     auto ptrTy0 = LLVMPointerType::get(ctx, 0);
 
-    // Check if any async copy was emitted by looking for the
-    // air.simdgroup_async_copy_2d declaration in the module.
-    bool hasAsyncDMA = mod.lookupSymbol<LLVMFuncOp>(
-                           "air.simdgroup_async_copy_2d.p3i8.p1i8") != nullptr;
-
-    if (hasAsyncDMA) {
-      // Wait on EXACTLY the copies whose tokens this wait consumes. Each token
-      // (adaptor operand) is that copy's event slot (ptr addrspace(0)); see the
-      // AsyncToken type conversion and the async_copy lowering. The token is a
-      // scf.for iter_arg, so the loop-carried value selects the correct
-      // alternating (double/triple-buffered) buffer each iteration: this is the
-      // num_stages>=3 correctness fix. A separate wait_simdgroup_events(1,
-      // slot) per token keeps the slot scalar (Metal v1 bitcode handles arrays
-      // of typed pointers poorly). Each slot is zero-initialized in the entry
-      // block, so a token from a sync/skip path holds a complete event and the
-      // wait is a real no-op, never a read of an uninitialized pointer.
-      auto waitFn = getOrCreateFn(mod, rewriter, "air.wait_simdgroup_events",
-                                  voidTy, {i32Ty, ptrTy0});
-      Value oneI32 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                              rewriter.getI32IntegerAttr(1));
-      for (Value evSlot : adaptor.getAsyncToken())
-        LLVM::CallOp::create(rewriter, loc, waitFn, ValueRange{oneI32, evSlot});
-    }
+    // Wait on EXACTLY the copies whose tokens this wait consumes. Each token
+    // (adaptor operand) is that copy's event slot (ptr addrspace(0)); see the
+    // AsyncToken type conversion and the async_copy lowering. The token is a
+    // scf.for iter_arg, so the loop-carried value selects the correct
+    // alternating (double/triple-buffered) buffer each iteration: this is the
+    // num_stages>=3 correctness fix. A separate wait_simdgroup_events(1,
+    // slot) per token keeps the slot scalar (Metal v1 bitcode handles arrays
+    // of typed pointers poorly). Each slot is zero-initialized in the entry
+    // block, so a token from a sync/skip path holds a complete event and the
+    // wait is a real no-op, never a read of an uninitialized pointer. The
+    // waits are emitted UNCONDITIONALLY: gating them on the module already
+    // containing the DMA declaration is conversion-order dependent (a loop
+    // wait lowers before the loop's copies; sync prologue copies declare
+    // nothing) and dropping the wait while any DMA is live reads in-flight
+    // slots.
+    auto waitFn = getOrCreateFn(mod, rewriter, "air.wait_simdgroup_events",
+                                voidTy, {i32Ty, ptrTy0});
+    Value oneI32 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                            rewriter.getI32IntegerAttr(1));
+    for (Value evSlot : adaptor.getAsyncToken())
+      LLVM::CallOp::create(rewriter, loc, waitFn, ValueRange{oneI32, evSlot});
 
     // Always emit TG barrier (needed for both sync and async paths
     // to ensure shared memory visibility across all threads).
@@ -4756,6 +4754,32 @@ struct ConvertTritonAppleGPUToLLVMPass
 
     if (failed(applyPartialConversion(mod, target, std::move(patterns))))
       signalPassFailure();
+
+    // Async-wait cleanup. AsyncWaitOp lowers a wait_simdgroup_events per
+    // token unconditionally because at pattern time it cannot know whether
+    // any copy in the kernel takes the DMA path (a loop wait converts before
+    // the loop's copies). When the finished module has no DMA call at all,
+    // the waits guard nothing and the AIR JIT refuses to materialize the
+    // intrinsic, so strip them and the dead declaration here.
+    bool hasDMACall = false;
+    mod.walk([&](LLVM::CallOp call) {
+      if (call.getCallee() == "air.simdgroup_async_copy_2d.p3i8.p1i8")
+        hasDMACall = true;
+    });
+    if (!hasDMACall) {
+      SmallVector<LLVM::CallOp> waitCalls;
+      mod.walk([&](LLVM::CallOp call) {
+        if (call.getCallee() == "air.wait_simdgroup_events")
+          waitCalls.push_back(call);
+      });
+      for (auto call : waitCalls)
+        call.erase();
+      for (StringRef fn : {"air.wait_simdgroup_events",
+                           "air.simdgroup_async_copy_2d.p3i8.p1i8"})
+        if (auto decl = mod.lookupSymbol<LLVMFuncOp>(fn))
+          if (decl.use_empty())
+            decl.erase();
+    }
 
     // Fix up llvm.loop_annotation on llvm.br / llvm.cond_br ops.
     //

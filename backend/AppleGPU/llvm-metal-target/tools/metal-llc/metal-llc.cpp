@@ -18,6 +18,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LLVMRemarkStreamer.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
@@ -60,10 +61,9 @@ static cl::opt<std::string> MTriple("mtriple",
                                     cl::init("air"));
 
 static cl::opt<std::string>
-    TGBytesOut("tg-bytes-out",
-               cl::desc("Write threadgroup memory total (bytes, post-pass) "
-                        "to this file"),
-               cl::init(""));
+    RemarksFilename("pass-remarks-output",
+                    cl::desc("Output filename for pass remarks (YAML)"),
+                    cl::value_desc("filename"), cl::init(""));
 
 static cl::opt<std::string>
     FileType("filetype",
@@ -153,6 +153,14 @@ int main(int argc, char **argv) {
   if (EC)
     return reportError("cannot open output: " + EC.message());
 
+  auto RemarksOrErr =
+      setupLLVMOptimizationRemarks(Ctx, RemarksFilename, /*RemarksPasses=*/"",
+                                   /*RemarksFormat=*/"yaml",
+                                   /*RemarksWithHotness=*/false);
+  if (!RemarksOrErr)
+    return reportError(toString(RemarksOrErr.takeError()));
+  auto RemarksFile = std::move(*RemarksOrErr);
+
   // Run the codegen pipeline.
   legacy::PassManager PM;
   TargetLibraryInfoImpl TLII(Triple(M->getTargetTriple()));
@@ -164,25 +172,8 @@ int main(int argc, char **argv) {
   }
 
   PM.run(*M);
-
-  if (!TGBytesOut.empty()) {
-    const DataLayout &DL = M->getDataLayout();
-    uint64_t Total = 0;
-    for (const GlobalVariable &GV : M->globals()) {
-      if (GV.getAddressSpace() != 3 || GV.isDeclaration())
-        continue;
-      uint64_t AlignB = GV.getAlign().value_or(llvm::Align(1)).value();
-      if (Total % AlignB)
-        Total += AlignB - (Total % AlignB);
-      Total += DL.getTypeAllocSize(GV.getValueType());
-    }
-    std::error_code TGEC;
-    raw_fd_ostream TGOut(TGBytesOut, TGEC, sys::fs::OF_Text);
-    if (TGEC)
-      return reportError("cannot open tg-bytes-out: " + TGEC.message());
-    TGOut << Total << "\n";
-  }
-
+  if (RemarksFile)
+    RemarksFile->keep();
   Out->keep();
   return 0;
 }

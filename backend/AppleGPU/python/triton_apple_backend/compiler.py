@@ -101,12 +101,20 @@ def _load_metalir():
             "    cmake -B build -G Ninja && cmake --build build")
 
     def compile_ir(llvm_ir: str) -> tuple:
-        """One llc run: metallib bytes plus the post-coalesce threadgroup
-        total (--tg-bytes-out side channel), so the budget needs no second
-        pipeline pass."""
+        """One llc run: metallib bytes plus the post-pipeline threadgroup
+        total, emitted by the writer as a standard optimization remark
+        (-pass-remarks-output YAML), so the budget needs no second pass."""
+        import yaml
+
+        class _Remarks(yaml.SafeLoader):
+            pass
+
+        # remarks documents are tagged (!Passed/!Missed); map them all
+        _Remarks.add_multi_constructor(
+            '!', lambda loader, _suffix, node: loader.construct_mapping(node))
         with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as out_f:
             out_path = out_f.name
-        tg_path = out_path + '.tg'
+        remarks_path = out_path + '.yaml'
         try:
             if os.environ.get('TRITON_MPS_DEBUG'):
                 print(
@@ -114,8 +122,8 @@ def _load_metalir():
                 )
             proc = subprocess.run([
                 llc, '-mtriple=' + _air_triple(_host_macos_major()),
-                '-filetype=obj', '--tg-bytes-out=' + tg_path, '-o', out_path,
-                '-'
+                '-filetype=obj', '-pass-remarks-output=' + remarks_path, '-o',
+                out_path, '-'
             ],
                                   input=llvm_ir.encode(),
                                   capture_output=True,
@@ -125,11 +133,18 @@ def _load_metalir():
                     f"llc failed: {proc.stderr.decode(errors='replace')}")
             with open(out_path, 'rb') as f:
                 obj = f.read()
-            with open(tg_path) as f:
-                tg = int(f.read().strip())
+            tg = None
+            with open(remarks_path) as f:
+                for doc in yaml.load_all(f, Loader=_Remarks):
+                    if doc and doc.get('Name') == 'TGBytes':
+                        for arg in doc.get('Args', []):
+                            if 'TGBytes' in arg:
+                                tg = int(arg['TGBytes'])
+            if tg is None:
+                raise RuntimeError('TGBytes remark missing from llc output')
             return obj, tg
         finally:
-            for pth in (out_path, tg_path):
+            for pth in (out_path, remarks_path):
                 try:
                     os.unlink(pth)
                 except OSError:

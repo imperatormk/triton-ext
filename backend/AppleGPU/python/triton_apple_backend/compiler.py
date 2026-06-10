@@ -91,147 +91,6 @@ def _find_llc():
 
 # Sized scalar types that may appear as the element type of an `addrspace(3)`
 # global. Vectors are handled by multiplying through.
-_LLVM_SCALAR_BYTES = {
-    'i1': 1,
-    'i8': 1,
-    'i16': 2,
-    'i32': 4,
-    'i64': 8,
-    'half': 2,
-    'bfloat': 2,
-    'float': 4,
-    'double': 8,
-}
-
-
-def _split_struct_fields(body: str) -> list:
-    """Split a struct body 'T1, T2, ...' on top-level commas only.
-
-    Nested aggregates (`<..>`, `[..]`, `{..}`) contain commas of their own that
-    must not split the field list, so track bracket depth.
-    """
-    fields = []
-    depth = 0
-    start = 0
-    for i, ch in enumerate(body):
-        if ch in '<[{':
-            depth += 1
-        elif ch in '>]}':
-            depth -= 1
-        elif ch == ',' and depth == 0:
-            fields.append(body[start:i])
-            start = i + 1
-    tail = body[start:].strip()
-    if tail:
-        fields.append(tail)
-    return fields
-
-
-def _llvm_type_size(ty: str) -> int:
-    """Total bytes for an LLVM IR type literal as it appears in a global decl.
-
-    Handles scalars, iN, vectors <N x T>, arrays [N x T] (both recursively, so
-    nested aggregates like [4 x [8 x float]] size correctly), and literal
-    structs {T1, T2, ...}. Anything else raises so a new TG type is never
-    silently under-counted (which would let an over-budget config slip past the
-    autotuner and OOM/stall at runtime). Note: struct sizing here is a plain
-    field sum without inter-field ABI padding; AIR threadgroup structs emitted
-    by our lowering are packed scalar/vector tiles, so this matches in practice.
-    """
-    ty = ty.strip()
-    # Vector: <N x T>
-    m = re.fullmatch(r'<\s*(\d+)\s*x\s*(.+?)\s*>', ty)
-    if m:
-        return int(m.group(1)) * _llvm_type_size(m.group(2))
-    # Array: [N x T]
-    m = re.fullmatch(r'\[\s*(\d+)\s*x\s*(.+?)\s*\]', ty)
-    if m:
-        return int(m.group(1)) * _llvm_type_size(m.group(2))
-    # Literal struct: {T1, T2, ...} (packed form <{...}> too)
-    m = re.fullmatch(r'<?\{\s*(.*?)\s*\}>?', ty, re.DOTALL)
-    if m:
-        body = m.group(1).strip()
-        if not body:
-            return 0
-        return sum(_llvm_type_size(f) for f in _split_struct_fields(body))
-    # Sized scalar
-    if ty in _LLVM_SCALAR_BYTES:
-        return _LLVM_SCALAR_BYTES[ty]
-    # Generic iN
-    m = re.fullmatch(r'i(\d+)', ty)
-    if m:
-        return (int(m.group(1)) + 7) // 8
-    raise ValueError(f"unsupported LLVM type for tg-memory sizing: {ty!r}")
-
-
-def _leading_llvm_type(head: str) -> str:
-    """Extract the leading well-formed LLVM type token from a decl tail.
-
-    The text after `global ` starts with the type, optionally followed by an
-    initializer and attributes. Aggregates can nest, so a depth-tracking scan is
-    needed rather than a flat `[^>]`/`[^\\]]` class (which mis-stops on the first
-    inner bracket of e.g. [4 x [8 x float]]).
-    """
-    head = head.lstrip()
-    if not head:
-        raise ValueError("empty addrspace(3) type head")
-    first = head[0]
-    if first in '<[{':
-        depth = 0
-        for i, ch in enumerate(head):
-            if ch in '<[{':
-                depth += 1
-            elif ch in '>]}':
-                depth -= 1
-                if depth == 0:
-                    # `<{...}>` packed struct: consume the trailing '>' too.
-                    end = i + 1
-                    if ch == '}' and end < len(head) and head[end] == '>':
-                        end += 1
-                    return head[:end]
-        raise ValueError(f"unbalanced aggregate in type head: {head!r}")
-    # Scalar / iN: up to the next space, comma, or end.
-    m = re.match(r'[\w]+', head)
-    if not m:
-        raise ValueError(f"unrecognized addrspace(3) type head: {head!r}")
-    return m.group(0)
-
-
-def _tg_memory_bytes(llvm_ir: str) -> int:
-    """Sum bytes for `addrspace(3)` globals, padding the total to each align.
-
-    Plain summer; pass POST-coalesce IR (from `llc -filetype=asm`) so merged
-    buffers are already reflected. Pre-coalesce IR over-reports.
-
-    Every `@x = ... addrspace(3) ... global ...` line MUST be sized; a line that
-    matches the addrspace(3) anchor but not the full `global <type>` shape (e.g.
-    an unexpected qualifier order, an external decl) raises rather than being
-    silently skipped, because a silent skip under-counts the budget and lets an
-    over-budget config slip past the autotuner and OOM / stall at runtime.
-    """
-    total = 0
-    # Anchor: any global decl line whose address space is 3 (threadgroup).
-    anchor = re.compile(r'^@[\w$.]+\s*=\s*[^\n]*?addrspace\(3\)[^\n]*$',
-                        re.MULTILINE)
-    # Detailed shape: capture the type tail after `global ` and an optional align.
-    detail = re.compile(
-        r'^@[\w$.]+\s*=\s*(?:[^@\n]*?\s)?addrspace\(3\)\s+(?:[\w]+\s+)?global\s+'
-        r'(.+?)(?:,\s*align\s+(\d+))?\s*$')
-    for am in anchor.finditer(llvm_ir):
-        line = am.group(0)
-        dm = detail.match(line)
-        if not dm:
-            raise ValueError(
-                f"addrspace(3) global not understood for tg-memory sizing: "
-                f"{line.strip()!r}")
-        ty = _leading_llvm_type(dm.group(1))
-        align = int(dm.group(2)) if dm.group(2) else 1
-        if total % align:
-            total += align - (total % align)
-        total += _llvm_type_size(ty)
-    return total
-
-
 def _load_metalir():
     """Return a compile function backed by the out-of-tree `metal-llc`."""
     llc = _find_llc()
@@ -241,23 +100,22 @@ def _load_metalir():
             "  cd <triton-ext>/llvm-metal-target && \\\n"
             "    cmake -B build -G Ninja && cmake --build build")
 
-    def _run_llc(llvm_ir: str, filetype: str) -> bytes:
-        """Run `llc -filetype=<filetype>`; return output bytes.
-
-        Both filetypes run the full pipeline (incl. TG-global coalescing); only
-        the emit differs: `obj` writes the metallib, `asm` the post-pass IR.
-        """
-        with tempfile.NamedTemporaryFile(suffix='.' + filetype,
-                                         delete=False) as out_f:
+    def compile_ir(llvm_ir: str) -> tuple:
+        """One llc run: metallib bytes plus the post-coalesce threadgroup
+        total (--tg-bytes-out side channel), so the budget needs no second
+        pipeline pass."""
+        with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as out_f:
             out_path = out_f.name
+        tg_path = out_path + '.tg'
         try:
             if os.environ.get('TRITON_MPS_DEBUG'):
                 print(
-                    f"[mps] llc: {llc} -mtriple={_air_triple(_host_macos_major())} -filetype={filetype} (os_major={_host_macos_major()})"
+                    f"[mps] llc: {llc} -mtriple={_air_triple(_host_macos_major())} (os_major={_host_macos_major()})"
                 )
             proc = subprocess.run([
                 llc, '-mtriple=' + _air_triple(_host_macos_major()),
-                '-filetype=' + filetype, '-o', out_path, '-'
+                '-filetype=obj', '--tg-bytes-out=' + tg_path, '-o', out_path,
+                '-'
             ],
                                   input=llvm_ir.encode(),
                                   capture_output=True,
@@ -266,23 +124,17 @@ def _load_metalir():
                 raise RuntimeError(
                     f"llc failed: {proc.stderr.decode(errors='replace')}")
             with open(out_path, 'rb') as f:
-                return f.read()
+                obj = f.read()
+            with open(tg_path) as f:
+                tg = int(f.read().strip())
+            return obj, tg
         finally:
-            try:
-                os.unlink(out_path)
-            except OSError:
-                pass
+            for pth in (out_path, tg_path):
+                try:
+                    os.unlink(pth)
+                except OSError:
+                    pass
 
-    def compile_ir(llvm_ir: str) -> bytes:
-        return _run_llc(llvm_ir, 'obj')
-
-    def tg_memory_bytes(llvm_ir: str) -> int:
-        # Size shared memory from the post-coalesce IR (`llc -filetype=asm`), so
-        # the real merged footprint is measured rather than re-modelled here.
-        asm = _run_llc(llvm_ir, 'asm').decode(errors='replace')
-        return _tg_memory_bytes(asm)
-
-    compile_ir.tg_memory_bytes = tg_memory_bytes
     return compile_ir
 
 
@@ -487,7 +339,6 @@ class MPSBackend(BaseBackend):
         # lowering adds __tg_cvt_* threadgroup globals whose sizes depend
         # on the tile configuration. Compute the real total from the LLVM IR
         # so the autotuner can reject configs that exceed the 32 KB limit.
-        metadata["shared"] = _get_metalir_compile().tg_memory_bytes(llvm_ir)
         metadata["_llvm_ir"] = llvm_ir
 
         return llvm_mod
@@ -524,8 +375,12 @@ class MPSBackend(BaseBackend):
             kname = metadata["name"]
             open(f'/tmp/dot_kernel_{kname}.ll', 'w').write(llvm_ir)
 
-        # MetalIR C++ pipeline: LLVM IR → AIR transforms → v1 bitcode → metallib
-        result = _get_metalir_compile()(llvm_ir)
+        # MetalIR C++ pipeline: LLVM IR → AIR transforms → v1 bitcode → metallib.
+        # One llc run also returns the post-coalesce threadgroup total; the
+        # backend convert/dot lowerings add __tg_* globals past ttg.shared, so
+        # the real footprint replaces the front-end estimate here.
+        result, tg_bytes = _get_metalir_compile()(llvm_ir)
+        metadata["shared"] = tg_bytes
         if debug:
             open(f'/tmp/dot_kernel_{kname}.metallib', 'wb').write(result)
         return result

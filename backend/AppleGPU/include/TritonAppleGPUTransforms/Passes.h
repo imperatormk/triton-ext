@@ -23,6 +23,10 @@ std::unique_ptr<mlir::Pass> createStoreShuffleLayoutPass();
 // Grow num_stages=2 pipelined dot staging to 2 rotating SMEM slots
 std::unique_ptr<mlir::Pass> createWidenPipelinedStagingPass();
 
+// Scalarize a wide loop-carried literal-struct phi to per-element allocas so
+// IPSCCP (O3) does not non-terminate on the wide aggregate.
+std::unique_ptr<mlir::Pass> createDemoteWideAccumulatorPass();
+
 } // namespace mlir::triton::applegpu
 
 // Generated pass declarations

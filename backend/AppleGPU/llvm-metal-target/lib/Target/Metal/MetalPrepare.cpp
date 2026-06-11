@@ -158,27 +158,31 @@ static void collectTGByteGlobals(Module &M,
 // becomes its own global and the threadgroup budget explodes ~30x).
 //
 // The discriminator is structural, not a count threshold: unrolled addressing
-// yields a dense, uniformly-strided run (every adjacent gap equals one small
-// element/vector stride), whereas buffer boundaries are sparse and irregular
-// (sub-buffers have unrelated sizes, so at least one gap is large or the gaps
-// differ). `Offsets` must be sorted+deduped and exclude 0.
+// yields a DENSE run (every adjacent gap is a small element/vector stride, so
+// the slots are physically contiguous in one buffer), whereas true sub-buffer
+// boundaries are SPARSE — time-disjoint reuse buffers have unrelated sizes, so
+// at least one gap is *large* (a jump no single element/vector access could
+// span). The stride need NOT be uniform: a real unrolled run mixes 8-byte
+// scalar, 16-byte vec, and 4-byte sub-element gaps. The signal is the presence
+// of a large gap, not stride irregularity. `Offsets` must be sorted+deduped and
+// exclude 0.
 static bool offsetsAreBufferBoundaries(ArrayRef<int64_t> Offsets) {
   if (Offsets.empty())
     return false;
   if (Offsets.size() == 1)
     return true; // a single interior boundary is always a real split point
-  // A uniformly-strided run with a small stride is unrolled element
-  // addressing of one buffer; gaps wider than the widest natural access
-  // (a 16-byte vec4) cannot be consecutive element slots, so an irregular or
-  // wide-gap set marks true sub-buffer boundaries.
+  // The widest natural threadgroup access is a 16-byte vec4. Any gap wider than
+  // that cannot be two adjacent element slots of one buffer, so it marks a real
+  // sub-buffer boundary. A run whose every gap is <= 16 bytes is dense unrolled
+  // element addressing of ONE buffer and must NOT be split (else each tail-sized
+  // slice becomes its own global and the threadgroup budget explodes ~30x — see
+  // cummax scan2d: 27 contiguous i64 slots with mixed 4/8/16-byte gaps would
+  // split into 27 globals = 124 KB).
   constexpr int64_t kMaxElementStride = 16;
-  int64_t stride = Offsets[1] - Offsets[0];
-  bool uniform = stride > 0 && stride <= kMaxElementStride;
-  for (size_t i = 2; uniform && i < Offsets.size(); ++i)
-    if (Offsets[i] - Offsets[i - 1] != stride)
-      uniform = false;
-  // Uniform small-stride run starting at the first element slot => unrolled.
-  return !(uniform && Offsets.front() == stride);
+  for (size_t i = 1; i < Offsets.size(); ++i)
+    if (Offsets[i] - Offsets[i - 1] > kMaxElementStride)
+      return true; // a wide gap => genuine sub-buffer boundary
+  return false; // all gaps small => dense unrolled run of one buffer
 }
 
 static void collectTGTypedGlobals(Module &M,

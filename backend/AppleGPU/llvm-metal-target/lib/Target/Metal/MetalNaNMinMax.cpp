@@ -42,7 +42,10 @@ static constexpr Mapping kNaNMinMax[] = {
 // the scalar rename + NaN-propagation loop runs.
 static bool scalarizeVectorMinMax(Module &M) {
   bool Changed = false;
-  Intrinsic::ID Ids[] = {Intrinsic::minimum, Intrinsic::maximum};
+  // No AIR vector form exists for any of these; the mid-end's SLP builds
+  // vector minnum/maxnum calls that otherwise reach the writer unrenamed.
+  Intrinsic::ID Ids[] = {Intrinsic::minimum, Intrinsic::maximum,
+                         Intrinsic::minnum, Intrinsic::maxnum};
 
   for (Intrinsic::ID ID : Ids) {
     SmallVector<Function *, 4> VectorDecls;

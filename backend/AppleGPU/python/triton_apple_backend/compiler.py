@@ -345,6 +345,19 @@ class MPSBackend(BaseBackend):
         llvm.init_targets()
         context = llvm.context()
         llvm_mod = llvm.to_module(mod, context)
+        # Standard mid-end optimization, same call as the NVIDIA backend
+        # (DISABLE_LLVM_OPT=1 skips it). metal-llc only runs the codegen IR
+        # prologue (LSR), so without this the LLVM IR ships unoptimized.
+        _opt_level = {
+            '0': None,
+            '1': llvm.OPTIMIZE_O1,
+            '2': llvm.OPTIMIZE_O2,
+            '3': llvm.OPTIMIZE_O3,
+        }[os.environ.get('METAL_LLVM_OPT_LEVEL', '3')]
+        if _opt_level is not None:
+            llvm.optimize_module(llvm_mod, _opt_level,
+                                 disable_slp_vectorizer=bool(
+                                     os.environ.get('METAL_DISABLE_SLP')))
         llvm_ir = str(llvm_mod)
         if os.environ.get('TRITON_MPS_DEBUG'):
             open('/tmp/raw_pre.ll', 'w').write(llvm_ir)
@@ -379,9 +392,28 @@ class MPSBackend(BaseBackend):
         }
         entry_names = [n for n in defined_names if n not in called]
         if len(entry_names) != 1:
-            raise RuntimeError(
-                f"expected exactly one uncalled kernel entry among "
-                f"{defined_names}, found {len(entry_names)}: {entry_names}")
+            # The optimizer may inline a noinline helper's only call site,
+            # leaving the (dead) helper as a second uncalled define. The
+            # conversion stamps the launchable entry with the "air-kernel"
+            # function attribute; resolve through it.
+            attr_groups = {
+                m.group(1)
+                for m in re.finditer(
+                    r'^attributes (#\d+) = \{[^}]*"air-kernel"', llvm_ir,
+                    re.M)
+            }
+            marked = [
+                n for n in entry_names
+                if any(re.search(
+                    r'^define void @' + re.escape(n) + r'\(.*\) [^\n]*' +
+                    re.escape(g) + r'\b', llvm_ir, re.M) for g in attr_groups)
+            ]
+            if len(marked) == 1:
+                entry_names = marked
+            else:
+                raise RuntimeError(
+                    f"expected exactly one uncalled kernel entry among "
+                    f"{defined_names}, found {len(entry_names)}: {entry_names}")
         metadata["name"] = entry_names[0]
 
         debug = os.environ.get('TRITON_MPS_DEBUG')

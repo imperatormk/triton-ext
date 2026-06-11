@@ -65,6 +65,12 @@ static cl::opt<std::string>
                     cl::desc("Output filename for pass remarks (YAML)"),
                     cl::value_desc("filename"), cl::init(""));
 
+static cl::opt<char>
+    OptLevel("O",
+             cl::desc("Optimization level (-O0 disables the codegen IR "
+                      "prologue: LSR etc.; default -O2)"),
+             cl::Prefix, cl::init('2'));
+
 static cl::opt<std::string>
     FileType("filetype",
              cl::desc("File type to emit: 'obj' (metallib) or 'asm' (LLVM IR "
@@ -118,9 +124,16 @@ int main(int argc, char **argv) {
   if (!TheTarget)
     return reportError("lookupTarget failed: " + ErrStr);
 
+  CodeGenOptLevel OLvl;
+  if (auto Level = CodeGenOpt::parseLevel(OptLevel))
+    OLvl = *Level;
+  else
+    return reportError("invalid optimization level -O" + Twine(OptLevel));
+
   TargetOptions Options;
   std::unique_ptr<TargetMachine> TM(TheTarget->createTargetMachine(
-      TT, /*CPU=*/"", /*Features=*/"", Options, std::nullopt));
+      TT, /*CPU=*/"", /*Features=*/"", Options, std::nullopt, std::nullopt,
+      OLvl));
   if (!TM)
     return reportError("createTargetMachine returned null");
 

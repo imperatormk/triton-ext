@@ -28,6 +28,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include <functional>
 
 using namespace llvm;
 
@@ -221,6 +222,633 @@ static void fixGEPTypeMismatches(Module &M, PointeeTypeMap &PTM) {
   }
 }
 
+// The mid-end's VectorCombine scalarizes wide loads into vector-typed
+// two-index GEPs (`gep <N x T>, p, i, j`). The typed-pointer machinery has
+// no notion of vector pointees and silently mis-addresses them; rewrite to
+// the equivalent element-typed single-index GEP (`gep T, p, i*N+j`).
+static void normalizeVectorGEPs(Module &M) {
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<GetElementPtrInst *, 8> ToFix;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+          if (isa<FixedVectorType>(GEP->getSourceElementType()) &&
+              GEP->getNumIndices() == 2)
+            ToFix.push_back(GEP);
+    for (auto *GEP : ToFix) {
+      auto *VT = cast<FixedVectorType>(GEP->getSourceElementType());
+      IRBuilder<> B(GEP);
+      Value *I0 = B.CreateSExtOrTrunc(GEP->getOperand(1), B.getInt64Ty());
+      Value *I1 = B.CreateSExtOrTrunc(GEP->getOperand(2), B.getInt64Ty());
+      Value *Lin = B.CreateAdd(
+          B.CreateMul(I0, B.getInt64(VT->getNumElements())), I1);
+      auto *NewGEP = cast<GetElementPtrInst>(
+          B.CreateGEP(VT->getElementType(), GEP->getPointerOperand(), Lin));
+      NewGEP->setIsInBounds(GEP->isInBounds());
+      GEP->replaceAllUsesWith(NewGEP);
+      GEP->eraseFromParent();
+    }
+  }
+}
+
+// A pointer phi's record carries one pointee type; every incoming value must
+// resolve to it. Globals (typed as their value type) and differently-typed
+// GEP chains as incomings make the reader reject the record ("Invalid phi
+// record"); wrap such incomings in an identity bitcast typed to the phi's
+// pointee. The bitcast lands in the incoming block before its terminator.
+static void fixPhiIncomingTypes(Module &M, PointeeTypeMap &PTM) {
+  Type *FloatTy = Type::getFloatTy(M.getContext());
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        auto *PN = dyn_cast<PHINode>(&I);
+        if (!PN)
+          break; // phis are at block start
+        if (!PN->getType()->isPointerTy())
+          continue;
+        // Only intervene when an incoming carries a CONCRETE pointee that the
+        // phi record must be emitted against. If every incoming defaults to
+        // the per-AS fallback (e.g. all-null, or args used only by the phi),
+        // doing nothing keeps the phi, its incomings, and any consumer (e.g.
+        // an insertelement into a <N x ptr>) all resolving to the same
+        // default — touching it would create a spurious mismatch.
+        Type *PhiPointee = PTM.get(PN);
+        if (!PhiPointee) {
+          for (unsigned J = 0; J < PN->getNumIncomingValues(); ++J) {
+            Value *In = PN->getIncomingValue(J);
+            if (isa<Constant>(In))
+              continue;
+            if (auto *GV = dyn_cast<GlobalVariable>(In))
+              PhiPointee = GV->getValueType();
+            else if (auto *G = dyn_cast<GetElementPtrInst>(In))
+              PhiPointee = G->getResultElementType();
+            else if (Type *T = PTM.get(In))
+              PhiPointee = T;
+            else
+              continue;
+            break;
+          }
+        }
+        if (!PhiPointee)
+          continue; // no concrete pointee anywhere — leave the phi alone
+        for (unsigned J = 0; J < PN->getNumIncomingValues(); ++J) {
+          Value *In = PN->getIncomingValue(J);
+          Type *InPointee = nullptr;
+          if (isa<ConstantPointerNull>(In)) {
+            // A typed null is emitted via SETTYPE against its own pointer
+            // type's default pointee; when that disagrees with the phi
+            // pointee the record is invalid. Replace with an inttoptr(0)
+            // pinned to the phi pointee so the incoming is a real typed value.
+            auto &Ctx = M.getContext();
+            auto *Zero = ConstantInt::get(Type::getInt64Ty(Ctx), 0);
+            auto *I2P = new IntToPtrInst(
+                Zero, In->getType(), "",
+                PN->getIncomingBlock(J)->getTerminator()->getIterator());
+            PTM.set(I2P, PhiPointee);
+            PN->setIncomingValue(J, I2P);
+            continue;
+          }
+          if (isa<Constant>(In))
+            continue; // other constants: leave untouched
+          if (auto *GV = dyn_cast<GlobalVariable>(In))
+            InPointee = GV->getValueType();
+          else if (auto *G = dyn_cast<GetElementPtrInst>(In))
+            InPointee = G->getResultElementType();
+          else
+            InPointee = PTM.get(In);
+          if (InPointee == PhiPointee)
+            continue;
+          auto *BC = CastInst::Create(
+              Instruction::BitCast, In, In->getType(), "",
+              PN->getIncomingBlock(J)->getTerminator()->getIterator());
+          PTM.set(BC, PhiPointee);
+          PN->setIncomingValue(J, BC);
+        }
+        // Pin the phi's own pointee so the record's type index matches the
+        // (now-consistent) incomings.
+        PTM.set(PN, PhiPointee);
+      }
+  }
+}
+
+// Normalize the mid-end optimizer's byte-stride GEPs (`gep [N x i8]`,
+// single index) against the typed pointee the PTM assigned to their base.
+// When the pointee's alloc size equals N the rewrite to `gep <pointee>` is a
+// pure retype (identical stride); otherwise an identity bitcast gives the
+// GEP a base typed to its own source type. Without this the reader rejects
+// the module ("Explicit gep type does not match pointee type of pointer
+// operand"). Unlike fixGEPTypeMismatches this applies to every module, not
+// just MMA users — elementwise kernels hit it too.
+static void normalizeByteArrayGEPs(Module &M, PointeeTypeMap &PTM) {
+  const DataLayout &DL = M.getDataLayout();
+  // What the reader believes a base points to: for GEP-defined bases the
+  // type is derived structurally from the producing GEP record; everything
+  // else (args, call results) comes from the PTM-driven declarations.
+  auto effectivePointee = [&](Value *Base) -> Type * {
+    if (auto *G = dyn_cast<GetElementPtrInst>(Base))
+      return G->getResultElementType();
+    return PTM.get(Base);
+  };
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    // Rewriting a GEP changes the structural pointee its dependent GEPs see,
+    // so iterate to a fixpoint (chains are shallow; converges in 2-3 rounds).
+    bool Changed = true;
+    while (Changed) {
+      Changed = false;
+      SmallVector<GetElementPtrInst *, 8> ToFix;
+      for (auto &BB : F)
+        for (auto &I : BB)
+          if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+            if (GEP->getNumIndices() != 1)
+              continue;
+            Type *SrcTy = GEP->getSourceElementType();
+            auto *AT = dyn_cast<ArrayType>(SrcTy);
+            bool IsByteArray = AT && AT->getElementType()->isIntegerTy(8);
+            // Two byte-stride forms: `[N x i8]` (index = element count) and
+            // plain `i8` (index = byte offset).
+            if (!IsByteArray && !SrcTy->isIntegerTy(8))
+              continue;
+            // Array globals are normalizeArrayGlobalGEPs' job (2-index form).
+            if (isa<GlobalVariable>(GEP->getPointerOperand()))
+              continue;
+            Type *Pointee = effectivePointee(GEP->getPointerOperand());
+            if (!Pointee || Pointee == SrcTy)
+              continue;
+            ToFix.push_back(GEP);
+          }
+      for (auto *GEP : ToFix) {
+        Type *SrcTy = GEP->getSourceElementType();
+        Type *Pointee = effectivePointee(GEP->getPointerOperand());
+        bool PointeeOK =
+            Pointee->isSized() && !Pointee->isAggregateType() &&
+            DL.getTypeAllocSize(Pointee) > 0;
+        if (auto *AT = dyn_cast<ArrayType>(SrcTy)) {
+          // [N x i8]: same stride as the pointee iff alloc sizes match.
+          if (PointeeOK && DL.getTypeAllocSize(Pointee) == AT->getNumElements()) {
+            GEP->setSourceElementType(Pointee);
+            GEP->setResultElementType(Pointee);
+            Changed = true;
+            continue;
+          }
+        } else {
+          // i8: a constant byte offset divisible by the pointee size can be
+          // rescaled into an element-typed GEP.
+          auto *CI = dyn_cast<ConstantInt>(GEP->idx_begin()->get());
+          uint64_t ESz = PointeeOK ? DL.getTypeAllocSize(Pointee) : 0;
+          if (CI && ESz && CI->getSExtValue() % (int64_t)ESz == 0) {
+            GEP->setSourceElementType(Pointee);
+            GEP->setResultElementType(Pointee);
+            GEP->setOperand(1, ConstantInt::get(CI->getType(),
+                                                CI->getSExtValue() /
+                                                    (int64_t)ESz));
+            Changed = true;
+            continue;
+          }
+        }
+        // Fallback: retype the base to the GEP's own source type.
+        Value *Ptr = GEP->getPointerOperand();
+        auto *BC = CastInst::Create(Instruction::BitCast, Ptr, Ptr->getType(),
+                                    "", GEP->getIterator());
+        GEP->setOperand(0, BC);
+        PTM.set(BC, SrcTy);
+        Changed = true;
+      }
+    }
+  }
+}
+
+// INST_SELECT in the AIR-era encoding requires a scalar i1 condition (the
+// O3 canonicalizes 3-way comparison idioms (e.g. the if/elif/else `-1/0/1`
+// ladder a `tl.map_elementwise` callback expands to) into the `llvm.scmp` /
+// `llvm.ucmp` intrinsics. The Metal AIR backend has no lowering for them, so
+// the JIT fails with "Undefined symbols: llvm.scmp.*". Expand them inline:
+// scmp(a,b) = zext(a > b) - zext(a < b) using signed/unsigned predicates per
+// intrinsic, then sign-extended to the (possibly wider) result type.
+static void lowerCmpIntrinsics(Module &M) {
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<CallInst *, 8> Calls;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          Intrinsic::ID ID = CI->getIntrinsicID();
+          if (ID == Intrinsic::scmp || ID == Intrinsic::ucmp)
+            Calls.push_back(CI);
+        }
+    for (CallInst *CI : Calls) {
+      bool Signed = CI->getIntrinsicID() == Intrinsic::scmp;
+      IRBuilder<> B(CI);
+      Value *A = CI->getArgOperand(0);
+      Value *Bv = CI->getArgOperand(1);
+      Value *Gt = Signed ? B.CreateICmpSGT(A, Bv) : B.CreateICmpUGT(A, Bv);
+      Value *Lt = Signed ? B.CreateICmpSLT(A, Bv) : B.CreateICmpULT(A, Bv);
+      Type *RetTy = CI->getType();
+      Value *Res = B.CreateSub(B.CreateZExt(Gt, RetTy),
+                               B.CreateZExt(Lt, RetTy));
+      CI->replaceAllUsesWith(Res);
+      CI->eraseFromParent();
+    }
+  }
+  // Drop the now-unused intrinsic declarations so no symbol is referenced.
+  for (auto It = M.begin(); It != M.end();) {
+    Function &F = *It++;
+    Intrinsic::ID ID = F.getIntrinsicID();
+    if ((ID == Intrinsic::scmp || ID == Intrinsic::ucmp) && F.use_empty())
+      F.eraseFromParent();
+  }
+}
+
+// O3's vectorizer can produce `<N x ptr addrspace(AS)>` values when it
+// vectorizes a `tl.where`/select over pointer operands (e.g. the int-pointer
+// payload of a masked gather). A vector-of-pointers POINTER element type has
+// only one pointee slot per address space in the AIR type table, but the
+// scalar pointers feeding the insertelement chain can carry conflicting
+// pointees (an `i8` byte-array GEP base vs a `float`/`i64` typed null), so the
+// emitted TYPE_CODE_VECTOR element disagrees with the scalar operands and the
+// Metal reader rejects the module ("Invalid record"). These pointer vectors
+// only ever exist to be `ptrtoint`'d to an integer vector and stored, so lower
+// the whole `<N x ptr>` web to `<N x i64>` (pointer-width int): convert each
+// scalar pointer operand with a scalar ptrtoint, keep the vector ops
+// (insert/extract/phi/select) vectorized in integer space, and turn the
+// trailing `ptrtoint <N x ptr>` into a plain truncation/passthrough. No
+// pointee typing is needed for an integer vector, so the conflict disappears
+// without scalarizing the bulk vector operations.
+static void lowerVectorPointerToInt(Module &M) {
+  auto isPtrVec = [](Type *T) -> FixedVectorType * {
+    auto *VT = dyn_cast<FixedVectorType>(T);
+    if (VT && VT->getElementType()->isPointerTy())
+      return VT;
+    return nullptr;
+  };
+  Type *I64 = Type::getInt64Ty(M.getContext());
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    // Collect every instruction that produces a vector-of-pointers.
+    SmallVector<Instruction *, 16> PtrVecDefs;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (isPtrVec(I.getType()))
+          PtrVecDefs.push_back(&I);
+    if (PtrVecDefs.empty())
+      continue;
+
+    // Map each pointer-vector value to its integer-vector replacement.
+    DenseMap<Value *, Value *> IntOf;
+    auto intVecTy = [&](FixedVectorType *PVT) {
+      return FixedVectorType::get(I64, PVT->getNumElements());
+    };
+    // Materialize the integer-vector form of an arbitrary pointer-vector
+    // operand (constants/poison/undef and not-yet-rewritten defs).
+    std::function<Value *(Value *, IRBuilder<> &)> asIntVec =
+        [&](Value *V, IRBuilder<> &B) -> Value * {
+      if (auto *It = IntOf.lookup(V))
+        return It;
+      auto *PVT = cast<FixedVectorType>(V->getType());
+      if (isa<UndefValue>(V))
+        return UndefValue::get(intVecTy(PVT));
+      if (isa<ConstantAggregateZero>(V) ||
+          (isa<Constant>(V) && cast<Constant>(V)->isNullValue()))
+        return ConstantAggregateZero::get(intVecTy(PVT));
+      // Fallback for any other constant/value: ptrtoint the whole vector.
+      return B.CreatePtrToInt(V, intVecTy(PVT));
+    };
+
+    // First create placeholder integer phis so cycles resolve.
+    for (Instruction *I : PtrVecDefs)
+      if (auto *PN = dyn_cast<PHINode>(I)) {
+        IRBuilder<> B(PN);
+        auto *NewPN = B.CreatePHI(intVecTy(cast<FixedVectorType>(PN->getType())),
+                                  PN->getNumIncomingValues());
+        IntOf[PN] = NewPN;
+      }
+
+    // Rewrite the non-phi defs in program order.
+    for (Instruction *I : PtrVecDefs) {
+      if (isa<PHINode>(I))
+        continue;
+      IRBuilder<> B(I);
+      Value *Repl = nullptr;
+      if (auto *IE = dyn_cast<InsertElementInst>(I)) {
+        Value *Vec = asIntVec(IE->getOperand(0), B);
+        Value *Sc = B.CreatePtrToInt(IE->getOperand(1), I64);
+        Repl = B.CreateInsertElement(Vec, Sc, IE->getOperand(2));
+      } else if (auto *SV = dyn_cast<ShuffleVectorInst>(I)) {
+        Value *A = asIntVec(SV->getOperand(0), B);
+        Value *Bv = asIntVec(SV->getOperand(1), B);
+        Repl = B.CreateShuffleVector(A, Bv, SV->getShuffleMask());
+      } else if (auto *Sel = dyn_cast<SelectInst>(I)) {
+        Value *T = asIntVec(Sel->getTrueValue(), B);
+        Value *Fv = asIntVec(Sel->getFalseValue(), B);
+        Repl = B.CreateSelect(Sel->getCondition(), T, Fv);
+      } else if (auto *BC = dyn_cast<BitCastInst>(I)) {
+        // ptr-vec bitcast (e.g. addrspace-preserving): forward the int form.
+        Repl = asIntVec(BC->getOperand(0), B);
+      } else {
+        // Unhandled producer: ptrtoint then back so users still see a ptr-vec.
+        continue;
+      }
+      IntOf[I] = Repl;
+    }
+
+    // Fill phi incomings now that all defs have int forms.
+    for (Instruction *I : PtrVecDefs)
+      if (auto *PN = dyn_cast<PHINode>(I)) {
+        auto *NewPN = cast<PHINode>(IntOf[PN]);
+        for (unsigned J = 0; J < PN->getNumIncomingValues(); ++J) {
+          IRBuilder<> B(PN->getIncomingBlock(J)->getTerminator());
+          NewPN->addIncoming(asIntVec(PN->getIncomingValue(J), B),
+                             PN->getIncomingBlock(J));
+        }
+      }
+
+    // Redirect users: consumers of the pointer-vector now read the int form.
+    // ptrtoint <N x ptr>->ivec becomes the int form (with width fixups);
+    // extractelement yields a scalar int turned back into a pointer;
+    // everything else gets an inttoptr-rebuilt vector so it stays valid.
+    for (Instruction *I : PtrVecDefs) {
+      Value *Int = IntOf.lookup(I);
+      if (!Int)
+        continue;
+      SmallVector<Use *, 8> Uses;
+      for (Use &U : I->uses())
+        Uses.push_back(&U);
+      for (Use *U : Uses) {
+        auto *User = cast<Instruction>(U->getUser());
+        if (IntOf.count(User))
+          continue; // already rewritten to consume the int form
+        IRBuilder<> B(User);
+        if (auto *P2I = dyn_cast<PtrToIntInst>(User)) {
+          Value *V = Int;
+          if (P2I->getType() != Int->getType())
+            V = B.CreateZExtOrTrunc(Int, P2I->getType());
+          P2I->replaceAllUsesWith(V);
+          continue; // P2I now dead; cleaned up below
+        }
+        if (auto *EE = dyn_cast<ExtractElementInst>(User)) {
+          Value *Sc = B.CreateExtractElement(Int, EE->getIndexOperand());
+          EE->replaceAllUsesWith(B.CreateIntToPtr(Sc, EE->getType()));
+          continue;
+        }
+        // Generic consumer still expecting a pointer vector: rebuild one.
+        U->set(B.CreateIntToPtr(Int, I->getType()));
+      }
+    }
+
+    // Erase the now-dead pointer-vector defs and orphaned ptrtoints.
+    for (Instruction *I : reverse(PtrVecDefs)) {
+      if (!IntOf.count(I))
+        continue;
+      if (!I->use_empty())
+        I->replaceAllUsesWith(UndefValue::get(I->getType()));
+    }
+    // Drop ptrtoint/extractelement consumers that were replaced.
+    SmallVector<Instruction *, 8> Dead;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if ((isa<PtrToIntInst>(I) || isa<ExtractElementInst>(I)) &&
+            I.use_empty() && isPtrVec(I.getOperand(0)->getType()) &&
+            IntOf.count(I.getOperand(0)))
+          Dead.push_back(&I);
+    for (Instruction *I : Dead)
+      I->eraseFromParent();
+    for (Instruction *I : reverse(PtrVecDefs))
+      if (IntOf.count(I) && I->use_empty())
+        I->eraseFromParent();
+  }
+}
+
+// VSELECT form is rejected by the GPU JIT, see the SelectInst emission in
+// FunctionWriter). The mid-end vectorizers produce vector-condition selects;
+// scalarize them into per-lane extract/select/insert chains.
+static void scalarizeVectorSelects(Module &M) {
+  SmallVector<SelectInst *, 8> Sels;
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *Sel = dyn_cast<SelectInst>(&I))
+          if (Sel->getCondition()->getType()->isVectorTy())
+            Sels.push_back(Sel);
+  for (auto *Sel : Sels) {
+    IRBuilder<> B(Sel);
+    auto *VT = cast<FixedVectorType>(Sel->getType());
+    Value *Res = UndefValue::get(VT);
+    for (unsigned L = 0; L < VT->getNumElements(); ++L) {
+      Value *C = B.CreateExtractElement(Sel->getCondition(), B.getInt64(L));
+      Value *T = B.CreateExtractElement(Sel->getTrueValue(), B.getInt64(L));
+      Value *F = B.CreateExtractElement(Sel->getFalseValue(), B.getInt64(L));
+      Res = B.CreateInsertElement(Res, B.CreateSelect(C, T, F), B.getInt64(L));
+    }
+    Sel->replaceAllUsesWith(Res);
+    Sel->eraseFromParent();
+  }
+}
+
+// The mid-end emits >64-bit integer arithmetic for overflow-free closed
+// forms (e.g. SCEV's `trunc((zext(a) * zext(b)) >> 1)` triangular sums as
+// i65). The AGX JIT cannot legalize any iN > 64; expand such chains into
+// (lo, hi) i64 limb pairs. Unsupported wide ops fail loud.
+static void expandWideIntegers(Module &M) {
+  auto isWide = [](Type *T) {
+    return T->isIntegerTy() && T->getIntegerBitWidth() > 64 &&
+           T->getIntegerBitWidth() <= 128;
+  };
+  Type *I64 = Type::getInt64Ty(M.getContext());
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    DenseMap<Value *, std::pair<Value *, Value *>> Limbs; // wide -> (lo, hi)
+    SmallVector<Instruction *, 8> Wide;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (isWide(I.getType()) ||
+            llvm::any_of(I.operands(),
+                         [&](Value *Op) { return isWide(Op->getType()); }))
+          Wide.push_back(&I);
+    if (Wide.empty())
+      continue;
+    auto umulh = [&](IRBuilder<> &B, Value *A, Value *Bv) -> Value * {
+      Value *Mask = ConstantInt::get(I64, 0xffffffffull);
+      Value *AL = B.CreateAnd(A, Mask), *AH = B.CreateLShr(A, 32);
+      Value *BL = B.CreateAnd(Bv, Mask), *BH = B.CreateLShr(Bv, 32);
+      Value *LL = B.CreateMul(AL, BL);
+      Value *LH = B.CreateMul(AL, BH);
+      Value *HL = B.CreateMul(AH, BL);
+      Value *HH = B.CreateMul(AH, BH);
+      Value *Mid = B.CreateAdd(B.CreateAdd(B.CreateLShr(LL, 32),
+                                           B.CreateAnd(LH, Mask)),
+                               B.CreateAnd(HL, Mask));
+      return B.CreateAdd(
+          B.CreateAdd(HH, B.CreateAdd(B.CreateLShr(LH, 32),
+                                      B.CreateLShr(HL, 32))),
+          B.CreateLShr(Mid, 32));
+    };
+    for (Instruction *I : Wide) {
+      IRBuilder<> B(I);
+      auto limbsOf = [&](Value *V) -> std::pair<Value *, Value *> {
+        auto It = Limbs.find(V);
+        if (It != Limbs.end())
+          return It->second;
+        if (auto *C = dyn_cast<ConstantInt>(V)) {
+          APInt A = C->getValue();
+          return {ConstantInt::get(I64, A.trunc(64)),
+                  ConstantInt::get(I64, A.lshr(64).trunc(64))};
+        }
+        report_fatal_error("AIRWriter: unmapped wide integer operand");
+      };
+      if (auto *ZE = dyn_cast<ZExtInst>(I)) {
+        Limbs[I] = {B.CreateZExtOrTrunc(ZE->getOperand(0), I64),
+                    ConstantInt::get(I64, 0)};
+      } else if (auto *SE2 = dyn_cast<SExtInst>(I)) {
+        Value *Lo = B.CreateSExtOrTrunc(SE2->getOperand(0), I64);
+        Limbs[I] = {Lo, B.CreateAShr(Lo, 63)};
+      } else if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+        auto [L1, H1] = limbsOf(BO->getOperand(0));
+        switch (BO->getOpcode()) {
+        case Instruction::Mul: {
+          auto [L2, H2] = limbsOf(BO->getOperand(1));
+          Value *Lo = B.CreateMul(L1, L2);
+          Value *Hi = B.CreateAdd(
+              umulh(B, L1, L2),
+              B.CreateAdd(B.CreateMul(L1, H2), B.CreateMul(H1, L2)));
+          Limbs[I] = {Lo, Hi};
+          break;
+        }
+        case Instruction::Add: {
+          auto [L2, H2] = limbsOf(BO->getOperand(1));
+          Value *Lo = B.CreateAdd(L1, L2);
+          Value *Carry = B.CreateZExt(B.CreateICmpULT(Lo, L1), I64);
+          Limbs[I] = {Lo, B.CreateAdd(B.CreateAdd(H1, H2), Carry)};
+          break;
+        }
+        case Instruction::Sub: {
+          auto [L2, H2] = limbsOf(BO->getOperand(1));
+          Value *Lo = B.CreateSub(L1, L2);
+          Value *Borrow = B.CreateZExt(B.CreateICmpULT(L1, L2), I64);
+          Limbs[I] = {Lo, B.CreateSub(B.CreateSub(H1, H2), Borrow)};
+          break;
+        }
+        case Instruction::LShr: {
+          auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+          if (!CI)
+            report_fatal_error("AIRWriter: wide lshr by non-constant");
+          uint64_t Sh = CI->getZExtValue();
+          if (Sh == 0) {
+            Limbs[I] = {L1, H1};
+          } else if (Sh < 64) {
+            Limbs[I] = {B.CreateOr(B.CreateLShr(L1, Sh),
+                                   B.CreateShl(H1, 64 - Sh)),
+                        B.CreateLShr(H1, Sh)};
+          } else {
+            Limbs[I] = {B.CreateLShr(H1, Sh - 64), ConstantInt::get(I64, 0)};
+          }
+          break;
+        }
+        default:
+          report_fatal_error(Twine("AIRWriter: unhandled wide integer op '") +
+                             BO->getOpcodeName() + "'");
+        }
+      } else if (auto *TR = dyn_cast<TruncInst>(I)) {
+        auto [Lo, Hi] = limbsOf(TR->getOperand(0));
+        (void)Hi;
+        Value *R = B.CreateZExtOrTrunc(Lo, TR->getType());
+        TR->replaceAllUsesWith(R);
+      } else {
+        report_fatal_error(Twine("AIRWriter: unhandled wide integer user '") +
+                           I->getOpcodeName() + "'");
+      }
+    }
+    for (auto It = Wide.rbegin(); It != Wide.rend(); ++It)
+      (*It)->eraseFromParent();
+  }
+}
+
+// The AGX JIT cannot legalize bool-vector <-> integer bitcasts (the
+// optimizer's mask-packing idiom, `bitcast <N x i1> to iN`); expand into
+// per-bit shifts.
+static void scalarizeBoolVectorCasts(Module &M) {
+  SmallVector<BitCastInst *, 8> Casts;
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *BC = dyn_cast<BitCastInst>(&I)) {
+          auto *SV = dyn_cast<FixedVectorType>(BC->getSrcTy());
+          auto *DV = dyn_cast<FixedVectorType>(BC->getDestTy());
+          if ((SV && SV->getElementType()->isIntegerTy(1) &&
+               BC->getDestTy()->isIntegerTy(SV->getNumElements())) ||
+              (DV && DV->getElementType()->isIntegerTy(1) &&
+               BC->getSrcTy()->isIntegerTy(DV->getNumElements())))
+            Casts.push_back(BC);
+        }
+  for (auto *BC : Casts) {
+    IRBuilder<> B(BC);
+    Value *R;
+    if (auto *SV = dyn_cast<FixedVectorType>(BC->getSrcTy())) {
+      R = ConstantInt::get(BC->getDestTy(), 0);
+      for (unsigned L = 0; L < SV->getNumElements(); ++L) {
+        Value *Bit = B.CreateZExt(
+            B.CreateExtractElement(BC->getOperand(0), B.getInt64(L)),
+            BC->getDestTy());
+        R = B.CreateOr(R, B.CreateShl(Bit, L));
+      }
+    } else {
+      auto *DV = cast<FixedVectorType>(BC->getDestTy());
+      R = UndefValue::get(DV);
+      for (unsigned L = 0; L < DV->getNumElements(); ++L) {
+        Value *Bit = B.CreateTrunc(B.CreateLShr(BC->getOperand(0), L),
+                                   B.getInt1Ty());
+        R = B.CreateInsertElement(R, Bit, B.getInt64(L));
+      }
+    }
+    BC->replaceAllUsesWith(R);
+    BC->eraseFromParent();
+  }
+}
+
+// `zext nneg` is definitionally equal to `sext`; emit the sext form. The
+// AGX JIT widens zext-fed 64-bit multiplies into 65-bit operations it then
+// fails to legalize (PSO abort "unable to legalize instruction ... s65"),
+// while the sext form is its long-proven path.
+static void canonicalizeNNegZExt(Module &M) {
+  SmallVector<ZExtInst *, 16> Zexts;
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *ZE = dyn_cast<ZExtInst>(&I))
+          if (ZE->hasNonNeg())
+            Zexts.push_back(ZE);
+  for (auto *ZE : Zexts) {
+    auto *SE = CastInst::Create(Instruction::SExt, ZE->getOperand(0),
+                                ZE->getType(), "", ZE->getIterator());
+    SE->takeName(ZE);
+    ZE->replaceAllUsesWith(SE);
+    ZE->eraseFromParent();
+  }
+}
+
+// AIR v1 bitcode has no freeze opcode. Replacing freeze with its operand is
+// a legal refinement (freeze only matters for poison/undef inputs, where any
+// fixed value is a valid choice).
+static void lowerFreezeInsts(Module &M) {
+  SmallVector<FreezeInst *, 8> Frozen;
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *FI = dyn_cast<FreezeInst>(&I))
+          Frozen.push_back(FI);
+  for (auto *FI : Frozen) {
+    FI->replaceAllUsesWith(FI->getOperand(0));
+    FI->eraseFromParent();
+  }
+}
+
 // Give every simdgroup-matrix call a pointer operand whose typed pointee
 // matches the intrinsic's element suffix. A float-typed TG/device pointer
 // passed straight into a p3f16/p1f16 load (or any suffix mismatch) emits an
@@ -269,8 +897,30 @@ static void fixAccessTypeMismatch(Module &M, PointeeTypeMap &PTM) {
           AccessTy = SI->getValueOperand()->getType();
           Ptr = SI->getPointerOperand();
         }
-        if (!AccessTy || !AccessTy->isVectorTy() || isa<BitCastInst>(Ptr))
+        if (!AccessTy || isa<BitCastInst>(Ptr))
           continue;
+        // Vector accesses always get the retype (legacy behavior). Scalar
+        // accesses only when the pointer's pointee provably disagrees — the
+        // optimizer's folded byte-GEPs leave e.g. a float store through an
+        // i8-typed pointer, which the reader rejects ("Explicit load/store
+        // type does not match pointee type of pointer operand"). For a
+        // GEP-defined pointer the reader derives the pointee structurally
+        // from the GEP record, so compare against the GEP result type, not
+        // the PTM entry (usage inference may already claim the access type).
+        if (!AccessTy->isVectorTy()) {
+          // inttoptr-derived pointers get their typed pointer from the
+          // shared per-type default, which other values' inference can
+          // claim first — always retype them to the access type.
+          if (!isa<IntToPtrInst>(Ptr)) {
+            Type *Pointee = nullptr;
+            if (auto *G = dyn_cast<GetElementPtrInst>(Ptr))
+              Pointee = G->getResultElementType();
+            else
+              Pointee = PTM.get(Ptr);
+            if (!Pointee || Pointee == AccessTy)
+              continue;
+          }
+        }
         Fix.push_back(&I);
       }
     for (Instruction *I : Fix) {
@@ -318,8 +968,18 @@ static void fixMMAPointerSuffixMismatch(Module &M, PointeeTypeMap &PTM) {
         Value *Op = CI->getArgOperand(J);
         if (!Op->getType()->isPointerTy())
           continue;
-        if (Elem->isFloatTy() && !isa<Constant>(Op))
-          continue;
+        if (Elem->isFloatTy() && !isa<Constant>(Op)) {
+          // Float-suffix operands are normally float-typed already; wrap
+          // only when the pointee provably disagrees (the optimizer's
+          // byte-GEP chains leave i8-typed pointers feeding p1f32/p3f32).
+          Type *Pointee = nullptr;
+          if (auto *G = dyn_cast<GetElementPtrInst>(Op))
+            Pointee = G->getResultElementType();
+          else
+            Pointee = PTM.get(Op);
+          if (!Pointee || Pointee == Elem)
+            continue;
+        }
         if (isa<BitCastInst>(Op) || isa<AllocaInst>(Op))
           continue;
         auto *BC = CastInst::Create(Instruction::BitCast, Op, Op->getType(), "",
@@ -482,6 +1142,103 @@ static void fixKernelArgMetadata(Module &M, const PointeeTypeMap &PTM) {
       ArgDescs->replaceOperandWith(A, NewArgMD);
     }
   }
+}
+
+// Map LLVM's in-memory AttrKind to the AIR-v1 bitcode attr-kind encoding.
+// The two numbering spaces diverged long ago, and the mid-end optimizer
+// attaches modern attributes (captures, noundef, memory, ...) that Apple's
+// reader rejects as "Unknown attribute kind" — anything outside this
+// whitelist is dropped (attributes are hints; dropping is always sound).
+static std::optional<uint64_t> airEnumAttrKind(Attribute::AttrKind K) {
+  switch (K) {
+  case Attribute::NoAlias:
+    return 9;
+  case Attribute::NoUnwind:
+    return 18;
+  case Attribute::ReadNone:
+    return 20;
+  case Attribute::ReadOnly:
+    return 21;
+  case Attribute::NonNull:
+    return 26;
+  case Attribute::Convergent:
+    return 43;
+  case Attribute::WriteOnly:
+    return 52;
+  case Attribute::WillReturn:
+    return 61;
+  case Attribute::NoFree:
+    return 62;
+  case Attribute::NoSync:
+    return 63;
+  case Attribute::MustProgress:
+    return 70;
+  default:
+    return std::nullopt;
+  }
+}
+
+static std::optional<uint64_t> airIntAttrKind(Attribute::AttrKind K) {
+  switch (K) {
+  case Attribute::Alignment:
+    return 1;
+  case Attribute::Dereferenceable:
+    return 41;
+  case Attribute::DereferenceableOrNull:
+    return 42;
+  default:
+    return std::nullopt;
+  }
+}
+
+// Append the AIR-bitcode encoding of Attr to Grp (no-op for attributes
+// outside the whitelist). Returns true if the attribute was encoded.
+// captures(none) maps back to the legacy valueless nocapture kind.
+static bool encodeAirAttr(const Attribute &Attr,
+                          SmallVectorImpl<uint64_t> *Grp) {
+  if (Attr.isEnumAttribute()) {
+    if (auto BK = airEnumAttrKind(Attr.getKindAsEnum())) {
+      if (Grp) {
+        Grp->push_back(0);
+        Grp->push_back(*BK);
+      }
+      return true;
+    }
+    return false;
+  }
+  if (Attr.isIntAttribute()) {
+    if (Attr.getKindAsEnum() == Attribute::Captures) {
+      if (!capturesNothing(Attr.getCaptureInfo()))
+        return false;
+      if (Grp) {
+        Grp->push_back(0);
+        Grp->push_back(11); // nocapture
+      }
+      return true;
+    }
+    if (auto BK = airIntAttrKind(Attr.getKindAsEnum())) {
+      if (Grp) {
+        Grp->push_back(1);
+        Grp->push_back(*BK);
+        Grp->push_back(Attr.getValueAsInt());
+      }
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+// True if at least one attribute in AS survives the AIR whitelist (string
+// attributes always pass through).
+static bool hasAirAttrs(const AttributeSet &AS) {
+  for (Attribute Attr : AS) {
+    if (Attr.isStringAttribute())
+      return true;
+    if (encodeAirAttr(Attr, nullptr))
+      return true;
+  }
+  return false;
 }
 
 // Forward declarations (defined in separate .cpp files)
@@ -652,8 +1409,18 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
     W.ExitBlock();
 
     // Pre-serialization IR fixups (these helpers refine the PTM in place).
+    expandWideIntegers(M);
+    lowerFreezeInsts(M);
+    canonicalizeNNegZExt(M);
+    scalarizeBoolVectorCasts(M);
+    lowerCmpIntrinsics(M);
+    lowerVectorPointerToInt(M);
+    scalarizeVectorSelects(M);
     removeRedundantBitcasts(M, PTM);
+    normalizeVectorGEPs(M);
     fixGEPTypeMismatches(M, PTM);
+    normalizeByteArrayGEPs(M, PTM);
+    fixPhiIncomingTypes(M, PTM);
     fixMMAPointerSuffixMismatch(M, PTM);
     scalarizeAggregateLoads(M);
     fixAccessTypeMismatch(M, PTM);
@@ -781,12 +1548,12 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
       SmallVector<unsigned, 4> GroupIDs;
       for (unsigned i = 0; i < F.arg_size(); i++) {
         AttributeSet AS = AL.getParamAttrs(i);
-        if (!AS.hasAttributes())
+        if (!AS.hasAttributes() || !hasAirAttrs(AS))
           continue;
         GroupIDs.push_back(getGroupID(i + 1, AS));
       }
       AttributeSet RetAS = AL.getRetAttrs();
-      if (RetAS.hasAttributes())
+      if (RetAS.hasAttributes() && hasAirAttrs(RetAS))
         GroupIDs.push_back(getGroupID(0, RetAS));
       if (GroupIDs.empty())
         continue;
@@ -868,17 +1635,8 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
                   Grp.push_back((unsigned char)C);
                 Grp.push_back(0);
               }
-            } else if (Attr.isEnumAttribute()) {
-              // For the small set we currently emit (NoAlias / NoCapture /
-              // ReadOnly), the LLVM AttrKind enum value matches the bitcode
-              // attr-kind encoding for v1, same assumption the legacy
-              // hardcoded path made.
-              Grp.push_back(0);
-              Grp.push_back((uint64_t)Attr.getKindAsEnum());
-            } else if (Attr.isIntAttribute()) {
-              Grp.push_back(1);
-              Grp.push_back((uint64_t)Attr.getKindAsEnum());
-              Grp.push_back(Attr.getValueAsInt());
+            } else {
+              encodeAirAttr(Attr, &Grp);
             }
           }
         }

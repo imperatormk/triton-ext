@@ -8,9 +8,11 @@ llvm_map_components_to_libnames(_metal_llc_llvm_libs
   Core
   IRReader
   MC
+  ScalarOpts
   Support
   Target
   TargetParser
+  TransformUtils
 )
 
 target_link_libraries(metal-llc PRIVATE LLVMMetalTarget ${_metal_llc_llvm_libs})

@@ -36,7 +36,7 @@ def _native_load_metallib_available():
     return hasattr(torch, "mps") and hasattr(torch.mps, "load_metallib")
 
 
-def _materialize_offline_error(metallib_bytes):
+def _materialize_offline_error(metallib_bytes, name=None):
     """Replay a metallib through the offline Metal toolchain to surface the real
     lowering error behind an opaque in-process PSO failure.
 
@@ -52,6 +52,12 @@ def _materialize_offline_error(metallib_bytes):
     Returns a combined diagnostic str (always including the saved metallib path
     for manual inspection) or None if no tool is available. Best-effort: any
     failure here is swallowed so it never masks the original error.
+
+    The failing metallib is saved to a STABLE, named location when
+    METAL_PSO_FAIL_DIR is set (the test harness points it at the persisted dump
+    base), so the exact failing config survives the run for offline triage even
+    when inductor's per-worker tempdir is reaped. The filename embeds the kernel
+    name; a `.txt` sidecar records the verifier error. Falls back to a tempfile.
     """
     import subprocess as _sp
     import tempfile as _tf
@@ -65,12 +71,26 @@ def _materialize_offline_error(metallib_bytes):
         except (OSError, _sp.SubprocessError, ValueError):
             return None, None
 
-    try:
-        with _tf.NamedTemporaryFile(suffix='.metallib', delete=False) as f:
-            f.write(metallib_bytes)
-            mlib = f.name
-    except (OSError, ValueError):
-        return None
+    mlib = None
+    fail_dir = _os.environ.get('METAL_PSO_FAIL_DIR')
+    if fail_dir:
+        try:
+            import hashlib as _hl
+            _os.makedirs(fail_dir, exist_ok=True)
+            h = _hl.sha1(bytes(metallib_bytes)).hexdigest()[:12]
+            stem = f"{name or 'kernel'}-{h}"
+            mlib = _os.path.join(fail_dir, stem + '.metallib')
+            with open(mlib, 'wb') as f:
+                f.write(metallib_bytes)
+        except (OSError, ValueError):
+            mlib = None
+    if mlib is None:
+        try:
+            with _tf.NamedTemporaryFile(suffix='.metallib', delete=False) as f:
+                f.write(metallib_bytes)
+                mlib = f.name
+        except (OSError, ValueError):
+            return None
 
     parts = [f"(metallib saved for inspection: {mlib})"]
 
@@ -91,7 +111,15 @@ def _materialize_offline_error(metallib_bytes):
 
     if rc is None and rc2 is None:
         return None  # no offline toolchain available
-    return "\n".join(parts)
+    diagnostic = "\n".join(parts)
+    # Persist a sidecar so the failing config is greppable after the run.
+    if fail_dir and mlib and mlib.startswith(fail_dir):
+        try:
+            with open(mlib + '.txt', 'w') as f:
+                f.write(f"kernel: {name}\n{diagnostic}\n")
+        except OSError:
+            pass
+    return diagnostic
 
 
 class _NativeKernel:
@@ -252,7 +280,7 @@ class MPSUtils:
                        'XPC_CONNECTION_INTERRUPTED', 'PSO creation failed',
                        'Unexpected bitcode')
             if any(s in msg for s in _opaque):
-                detail = _materialize_offline_error(bytes(metallib_bytes))
+                detail = _materialize_offline_error(bytes(metallib_bytes), name)
                 if detail:
                     raise RuntimeError(f"{msg}\n\n"
                                        f"offline Metal toolchain diagnostic:\n"

@@ -78,8 +78,16 @@ ModulePass *createMetalDeviceLoadsVolatileLegacyPass();
 /// Initializer for the Metal scalar-store-guard pass.
 void initializeMetalScalarStoreGuardLegacyPass(PassRegistry &);
 
+/// Initializer for the Metal scalarize-shuffle-operands pass.
+void initializeMetalScalarizeShuffleOperandsLegacyPass(PassRegistry &);
+
 /// Pass to guard scalar device stores with a `tid.x == 0` check.
 ModulePass *createMetalScalarStoreGuardLegacyPass();
+
+/// Pass to scalarize vector data-flow feeding `air.simd_shuffle*` operands,
+/// working around an AGX JIT miscompile of cross-lane shuffles whose operand
+/// lives in a vector register.
+ModulePass *createMetalScalarizeShuffleOperandsLegacyPass();
 
 /// Initializer for the Metal threadgroup-global coalesce pass.
 void initializeMetalTGGlobalCoalesceLegacyPass(PassRegistry &);
@@ -142,6 +150,14 @@ void initializeMetalPrepareLegacyPass(PassRegistry &);
 /// Pass to normalize i1 GEPs to i8, lower oversized / undef-bearing ptr phis
 /// to i64, and insert typed-pointer transitions before atomic intrinsics.
 ModulePass *createMetalPrepareLegacyPass();
+
+/// Initializer for the Metal cross-buffer store-separate pass.
+void initializeMetalCrossBufferStoreSeparateLegacyPass(PassRegistry &);
+
+/// Pass to restore O0-style control-flow separation of same-offset
+/// cross-buffer device stores, working around the AGX-1 JIT store-coalescing
+/// miscompile. No-op on single-output kernels. See AGX_BUGS.md (AGX-1).
+ModulePass *createMetalCrossBufferStoreSeparateLegacyPass();
 
 } // namespace llvm
 

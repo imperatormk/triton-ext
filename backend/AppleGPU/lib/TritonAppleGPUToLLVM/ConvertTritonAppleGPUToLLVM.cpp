@@ -2254,6 +2254,13 @@ struct AppleFuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
     auto llvmFuncTy = LLVM::LLVMFunctionType::get(retTy, newArgTypes);
     auto newFuncOp = LLVM::LLVMFuncOp::create(
         rewriter, loc, funcOp.getName(), llvmFuncTy, LLVM::Linkage::External);
+    // Mark the launchable entry: downstream consumers (entry-name detection,
+    // non-kernel inlining/pruning, !air.kernel emission) must not infer
+    // kernel identity from the call graph — the optimizer may inline a
+    // noinline helper's only call site, leaving two uncalled functions.
+    if (isKernel)
+      newFuncOp.setPassthroughAttr(
+          rewriter.getArrayAttr({rewriter.getStringAttr("air-kernel")}));
 
     // Move function body into new func
     rewriter.inlineRegionBefore(funcOp.getBody(), newFuncOp.getBody(),
@@ -4757,6 +4764,36 @@ struct ConvertTritonAppleGPUToLLVMPass
         brOp.setLoopAnnotationAttr(attr);
         brOp->removeDiscardableAttr("llvm.loop_annotation");
       }
+    });
+
+    // Cooperative air.* declarations must reach the LLVM mid-end marked
+    // `convergent` (barriers and event waits also `noduplicate`), or its
+    // CFG transforms may sink/duplicate them into divergent control flow
+    // and desynchronize the threadgroup.
+    mod.walk([](LLVMFuncOp fn) {
+      if (!fn.isExternal())
+        return;
+      StringRef name = fn.getName();
+      if (!name.starts_with("air."))
+        return;
+      bool isBarrierLike =
+          name.contains("barrier") || name.contains("wait_simdgroup");
+      if (!isBarrierLike && !name.contains("simdgroup"))
+        return;
+      SmallVector<Attribute> pass;
+      if (auto existing = fn.getPassthroughAttr())
+        pass.append(existing.begin(), existing.end());
+      auto addAttr = [&](StringRef a) {
+        for (Attribute e : pass)
+          if (auto s = dyn_cast<StringAttr>(e))
+            if (s.getValue() == a)
+              return;
+        pass.push_back(StringAttr::get(fn.getContext(), a));
+      };
+      addAttr("convergent");
+      if (isBarrierLike)
+        addAttr("noduplicate");
+      fn.setPassthroughAttr(ArrayAttr::get(fn.getContext(), pass));
     });
   }
 };

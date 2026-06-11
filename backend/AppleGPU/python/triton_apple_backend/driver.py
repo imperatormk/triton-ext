@@ -280,7 +280,8 @@ class MPSUtils:
                        'XPC_CONNECTION_INTERRUPTED', 'PSO creation failed',
                        'Unexpected bitcode')
             if any(s in msg for s in _opaque):
-                detail = _materialize_offline_error(bytes(metallib_bytes), name)
+                detail = _materialize_offline_error(bytes(metallib_bytes),
+                                                    name)
                 if detail:
                     raise RuntimeError(f"{msg}\n\n"
                                        f"offline Metal toolchain diagnostic:\n"

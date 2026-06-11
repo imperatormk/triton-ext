@@ -3423,19 +3423,22 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         auto loadATileRT = [&](int64_t k, Value tkElemOff) -> Value {
           Value aTilePtr = computeTileDevPtr(
               aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
-              k * warpsM * 8, /*tileCol=*/0, warpRowElem, /*extraCol=*/tkElemOff);
-          return isIntInput ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
-                            : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
-                                            aDevStride, zeroOff, aDevTranspose);
+              k * warpsM * 8, /*tileCol=*/0, warpRowElem,
+              /*extraCol=*/tkElemOff);
+          return isIntInput
+                     ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
+                     : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape, aDevStride,
+                                     zeroOff, aDevTranspose);
         };
         auto loadBTileRT = [&](Value tkElemOff, int64_t j) -> Value {
           Value bTilePtr = computeTileDevPtr(
               bPtrs, bOffsets, bRowStride, bColStride, bBaseRow, bBaseCol,
               /*tileRow=*/0, j * warpsN * 8, /*extraRow=*/tkElemOff,
               warpColElem);
-          return isIntInput ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
-                            : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape,
-                                            bDevStride, zeroOff, bDevTranspose);
+          return isIntInput
+                     ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
+                     : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape, bDevStride,
+                                     zeroOff, bDevTranspose);
         };
 
         if (!doRoll) {
@@ -3489,10 +3492,12 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           }
           for (size_t a = 0; a < hdrArgTys.size(); ++a)
             exitBlock->addArgument(hdrArgTys[a], hdrArgLocs[a]);
-          Block *header = rewriter.createBlock(exitBlock, hdrArgTys, hdrArgLocs);
+          Block *header =
+              rewriter.createBlock(exitBlock, hdrArgTys, hdrArgLocs);
           Block *body = rewriter.createBlock(exitBlock);
 
-          // Entry edge: jump into the header with tk=0 and the C-in accumulators.
+          // Entry edge: jump into the header with tk=0 and the C-in
+          // accumulators.
           rewriter.setInsertionPointToEnd(curBlock);
           SmallVector<Value> entryArgs;
           entryArgs.push_back(
@@ -3528,10 +3533,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             // sub-step K index = (tk + u); element offset = (tk + u) * 8.
             Value subIdx =
                 (u == 0) ? tkIv
-                         : arith::AddIOp::create(
-                               rewriter, loc, tkIv,
-                               arith::ConstantIntOp::create(rewriter, loc, u,
-                                                            32));
+                         : arith::AddIOp::create(rewriter, loc, tkIv,
+                                                 arith::ConstantIntOp::create(
+                                                     rewriter, loc, u, 32));
             Value tkElemOff = arith::MulIOp::create(rewriter, loc, subIdx, c8);
             SmallVector<Value> matA_cur(ownM);
             for (int64_t k = 0; k < ownM; ++k)
@@ -3556,12 +3560,12 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
               backArgs.push_back(acc[k][j]);
           LLVM::BrOp::create(rewriter, loc, backArgs, header);
 
-          // Exit: harvest the final accumulators from the header-forwarded args.
+          // Exit: harvest the final accumulators from the header-forwarded
+          // args.
           rewriter.setInsertionPointToStart(exitBlock);
           for (int64_t k = 0; k < ownM; ++k)
             for (int64_t j = 0; j < ownN; ++j)
-              matC_tiles[k][j] =
-                  exitBlock->getArgument(1 + k * ownN + j);
+              matC_tiles[k][j] = exitBlock->getArgument(1 + k * ownN + j);
         }
       }
     } else if (batchStrips) {

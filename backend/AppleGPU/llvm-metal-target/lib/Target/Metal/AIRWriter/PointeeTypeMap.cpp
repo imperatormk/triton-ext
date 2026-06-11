@@ -57,15 +57,16 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
       if (SI->getPointerOperand() == Ptr)
         return SI->getValueOperand()->getType();
     }
-    // Follow identity pointer bitcasts on DEVICE (addrspace 1) pointers: a device
-    // output buffer's store often sits past a no-op ptr→ptr bitcast the mid-end
-    // leaves between a byte-form GEP and the typed store, so the base would
-    // otherwise infer the [N x i8] GEP source type instead of the stored element
-    // type (div7's i64 outputs). Restricted to addrspace(1): threadgroup
-    // (addrspace 3) smem uses array-typed globals (`[N x float]`) whose GEP chain
-    // must keep its array element type — following identity smem bitcasts there
-    // makes the base infer a scalar pointee that disagrees with the array GEP and
-    // the AIR writer rejects it ("Explicit gep type does not match pointee type").
+    // Follow identity pointer bitcasts on DEVICE (addrspace 1) pointers: a
+    // device output buffer's store often sits past a no-op ptr→ptr bitcast the
+    // mid-end leaves between a byte-form GEP and the typed store, so the base
+    // would otherwise infer the [N x i8] GEP source type instead of the stored
+    // element type (div7's i64 outputs). Restricted to addrspace(1):
+    // threadgroup (addrspace 3) smem uses array-typed globals (`[N x float]`)
+    // whose GEP chain must keep its array element type — following identity
+    // smem bitcasts there makes the base infer a scalar pointee that disagrees
+    // with the array GEP and the AIR writer rejects it ("Explicit gep type does
+    // not match pointee type").
     if (auto *BC = dyn_cast<BitCastInst>(U)) {
       if (BC->getType()->isPointerTy() &&
           BC->getType()->getPointerAddressSpace() == AS::Device)

@@ -378,12 +378,14 @@ class MPSBackend(BaseBackend):
                     _kn = (metadata.get('name') if isinstance(metadata, dict)
                            else getattr(metadata, 'name', None)) or 'kernel'
                     _h = _hl.sha1(_pre.encode()).hexdigest()[:12]
-                    _preopt_path = os.path.join(_preopt_dir, f'{_kn}-{_h}.preopt.ll')
+                    _preopt_path = os.path.join(_preopt_dir,
+                                                f'{_kn}-{_h}.preopt.ll')
                     with open(_preopt_path, 'w') as _f:
                         _f.write(_pre)
                 except Exception:
                     _preopt_path = None
-            llvm.optimize_module(llvm_mod, _opt_level,
+            llvm.optimize_module(llvm_mod,
+                                 _opt_level,
                                  disable_slp_vectorizer=bool(
                                      os.environ.get('METAL_DISABLE_SLP')))
             if _preopt_path:
@@ -432,21 +434,22 @@ class MPSBackend(BaseBackend):
             attr_groups = {
                 m.group(1)
                 for m in re.finditer(
-                    r'^attributes (#\d+) = \{[^}]*"air-kernel"', llvm_ir,
-                    re.M)
+                    r'^attributes (#\d+) = \{[^}]*"air-kernel"', llvm_ir, re.M)
             }
             marked = [
-                n for n in entry_names
-                if any(re.search(
-                    r'^define void @' + re.escape(n) + r'\(.*\) [^\n]*' +
-                    re.escape(g) + r'\b', llvm_ir, re.M) for g in attr_groups)
+                n for n in entry_names if any(
+                    re.search(
+                        r'^define void @' + re.escape(n) + r'\(.*\) [^\n]*' +
+                        re.escape(g) + r'\b', llvm_ir, re.M)
+                    for g in attr_groups)
             ]
             if len(marked) == 1:
                 entry_names = marked
             else:
                 raise RuntimeError(
                     f"expected exactly one uncalled kernel entry among "
-                    f"{defined_names}, found {len(entry_names)}: {entry_names}")
+                    f"{defined_names}, found {len(entry_names)}: {entry_names}"
+                )
         metadata["name"] = entry_names[0]
 
         debug = os.environ.get('TRITON_MPS_DEBUG')

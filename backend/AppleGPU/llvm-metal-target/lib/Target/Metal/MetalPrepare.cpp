@@ -174,15 +174,15 @@ static bool offsetsAreBufferBoundaries(ArrayRef<int64_t> Offsets) {
   // The widest natural threadgroup access is a 16-byte vec4. Any gap wider than
   // that cannot be two adjacent element slots of one buffer, so it marks a real
   // sub-buffer boundary. A run whose every gap is <= 16 bytes is dense unrolled
-  // element addressing of ONE buffer and must NOT be split (else each tail-sized
-  // slice becomes its own global and the threadgroup budget explodes ~30x — see
-  // cummax scan2d: 27 contiguous i64 slots with mixed 4/8/16-byte gaps would
-  // split into 27 globals = 124 KB).
+  // element addressing of ONE buffer and must NOT be split (else each
+  // tail-sized slice becomes its own global and the threadgroup budget explodes
+  // ~30x — see cummax scan2d: 27 contiguous i64 slots with mixed 4/8/16-byte
+  // gaps would split into 27 globals = 124 KB).
   constexpr int64_t kMaxElementStride = 16;
   for (size_t i = 1; i < Offsets.size(); ++i)
     if (Offsets[i] - Offsets[i - 1] > kMaxElementStride)
       return true; // a wide gap => genuine sub-buffer boundary
-  return false; // all gaps small => dense unrolled run of one buffer
+  return false;    // all gaps small => dense unrolled run of one buffer
 }
 
 static void collectTGTypedGlobals(Module &M,
@@ -617,51 +617,51 @@ splitMixedByteGlobals(Module &M,
     };
     std::function<void(Value *, int64_t, bool)> CollectTypes =
         [&](Value *V, int64_t BaseOff, bool UnderDynamic) {
-      for (auto *U : V->users()) {
-        if (auto *SI = dyn_cast<StoreInst>(U)) {
-          if (SI->getPointerOperand() == V) {
-            Type *T = SI->getValueOperand()->getType();
-            if (auto *VT = dyn_cast<FixedVectorType>(T))
-              T = VT->getElementType();
-            if (T->isIntegerTy() || T->isFloatingPointTy()) {
-              AllScalarTypes.insert(T);
-              AllScalarSizes.insert(DL.getTypeAllocSize(T));
-              flagWideBaseAccess(T, BaseOff, UnderDynamic);
+          for (auto *U : V->users()) {
+            if (auto *SI = dyn_cast<StoreInst>(U)) {
+              if (SI->getPointerOperand() == V) {
+                Type *T = SI->getValueOperand()->getType();
+                if (auto *VT = dyn_cast<FixedVectorType>(T))
+                  T = VT->getElementType();
+                if (T->isIntegerTy() || T->isFloatingPointTy()) {
+                  AllScalarTypes.insert(T);
+                  AllScalarSizes.insert(DL.getTypeAllocSize(T));
+                  flagWideBaseAccess(T, BaseOff, UnderDynamic);
+                }
+              }
+            } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+              Type *T = LI->getType();
+              if (auto *VT = dyn_cast<FixedVectorType>(T))
+                T = VT->getElementType();
+              if (T->isIntegerTy() || T->isFloatingPointTy()) {
+                AllScalarTypes.insert(T);
+                AllScalarSizes.insert(DL.getTypeAllocSize(T));
+                flagWideBaseAccess(T, BaseOff, UnderDynamic);
+              }
+            } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+              APInt Off(64, 0);
+              if (GEP->accumulateConstantOffset(DL, Off)) {
+                int64_t ByteOff = Off.getSExtValue();
+                // A constant offset is a partition boundary only when reached
+                // from the arena base by constants alone; chained on a dynamic
+                // base it is plain element addressing (the optimizer's packed
+                // multi-word reads), not a buffer boundary.
+                if (ByteOff != 0 && !UnderDynamic)
+                  ConstOffsets.push_back(ByteOff);
+                CollectTypes(GEP, BaseOff + ByteOff, UnderDynamic);
+              } else {
+                Type *ST = GEP->getSourceElementType();
+                if (BaseOff == 0 &&
+                    (ST->isIntegerTy() || ST->isFloatingPointTy()) &&
+                    DL.getTypeAllocSize(ST) > 1)
+                  WideRuntimeBaseBuffer = true;
+                CollectTypes(GEP, BaseOff, /*UnderDynamic=*/true);
+              }
+            } else if (isa<BitCastInst>(U)) {
+              CollectTypes(U, BaseOff, UnderDynamic);
             }
           }
-        } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-          Type *T = LI->getType();
-          if (auto *VT = dyn_cast<FixedVectorType>(T))
-            T = VT->getElementType();
-          if (T->isIntegerTy() || T->isFloatingPointTy()) {
-            AllScalarTypes.insert(T);
-            AllScalarSizes.insert(DL.getTypeAllocSize(T));
-            flagWideBaseAccess(T, BaseOff, UnderDynamic);
-          }
-        } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-          APInt Off(64, 0);
-          if (GEP->accumulateConstantOffset(DL, Off)) {
-            int64_t ByteOff = Off.getSExtValue();
-            // A constant offset is a partition boundary only when reached
-            // from the arena base by constants alone; chained on a dynamic
-            // base it is plain element addressing (the optimizer's packed
-            // multi-word reads), not a buffer boundary.
-            if (ByteOff != 0 && !UnderDynamic)
-              ConstOffsets.push_back(ByteOff);
-            CollectTypes(GEP, BaseOff + ByteOff, UnderDynamic);
-          } else {
-            Type *ST = GEP->getSourceElementType();
-            if (BaseOff == 0 &&
-                (ST->isIntegerTy() || ST->isFloatingPointTy()) &&
-                DL.getTypeAllocSize(ST) > 1)
-              WideRuntimeBaseBuffer = true;
-            CollectTypes(GEP, BaseOff, /*UnderDynamic=*/true);
-          }
-        } else if (isa<BitCastInst>(U)) {
-          CollectTypes(U, BaseOff, UnderDynamic);
-        }
-      }
-    };
+        };
     CollectTypes(GV, 0, /*UnderDynamic=*/false);
 
     // Split only a genuinely heterogeneous buffer: one that mixes scalar
@@ -1595,10 +1595,9 @@ static bool fixResidualI8GEPs(Module &M) {
       if (auto *PAT = dyn_cast<ArrayType>(ParentElem))
         ParentElem = PAT->getElementType();
       if (ParentElem != ElemTy)
-        Base = CastInst::Create(Instruction::BitCast, Base, Base->getType(),
-                                "", GEP->getIterator());
-      auto *NewGEP = B.CreateInBoundsGEP(ElemTy, Base, ElemIdx,
-                                         GEP->getName());
+        Base = CastInst::Create(Instruction::BitCast, Base, Base->getType(), "",
+                                GEP->getIterator());
+      auto *NewGEP = B.CreateInBoundsGEP(ElemTy, Base, ElemIdx, GEP->getName());
 
       // If the access type's scalar differs from the anchor element type (e.g.
       // <4 x i32> vector access through a float-anchored TG global), rewrite

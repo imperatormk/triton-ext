@@ -336,8 +336,8 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         // desynchronizes every later relative operand ID in the bitstream
         // (reader-side "Invalid record" far from the cause). Fail loud.
         report_fatal_error(Twine("AIRWriter: unhandled instruction '") +
-                           I.getOpcodeName() + "' in function '" +
-                           F.getName() + "'");
+                           I.getOpcodeName() + "' in function '" + F.getName() +
+                           "'");
       }
 
       if (I.hasMetadataOtherThanDebugLoc())

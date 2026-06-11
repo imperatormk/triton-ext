@@ -2259,8 +2259,8 @@ struct AppleFuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
     // kernel identity from the call graph — the optimizer may inline a
     // noinline helper's only call site, leaving two uncalled functions.
     if (isKernel)
-      newFuncOp.setPassthroughAttr(rewriter.getArrayAttr(
-          {rewriter.getStringAttr("air-kernel")}));
+      newFuncOp.setPassthroughAttr(
+          rewriter.getArrayAttr({rewriter.getStringAttr("air-kernel")}));
 
     // Move function body into new func
     rewriter.inlineRegionBefore(funcOp.getBody(), newFuncOp.getBody(),

@@ -131,9 +131,9 @@ int main(int argc, char **argv) {
     return reportError("invalid optimization level -O" + Twine(OptLevel));
 
   TargetOptions Options;
-  std::unique_ptr<TargetMachine> TM(TheTarget->createTargetMachine(
-      TT, /*CPU=*/"", /*Features=*/"", Options, std::nullopt, std::nullopt,
-      OLvl));
+  std::unique_ptr<TargetMachine> TM(
+      TheTarget->createTargetMachine(TT, /*CPU=*/"", /*Features=*/"", Options,
+                                     std::nullopt, std::nullopt, OLvl));
   if (!TM)
     return reportError("createTargetMachine returned null");
 

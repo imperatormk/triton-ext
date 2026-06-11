@@ -242,8 +242,8 @@ static void normalizeVectorGEPs(Module &M) {
       IRBuilder<> B(GEP);
       Value *I0 = B.CreateSExtOrTrunc(GEP->getOperand(1), B.getInt64Ty());
       Value *I1 = B.CreateSExtOrTrunc(GEP->getOperand(2), B.getInt64Ty());
-      Value *Lin = B.CreateAdd(
-          B.CreateMul(I0, B.getInt64(VT->getNumElements())), I1);
+      Value *Lin =
+          B.CreateAdd(B.CreateMul(I0, B.getInt64(VT->getNumElements())), I1);
       auto *NewGEP = cast<GetElementPtrInst>(
           B.CreateGEP(VT->getElementType(), GEP->getPointerOperand(), Lin));
       NewGEP->setIsInBounds(GEP->isInBounds());
@@ -385,12 +385,12 @@ static void normalizeByteArrayGEPs(Module &M, PointeeTypeMap &PTM) {
       for (auto *GEP : ToFix) {
         Type *SrcTy = GEP->getSourceElementType();
         Type *Pointee = effectivePointee(GEP->getPointerOperand());
-        bool PointeeOK =
-            Pointee->isSized() && !Pointee->isAggregateType() &&
-            DL.getTypeAllocSize(Pointee) > 0;
+        bool PointeeOK = Pointee->isSized() && !Pointee->isAggregateType() &&
+                         DL.getTypeAllocSize(Pointee) > 0;
         if (auto *AT = dyn_cast<ArrayType>(SrcTy)) {
           // [N x i8]: same stride as the pointee iff alloc sizes match.
-          if (PointeeOK && DL.getTypeAllocSize(Pointee) == AT->getNumElements()) {
+          if (PointeeOK &&
+              DL.getTypeAllocSize(Pointee) == AT->getNumElements()) {
             GEP->setSourceElementType(Pointee);
             GEP->setResultElementType(Pointee);
             Changed = true;
@@ -404,9 +404,9 @@ static void normalizeByteArrayGEPs(Module &M, PointeeTypeMap &PTM) {
           if (CI && ESz && CI->getSExtValue() % (int64_t)ESz == 0) {
             GEP->setSourceElementType(Pointee);
             GEP->setResultElementType(Pointee);
-            GEP->setOperand(1, ConstantInt::get(CI->getType(),
-                                                CI->getSExtValue() /
-                                                    (int64_t)ESz));
+            GEP->setOperand(1,
+                            ConstantInt::get(CI->getType(), CI->getSExtValue() /
+                                                                (int64_t)ESz));
             Changed = true;
             continue;
           }
@@ -450,8 +450,8 @@ static void lowerCmpIntrinsics(Module &M) {
       Value *Gt = Signed ? B.CreateICmpSGT(A, Bv) : B.CreateICmpUGT(A, Bv);
       Value *Lt = Signed ? B.CreateICmpSLT(A, Bv) : B.CreateICmpULT(A, Bv);
       Type *RetTy = CI->getType();
-      Value *Res = B.CreateSub(B.CreateZExt(Gt, RetTy),
-                               B.CreateZExt(Lt, RetTy));
+      Value *Res =
+          B.CreateSub(B.CreateZExt(Gt, RetTy), B.CreateZExt(Lt, RetTy));
       CI->replaceAllUsesWith(Res);
       CI->eraseFromParent();
     }
@@ -525,8 +525,9 @@ static void lowerVectorPointerToInt(Module &M) {
     for (Instruction *I : PtrVecDefs)
       if (auto *PN = dyn_cast<PHINode>(I)) {
         IRBuilder<> B(PN);
-        auto *NewPN = B.CreatePHI(intVecTy(cast<FixedVectorType>(PN->getType())),
-                                  PN->getNumIncomingValues());
+        auto *NewPN =
+            B.CreatePHI(intVecTy(cast<FixedVectorType>(PN->getType())),
+                        PN->getNumIncomingValues());
         IntOf[PN] = NewPN;
       }
 
@@ -668,9 +669,9 @@ static void expandWideIntegers(Module &M) {
     SmallVector<Instruction *, 8> Wide;
     for (auto &BB : F)
       for (auto &I : BB)
-        if (isWide(I.getType()) ||
-            llvm::any_of(I.operands(),
-                         [&](Value *Op) { return isWide(Op->getType()); }))
+        if (isWide(I.getType()) || llvm::any_of(I.operands(), [&](Value *Op) {
+              return isWide(Op->getType());
+            }))
           Wide.push_back(&I);
     if (Wide.empty())
       continue;
@@ -682,13 +683,12 @@ static void expandWideIntegers(Module &M) {
       Value *LH = B.CreateMul(AL, BH);
       Value *HL = B.CreateMul(AH, BL);
       Value *HH = B.CreateMul(AH, BH);
-      Value *Mid = B.CreateAdd(B.CreateAdd(B.CreateLShr(LL, 32),
-                                           B.CreateAnd(LH, Mask)),
-                               B.CreateAnd(HL, Mask));
-      return B.CreateAdd(
-          B.CreateAdd(HH, B.CreateAdd(B.CreateLShr(LH, 32),
-                                      B.CreateLShr(HL, 32))),
-          B.CreateLShr(Mid, 32));
+      Value *Mid =
+          B.CreateAdd(B.CreateAdd(B.CreateLShr(LL, 32), B.CreateAnd(LH, Mask)),
+                      B.CreateAnd(HL, Mask));
+      return B.CreateAdd(B.CreateAdd(HH, B.CreateAdd(B.CreateLShr(LH, 32),
+                                                     B.CreateLShr(HL, 32))),
+                         B.CreateLShr(Mid, 32));
     };
     for (Instruction *I : Wide) {
       IRBuilder<> B(I);
@@ -715,9 +715,9 @@ static void expandWideIntegers(Module &M) {
         case Instruction::Mul: {
           auto [L2, H2] = limbsOf(BO->getOperand(1));
           Value *Lo = B.CreateMul(L1, L2);
-          Value *Hi = B.CreateAdd(
-              umulh(B, L1, L2),
-              B.CreateAdd(B.CreateMul(L1, H2), B.CreateMul(H1, L2)));
+          Value *Hi =
+              B.CreateAdd(umulh(B, L1, L2), B.CreateAdd(B.CreateMul(L1, H2),
+                                                        B.CreateMul(H1, L2)));
           Limbs[I] = {Lo, Hi};
           break;
         }
@@ -743,9 +743,9 @@ static void expandWideIntegers(Module &M) {
           if (Sh == 0) {
             Limbs[I] = {L1, H1};
           } else if (Sh < 64) {
-            Limbs[I] = {B.CreateOr(B.CreateLShr(L1, Sh),
-                                   B.CreateShl(H1, 64 - Sh)),
-                        B.CreateLShr(H1, Sh)};
+            Limbs[I] = {
+                B.CreateOr(B.CreateLShr(L1, Sh), B.CreateShl(H1, 64 - Sh)),
+                B.CreateLShr(H1, Sh)};
           } else {
             Limbs[I] = {B.CreateLShr(H1, Sh - 64), ConstantInt::get(I64, 0)};
           }
@@ -802,8 +802,8 @@ static void scalarizeBoolVectorCasts(Module &M) {
       auto *DV = cast<FixedVectorType>(BC->getDestTy());
       R = UndefValue::get(DV);
       for (unsigned L = 0; L < DV->getNumElements(); ++L) {
-        Value *Bit = B.CreateTrunc(B.CreateLShr(BC->getOperand(0), L),
-                                   B.getInt1Ty());
+        Value *Bit =
+            B.CreateTrunc(B.CreateLShr(BC->getOperand(0), L), B.getInt1Ty());
         R = B.CreateInsertElement(R, Bit, B.getInt64(L));
       }
     }

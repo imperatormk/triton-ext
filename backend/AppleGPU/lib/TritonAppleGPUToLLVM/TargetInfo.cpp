@@ -182,8 +182,8 @@ static LLVMFuncOp getOrInsertShuffleIntrinsic(RewriterBase &rewriter,
   rewriter.setInsertionPointToStart(mod.getBody());
   auto i16Ty = IntegerType::get(mod.getContext(), 16);
   auto fnTy = LLVMFunctionType::get(valTy, {valTy, i16Ty}, false);
-  auto fn = LLVMFuncOp::create(rewriter, mod.getLoc(), name, fnTy,
-                               Linkage::External);
+  auto fn =
+      LLVMFuncOp::create(rewriter, mod.getLoc(), name, fnTy, Linkage::External);
   // A SIMD shuffle is a cross-lane (convergent) operation: its result depends
   // on which lanes execute it together. Without `convergent`, the LLVM mid-end
   // (notably the SLP vectorizer at O1+) freely reorders/duplicates the calls
@@ -191,10 +191,9 @@ static LLVMFuncOp getOrInsertShuffleIntrinsic(RewriterBase &rewriter,
   // silently corrupts cross-lane reductions. `noduplicate` further forbids
   // cloning the call. This mirrors what Apple's own `metal` frontend emits.
   auto *ctx = mod.getContext();
-  SmallVector<Attribute> pass{StringAttr::get(ctx, "convergent"),
-                              StringAttr::get(ctx, "noduplicate"),
-                              StringAttr::get(ctx, "nounwind"),
-                              StringAttr::get(ctx, "willreturn")};
+  SmallVector<Attribute> pass{
+      StringAttr::get(ctx, "convergent"), StringAttr::get(ctx, "noduplicate"),
+      StringAttr::get(ctx, "nounwind"), StringAttr::get(ctx, "willreturn")};
   fn.setPassthroughAttr(ArrayAttr::get(ctx, pass));
   return fn;
 }

@@ -45,10 +45,8 @@ void emitConstantsBlock(BitstreamWriter &W, ValueEnumerator &E,
       if (auto *CI = dyn_cast<ConstantInt>(C))
         Bits = CI->getValue().getZExtValue();
       else
-        Bits = cast<ConstantFP>(C)
-                   ->getValueAPF()
-                   .bitcastToAPInt()
-                   .getZExtValue();
+        Bits =
+            cast<ConstantFP>(C)->getValueAPF().bitcastToAPInt().getZExtValue();
       for (unsigned I = 0; I < VT->getNumElements(); I++)
         V.push_back(Bits);
       W.EmitRecord(bitc::CST_CODE_DATA, V);

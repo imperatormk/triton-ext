@@ -155,7 +155,8 @@ public:
     // `metal` frontend never feeds vector-extracted values into shuffles. The
     // SLP vectorizer (O1+) creates exactly this pattern in reduce/scan kernels,
     // so scalarize the vector chains entangled with shuffle operands back to
-    // scalars before AIR emission. GEMM's pure load/store vectors are untouched.
+    // scalars before AIR emission. GEMM's pure load/store vectors are
+    // untouched.
     addPass(createMetalScalarizeShuffleOperandsLegacyPass());
     addPass(createMetalInlineNonKernelLegacyPass());
     // Apple GPU has no double type; demote all f64 to f32 before anything

@@ -11,8 +11,8 @@
 //
 //   ^bb1(%iv: i32, %acc: !llvm.struct<(f32 x1024)>):     ; the phi
 //     ... %e = llvm.extractvalue %acc[i] ...             ; 1024 reads
-//     ... %acc.next = llvm.insertvalue ..., i ...        ; 1024 writes (undef base)
-//     llvm.br ^bb1(%iv.next, %acc.next)
+//     ... %acc.next = llvm.insertvalue ..., i ...        ; 1024 writes (undef
+//     base) llvm.br ^bb1(%iv.next, %acc.next)
 //
 // LLVM's interprocedural SCCP (part of optimize_module(O3), the same call the
 // NVIDIA backend makes) NON-TERMINATES on this shape: getStructValueState /
@@ -99,8 +99,7 @@ static void storeFields(OpBuilder &b, Location loc, Value structVal,
   for (int64_t i = 0, n = slots.size(); i < n; ++i) {
     Value v = resolveField(structVal, i);
     if (!v)
-      v = LLVM::ExtractValueOp::create(b, loc, structVal,
-                                       ArrayRef<int64_t>{i});
+      v = LLVM::ExtractValueOp::create(b, loc, structVal, ArrayRef<int64_t>{i});
     LLVM::StoreOp::create(b, loc, v, slots[i]);
   }
 }
@@ -183,8 +182,8 @@ struct DemoteWideAccumulator
     // N scalar slots in the entry block.
     Block &entry = func.getBody().front();
     b.setInsertionPointToStart(&entry);
-    Value one = LLVM::ConstantOp::create(
-        b, loc, b.getI32Type(), b.getI32IntegerAttr(1));
+    Value one = LLVM::ConstantOp::create(b, loc, b.getI32Type(),
+                                         b.getI32IntegerAttr(1));
     auto ptrTy = LLVM::LLVMPointerType::get(func.getContext());
     SmallVector<Value> slots;
     slots.reserve(n);
@@ -223,8 +222,8 @@ struct DemoteWideAccumulator
     for (Operation *u : extractUsers) {
       auto ev = cast<LLVM::ExtractValueOp>(u);
       b.setInsertionPoint(ev);
-      Value ld =
-          LLVM::LoadOp::create(b, ev.getLoc(), elemTy, slots[ev.getPosition()[0]]);
+      Value ld = LLVM::LoadOp::create(b, ev.getLoc(), elemTy,
+                                      slots[ev.getPosition()[0]]);
       ev.getResult().replaceAllUsesWith(ld);
       ev.erase();
     }

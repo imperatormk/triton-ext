@@ -35,6 +35,39 @@ using namespace llvm;
 namespace llvm {
 namespace metal {
 
+// The pointee type the Metal reader will attribute to a pointer value.
+static Type *effectivePointee(Value *Base, const PointeeTypeMap &PTM) {
+  if (auto *G = dyn_cast<GetElementPtrInst>(Base))
+    return G->getResultElementType();
+  return PTM.get(Base);
+}
+
+// Insert an identity bitcast carrying NewPointee in the PTM. See header above.
+static BitCastInst *retypePointerVia(Value *Ptr, Type *NewPointee,
+                                     Instruction *BeforeI,
+                                     PointeeTypeMap &PTM) {
+  auto *BC = cast<BitCastInst>(CastInst::Create(
+      Instruction::BitCast, Ptr, Ptr->getType(), "", BeforeI->getIterator()));
+  PTM.set(BC, NewPointee);
+  return BC;
+}
+
+// Collect every instruction of type `Inst` in the module that satisfies
+// `Pred`, into a worklist. The collect-then-rewrite split is mandatory for the
+// scalarize/lower passes: each rewrites by inserting new instructions and
+// erasing the original, so collecting first keeps the body iterators valid.
+template <typename Inst, typename PredT>
+static SmallVector<Inst *, 8> collectInsts(Module &M, PredT Pred) {
+  SmallVector<Inst *, 8> Out;
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *Cast = dyn_cast<Inst>(&I))
+          if (Pred(Cast))
+            Out.push_back(Cast);
+  return Out;
+}
+
 // Lower all ConstantExpr operands in instructions to real instructions.
 // Metal's GPU JIT doesn't handle constant expression records in bitcode,
 // so they must be materialized as instructions before serialization.
@@ -138,120 +171,10 @@ void lowerConstantExprs(Module &M) {
   }
 }
 
-// Fix GEP source type / pointer pointee mismatches for Metal typed bitcode.
-//
-// Metal v1 typed-pointer bitcode requires the GEP source element type to match
-// the pointer's pointee type. When a GEP uses a different element type than the
-// pointer (e.g., `gep half, float*3 %ptr`), the GPU JIT rejects it.
-//
-// For TG (AS3) pointers where the buffer is float-typed (from MMA merge) but
-// accessed with half/i8 GEPs (from pipelined loads), we insert identity
-// bitcasts before the GEP. The bitcast creates a new pointer value that the
-// PTM can type as half* instead of float*, making the GEP consistent:
-// %bc = bitcast float*3 %ptr to float*3 (identity in opaque-ptr IR)
-// %p = gep half, float*3 %bc, i32 %idx
-// Then PTM sets %bc → half, so typed bitcode sees: gep half, half*3 %bc, idx
-//
-// For device (AS1) pointers with i8 GEPs (from async copy byte offsets),
-// convert to float-stride GEPs since all device pointers are float*.
-static void fixGEPTypeMismatches(Module &M, PointeeTypeMap &PTM) {
-  bool HasMMA = false;
-  for (auto &F : M)
-    if (F.getName().starts_with("air.simdgroup_matrix_8x8_"))
-      HasMMA = true;
-  if (!HasMMA)
-    return;
-
-  auto &Ctx = M.getContext();
-  Type *FloatTy = Type::getFloatTy(Ctx);
-
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-    SmallVector<GetElementPtrInst *, 8> ToFix;
-    for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-          Type *SrcTy = GEP->getSourceElementType();
-          if (SrcTy == FloatTy)
-            continue;
-          if (GEP->getNumIndices() != 1)
-            continue;
-          if (!SrcTy->isIntegerTy() && !SrcTy->isHalfTy() &&
-              !SrcTy->isBFloatTy())
-            continue;
-          unsigned AS = GEP->getPointerAddressSpace();
-          if (AS != metal::AS::Device && AS != metal::AS::Threadgroup)
-            continue;
-          // Don't float-ify a GEP whose pointer is a genuine integer buffer
-          // (e.g. the i32 output of an int8 dot, whose f32 accumulator is
-          // fptosi'd to i32). The collapse-to-float assumption holds only for
-          // buffers fed to float MMA intrinsics; rewriting an i32 buffer's GEP
-          // source to float leaves its pointee i32 → "Explicit gep type does
-          // not match pointee type" → materializeAll failure.
-          if (Type *Pointee = PTM.get(GEP->getPointerOperand()))
-            if (Pointee->isIntegerTy() &&
-                Pointee == GEP->getSourceElementType())
-              continue;
-          ToFix.push_back(GEP);
-        }
-
-    for (auto *GEP : ToFix) {
-      Type *SrcTy = GEP->getSourceElementType();
-      unsigned SrcSize = SrcTy->getPrimitiveSizeInBits();
-      Value *Ptr = GEP->getPointerOperand();
-
-      // Same-size types (e.g., i32 vs float, both 4 bytes):
-      // Just change the GEP source element type to float. The stride is
-      // identical so the pointer arithmetic doesn't change.
-      if (SrcSize == 32) {
-        GEP->setSourceElementType(FloatTy);
-        GEP->setResultElementType(FloatTy);
-        continue;
-      }
-
-      // Different-size types (half=16bit, i8=8bit vs float=32bit):
-      // Insert identity bitcast before GEP to create a new pointer value
-      // with the correct PTM entry. The bitcast is a no-op in opaque-ptr IR
-      // but gives the serializer a different typed pointer for the GEP source.
-      auto *BC = CastInst::Create(Instruction::BitCast, Ptr, Ptr->getType(), "",
-                                  GEP->getIterator());
-      GEP->setOperand(0, BC);
-      PTM.set(BC, SrcTy);
-    }
-  }
-}
-
-// The mid-end's VectorCombine scalarizes wide loads into vector-typed
-// two-index GEPs (`gep <N x T>, p, i, j`). The typed-pointer machinery has
-// no notion of vector pointees and silently mis-addresses them; rewrite to
-// the equivalent element-typed single-index GEP (`gep T, p, i*N+j`).
-static void normalizeVectorGEPs(Module &M) {
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-    SmallVector<GetElementPtrInst *, 8> ToFix;
-    for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
-          if (isa<FixedVectorType>(GEP->getSourceElementType()) &&
-              GEP->getNumIndices() == 2)
-            ToFix.push_back(GEP);
-    for (auto *GEP : ToFix) {
-      auto *VT = cast<FixedVectorType>(GEP->getSourceElementType());
-      IRBuilder<> B(GEP);
-      Value *I0 = B.CreateSExtOrTrunc(GEP->getOperand(1), B.getInt64Ty());
-      Value *I1 = B.CreateSExtOrTrunc(GEP->getOperand(2), B.getInt64Ty());
-      Value *Lin =
-          B.CreateAdd(B.CreateMul(I0, B.getInt64(VT->getNumElements())), I1);
-      auto *NewGEP = cast<GetElementPtrInst>(
-          B.CreateGEP(VT->getElementType(), GEP->getPointerOperand(), Lin));
-      NewGEP->setIsInBounds(GEP->isInBounds());
-      GEP->replaceAllUsesWith(NewGEP);
-      GEP->eraseFromParent();
-    }
-  }
-}
+// (The shapes 1-3 GEP normalizers — formerly normalizeVectorGEPs,
+// fixGEPTypeMismatches, normalizeByteArrayGEPs and their 3-call wrapper — are
+// now folded into the single normalizeGEPs pass below. See its taxonomy
+// comment for the per-shape classifier and rationale.)
 
 // A pointer phi's record carries one pointee type; every incoming value must
 // resolve to it. Globals (typed as their value type) and differently-typed
@@ -322,11 +245,10 @@ static void fixPhiIncomingTypes(Module &M, PointeeTypeMap &PTM) {
             InPointee = PTM.get(In);
           if (InPointee == PhiPointee)
             continue;
-          auto *BC = CastInst::Create(
-              Instruction::BitCast, In, In->getType(), "",
-              PN->getIncomingBlock(J)->getTerminator()->getIterator());
-          PTM.set(BC, PhiPointee);
-          PN->setIncomingValue(J, BC);
+          PN->setIncomingValue(
+              J,
+              retypePointerVia(In, PhiPointee,
+                               PN->getIncomingBlock(J)->getTerminator(), PTM));
         }
         // Pin the phi's own pointee so the record's type index matches the
         // (now-consistent) incomings.
@@ -335,56 +257,185 @@ static void fixPhiIncomingTypes(Module &M, PointeeTypeMap &PTM) {
   }
 }
 
-// Normalize the mid-end optimizer's byte-stride GEPs (`gep [N x i8]`,
-// single index) against the typed pointee the PTM assigned to their base.
-// When the pointee's alloc size equals N the rewrite to `gep <pointee>` is a
-// pure retype (identical stride); otherwise an identity bitcast gives the
-// GEP a base typed to its own source type. Without this the reader rejects
-// the module ("Explicit gep type does not match pointee type of pointer
-// operand"). Unlike fixGEPTypeMismatches this applies to every module, not
-// just MMA users — elementwise kernels hit it too.
-static void normalizeByteArrayGEPs(Module &M, PointeeTypeMap &PTM) {
+// GEP source-element-type normalization (shapes 1-3, single pass).
+//
+// The Metal v1 reader requires a GEP's explicit source element type to equal
+// the typed pointee it attributes to the base pointer; any disagreement is
+// "Explicit gep type does not match pointee type of pointer operand". O3 emits
+// four distinct GEP shapes that violate this. This pass classifies each GEP it
+// walks and dispatches to the matching arm:
+//
+//   1. Vector-pointee GEP    `gep <NxT>, p, i, j`   (VectorCombine wide load)
+//        -> linearize to `gep T, p, i*N+j`. The typed-pointer machinery has no
+//           vector-pointee slot, so the two indices are flattened into one.
+//   2. MMA element-mismatch   `gep half/i8/i32, p`  (device/TG MMA buffers)
+//        -> collapse to float-element (same-size i32/float retype, no stride
+//           change) or, for a smaller source (half/i8), an identity-bitcast
+//           base typed to that source. MMA-modules only; a genuine i32 integer
+//           buffer (PTM pointee == i32 source) is left alone.
+//   3. Byte-stride GEP        `gep [Nxi8]/i8, p`     (non-global folded bytes)
+//        -> rescale to the base's PTM pointee when the stride divides (pure
+//           retype, or constant byte-offset rescale for plain i8), else an
+//           identity-bitcast base typed to the source. Applies to every module,
+//           not just MMA users. Global bases are skipped (shape 4's job).
+//   4. Array-global GEP       `gep elem, @GV, i`     (handled post-constexpr by
+//           normalizeArrayGlobalGEPs, see its call site — it must run after
+//           lowerConstantExprs so materialized constexpr GEPs are covered).
+//
+// Ordering / why this is structured as three sequential phases:
+//   - Phase 1, shape 1 (vector linearization) ERASES the 2-index GEP and emits
+//     a new single-index `gep T` whose source type T (the vector element type)
+//     may itself be half/i8 — i.e. a fresh shape-2/3 candidate. The original
+//     three passes ran sequentially, so the byte/MMA retypers saw shape-1
+//     output. We preserve that by doing all vector linearization first,
+//     module-wide, before the type-mismatch arms run. (A single collect-once
+//     walk would miss these freshly-created GEPs, changing behavior.)
+//   - Phase 2, shape 2 (MMA element-mismatch) is a ONE-SHOT collect+rewrite
+//     (NO fixpoint), exactly as the original fixGEPTypeMismatches: a half/i8
+//     base-bitcast leaves the GEP source type unchanged, so re-running the
+//     shape-2 predicate would re-fire and emit a second redundant bitcast.
+//   - Phase 3, shape 3 (byte-stride) is iterated to a fixpoint, exactly as the
+//     original normalizeByteArrayGEPs: retyping a GEP changes the pointee its
+//     dependent GEPs see, so we re-scan until nothing changes.
+//   - Precedence on overlap: a plain `i8`/half single-index GEP on a device/TG
+//     pointer can match BOTH shape 2 and shape 3. In the original sequence
+//     shape 2 ran first (whole pass) and claimed/rewrote it before shape 3's
+//     pass even started. We preserve that by running phase 2 entirely before
+//     phase 3, and by having classify() return MMATypeMismatch ahead of
+//     ByteArray. Once shape 2 has retyped an i8 GEP's base, shape 3's
+//     `Pointee != SrcTy` test no longer fires on it (Pointee now == i8 source),
+//     matching the original cross-pass interaction. Shape 3 also requires a
+//     non-global base, keeping it disjoint from shape 4.
+//
+// Shape 4 (normalizeArrayGlobalGEPs) is deliberately NOT folded in here: it
+// must run LATER, after lowerConstantExprs materializes constexpr GEPs. It
+// stays a separate call at its current call site.
+static void normalizeGEPs(Module &M, PointeeTypeMap &PTM) {
+  auto &Ctx = M.getContext();
+  Type *FloatTy = Type::getFloatTy(Ctx);
   const DataLayout &DL = M.getDataLayout();
-  // What the reader believes a base points to: for GEP-defined bases the
-  // type is derived structurally from the producing GEP record; everything
-  // else (args, call results) comes from the PTM-driven declarations.
-  auto effectivePointee = [&](Value *Base) -> Type * {
-    if (auto *G = dyn_cast<GetElementPtrInst>(Base))
-      return G->getResultElementType();
-    return PTM.get(Base);
-  };
+
+  bool HasMMA = false;
+  for (auto &F : M)
+    if (F.getName().starts_with("air.simdgroup_matrix_8x8_"))
+      HasMMA = true;
+
+  // --- Phase 1: shape-1 vector-pointee linearization (module-wide first) ---
+  // Must complete before the type-mismatch arms so the half/i8 single-index
+  // GEPs it produces are visible to shapes 2/3 (see ordering note above).
   for (auto &F : M) {
     if (F.isDeclaration())
       continue;
-    // Rewriting a GEP changes the structural pointee its dependent GEPs see,
-    // so iterate to a fixpoint (chains are shallow; converges in 2-3 rounds).
+    SmallVector<GetElementPtrInst *, 8> ToFix;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+          if (isa<FixedVectorType>(GEP->getSourceElementType()) &&
+              GEP->getNumIndices() == 2)
+            ToFix.push_back(GEP);
+    for (auto *GEP : ToFix) {
+      auto *VT = cast<FixedVectorType>(GEP->getSourceElementType());
+      IRBuilder<> B(GEP);
+      Value *I0 = B.CreateSExtOrTrunc(GEP->getOperand(1), B.getInt64Ty());
+      Value *I1 = B.CreateSExtOrTrunc(GEP->getOperand(2), B.getInt64Ty());
+      Value *Lin =
+          B.CreateAdd(B.CreateMul(I0, B.getInt64(VT->getNumElements())), I1);
+      auto *NewGEP = cast<GetElementPtrInst>(
+          B.CreateGEP(VT->getElementType(), GEP->getPointerOperand(), Lin));
+      NewGEP->setIsInBounds(GEP->isInBounds());
+      GEP->replaceAllUsesWith(NewGEP);
+      GEP->eraseFromParent();
+    }
+  }
+
+  // Shape-2 (MMA element-mismatch) predicate. MMA-modules only.
+  auto isMMAMismatch = [&](GetElementPtrInst *GEP) -> bool {
+    if (!HasMMA)
+      return false;
+    Type *SrcTy = GEP->getSourceElementType();
+    if (SrcTy == FloatTy || GEP->getNumIndices() != 1)
+      return false;
+    if (!SrcTy->isIntegerTy() && !SrcTy->isHalfTy() && !SrcTy->isBFloatTy())
+      return false;
+    unsigned AS = GEP->getPointerAddressSpace();
+    if (AS != metal::AS::Device && AS != metal::AS::Threadgroup)
+      return false;
+    // Don't float-ify a genuine integer buffer (e.g. the i32 output of an int8
+    // dot, whose f32 accumulator is fptosi'd to i32). Collapse-to-float holds
+    // only for buffers fed to float MMA intrinsics; rewriting an i32 buffer's
+    // GEP source to float leaves its pointee i32 → "gep type does not match
+    // pointee" → materializeAll failure.
+    if (Type *Pointee = PTM.get(GEP->getPointerOperand()))
+      if (Pointee->isIntegerTy() && Pointee == SrcTy)
+        return false;
+    return true;
+  };
+
+  // Shape-3 (byte-stride GEP on non-global bases) predicate.
+  auto isByteArray = [&](GetElementPtrInst *GEP) -> bool {
+    if (GEP->getNumIndices() != 1)
+      return false;
+    Type *SrcTy = GEP->getSourceElementType();
+    auto *AT = dyn_cast<ArrayType>(SrcTy);
+    bool IsByteArray = AT && AT->getElementType()->isIntegerTy(8);
+    // Two byte-stride forms: `[N x i8]` (index = element count) and plain `i8`
+    // (index = byte offset).
+    if (!IsByteArray && !SrcTy->isIntegerTy(8))
+      return false;
+    // Array globals are normalizeArrayGlobalGEPs' job (shape 4, 2-index form).
+    if (isa<GlobalVariable>(GEP->getPointerOperand()))
+      return false;
+    Type *Pointee = effectivePointee(GEP->getPointerOperand(), PTM);
+    return Pointee && Pointee != SrcTy;
+  };
+
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    // --- Phase 2: shape 2 (MMA element-mismatch) — one-shot, NO fixpoint.
+    // Runs entirely before phase 3 to claim overlapping i8/half device/TG
+    // GEPs first (original pass order). A half/i8 base-bitcast leaves the GEP
+    // source unchanged, so re-running would emit a redundant second bitcast —
+    // hence no fixpoint, exactly as the original fixGEPTypeMismatches.
+    {
+      SmallVector<GetElementPtrInst *, 8> ToFix;
+      for (auto &BB : F)
+        for (auto &I : BB)
+          if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+            if (isMMAMismatch(GEP))
+              ToFix.push_back(GEP);
+      for (auto *GEP : ToFix) {
+        Type *SrcTy = GEP->getSourceElementType();
+        Value *Ptr = GEP->getPointerOperand();
+        // Same-size types (i32 vs float, both 4 bytes): retype the GEP source
+        // to float. Stride is identical so the arithmetic is unchanged.
+        if (SrcTy->getPrimitiveSizeInBits() == 32) {
+          GEP->setSourceElementType(FloatTy);
+          GEP->setResultElementType(FloatTy);
+          continue;
+        }
+        // Different-size (half=16, i8=8 vs float=32): stride differs, so we
+        // can't retype the GEP itself — give it a base typed to its source.
+        GEP->setOperand(0, retypePointerVia(Ptr, SrcTy, GEP, PTM));
+      }
+    }
+
+    // --- Phase 3: shape 3 (byte-stride) — iterated to a fixpoint.
+    // Rewriting a GEP changes the pointee its dependent GEPs see, so re-scan
+    // until nothing changes (chains are shallow; converges in 2-3 rounds).
     bool Changed = true;
     while (Changed) {
       Changed = false;
       SmallVector<GetElementPtrInst *, 8> ToFix;
       for (auto &BB : F)
         for (auto &I : BB)
-          if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-            if (GEP->getNumIndices() != 1)
-              continue;
-            Type *SrcTy = GEP->getSourceElementType();
-            auto *AT = dyn_cast<ArrayType>(SrcTy);
-            bool IsByteArray = AT && AT->getElementType()->isIntegerTy(8);
-            // Two byte-stride forms: `[N x i8]` (index = element count) and
-            // plain `i8` (index = byte offset).
-            if (!IsByteArray && !SrcTy->isIntegerTy(8))
-              continue;
-            // Array globals are normalizeArrayGlobalGEPs' job (2-index form).
-            if (isa<GlobalVariable>(GEP->getPointerOperand()))
-              continue;
-            Type *Pointee = effectivePointee(GEP->getPointerOperand());
-            if (!Pointee || Pointee == SrcTy)
-              continue;
-            ToFix.push_back(GEP);
-          }
+          if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+            if (isByteArray(GEP))
+              ToFix.push_back(GEP);
       for (auto *GEP : ToFix) {
         Type *SrcTy = GEP->getSourceElementType();
-        Type *Pointee = effectivePointee(GEP->getPointerOperand());
+        Type *Pointee = effectivePointee(GEP->getPointerOperand(), PTM);
         bool PointeeOK = Pointee->isSized() && !Pointee->isAggregateType() &&
                          DL.getTypeAllocSize(Pointee) > 0;
         if (auto *AT = dyn_cast<ArrayType>(SrcTy)) {
@@ -411,19 +462,15 @@ static void normalizeByteArrayGEPs(Module &M, PointeeTypeMap &PTM) {
             continue;
           }
         }
-        // Fallback: retype the base to the GEP's own source type.
-        Value *Ptr = GEP->getPointerOperand();
-        auto *BC = CastInst::Create(Instruction::BitCast, Ptr, Ptr->getType(),
-                                    "", GEP->getIterator());
-        GEP->setOperand(0, BC);
-        PTM.set(BC, SrcTy);
+        // Fallback: give the GEP a base typed to its own source type.
+        GEP->setOperand(
+            0, retypePointerVia(GEP->getPointerOperand(), SrcTy, GEP, PTM));
         Changed = true;
       }
     }
   }
 }
 
-// INST_SELECT in the AIR-era encoding requires a scalar i1 condition (the
 // O3 canonicalizes 3-way comparison idioms (e.g. the if/elif/else `-1/0/1`
 // ladder a `tl.map_elementwise` callback expands to) into the `llvm.scmp` /
 // `llvm.ucmp` intrinsics. The Metal AIR backend has no lowering for them, so
@@ -626,17 +673,14 @@ static void lowerVectorPointerToInt(Module &M) {
   }
 }
 
-// VSELECT form is rejected by the GPU JIT, see the SelectInst emission in
-// FunctionWriter). The mid-end vectorizers produce vector-condition selects;
-// scalarize them into per-lane extract/select/insert chains.
+// The vector-condition SELECT form (VSELECT) is rejected by the AGX JIT (see
+// the SelectInst emission in FunctionWriter). The mid-end vectorizers produce
+// vector-condition selects on `where`/`clamp`; scalarize each into a per-lane
+// extract/select/insert chain that re-vectorizes the result.
 static void scalarizeVectorSelects(Module &M) {
-  SmallVector<SelectInst *, 8> Sels;
-  for (auto &F : M)
-    for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *Sel = dyn_cast<SelectInst>(&I))
-          if (Sel->getCondition()->getType()->isVectorTy())
-            Sels.push_back(Sel);
+  auto Sels = collectInsts<SelectInst>(M, [](SelectInst *Sel) {
+    return Sel->getCondition()->getType()->isVectorTy();
+  });
   for (auto *Sel : Sels) {
     IRBuilder<> B(Sel);
     auto *VT = cast<FixedVectorType>(Sel->getType());
@@ -774,19 +818,14 @@ static void expandWideIntegers(Module &M) {
 // optimizer's mask-packing idiom, `bitcast <N x i1> to iN`); expand into
 // per-bit shifts.
 static void scalarizeBoolVectorCasts(Module &M) {
-  SmallVector<BitCastInst *, 8> Casts;
-  for (auto &F : M)
-    for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *BC = dyn_cast<BitCastInst>(&I)) {
-          auto *SV = dyn_cast<FixedVectorType>(BC->getSrcTy());
-          auto *DV = dyn_cast<FixedVectorType>(BC->getDestTy());
-          if ((SV && SV->getElementType()->isIntegerTy(1) &&
-               BC->getDestTy()->isIntegerTy(SV->getNumElements())) ||
-              (DV && DV->getElementType()->isIntegerTy(1) &&
-               BC->getSrcTy()->isIntegerTy(DV->getNumElements())))
-            Casts.push_back(BC);
-        }
+  auto Casts = collectInsts<BitCastInst>(M, [](BitCastInst *BC) {
+    auto *SV = dyn_cast<FixedVectorType>(BC->getSrcTy());
+    auto *DV = dyn_cast<FixedVectorType>(BC->getDestTy());
+    return (SV && SV->getElementType()->isIntegerTy(1) &&
+            BC->getDestTy()->isIntegerTy(SV->getNumElements())) ||
+           (DV && DV->getElementType()->isIntegerTy(1) &&
+            BC->getSrcTy()->isIntegerTy(DV->getNumElements()));
+  });
   for (auto *BC : Casts) {
     IRBuilder<> B(BC);
     Value *R;
@@ -849,144 +888,125 @@ static void lowerFreezeInsts(Module &M) {
   }
 }
 
+// AIR v1 bitcode has no aggregate load: the reader cannot enumerate an
+// `[N x T]`-typed LOAD record. The mid-end produces them when it widens a
+// small fixed-count gather into one load. Expand into per-element
+// GEP+load+insertvalue so every load is scalar/vector-typed.
+static void scalarizeAggregateLoads(Module &M) {
+  // Field-based (not lane-based): decompose along the aggregate's elements, so
+  // every emitted load is scalar/vector-typed. Distinct from the vector
+  // scalarizers above, which decompose along SIMD lanes.
+  auto Aggs = collectInsts<LoadInst>(
+      M, [](LoadInst *LI) { return isa<ArrayType>(LI->getType()); });
+  for (LoadInst *LI : Aggs) {
+    auto *AT = cast<ArrayType>(LI->getType());
+    Type *ElemTy = AT->getElementType();
+    Value *Ptr = LI->getPointerOperand();
+    Value *Agg = UndefValue::get(AT);
+    IRBuilder<> B(LI);
+    for (uint64_t E = 0; E < AT->getNumElements(); ++E) {
+      Value *EP = B.CreateGEP(ElemTy, Ptr, B.getInt64(E));
+      Value *EV = B.CreateLoad(ElemTy, EP);
+      Agg = B.CreateInsertValue(Agg, EV, {unsigned(E)});
+    }
+    LI->replaceAllUsesWith(Agg);
+    LI->eraseFromParent();
+  }
+}
+
+// Make every load/store's recorded pointer pointee equal its access type.
+// The optimizer's folded byte-GEPs and reused buffers leave e.g. a float store
+// through an i8-typed pointer; the reader rejects this with "Explicit
+// load/store type does not match pointee type of pointer operand". Route such
+// accesses through an identity bitcast pinned to the access type.
+static void fixAccessTypeMismatch(Module &M, PointeeTypeMap &PTM) {
+  // The access type a load/store demands of its pointer operand, or null if
+  // this instruction is neither.
+  auto accessTypeOf = [](Instruction *I) -> Type * {
+    if (auto *LI = dyn_cast<LoadInst>(I))
+      return LI->getType();
+    if (auto *SI = dyn_cast<StoreInst>(I))
+      return SI->getValueOperand()->getType();
+    return nullptr;
+  };
+  auto pointerOf = [](Instruction *I) -> Value * {
+    if (auto *LI = dyn_cast<LoadInst>(I))
+      return LI->getPointerOperand();
+    return cast<StoreInst>(I)->getPointerOperand();
+  };
+  auto Fix = collectInsts<Instruction>(M, [&](Instruction *I) {
+    Type *AccessTy = accessTypeOf(I);
+    if (!AccessTy)
+      return false;
+    Value *Ptr = pointerOf(I);
+    if (isa<BitCastInst>(Ptr))
+      return false;
+    // Vector accesses always get the retype (legacy behavior). Scalar
+    // accesses only when the pointer's pointee provably disagrees.
+    if (!AccessTy->isVectorTy()) {
+      // inttoptr-derived pointers get their typed pointer from the shared
+      // per-type default, which other values' inference can claim first —
+      // always retype them to the access type.
+      if (!isa<IntToPtrInst>(Ptr)) {
+        Type *Pointee = effectivePointee(Ptr, PTM);
+        if (!Pointee || Pointee == AccessTy)
+          return false;
+      }
+    }
+    return true;
+  });
+  for (Instruction *I : Fix) {
+    if (auto *LI = dyn_cast<LoadInst>(I))
+      LI->setOperand(
+          0, retypePointerVia(LI->getPointerOperand(), LI->getType(), LI, PTM));
+    else {
+      auto *SI = cast<StoreInst>(I);
+      SI->setOperand(1, retypePointerVia(SI->getPointerOperand(),
+                                         SI->getValueOperand()->getType(), SI,
+                                         PTM));
+    }
+  }
+}
+
 // Give every simdgroup-matrix call a pointer operand whose typed pointee
 // matches the intrinsic's element suffix. A float-typed TG/device pointer
 // passed straight into a p3f16/p1f16 load (or any suffix mismatch) emits an
 // invalid typed record (PSO "Failed to materializeAll"); the identity bitcast
-// plus a PTM entry retypes it, same convention as fixGEPTypeMismatches.
-static void scalarizeAggregateLoads(Module &M) {
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-    SmallVector<LoadInst *, 4> Aggs;
-    for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (isa<ArrayType>(LI->getType()))
-            Aggs.push_back(LI);
-    for (LoadInst *LI : Aggs) {
-      auto *AT = cast<ArrayType>(LI->getType());
-      Type *ElemTy = AT->getElementType();
-      Value *Ptr = LI->getPointerOperand();
-      Value *Agg = UndefValue::get(AT);
-      IRBuilder<> B(LI);
-      for (uint64_t E = 0; E < AT->getNumElements(); ++E) {
-        Value *EP = B.CreateGEP(ElemTy, Ptr, B.getInt64(E));
-        Value *EV = B.CreateLoad(ElemTy, EP);
-        Agg = B.CreateInsertValue(Agg, EV, {unsigned(E)});
-      }
-      LI->replaceAllUsesWith(Agg);
-      LI->eraseFromParent();
-    }
-  }
-}
-
-static void fixAccessTypeMismatch(Module &M, PointeeTypeMap &PTM) {
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-    SmallVector<Instruction *, 8> Fix;
-    for (auto &BB : F)
-      for (auto &I : BB) {
-        Type *AccessTy = nullptr;
-        Value *Ptr = nullptr;
-        if (auto *LI = dyn_cast<LoadInst>(&I)) {
-          AccessTy = LI->getType();
-          Ptr = LI->getPointerOperand();
-        } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
-          AccessTy = SI->getValueOperand()->getType();
-          Ptr = SI->getPointerOperand();
-        }
-        if (!AccessTy || isa<BitCastInst>(Ptr))
-          continue;
-        // Vector accesses always get the retype (legacy behavior). Scalar
-        // accesses only when the pointer's pointee provably disagrees — the
-        // optimizer's folded byte-GEPs leave e.g. a float store through an
-        // i8-typed pointer, which the reader rejects ("Explicit load/store
-        // type does not match pointee type of pointer operand"). For a
-        // GEP-defined pointer the reader derives the pointee structurally
-        // from the GEP record, so compare against the GEP result type, not
-        // the PTM entry (usage inference may already claim the access type).
-        if (!AccessTy->isVectorTy()) {
-          // inttoptr-derived pointers get their typed pointer from the
-          // shared per-type default, which other values' inference can
-          // claim first — always retype them to the access type.
-          if (!isa<IntToPtrInst>(Ptr)) {
-            Type *Pointee = nullptr;
-            if (auto *G = dyn_cast<GetElementPtrInst>(Ptr))
-              Pointee = G->getResultElementType();
-            else
-              Pointee = PTM.get(Ptr);
-            if (!Pointee || Pointee == AccessTy)
-              continue;
-          }
-        }
-        Fix.push_back(&I);
-      }
-    for (Instruction *I : Fix) {
-      Value *Ptr = isa<LoadInst>(I) ? cast<LoadInst>(I)->getPointerOperand()
-                                    : cast<StoreInst>(I)->getPointerOperand();
-      Type *AccessTy = isa<LoadInst>(I)
-                           ? I->getType()
-                           : cast<StoreInst>(I)->getValueOperand()->getType();
-      auto *BC = CastInst::Create(Instruction::BitCast, Ptr, Ptr->getType(), "",
-                                  I->getIterator());
-      if (isa<LoadInst>(I))
-        cast<LoadInst>(I)->setOperand(0, BC);
-      else
-        cast<StoreInst>(I)->setOperand(1, BC);
-      PTM.set(BC, AccessTy);
-    }
-  }
-}
-
+// plus a PTM entry retypes it, same retypePointerVia convention as
+// normalizeGEPs.
 static void fixMMAPointerSuffixMismatch(Module &M, PointeeTypeMap &PTM) {
   auto &Ctx = M.getContext();
-  for (auto &F : M) {
-    if (F.isDeclaration())
+  auto Calls = collectInsts<CallInst>(M, [](CallInst *CI) {
+    return CI->getCalledFunction() &&
+           CI->getCalledFunction()->getName().starts_with(
+               "air.simdgroup_matrix_8x8_");
+  });
+  for (auto *CI : Calls) {
+    StringRef Name = CI->getCalledFunction()->getName();
+    Type *Elem = nullptr;
+    if (Name.contains("f16") && !Name.contains("bf16"))
+      Elem = Type::getHalfTy(Ctx);
+    else if (Name.contains("bf16"))
+      Elem = Type::getBFloatTy(Ctx);
+    else if (Name.contains("f32"))
+      Elem = Type::getFloatTy(Ctx);
+    if (!Elem)
       continue;
-    SmallVector<CallInst *, 8> Calls;
-    for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *CI = dyn_cast<CallInst>(&I))
-          if (CI->getCalledFunction() &&
-              CI->getCalledFunction()->getName().starts_with(
-                  "air.simdgroup_matrix_8x8_"))
-            Calls.push_back(CI);
-    for (auto *CI : Calls) {
-      StringRef Name = CI->getCalledFunction()->getName();
-      Type *Elem = nullptr;
-      if (Name.contains("f16") && !Name.contains("bf16"))
-        Elem = Type::getHalfTy(Ctx);
-      else if (Name.contains("bf16"))
-        Elem = Type::getBFloatTy(Ctx);
-      else if (Name.contains("f32"))
-        Elem = Type::getFloatTy(Ctx);
-      if (!Elem)
+    for (unsigned J = 0; J < CI->arg_size(); J++) {
+      Value *Op = CI->getArgOperand(J);
+      if (!Op->getType()->isPointerTy())
         continue;
-      for (unsigned J = 0; J < CI->arg_size(); J++) {
-        Value *Op = CI->getArgOperand(J);
-        if (!Op->getType()->isPointerTy())
+      if (Elem->isFloatTy() && !isa<Constant>(Op)) {
+        // Float-suffix operands are normally float-typed already; wrap
+        // only when the pointee provably disagrees (the optimizer's
+        // byte-GEP chains leave i8-typed pointers feeding p1f32/p3f32).
+        Type *Pointee = effectivePointee(Op, PTM);
+        if (!Pointee || Pointee == Elem)
           continue;
-        if (Elem->isFloatTy() && !isa<Constant>(Op)) {
-          // Float-suffix operands are normally float-typed already; wrap
-          // only when the pointee provably disagrees (the optimizer's
-          // byte-GEP chains leave i8-typed pointers feeding p1f32/p3f32).
-          Type *Pointee = nullptr;
-          if (auto *G = dyn_cast<GetElementPtrInst>(Op))
-            Pointee = G->getResultElementType();
-          else
-            Pointee = PTM.get(Op);
-          if (!Pointee || Pointee == Elem)
-            continue;
-        }
-        if (isa<BitCastInst>(Op) || isa<AllocaInst>(Op))
-          continue;
-        auto *BC = CastInst::Create(Instruction::BitCast, Op, Op->getType(), "",
-                                    CI->getIterator());
-        CI->setArgOperand(J, BC);
-        PTM.set(BC, Elem);
       }
+      if (isa<BitCastInst>(Op) || isa<AllocaInst>(Op))
+        continue;
+      CI->setArgOperand(J, retypePointerVia(Op, Elem, CI, PTM));
     }
   }
 }
@@ -1288,6 +1308,8 @@ static void removeRedundantBitcasts(Module &M, PointeeTypeMap &PTM) {
   }
 }
 
+// normalizeGEPs shape 4 (array-global element GEP). Runs after
+// lowerConstantExprs (see call site) — keep it out of normalizeGEPs.
 // Normalize single-index element GEPs on array globals into 2-index array
 // GEPs. A global variable's typed-pointer pointee is its array value type
 // (e.g. [2 x i32]); a GEP that indexes it as `gep i32, @GV, %idx` carries an
@@ -1408,7 +1430,21 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
     }
     W.ExitBlock();
 
-    // Pre-serialization IR fixups (these helpers refine the PTM in place).
+    // Pre-serialization IR fixups. These bring the O3-optimized module into
+    // the subset the Metal v1 typed-pointer bitcode + AGX JIT accept, and
+    // refine the PTM (pointer->pointee map) in place. Four stages, ordered:
+    //
+    //   A. Legalize / lower constructs the AGX JIT can't take (wide ints,
+    //      freeze, nneg-zext, bool-vector casts, scmp/ucmp, vector-of-ptr,
+    //      vector-cond selects). These run first because they rewrite the IR
+    //      shape the later type fixups inspect.
+    //   B. Normalize GEP source types (shapes 1-3; see normalizeGEPs).
+    //   C. Make pointer pointees agree across phis / MMA calls / aggregate
+    //      loads / loads+stores (the identity-bitcast type-agreement fixups).
+    //   D. Materialize ConstantExprs, then the post-constexpr GEP shape 4 and
+    //      kernel-arg metadata.
+    //
+    // --- Stage A: legalize / lower ---
     expandWideIntegers(M);
     lowerFreezeInsts(M);
     canonicalizeNNegZExt(M);
@@ -1417,19 +1453,19 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
     lowerVectorPointerToInt(M);
     scalarizeVectorSelects(M);
     removeRedundantBitcasts(M, PTM);
-    normalizeVectorGEPs(M);
-    fixGEPTypeMismatches(M, PTM);
-    normalizeByteArrayGEPs(M, PTM);
+    // --- Stage B: GEP source-type normalization ---
+    // Shapes 1-3 (see normalizeGEPs). Runs after the Stage-A passes that
+    // create new GEPs and before the Stage-C fixups that read GEP result types.
+    normalizeGEPs(M, PTM);
+    // --- Stage C: pointer-pointee type agreement ---
     fixPhiIncomingTypes(M, PTM);
     fixMMAPointerSuffixMismatch(M, PTM);
     scalarizeAggregateLoads(M);
     fixAccessTypeMismatch(M, PTM);
 
+    // --- Stage D: materialize constexprs, then post-constexpr fixups ---
     // Lower ConstantExpr operands to real instructions before enumeration.
     lowerConstantExprs(M);
-
-    // Normalize element-typed GEPs on array globals to 2-index array GEPs so
-    // the GEP source type matches the global's typed-pointer pointee.
     normalizeArrayGlobalGEPs(M);
 
     // Fix kernel argument metadata to match actual pointee types.

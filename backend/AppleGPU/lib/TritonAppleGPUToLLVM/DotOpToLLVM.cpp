@@ -3385,34 +3385,183 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                       ValueRange{matA[k][tk], matB[tk][j], matC_tiles[k][j]})
                       .getResult();
       } else {
-        // Prologue: load this warp's owned A tile-rows for tk=0
-        SmallVector<Value> matA_cur(ownM);
-        for (int64_t k = 0; k < ownM; ++k)
-          matA_cur[k] = loadATile(k, 0);
+        // ── ROLLED K-LOOP (task #86) ──────────────────────────────────────
+        // Emit the K-step accumulation as a REAL LLVM-dialect loop with the
+        // owned simdgroup-matrix accumulators carried as loop block arguments
+        // (phi-style iter_args), instead of straight-line unrolling all tilesK
+        // steps. The fully-unrolled form gave LLVM-O3 N identical copies of the
+        // <64 x float> matrix tiles to scalarize/revectorize (extract-all/
+        // insert-all churn), inflating register pressure so the AGX driver
+        // capped maxThreadsPerThreadgroup (~384 vs ~896). With a real loop the
+        // accumulator is a single persistent phi value O3 cannot amplify.
+        //
+        // A bounded compile-time unroll factor U (METAL_MMA_KUNROLL, default 2)
+        // keeps latency hiding (several independent A/B loads + MMAs in flight
+        // per trip) without the full explosion. The device-direct A/B loads
+        // fold the runtime K offset (tk*8) into the tile pointer, so the loads
+        // ride the runtime induction variable.
+        //
+        // Rolled only when tilesK is a multiple of U and the resulting trip
+        // count is >= 2; otherwise (small/odd K) fall back to the original
+        // straight-line unroll, where rolling buys nothing.
+        int64_t kUnroll = 2;
+        if (const char *e = ::getenv("METAL_MMA_KUNROLL")) {
+          int64_t v = atoll(e);
+          if (v >= 1)
+            kUnroll = v;
+        }
+        // Clamp the unroll factor to a divisor of tilesK so the rolled trip
+        // count is exact (no remainder tail to special-case).
+        while (kUnroll > 1 && (tilesK % kUnroll) != 0)
+          --kUnroll;
+        int64_t tripCount = tilesK / kUnroll;
+        bool doRoll = (tilesK > kUnroll) && (tripCount >= 2);
 
-        for (int64_t tk = 0; tk < tilesK; ++tk) {
-          // Prefetch owned A tile-rows for tk+1
-          SmallVector<Value> matA_next(ownM);
-          if (tk + 1 < tilesK) {
-            for (int64_t k = 0; k < ownM; ++k)
-              matA_next[k] = loadATile(k, tk + 1);
+        // Runtime-K tile loaders: same as loadATile/loadBTile but the K offset
+        // is a runtime Value (tk*8) folded into computeTileDevPtr's free extra
+        // offset (A's column / B's row), so the load follows the loop IV.
+        auto loadATileRT = [&](int64_t k, Value tkElemOff) -> Value {
+          Value aTilePtr = computeTileDevPtr(
+              aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
+              k * warpsM * 8, /*tileCol=*/0, warpRowElem, /*extraCol=*/tkElemOff);
+          return isIntInput ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
+                            : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
+                                            aDevStride, zeroOff, aDevTranspose);
+        };
+        auto loadBTileRT = [&](Value tkElemOff, int64_t j) -> Value {
+          Value bTilePtr = computeTileDevPtr(
+              bPtrs, bOffsets, bRowStride, bColStride, bBaseRow, bBaseCol,
+              /*tileRow=*/0, j * warpsN * 8, /*extraRow=*/tkElemOff,
+              warpColElem);
+          return isIntInput ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
+                            : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape,
+                                            bDevStride, zeroOff, bDevTranspose);
+        };
+
+        if (!doRoll) {
+          // Original straight-line unroll (small/odd K — rolling buys nothing).
+          SmallVector<Value> matA_cur(ownM);
+          for (int64_t k = 0; k < ownM; ++k)
+            matA_cur[k] = loadATile(k, 0);
+
+          for (int64_t tk = 0; tk < tilesK; ++tk) {
+            SmallVector<Value> matA_next(ownM);
+            if (tk + 1 < tilesK) {
+              for (int64_t k = 0; k < ownM; ++k)
+                matA_next[k] = loadATile(k, tk + 1);
+            }
+            for (int64_t j = 0; j < ownN; ++j) {
+              Value matB = loadBTile(tk, j);
+              for (int64_t k = 0; k < ownM; ++k) {
+                matC_tiles[k][j] =
+                    LLVM::CallOp::create(
+                        rewriter, loc, devMmaFn,
+                        ValueRange{matA_cur[k], matB, matC_tiles[k][j]})
+                        .getResult();
+              }
+            }
+            if (tk + 1 < tilesK)
+              matA_cur = matA_next;
           }
+        } else {
+          // Real loop. Carried values: the ownM*ownN accumulator matrices,
+          // flattened row-major as [k*ownN + j]. The induction variable is the
+          // K-step index tk (i32), stepping by kUnroll each trip.
+          int64_t nAcc = ownM * ownN;
+          auto accInit = [&](int64_t k, int64_t j) -> Value {
+            return matC_tiles[k][j];
+          };
 
-          // Load this warp's owned B tile-cols and accumulate
-          for (int64_t j = 0; j < ownN; ++j) {
-            Value matB = loadBTile(tk, j);
+          Block *curBlock = rewriter.getInsertionBlock();
+          Block::iterator curPoint = rewriter.getInsertionPoint();
+          Block *exitBlock = curBlock->splitBlock(curPoint);
 
-            for (int64_t k = 0; k < ownM; ++k) {
-              matC_tiles[k][j] =
-                  LLVM::CallOp::create(
-                      rewriter, loc, devMmaFn,
-                      ValueRange{matA_cur[k], matB, matC_tiles[k][j]})
-                      .getResult();
+          // Header block args: tk (i32) + nAcc accumulators (matTy). The exit
+          // block carries the SAME signature (the cond_br false edge forwards
+          // tk + the final accumulators), so add matching args to it.
+          SmallVector<Type> hdrArgTys;
+          SmallVector<Location> hdrArgLocs;
+          hdrArgTys.push_back(i32Ty);
+          hdrArgLocs.push_back(loc);
+          for (int64_t a = 0; a < nAcc; ++a) {
+            hdrArgTys.push_back(matTy);
+            hdrArgLocs.push_back(loc);
+          }
+          for (size_t a = 0; a < hdrArgTys.size(); ++a)
+            exitBlock->addArgument(hdrArgTys[a], hdrArgLocs[a]);
+          Block *header = rewriter.createBlock(exitBlock, hdrArgTys, hdrArgLocs);
+          Block *body = rewriter.createBlock(exitBlock);
+
+          // Entry edge: jump into the header with tk=0 and the C-in accumulators.
+          rewriter.setInsertionPointToEnd(curBlock);
+          SmallVector<Value> entryArgs;
+          entryArgs.push_back(
+              arith::ConstantIntOp::create(rewriter, loc, 0, 32));
+          for (int64_t k = 0; k < ownM; ++k)
+            for (int64_t j = 0; j < ownN; ++j)
+              entryArgs.push_back(accInit(k, j));
+          LLVM::BrOp::create(rewriter, loc, entryArgs, header);
+
+          // Header: while (tk < tilesK) -> body else -> exit.
+          rewriter.setInsertionPointToEnd(header);
+          Value tkIv = header->getArgument(0);
+          Value tkLimit =
+              arith::ConstantIntOp::create(rewriter, loc, tilesK, 32);
+          Value cond = arith::CmpIOp::create(
+              rewriter, loc, arith::CmpIPredicate::slt, tkIv, tkLimit);
+          SmallVector<Value> exitFwd(header->getArguments().begin(),
+                                     header->getArguments().end());
+          LLVM::CondBrOp::create(rewriter, loc, cond, body, ValueRange{},
+                                 exitBlock, exitFwd);
+
+          // Body: unroll kUnroll sub-steps, threading the accumulators.
+          rewriter.setInsertionPointToEnd(body);
+          Value c8 = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+          // Working copy of the carried accumulators (indexed [k][j]).
+          SmallVector<SmallVector<Value>> acc(ownM);
+          for (int64_t k = 0; k < ownM; ++k) {
+            acc[k].resize(ownN);
+            for (int64_t j = 0; j < ownN; ++j)
+              acc[k][j] = header->getArgument(1 + k * ownN + j);
+          }
+          for (int64_t u = 0; u < kUnroll; ++u) {
+            // sub-step K index = (tk + u); element offset = (tk + u) * 8.
+            Value subIdx =
+                (u == 0) ? tkIv
+                         : arith::AddIOp::create(
+                               rewriter, loc, tkIv,
+                               arith::ConstantIntOp::create(rewriter, loc, u,
+                                                            32));
+            Value tkElemOff = arith::MulIOp::create(rewriter, loc, subIdx, c8);
+            SmallVector<Value> matA_cur(ownM);
+            for (int64_t k = 0; k < ownM; ++k)
+              matA_cur[k] = loadATileRT(k, tkElemOff);
+            for (int64_t j = 0; j < ownN; ++j) {
+              Value matB = loadBTileRT(tkElemOff, j);
+              for (int64_t k = 0; k < ownM; ++k)
+                acc[k][j] = LLVM::CallOp::create(
+                                rewriter, loc, devMmaFn,
+                                ValueRange{matA_cur[k], matB, acc[k][j]})
+                                .getResult();
             }
           }
+          // tk += kUnroll, branch back to header with updated accumulators.
+          Value tkNext = arith::AddIOp::create(
+              rewriter, loc, tkIv,
+              arith::ConstantIntOp::create(rewriter, loc, kUnroll, 32));
+          SmallVector<Value> backArgs;
+          backArgs.push_back(tkNext);
+          for (int64_t k = 0; k < ownM; ++k)
+            for (int64_t j = 0; j < ownN; ++j)
+              backArgs.push_back(acc[k][j]);
+          LLVM::BrOp::create(rewriter, loc, backArgs, header);
 
-          if (tk + 1 < tilesK)
-            matA_cur = matA_next;
+          // Exit: harvest the final accumulators from the header-forwarded args.
+          rewriter.setInsertionPointToStart(exitBlock);
+          for (int64_t k = 0; k < ownM; ++k)
+            for (int64_t j = 0; j < ownN; ++j)
+              matC_tiles[k][j] =
+                  exitBlock->getArgument(1 + k * ownN + j);
         }
       }
     } else if (batchStrips) {

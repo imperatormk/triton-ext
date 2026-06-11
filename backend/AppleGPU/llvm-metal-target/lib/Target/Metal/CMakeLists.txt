@@ -35,6 +35,7 @@ set(METAL_CODEGEN_SOURCES
   MetalAsyncEventToAlloca.cpp
   MetalBFloat16CastDecompose.cpp
   MetalBarrierRename.cpp
+  MetalCrossBufferStoreSeparate.cpp
   MetalDemoteF64.cpp
   MetalDeviceLoadsVolatile.cpp
   MetalInlineNonKernel.cpp
@@ -45,6 +46,7 @@ set(METAL_CODEGEN_SOURCES
   MetalNormalizeAllocas.cpp
   MetalPrepare.cpp
   MetalScalarBufferPacking.cpp
+  MetalScalarizeShuffleOperands.cpp
   MetalScalarStoreGuard.cpp
   MetalSplitI64Shuffle.cpp
   MetalTGBarrierInsert.cpp
@@ -111,6 +113,8 @@ llvm_map_components_to_libnames(_metal_llvm_libs
   CodeGenTypes
   Core
   MC
+  Passes
+  ScalarOpts
   SelectionDAG
   Support
   Target

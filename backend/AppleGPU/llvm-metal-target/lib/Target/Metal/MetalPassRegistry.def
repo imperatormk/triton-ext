@@ -34,6 +34,7 @@ MODULE_PASS("metal-scalar-buffer-packing", MetalScalarBufferPackingPass())
 MODULE_PASS("metal-air-system-values", MetalAIRSystemValuesPass())
 MODULE_PASS("metal-alias-annotate", MetalAliasAnnotatePass())
 MODULE_PASS("metal-prepare", MetalPreparePass())
+MODULE_PASS("metal-cross-buffer-store-separate", MetalCrossBufferStoreSeparatePass())
 MODULE_PASS("metal-embed", MetalEmbedderPass())
 #undef MODULE_PASS
 

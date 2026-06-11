@@ -88,4 +88,28 @@ def WidenPipelinedStaging : Pass<"triton-apple-widen-staging", "mlir::ModuleOp">
   ];
 }
 
+def DemoteWideAccumulator : Pass<"triton-apple-demote-wide-accumulator", "mlir::ModuleOp"> {
+  let summary = "Scalarize a wide loop-carried literal-struct phi to per-element allocas";
+
+  let description = [{
+    A rolled scf.for whose iter_arg is a large per-thread tensor slice lowers to
+    a loop with a single literal-struct block argument (the phi),
+    !llvm.struct<(f32 x N)> for large N, rebuilt every iteration via N
+    insertvalue and read via N extractvalue. LLVM's IPSCCP (part of
+    optimize_module(O3)) non-terminates on such a wide aggregate phi.
+
+    This pass demotes the wide struct phi to N scalar allocas the loop
+    load/modify/stores in place: the field value stored on the latch edge is
+    pulled directly out of the producing insertvalue chain, so no wide aggregate
+    SSA value is ever materialized. mem2reg/SROA then handle the scalar slots
+    trivially and IPSCCP sees N independent scalar lattices instead of one
+    N-field aggregate. Only fires above a field-count threshold, so ordinary
+    small loop-carried tensors are untouched.
+  }];
+
+  let dependentDialects = [
+    "mlir::LLVM::LLVMDialect"
+  ];
+}
+
 #endif // TRITON_APPLE_GPU_TRANSFORMS_PASSES

@@ -12,6 +12,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
@@ -23,6 +24,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
@@ -145,6 +147,42 @@ static void collectTGByteGlobals(Module &M,
     if (AT && AT->getElementType()->isIntegerTy(8))
       Out.push_back(&GV);
   }
+}
+
+// Decide whether a set of constant byte offsets into a threadgroup arena
+// represents genuine *buffer boundaries* (the triton allocator packs a few
+// time-disjoint sub-buffers, each worth splitting into its own typed global)
+// or merely *unrolled element addressing* (the mid-end constant-folds a
+// strided access `base + k*elemSize` into many constant-offset GEPs — these
+// all belong to ONE buffer and must NOT be split, or each tail-sized slice
+// becomes its own global and the threadgroup budget explodes ~30x).
+//
+// The discriminator is structural, not a count threshold: unrolled addressing
+// yields a DENSE run (every adjacent gap is a small element/vector stride, so
+// the slots are physically contiguous in one buffer), whereas true sub-buffer
+// boundaries are SPARSE — time-disjoint reuse buffers have unrelated sizes, so
+// at least one gap is *large* (a jump no single element/vector access could
+// span). The stride need NOT be uniform: a real unrolled run mixes 8-byte
+// scalar, 16-byte vec, and 4-byte sub-element gaps. The signal is the presence
+// of a large gap, not stride irregularity. `Offsets` must be sorted+deduped and
+// exclude 0.
+static bool offsetsAreBufferBoundaries(ArrayRef<int64_t> Offsets) {
+  if (Offsets.empty())
+    return false;
+  if (Offsets.size() == 1)
+    return true; // a single interior boundary is always a real split point
+  // The widest natural threadgroup access is a 16-byte vec4. Any gap wider than
+  // that cannot be two adjacent element slots of one buffer, so it marks a real
+  // sub-buffer boundary. A run whose every gap is <= 16 bytes is dense unrolled
+  // element addressing of ONE buffer and must NOT be split (else each
+  // tail-sized slice becomes its own global and the threadgroup budget explodes
+  // ~30x — see cummax scan2d: 27 contiguous i64 slots with mixed 4/8/16-byte
+  // gaps would split into 27 globals = 124 KB).
+  constexpr int64_t kMaxElementStride = 16;
+  for (size_t i = 1; i < Offsets.size(); ++i)
+    if (Offsets[i] - Offsets[i - 1] > kMaxElementStride)
+      return true; // a wide gap => genuine sub-buffer boundary
+  return false;    // all gaps small => dense unrolled run of one buffer
 }
 
 static void collectTGTypedGlobals(Module &M,
@@ -314,6 +352,79 @@ static bool scalarizeVec1Users(Value *V, Type *I32Ty) {
   return Changed;
 }
 
+// Replace a `load <N x i1>` whose result is only consumed by constant-index
+// `extractelement`s with scalar byte loads + bit extraction. Triton's bool
+// reductions store individual bools into threadgroup memory and reload them as
+// a wide packed-bool vector, then read back a few lanes. The Apple AGX
+// AIR->ISA lowering hits a fatal error ("report_fatal_error", surfaced to the
+// runtime as XPC_ERROR_CONNECTION_INTERRUPTED during PSO creation) on any
+// `<N x i1>` threadgroup load.
+//
+// In LLVM's memory model a vector of i1 is BIT-PACKED (independent of the i1
+// alloc size), so lane K lives in byte K/8 at bit K%8. We load the containing
+// byte and extract the bit; the common case (bools stored one-per-byte and read
+// back at lane multiples of 8) reduces to a plain byte load + low-bit trunc.
+static bool narrowVectorI1Loads(Function &F) {
+  bool Changed = false;
+  SmallVector<LoadInst *, 4> Targets;
+  for (Instruction &I : instructions(F)) {
+    auto *LI = dyn_cast<LoadInst>(&I);
+    if (!LI)
+      continue;
+    auto *VT = dyn_cast<FixedVectorType>(LI->getType());
+    if (!VT || !VT->getElementType()->isIntegerTy(1))
+      continue;
+    // Every use must be a constant-index extractelement.
+    bool OnlyConstExtract = !LI->use_empty();
+    for (User *U : LI->users()) {
+      auto *EE = dyn_cast<ExtractElementInst>(U);
+      if (!EE || !isa<ConstantInt>(EE->getIndexOperand())) {
+        OnlyConstExtract = false;
+        break;
+      }
+    }
+    if (OnlyConstExtract)
+      Targets.push_back(LI);
+  }
+  Type *I8 = Type::getInt8Ty(F.getContext());
+  for (LoadInst *LI : Targets) {
+    Value *Base = LI->getPointerOperand();
+    // One byte load per containing byte (lane/8), reused across lanes.
+    DenseMap<uint64_t, Value *> ByteLoad;
+    for (User *U : llvm::make_early_inc_range(LI->users())) {
+      auto *EE = cast<ExtractElementInst>(U);
+      uint64_t Lane = cast<ConstantInt>(EE->getIndexOperand())->getZExtValue();
+      uint64_t ByteOff = Lane / 8, BitOff = Lane % 8;
+      Value *&Byte = ByteLoad[ByteOff];
+      IRBuilder<> B(LI);
+      if (!Byte) {
+        Value *Ptr = Base;
+        if (ByteOff != 0)
+          Ptr = B.CreateInBoundsGEP(I8, Base,
+                                    B.getInt64(static_cast<int64_t>(ByteOff)));
+        Byte = B.CreateAlignedLoad(I8, Ptr, Align(1), LI->isVolatile());
+      }
+      Value *Bit = Byte;
+      if (BitOff != 0)
+        Bit = B.CreateLShr(Byte, ConstantInt::get(I8, BitOff));
+      Value *AsI1 = B.CreateTrunc(Bit, EE->getType());
+      EE->replaceAllUsesWith(AsI1);
+      EE->eraseFromParent();
+    }
+    LI->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
+static bool narrowVectorI1Loads(Module &M) {
+  bool Changed = false;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      Changed |= narrowVectorI1Loads(F);
+  return Changed;
+}
+
 static bool foldExtractInsert(Function &F) {
   bool Changed = false;
   for (auto &BB : F) {
@@ -475,53 +586,101 @@ splitMixedByteGlobals(Module &M,
     uint64_t TotalBytes = OldAT->getNumElements();
 
     SmallPtrSet<Type *, 4> AllScalarTypes;
+    // Distinct *byte sizes* among the accesses. Same-size scalar types
+    // (e.g. i16 / half / bfloat, or i32 / float) are type-pun views of the same
+    // physical slots — the mid-end freely bitcasts between them — so they must
+    // NOT trigger a type-split: doing so would scatter a store and its matching
+    // load into separate typed globals at different threadgroup addresses,
+    // breaking the buffer's store->load aliasing. A genuine mixed buffer (the
+    // triton allocator packing time-disjoint buffers of different element
+    // widths, e.g. an i64 index next to an f32 value) has >1 distinct size.
+    SmallSet<uint64_t, 4> AllScalarSizes;
     SmallVector<int64_t, 4> ConstOffsets;
     // A wide (>1 byte) element type indexed by a runtime value directly off the
     // arena base (offset 0). The allocator overlaps time-disjoint buffers in
     // one byte arena, so this buffer's dynamic slots may run past an interior
     // constant offset that belongs to a later, time-disjoint reuse buffer.
     bool WideRuntimeBaseBuffer = false;
-    std::function<void(Value *, int64_t)> CollectTypes = [&](Value *V,
-                                                             int64_t BaseOff) {
-      for (auto *U : V->users()) {
-        if (auto *SI = dyn_cast<StoreInst>(U)) {
-          if (SI->getPointerOperand() == V) {
-            Type *T = SI->getValueOperand()->getType();
-            if (T->isIntegerTy() || T->isFloatingPointTy())
-              AllScalarTypes.insert(T);
-          }
-        } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-          Type *T = LI->getType();
-          if (T->isIntegerTy() || T->isFloatingPointTy())
-            AllScalarTypes.insert(T);
-        } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-          APInt Off(64, 0);
-          if (GEP->accumulateConstantOffset(DL, Off)) {
-            int64_t ByteOff = Off.getSExtValue();
-            if (ByteOff != 0)
-              ConstOffsets.push_back(ByteOff);
-            CollectTypes(GEP, BaseOff + ByteOff);
-          } else {
-            Type *ST = GEP->getSourceElementType();
-            if (BaseOff == 0 &&
-                (ST->isIntegerTy() || ST->isFloatingPointTy()) &&
-                DL.getTypeAllocSize(ST) > 1)
-              WideRuntimeBaseBuffer = true;
-            CollectTypes(GEP, BaseOff);
-          }
-        } else if (isa<BitCastInst>(U)) {
-          CollectTypes(U, BaseOff);
-        }
-      }
+    // Helper: a wide (>1 byte) scalar access whose pointer is a dynamic
+    // (runtime-indexed) slot of the offset-0 buffer means that buffer's dynamic
+    // slots can run past an interior constant offset belonging to a later,
+    // time-disjoint reuse buffer. Such a base buffer must be sized to span all
+    // its slots, not truncated at the first split offset. Triton emits these as
+    // byte (i8) GEPs feeding a typed load/store, so the access WIDTH lives on
+    // the memory op, not the GEP source element type.
+    auto flagWideBaseAccess = [&](Type *AccessTy, int64_t BaseOff,
+                                  bool UnderDynamic) {
+      if (BaseOff == 0 && UnderDynamic &&
+          (AccessTy->isIntegerTy() || AccessTy->isFloatingPointTy()) &&
+          DL.getTypeAllocSize(AccessTy) > 1)
+        WideRuntimeBaseBuffer = true;
     };
-    CollectTypes(GV, 0);
+    std::function<void(Value *, int64_t, bool)> CollectTypes =
+        [&](Value *V, int64_t BaseOff, bool UnderDynamic) {
+          for (auto *U : V->users()) {
+            if (auto *SI = dyn_cast<StoreInst>(U)) {
+              if (SI->getPointerOperand() == V) {
+                Type *T = SI->getValueOperand()->getType();
+                if (auto *VT = dyn_cast<FixedVectorType>(T))
+                  T = VT->getElementType();
+                if (T->isIntegerTy() || T->isFloatingPointTy()) {
+                  AllScalarTypes.insert(T);
+                  AllScalarSizes.insert(DL.getTypeAllocSize(T));
+                  flagWideBaseAccess(T, BaseOff, UnderDynamic);
+                }
+              }
+            } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+              Type *T = LI->getType();
+              if (auto *VT = dyn_cast<FixedVectorType>(T))
+                T = VT->getElementType();
+              if (T->isIntegerTy() || T->isFloatingPointTy()) {
+                AllScalarTypes.insert(T);
+                AllScalarSizes.insert(DL.getTypeAllocSize(T));
+                flagWideBaseAccess(T, BaseOff, UnderDynamic);
+              }
+            } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+              APInt Off(64, 0);
+              if (GEP->accumulateConstantOffset(DL, Off)) {
+                int64_t ByteOff = Off.getSExtValue();
+                // A constant offset is a partition boundary only when reached
+                // from the arena base by constants alone; chained on a dynamic
+                // base it is plain element addressing (the optimizer's packed
+                // multi-word reads), not a buffer boundary.
+                if (ByteOff != 0 && !UnderDynamic)
+                  ConstOffsets.push_back(ByteOff);
+                CollectTypes(GEP, BaseOff + ByteOff, UnderDynamic);
+              } else {
+                Type *ST = GEP->getSourceElementType();
+                if (BaseOff == 0 &&
+                    (ST->isIntegerTy() || ST->isFloatingPointTy()) &&
+                    DL.getTypeAllocSize(ST) > 1)
+                  WideRuntimeBaseBuffer = true;
+                CollectTypes(GEP, BaseOff, /*UnderDynamic=*/true);
+              }
+            } else if (isa<BitCastInst>(U)) {
+              CollectTypes(U, BaseOff, UnderDynamic);
+            }
+          }
+        };
+    CollectTypes(GV, 0, /*UnderDynamic=*/false);
 
-    if (AllScalarTypes.size() <= 1 || ConstOffsets.empty())
+    // Split only a genuinely heterogeneous buffer: one that mixes scalar
+    // accesses of *different byte widths*. A buffer touched by several scalar
+    // types that all share one width (i16/half/bfloat, or i32/float) is a
+    // single typed slot under bitcasts and must stay one global.
+    if (AllScalarSizes.size() <= 1 || ConstOffsets.empty())
       continue;
 
     llvm::sort(ConstOffsets);
     ConstOffsets.erase(std::unique(ConstOffsets.begin(), ConstOffsets.end()),
                        ConstOffsets.end());
+
+    // Only split when the constant offsets are genuine sub-buffer boundaries,
+    // not the dense uniformly-strided run the mid-end emits when it unrolls a
+    // strided access (splitting that would allocate a tail-sized global per
+    // element slot — a ~30x threadgroup budget explosion).
+    if (!offsetsAreBufferBoundaries(ConstOffsets))
+      continue;
 
     // Size of the base (offset-0) typed global. Normally it ends at the first
     // constant offset. But when the offset-0 buffer is a wide runtime-indexed
@@ -1043,8 +1202,15 @@ static bool retypeByteGlobals(Module &M) {
     bool HasDynamic = false;
     for (auto *U : GV->users()) {
       auto *GEP = dyn_cast<GetElementPtrInst>(U);
-      if (!GEP)
-        continue;
+      if (!GEP) {
+        // Splitting is only sound when every access provably stays inside
+        // its constant-offset region. A non-GEP user (identity bitcast,
+        // direct access, intrinsic operand) hides an access chain that may
+        // span regions — treat like a dynamic offset and keep the global
+        // whole.
+        HasDynamic = true;
+        break;
+      }
       APInt Off(64, 0);
       if (GEP->accumulateConstantOffset(DL, Off)) {
         int64_t ByteOff = Off.getSExtValue();
@@ -1060,6 +1226,11 @@ static bool retypeByteGlobals(Module &M) {
 
     llvm::sort(Offsets);
     Offsets.erase(std::unique(Offsets.begin(), Offsets.end()), Offsets.end());
+
+    // Same boundary-vs-unrolled-addressing discriminator as the mixed-byte
+    // path above: only split on genuine sub-buffer boundaries.
+    if (!offsetsAreBufferBoundaries(Offsets))
+      continue;
 
     DenseMap<int64_t, GlobalVariable *> SplitMap;
     for (int64_t Off : Offsets) {
@@ -1386,6 +1557,26 @@ static bool fixResidualI8GEPs(Module &M) {
       if (ElemSize == 0 || ElemSize == 1)
         continue;
 
+      // The byte offset must be provably a multiple of the element size;
+      // rescaling truncates otherwise (the optimizer emits sub-element
+      // offsets, e.g. half data staged in a float-typed TG scratch). Leave
+      // unaligned byte GEPs alone — the writer's identity-bitcast retype
+      // keeps their records consistent.
+      {
+        Value *AlignIdx = stripIdentityIntOps(GEP->getOperand(1));
+        bool Aligned = false;
+        if (auto *CI = dyn_cast<ConstantInt>(AlignIdx))
+          Aligned = CI->getZExtValue() % ElemSize == 0;
+        else {
+          unsigned TZ =
+              std::max(minTrailingZeros(AlignIdx),
+                       computeKnownBits(AlignIdx, DL).countMinTrailingZeros());
+          Aligned = (1u << TZ) >= ElemSize;
+        }
+        if (!Aligned)
+          continue;
+      }
+
       IRBuilder<> B(GEP);
       Value *ByteIdx = GEP->getOperand(1);
       Value *ElemIdx;
@@ -1395,8 +1586,18 @@ static bool fixResidualI8GEPs(Module &M) {
       else
         ElemIdx = B.CreateUDiv(ByteIdx,
                                ConstantInt::get(ByteIdx->getType(), ElemSize));
-      auto *NewGEP = B.CreateInBoundsGEP(ElemTy, GEP->getPointerOperand(),
-                                         ElemIdx, GEP->getName());
+      // When the new element type does not match the producing GEP's own
+      // element type (access-driven anchor over an i8 base), retype the base
+      // through an identity bitcast so the writer's usage inference gives it
+      // the anchor type instead of the byte type.
+      Value *Base = GEP->getPointerOperand();
+      Type *ParentElem = SrcGEP->getSourceElementType();
+      if (auto *PAT = dyn_cast<ArrayType>(ParentElem))
+        ParentElem = PAT->getElementType();
+      if (ParentElem != ElemTy)
+        Base = CastInst::Create(Instruction::BitCast, Base, Base->getType(), "",
+                                GEP->getIterator());
+      auto *NewGEP = B.CreateInBoundsGEP(ElemTy, Base, ElemIdx, GEP->getName());
 
       // If the access type's scalar differs from the anchor element type (e.g.
       // <4 x i32> vector access through a float-anchored TG global), rewrite
@@ -2172,6 +2373,7 @@ static bool metalPrepare(Module &M) {
   Changed |= foldConditionalConstants(M);
   Changed |= decomposeStructPhis(M, DecomposedFns);
   Changed |= rewriteTGGlobalGEPs(M);
+  Changed |= narrowVectorI1Loads(M);
   Changed |= normalizeI1Pointers(M);
   Changed |= ptrPhiToI64(M, DecomposedFns);
   Changed |= atomicTypedPointerFixup(M);

@@ -157,10 +157,8 @@ public:
     // so scalarize the vector chains entangled with shuffle operands back to
     // scalars before AIR emission. GEMM's pure load/store vectors are
     // untouched.
-    // EXPERIMENT: #1 ScalarizeShuffleOperands disabled — dispensable on the
-    // MPS custom suite + inductor stress sweep (no regressions). Restore if a
-    // cross-lane reduction/scan kernel miscompiles on AGX.
-    // addPass(createMetalScalarizeShuffleOperandsLegacyPass());
+    // addPass(createMetalScalarizeShuffleOperandsLegacyPass()); // disabled for
+    // now
     addPass(createMetalInlineNonKernelLegacyPass());
     // Apple GPU has no double type; demote all f64 to f32 before anything
     // else touches the IR (and before serialization, which would crash the

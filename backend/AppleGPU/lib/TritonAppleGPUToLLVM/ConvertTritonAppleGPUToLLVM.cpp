@@ -15,6 +15,7 @@
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
@@ -4653,6 +4654,7 @@ struct ConvertTritonAppleGPUToLLVMPass
     patterns.add<AsyncWaitOpAppleConversion>(
         typeConverter, PatternBenefit(patternBenefitDefault + 10));
 
+    mlir::arith::populateCeilFloorDivExpandOpsPatterns(patterns);
     mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
     // Triton elementwise + view patterns override arith scalar patterns
     // for tensor types (higher benefit wins for same op).

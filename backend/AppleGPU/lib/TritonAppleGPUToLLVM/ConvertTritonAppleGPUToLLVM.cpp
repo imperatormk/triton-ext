@@ -4662,6 +4662,9 @@ struct ConvertTritonAppleGPUToLLVMPass
     mlir::triton::populateClampFOpToLLVMPattern(typeConverter, patterns,
                                                 axisInfoAnalysis, targetInfo,
                                                 patternBenefitDefault + 1);
+    mlir::triton::populateMinMaxFOpToLLVMPattern(
+        typeConverter, patterns, axisInfoAnalysis,
+        /*hwNanPropagationSupported=*/true, patternBenefitDefault + 1);
 #define POPULATE_FLOAT_OP(SRC_OP, DST_OP)                                      \
   patterns.add<mlir::triton::gpu::ElementwiseOpConversion<SRC_OP, DST_OP>>(    \
       typeConverter, axisInfoAnalysis, patternBenefitDefault + 1)

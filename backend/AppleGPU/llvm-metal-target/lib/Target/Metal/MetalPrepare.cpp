@@ -306,6 +306,10 @@ static bool insertIdentityBitcastsAtNonByteAccesses(Value *Root) {
 }
 
 static bool scalarizeVec1Users(Value *V, Type *I32Ty) {
+  // EXPERIMENT: #3 Vec1Users scalarization disabled — dispensable on the MPS
+  // custom suite + inductor stress sweep. Apple's frontend never emits <1xT>;
+  // metal-llc lowers it fine. Restore if a <1 x T> access fails to materialize.
+  return false;
   bool Changed = false;
   SmallVector<Instruction *, 8> Vec1Users;
   std::function<void(Value *)> FindVec1 = [&](Value *V) {
@@ -1749,6 +1753,12 @@ static bool fixMismatchedTGGEPs(Module &M) {
 // stores on such mixed-width globals to a sequence of element stores fixes the
 // materialization while leaving the audited same-width vec4/vec2 path intact.
 static bool scalarizeMixedWidthTGVecStores(Module &M) {
+  // EXPERIMENT: #4 MixedWidthTGVecStores scalarization disabled — dispensable
+  // on the MPS custom suite + inductor stress sweep. xcrun metal compiles
+  // mixed-width TG vector stores fine on Metal 4 (the pass's own comment admits
+  // it was a pre-Metal-4 workaround). Restore if materializeAll fails on a
+  // mixed-width threadgroup global.
+  return false;
   bool Changed = false;
   Type *I32 = Type::getInt32Ty(M.getContext());
   const DataLayout &DL = M.getDataLayout();

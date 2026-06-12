@@ -231,8 +231,8 @@ static bool airSystemValues(Module &M) {
         continue;
 
       SmallVector<Metadata *, 16> ParamNodes;
-      unsigned ArgIdx = 0;  // device/constant buffer location-index space
-      unsigned TGIdx = 0;   // threadgroup buffers have their own index space
+      unsigned ArgIdx = 0; // device/constant buffer location-index space
+      unsigned TGIdx = 0;  // threadgroup buffers have their own index space
       auto *FTy = F.getFunctionType();
 
       // Buffer params: device AS=1, constant AS=2, threadgroup AS=3. Apple

@@ -27,6 +27,7 @@
 //   DotOpBlockedConversion  — blocked encoding on C, any rank (batch-aware)
 //   DotOpAppleMmaConversion — AppleMmaEncoding on C, rank-2 only
 
+#include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
 #include "TritonAppleGPUTransforms/Passes.h"
@@ -293,6 +294,22 @@ static LLVMFuncOp getOrInsertIntrinsic(ConversionPatternRewriter &rewriter,
     }
   }
   return fn;
+}
+
+// One zero-filled simdgroup_matrix fragment (<64 x f32>), the identity C-in for
+// an empty accumulator and the per-slot init for the fragment ABI struct.
+static Value getOrInsertSimdgroupInitFilled(ConversionPatternRewriter &rewriter,
+                                            Location loc, ModuleOp mod,
+                                            float fill = 0.0f) {
+  auto *ctx = mod.getContext();
+  auto f32Ty = Float32Type::get(ctx);
+  auto matTy = getSimdgroupMatrixType(ctx);
+  auto initFn = getOrInsertIntrinsic(
+      rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
+      LLVMFunctionType::get(matTy, {f32Ty}, false));
+  Value fz = arith::ConstantOp::create(
+      rewriter, loc, rewriter.getF32FloatAttr(fill));
+  return LLVM::CallOp::create(rewriter, loc, initFn, ValueRange{fz}).getResult();
 }
 
 static LLVM::GlobalOp getOrCreateTGGlobal(ConversionPatternRewriter &rewriter,
@@ -2245,9 +2262,18 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     if (!aSrcEnc || !bSrcEnc)
       return failure();
 
+    // Fragment ABI: C arrived as struct<(<64xf32> x F)> (the dot-chain
+    // accumulator). The F fragment vectors seed matC_tiles directly and the
+    // result packs back into the same struct — no scalar insertelement/
+    // extractelement bridge on the register-resident paths.
+    bool fragC = !elemsC.empty() && isa<VectorType>(elemsC.front().getType());
+    SmallVector<Value> fragCIn;
+    if (fragC)
+      fragCIn = elemsC;
+
     if ((int64_t)elemsA.size() != (int64_t)aOffsets.size() ||
         (int64_t)elemsB.size() != (int64_t)bOffsets.size() ||
-        (int64_t)elemsC.size() != (int64_t)cOffsets.size())
+        (!fragC && (int64_t)elemsC.size() != (int64_t)cOffsets.size()))
       return failure();
 
     // Try to get device pointers for A and B
@@ -3095,6 +3121,17 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // the warp grid (single-warp grids degenerate to the full absolute grid).
     auto laneLocalCIn = [&](int64_t wM, int64_t wN, int64_t owM, int64_t owN) {
       auto matTyL = getSimdgroupMatrixType(ctx);
+      if (fragC) {
+        for (int64_t k = 0; k < owM; ++k)
+          for (int64_t j = 0; j < owN; ++j) {
+            int64_t fi = k * owN + j;
+            matC_tiles[k][j] = (fi < (int64_t)fragCIn.size())
+                                   ? fragCIn[fi]
+                                   : getOrInsertSimdgroupInitFilled(
+                                         rewriter, loc, mod);
+          }
+        return;
+      }
       auto initFnL = getOrInsertIntrinsic(
           rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
           LLVMFunctionType::get(matTyL, {f32Ty}, false));
@@ -3167,6 +3204,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // register bit = col bit0); owned local tile = (rowOff/8 - warpRowOff,
       // colOff/8 - warpColOff) but since cOffsets are warp-relative the local
       // tile is (rowOff/8, colOff/8) folded into ownership below.
+      if (fragC) {
+        laneLocalCIn(cWarpsM, cWarpsN, ownM, ownN);
+      } else {
       auto matTyL = getSimdgroupMatrixType(ctx);
       auto initFnL = getOrInsertIntrinsic(
           rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
@@ -3197,6 +3237,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         matC_tiles[localTm][localTn] = InsertElementOp::create(
             rewriter, loc, matTyL, matC_tiles[localTm][localTn], v, vIdxC);
       }
+      }
     } else {
       // ── LANE-LOCAL C-in (physical AppleMma layout), per-strip path ──────
       // PER-WARP OWNED-COLUMN compute (Part 2): the per-strip path keeps A
@@ -3222,7 +3263,29 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           matC_tiles[tm][j] = zMatP;
       Value c8p = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
       Value absTileRowP = arith::DivUIOp::create(rewriter, loc, cBaseRow, c8p);
-      for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
+      // Fragment C-in: the struct holds this warp's owned tiles (k in [0,ownM),
+      // absolute row absTileRow + k*warpsM). Seed the absolute-indexed
+      // matC_tiles[tm][j] by a runtime row-equality select so each fragment lands
+      // in its true tile-row tm (the non-fragment path seeds per-element below).
+      if (fragC) {
+        for (int64_t k = 0; k < ownM; ++k)
+          for (int64_t j = 0; j < ownN; ++j) {
+            int64_t fi = k * ownN + j;
+            if (fi >= (int64_t)fragCIn.size())
+              continue;
+            Value wantTm = arith::AddIOp::create(
+                rewriter, loc, absTileRowP,
+                arith::ConstantIntOp::create(rewriter, loc, k * cWarpsM, 32));
+            for (int64_t tm = 0; tm < tilesM; ++tm) {
+              Value tmEq = arith::CmpIOp::create(
+                  rewriter, loc, arith::CmpIPredicate::eq, wantTm,
+                  arith::ConstantIntOp::create(rewriter, loc, tm, 32));
+              matC_tiles[tm][j] = LLVM::SelectOp::create(
+                  rewriter, loc, tmEq, fragCIn[fi], matC_tiles[tm][j]);
+            }
+          }
+      }
+      for (size_t idx = 0; !fragC && idx < cOffsets.size(); ++idx) {
         int64_t rowOff = cOffsets[idx][0];
         int64_t colOff = cOffsets[idx][1];
         int64_t localTn = (colOff / 8) / std::max<int64_t>(1, cWarpsN);
@@ -3686,6 +3749,55 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
     // ── Phase 4: Extract C results from MMA tiles ────────────────────
     auto outElemTy = cType.getElementType();
+
+    // Fragment ABI: pack the owned matC_tiles vectors straight back into the
+    // fragment struct (no scalar extractelement bridge), keeping the
+    // accumulator vectorized through the loop carry.
+    if (fragC) {
+      auto outStructTy =
+          cast<LLVMStructType>(getTypeConverter()->convertType(cType));
+      Value result = UndefOp::create(rewriter, loc, outStructTy);
+      int64_t F = (int64_t)outStructTy.getBody().size();
+      // fastPath / batchStrips index matC_tiles warp-locally ([0,ownM)), so the
+      // owned tile (k,j) is matC_tiles[k][j] directly. The per-strip path
+      // instead computes the FULL absolute tile-ROW grid (matC_tiles indexed
+      // [0,tilesM)), with this warp's owned rows selected at runtime by cBaseRow
+      // — mirror the non-fragment per-strip C-out's runtime row-equality select
+      // so warp r packs ITS rows (warpRow + k*warpsM), not absolute rows 0..ownM.
+      bool perStrip = !fastPath && !batchStrips;
+      Value absTileRow;
+      if (perStrip) {
+        Value c8 = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+        absTileRow = arith::DivUIOp::create(rewriter, loc, cBaseRow, c8);
+      }
+      for (int64_t k = 0; k < ownM; ++k)
+        for (int64_t j = 0; j < ownN; ++j) {
+          int64_t fi = k * ownN + j;
+          if (fi >= F)
+            continue;
+          Value frag;
+          if (perStrip) {
+            Value wantTm = arith::AddIOp::create(
+                rewriter, loc, absTileRow,
+                arith::ConstantIntOp::create(rewriter, loc, k * cWarpsM, 32));
+            frag = getOrInsertSimdgroupInitFilled(rewriter, loc, mod);
+            for (int64_t tm = 0; tm < tilesM; ++tm) {
+              Value tmEq = arith::CmpIOp::create(
+                  rewriter, loc, arith::CmpIPredicate::eq, wantTm,
+                  arith::ConstantIntOp::create(rewriter, loc, tm, 32));
+              frag = LLVM::SelectOp::create(rewriter, loc, tmEq,
+                                            matC_tiles[tm][j], frag);
+            }
+          } else {
+            frag = matC_tiles[k][j];
+          }
+          result = InsertValueOp::create(rewriter, loc, outStructTy, result,
+                                         frag, ArrayRef<int64_t>{fi});
+        }
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
     SmallVector<Value> resultElems(elemsC.size());
     for (size_t i = 0; i < elemsC.size(); ++i)
       resultElems[i] = arith::ConstantOp::create(
@@ -3782,6 +3894,49 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
   }
 };
 
+// Fragment ABI: a splat constant feeding the dot-chain (the zero accumulator
+// init) lowers to a struct of F init-filled simdgroup fragments. Matches only
+// when the type converter has chosen the fragment struct for this #mma tensor;
+// otherwise defers to the generic flat constant lowering.
+struct AppleMmaConstantConversion
+    : public ConvertOpToLLVMPattern<arith::ConstantOp> {
+  using ConvertOpToLLVMPattern<arith::ConstantOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto ty = dyn_cast<RankedTensorType>(op.getType());
+    if (!ty)
+      return failure();
+    auto enc = dyn_cast<AppleMmaEncodingAttr>(ty.getEncoding());
+    if (!enc)
+      return failure();
+    auto outTy = getTypeConverter()->convertType(ty);
+    auto structTy = dyn_cast_or_null<LLVMStructType>(outTy);
+    if (!structTy || structTy.getBody().empty() ||
+        !isa<VectorType>(structTy.getBody()[0]))
+      return failure(); // not on the fragment path
+
+    auto splat = dyn_cast<DenseElementsAttr>(op.getValue());
+    if (!splat || !splat.isSplat())
+      return failure();
+    auto fVal = dyn_cast<FloatAttr>(splat.getSplatValue<Attribute>());
+    if (!fVal)
+      return failure();
+
+    auto loc = op.getLoc();
+    auto mod = op->getParentOfType<ModuleOp>();
+    Value frag = getOrInsertSimdgroupInitFilled(
+        rewriter, loc, mod, (float)fVal.getValue().convertToDouble());
+    Value result = UndefOp::create(rewriter, loc, structTy);
+    for (size_t i = 0; i < structTy.getBody().size(); ++i)
+      result = InsertValueOp::create(rewriter, loc, structTy, result, frag,
+                                     ArrayRef<int64_t>{(int64_t)i});
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 } // anonymous namespace
 
 namespace mlir::triton::applegpu {
@@ -3791,6 +3946,8 @@ void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                  PatternBenefit benefit) {
   patterns.add<DotOpBlockedConversion>(typeConverter, benefit);
   patterns.add<DotOpAppleMmaConversion>(typeConverter, benefit);
+  patterns.add<AppleMmaConstantConversion>(
+      typeConverter, benefit.getBenefit() + 100);
 }
 
 } // namespace mlir::triton::applegpu

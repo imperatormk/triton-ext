@@ -307,9 +307,10 @@ static Value getOrInsertSimdgroupInitFilled(ConversionPatternRewriter &rewriter,
   auto initFn = getOrInsertIntrinsic(
       rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
       LLVMFunctionType::get(matTy, {f32Ty}, false));
-  Value fz = arith::ConstantOp::create(
-      rewriter, loc, rewriter.getF32FloatAttr(fill));
-  return LLVM::CallOp::create(rewriter, loc, initFn, ValueRange{fz}).getResult();
+  Value fz =
+      arith::ConstantOp::create(rewriter, loc, rewriter.getF32FloatAttr(fill));
+  return LLVM::CallOp::create(rewriter, loc, initFn, ValueRange{fz})
+      .getResult();
 }
 
 static LLVM::GlobalOp getOrCreateTGGlobal(ConversionPatternRewriter &rewriter,
@@ -3125,10 +3126,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         for (int64_t k = 0; k < owM; ++k)
           for (int64_t j = 0; j < owN; ++j) {
             int64_t fi = k * owN + j;
-            matC_tiles[k][j] = (fi < (int64_t)fragCIn.size())
-                                   ? fragCIn[fi]
-                                   : getOrInsertSimdgroupInitFilled(
-                                         rewriter, loc, mod);
+            matC_tiles[k][j] =
+                (fi < (int64_t)fragCIn.size())
+                    ? fragCIn[fi]
+                    : getOrInsertSimdgroupInitFilled(rewriter, loc, mod);
           }
         return;
       }
@@ -3207,36 +3208,36 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       if (fragC) {
         laneLocalCIn(cWarpsM, cWarpsN, ownM, ownN);
       } else {
-      auto matTyL = getSimdgroupMatrixType(ctx);
-      auto initFnL = getOrInsertIntrinsic(
-          rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
-          LLVMFunctionType::get(matTyL, {f32Ty}, false));
-      Value fzL =
-          arith::ConstantOp::create(rewriter, loc, rewriter.getZeroAttr(f32Ty));
-      Value zMatL =
-          LLVM::CallOp::create(rewriter, loc, initFnL, ValueRange{fzL})
-              .getResult();
-      for (int64_t k = 0; k < ownM; ++k)
-        for (int64_t j = 0; j < ownN; ++j)
-          matC_tiles[k][j] = zMatL;
-      // cOffsets enumerate this lane's owned positions across the full tensor
-      // tile grid; for per-warp ownership the entry's absolute tile maps to a
-      // local owned slot. Single-warp grids (ownM=tilesM) map identically.
-      for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
-        int64_t rowOff = cOffsets[idx][0];
-        int64_t colOff = cOffsets[idx][1];
-        int64_t localTm = (rowOff / 8) / std::max<int64_t>(1, cWarpsM);
-        int64_t localTn = (colOff / 8) / std::max<int64_t>(1, cWarpsN);
-        if (localTm >= ownM || localTn >= ownN)
-          continue;
-        int64_t vecIdx = colOff % 2;
-        Value v = elemsC[idx];
-        if (v.getType() != f32Ty)
-          v = toF32(rewriter, loc, v, f32Ty);
-        Value vIdxC = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
-        matC_tiles[localTm][localTn] = InsertElementOp::create(
-            rewriter, loc, matTyL, matC_tiles[localTm][localTn], v, vIdxC);
-      }
+        auto matTyL = getSimdgroupMatrixType(ctx);
+        auto initFnL = getOrInsertIntrinsic(
+            rewriter, mod, "air.simdgroup_matrix_8x8_init_filled.v64f32.f32",
+            LLVMFunctionType::get(matTyL, {f32Ty}, false));
+        Value fzL = arith::ConstantOp::create(rewriter, loc,
+                                              rewriter.getZeroAttr(f32Ty));
+        Value zMatL =
+            LLVM::CallOp::create(rewriter, loc, initFnL, ValueRange{fzL})
+                .getResult();
+        for (int64_t k = 0; k < ownM; ++k)
+          for (int64_t j = 0; j < ownN; ++j)
+            matC_tiles[k][j] = zMatL;
+        // cOffsets enumerate this lane's owned positions across the full tensor
+        // tile grid; for per-warp ownership the entry's absolute tile maps to a
+        // local owned slot. Single-warp grids (ownM=tilesM) map identically.
+        for (size_t idx = 0; idx < cOffsets.size(); ++idx) {
+          int64_t rowOff = cOffsets[idx][0];
+          int64_t colOff = cOffsets[idx][1];
+          int64_t localTm = (rowOff / 8) / std::max<int64_t>(1, cWarpsM);
+          int64_t localTn = (colOff / 8) / std::max<int64_t>(1, cWarpsN);
+          if (localTm >= ownM || localTn >= ownN)
+            continue;
+          int64_t vecIdx = colOff % 2;
+          Value v = elemsC[idx];
+          if (v.getType() != f32Ty)
+            v = toF32(rewriter, loc, v, f32Ty);
+          Value vIdxC = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+          matC_tiles[localTm][localTn] = InsertElementOp::create(
+              rewriter, loc, matTyL, matC_tiles[localTm][localTn], v, vIdxC);
+        }
       }
     } else {
       // ── LANE-LOCAL C-in (physical AppleMma layout), per-strip path ──────
@@ -3265,8 +3266,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       Value absTileRowP = arith::DivUIOp::create(rewriter, loc, cBaseRow, c8p);
       // Fragment C-in: the struct holds this warp's owned tiles (k in [0,ownM),
       // absolute row absTileRow + k*warpsM). Seed the absolute-indexed
-      // matC_tiles[tm][j] by a runtime row-equality select so each fragment lands
-      // in its true tile-row tm (the non-fragment path seeds per-element below).
+      // matC_tiles[tm][j] by a runtime row-equality select so each fragment
+      // lands in its true tile-row tm (the non-fragment path seeds per-element
+      // below).
       if (fragC) {
         for (int64_t k = 0; k < ownM; ++k)
           for (int64_t j = 0; j < ownN; ++j) {
@@ -3761,9 +3763,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // fastPath / batchStrips index matC_tiles warp-locally ([0,ownM)), so the
       // owned tile (k,j) is matC_tiles[k][j] directly. The per-strip path
       // instead computes the FULL absolute tile-ROW grid (matC_tiles indexed
-      // [0,tilesM)), with this warp's owned rows selected at runtime by cBaseRow
-      // — mirror the non-fragment per-strip C-out's runtime row-equality select
-      // so warp r packs ITS rows (warpRow + k*warpsM), not absolute rows 0..ownM.
+      // [0,tilesM)), with this warp's owned rows selected at runtime by
+      // cBaseRow — mirror the non-fragment per-strip C-out's runtime
+      // row-equality select so warp r packs ITS rows (warpRow + k*warpsM), not
+      // absolute rows 0..ownM.
       bool perStrip = !fastPath && !batchStrips;
       Value absTileRow;
       if (perStrip) {
@@ -3946,8 +3949,8 @@ void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                  PatternBenefit benefit) {
   patterns.add<DotOpBlockedConversion>(typeConverter, benefit);
   patterns.add<DotOpAppleMmaConversion>(typeConverter, benefit);
-  patterns.add<AppleMmaConstantConversion>(
-      typeConverter, benefit.getBenefit() + 100);
+  patterns.add<AppleMmaConstantConversion>(typeConverter,
+                                           benefit.getBenefit() + 100);
 }
 
 } // namespace mlir::triton::applegpu

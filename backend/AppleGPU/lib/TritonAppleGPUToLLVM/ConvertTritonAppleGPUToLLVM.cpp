@@ -63,9 +63,10 @@ static bool isAppleMmaTensor(Type t) {
 
 // Fragment-ABI candidate predicate for the kkt elementwise/mask chain. SEPARATE
 // from isAppleMmaTensor (which is load-bearing on the f32 GATE-A/B dot path):
-// admits the f32 accumulator AND the rank-2 i32/i1 #mma temporaries that the kkt
-// op-web builds (cmpi index compares, andi/select masks) so they can ride the
-// same per-lane simdgroup slot map. bf16/i64 #mma and slice<#mma> stay flat.
+// admits the f32 accumulator AND the rank-2 i32/i1 #mma temporaries that the
+// kkt op-web builds (cmpi index compares, andi/select masks) so they can ride
+// the same per-lane simdgroup slot map. bf16/i64 #mma and slice<#mma> stay
+// flat.
 static bool isFragmentCandidateTensor(Type t) {
   auto rt = dyn_cast<RankedTensorType>(t);
   if (!rt || !isa<AppleMmaEncodingAttr>(rt.getEncoding()) || rt.getRank() != 2)
@@ -124,8 +125,7 @@ static llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
     }
     if (isa<triton::BroadcastOp>(user)) {
       auto resTy = dyn_cast<RankedTensorType>(user->getResult(0).getType());
-      auto srcTy =
-          dyn_cast<RankedTensorType>(user->getOperand(0).getType());
+      auto srcTy = dyn_cast<RankedTensorType>(user->getOperand(0).getType());
       return resTy && srcTy && isFragmentCandidateTensor(resTy) &&
              isFragmentCandidateTensor(srcTy);
     }
@@ -364,8 +364,8 @@ struct ConvertLayoutOpAppleConversion
 
     // #mma (fragment) -> W-blocked store epilogue: when StoreShuffleLayout has
     // re-laid the store into the within-simdgroup "W" layout, the convert moves
-    // every C element to a lane in the SAME simdgroup it already occupies, so it
-    // needs no shared memory. Lower it as a register-only air.simd_shuffle
+    // every C element to a lane in the SAME simdgroup it already occupies, so
+    // it needs no shared memory. Lower it as a register-only air.simd_shuffle
     // restripe (oracle-validated in tools/fragment-oracle) instead of the TG
     // scatter/gather below. On any unexpected shape we fall through to the
     // (always-correct) TG path.
@@ -664,9 +664,8 @@ struct ConvertLayoutOpAppleConversion
     Value src = adaptor.getSrc();
     SmallVector<Value> srcElems;
     auto sStructTy = dyn_cast<LLVMStructType>(src.getType());
-    bool srcFragment =
-        srcMmaEnc && sStructTy && !sStructTy.getBody().empty() &&
-        isa<VectorType>(sStructTy.getBody()[0]);
+    bool srcFragment = srcMmaEnc && sStructTy && !sStructTy.getBody().empty() &&
+                       isa<VectorType>(sStructTy.getBody()[0]);
     if (srcFragment) {
       // #mma fragment struct → per-element scalars via the (fragIdx, vecIdx)
       // slot map, so the downstream TG-scatter epilogue sees flat scalars.
@@ -674,17 +673,17 @@ struct ConvertLayoutOpAppleConversion
       auto f32Ty = Float32Type::get(ctx);
       SmallVector<Value> frags;
       for (unsigned i = 0; i < sStructTy.getBody().size(); ++i)
-        frags.push_back(
-            ExtractValueOp::create(rewriter, loc, sStructTy.getBody()[i], src,
-                                   ArrayRef<int64_t>{(int64_t)i}));
+        frags.push_back(ExtractValueOp::create(rewriter, loc,
+                                               sStructTy.getBody()[i], src,
+                                               ArrayRef<int64_t>{(int64_t)i}));
       srcElems.resize(srcCoords.size());
       for (size_t i = 0; i < srcCoords.size(); ++i) {
         int64_t fragIdx, vecIdx;
         applegpu::appleMmaFragmentSlot(srcCoords[i].first, srcCoords[i].second,
                                        info, fragIdx, vecIdx);
-        Value frag = (fragIdx < (int64_t)frags.size())
-                         ? frags[fragIdx]
-                         : frags.empty() ? Value() : frags[0];
+        Value frag = (fragIdx < (int64_t)frags.size()) ? frags[fragIdx]
+                     : frags.empty()                   ? Value()
+                                                       : frags[0];
         Value vIdx = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
         srcElems[i] =
             LLVM::ExtractElementOp::create(rewriter, loc, f32Ty, frag, vIdx);
@@ -992,8 +991,7 @@ struct ConvertLayoutOpAppleConversion
           rewriter, loc, v,
           arith::ConstantIntOp::create(rewriter, loc, shift, 32));
       return arith::AndIOp::create(
-          rewriter, loc, s,
-          arith::ConstantIntOp::create(rewriter, loc, 1, 32));
+          rewriter, loc, s, arith::ConstantIntOp::create(rewriter, loc, 1, 32));
     };
     auto shl = [&](Value v, int64_t shift) -> Value {
       return arith::ShLIOp::create(
@@ -1020,15 +1018,13 @@ struct ConvertLayoutOpAppleConversion
           arith::ConstantIntOp::create(rewriter, loc, 7, 32));
       Value srcLane = arith::OrIOp::create(
           rewriter, loc,
-          arith::OrIOp::create(
-              rewriter, loc,
-              arith::OrIOp::create(rewriter, loc, bit(tCol, 1),
-                                   shl(bit(tRow, 0), 1)),
-              shl(bit(tRow, 1), 2)),
+          arith::OrIOp::create(rewriter, loc,
+                               arith::OrIOp::create(rewriter, loc, bit(tCol, 1),
+                                                    shl(bit(tRow, 0), 1)),
+                               shl(bit(tRow, 1), 2)),
           arith::OrIOp::create(rewriter, loc, shl(bit(tCol, 2), 3),
                                shl(bit(tRow, 2), 4)));
-      Value srcLane16 =
-          arith::TruncIOp::create(rewriter, loc, i16Ty, srcLane);
+      Value srcLane16 = arith::TruncIOp::create(rewriter, loc, i16Ty, srcLane);
 
       // Which fragment register holds (absRow,absCol). fragIdx is constant per
       // owned tile; for the W store one frag per 8x8 tile, vecIdx = col parity.
@@ -2956,10 +2952,10 @@ struct AppleMmaFragmentBinaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
       return failure();
     Value result = LLVM::UndefOp::create(rewriter, loc, sTy);
     for (size_t i = 0; i < sTy.getBody().size(); ++i) {
-      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
-                                             lhs, ArrayRef<int64_t>{(int64_t)i});
-      Value b = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
-                                             rhs, ArrayRef<int64_t>{(int64_t)i});
+      Value a = LLVM::ExtractValueOp::create(
+          rewriter, loc, sTy.getBody()[i], lhs, ArrayRef<int64_t>{(int64_t)i});
+      Value b = LLVM::ExtractValueOp::create(
+          rewriter, loc, sTy.getBody()[i], rhs, ArrayRef<int64_t>{(int64_t)i});
       Value v = LLVMOp::create(rewriter, loc, a, b);
       result = LLVM::InsertValueOp::create(rewriter, loc, sTy, result, v,
                                            ArrayRef<int64_t>{(int64_t)i});
@@ -2991,8 +2987,8 @@ struct AppleMmaFragmentUnaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
       return failure();
     Value result = LLVM::UndefOp::create(rewriter, loc, sTy);
     for (size_t i = 0; i < sTy.getBody().size(); ++i) {
-      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i], in,
-                                             ArrayRef<int64_t>{(int64_t)i});
+      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
+                                             in, ArrayRef<int64_t>{(int64_t)i});
       Value v = LLVMOp::create(rewriter, loc, a);
       result = LLVM::InsertValueOp::create(rewriter, loc, sTy, result, v,
                                            ArrayRef<int64_t>{(int64_t)i});
@@ -3031,19 +3027,17 @@ static Value emitFragShuffle(ConversionPatternRewriter &rewriter, Location loc,
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPointToStart(mod.getBody());
     auto fnTy = LLVMFunctionType::get(ty, {ty, i16Ty}, false);
-    auto fn =
-        LLVMFuncOp::create(rewriter, mod.getLoc(), name, fnTy, Linkage::External);
-    SmallVector<Attribute> pass{StringAttr::get(ctx, "convergent"),
-                                StringAttr::get(ctx, "noduplicate"),
-                                StringAttr::get(ctx, "nounwind"),
-                                StringAttr::get(ctx, "willreturn")};
+    auto fn = LLVMFuncOp::create(rewriter, mod.getLoc(), name, fnTy,
+                                 Linkage::External);
+    SmallVector<Attribute> pass{
+        StringAttr::get(ctx, "convergent"), StringAttr::get(ctx, "noduplicate"),
+        StringAttr::get(ctx, "nounwind"), StringAttr::get(ctx, "willreturn")};
     fn.setPassthroughAttr(ArrayAttr::get(ctx, pass));
     return fn;
   };
   if (vt.isF32()) {
     auto fn = declare("air.simd_shuffle.f32", vt);
-    return LLVM::CallOp::create(rewriter, loc, fn,
-                                ValueRange{val, srcLaneI16})
+    return LLVM::CallOp::create(rewriter, loc, fn, ValueRange{val, srcLaneI16})
         .getResult();
   }
   auto i32Ty = IntegerType::get(ctx, 32);
@@ -3054,9 +3048,9 @@ static Value emitFragShuffle(ConversionPatternRewriter &rewriter, Location loc,
   else if (!vt.isInteger(32))
     asI32 = LLVM::ZExtOp::create(rewriter, loc, i32Ty, val);
   auto fn = declare("air.simd_shuffle.s.i32", i32Ty);
-  Value sh = LLVM::CallOp::create(rewriter, loc, fn,
-                                  ValueRange{asI32, srcLaneI16})
-                 .getResult();
+  Value sh =
+      LLVM::CallOp::create(rewriter, loc, fn, ValueRange{asI32, srcLaneI16})
+          .getResult();
   if (isBool)
     return LLVM::TruncOp::create(rewriter, loc, vt, sh);
   if (!vt.isInteger(32))
@@ -3072,10 +3066,9 @@ static Value emitLaneId(ConversionPatternRewriter &rewriter, Location loc,
   if (!fn) {
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPointToStart(mod.getBody());
-    fn = LLVMFuncOp::create(rewriter, mod.getLoc(),
-                            "air.thread_index_in_simdgroup",
-                            LLVMFunctionType::get(i32Ty, {}, false),
-                            Linkage::External);
+    fn = LLVMFuncOp::create(
+        rewriter, mod.getLoc(), "air.thread_index_in_simdgroup",
+        LLVMFunctionType::get(i32Ty, {}, false), Linkage::External);
   }
   return LLVM::CallOp::create(rewriter, loc, fn, ValueRange{}).getResult();
 }
@@ -3105,8 +3098,9 @@ struct AppleMmaExpandDimsConversion
     Value src = adaptor.getSrc();
     if (auto inSt = dyn_cast<LLVMStructType>(src.getType()))
       for (unsigned i = 0; i < inSt.getBody().size(); ++i)
-        srcElems.push_back(LLVM::ExtractValueOp::create(
-            rewriter, loc, inSt.getBody()[i], src, ArrayRef<int64_t>{(int64_t)i}));
+        srcElems.push_back(
+            LLVM::ExtractValueOp::create(rewriter, loc, inSt.getBody()[i], src,
+                                         ArrayRef<int64_t>{(int64_t)i}));
     else
       srcElems.push_back(src);
 
@@ -3140,9 +3134,8 @@ struct AppleMmaExpandDimsConversion
           v = LLVM::TruncOp::create(rewriter, loc, eltTy, v);
       }
       Value vIdx = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
-      frags[fragIdx] = LLVM::InsertElementOp::create(rewriter, loc,
-                                                     sTy.getBody()[fragIdx],
-                                                     frags[fragIdx], v, vIdx);
+      frags[fragIdx] = LLVM::InsertElementOp::create(
+          rewriter, loc, sTy.getBody()[fragIdx], frags[fragIdx], v, vIdx);
     }
     Value res = LLVM::UndefOp::create(rewriter, loc, sTy);
     for (size_t i = 0; i < frags.size(); ++i)
@@ -3222,8 +3215,8 @@ struct AppleMmaBroadcastConversion
       if (inFrag >= (int64_t)srcFrags.size())
         inFrag = 0;
       Value inIdx = arith::ConstantIntOp::create(rewriter, loc, inVec, 32);
-      Value scalar = LLVM::ExtractElementOp::create(
-          rewriter, loc, srcFrags[inFrag], inIdx);
+      Value scalar = LLVM::ExtractElementOp::create(rewriter, loc,
+                                                    srcFrags[inFrag], inIdx);
       Value shuffled = emitFragShuffle(rewriter, loc, mod, scalar, srcLane16);
       Value outIdx = arith::ConstantIntOp::create(rewriter, loc, outVec, 32);
       outFrags[outFrag] = LLVM::InsertElementOp::create(
@@ -3241,7 +3234,8 @@ struct AppleMmaBroadcastConversion
 // Per-slot integer binary (cmpi/andi) on #mma fragments. Like the f32 binary
 // pattern but the result element type may differ from operands (cmpi: i32→i1).
 template <typename SrcOp>
-struct AppleMmaFragmentIntBinaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
+struct AppleMmaFragmentIntBinaryConversion
+    : public ConvertOpToLLVMPattern<SrcOp> {
   using ConvertOpToLLVMPattern<SrcOp>::ConvertOpToLLVMPattern;
   using OpAdaptor = typename SrcOp::Adaptor;
   LogicalResult
@@ -3262,15 +3256,14 @@ struct AppleMmaFragmentIntBinaryConversion : public ConvertOpToLLVMPattern<SrcOp
     Type outVecTy = outSt.getBody()[0];
     Value result = LLVM::UndefOp::create(rewriter, loc, outSt);
     for (size_t i = 0; i < sTy.getBody().size(); ++i) {
-      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
-                                             lhs, ArrayRef<int64_t>{(int64_t)i});
-      Value b = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
-                                             rhs, ArrayRef<int64_t>{(int64_t)i});
+      Value a = LLVM::ExtractValueOp::create(
+          rewriter, loc, sTy.getBody()[i], lhs, ArrayRef<int64_t>{(int64_t)i});
+      Value b = LLVM::ExtractValueOp::create(
+          rewriter, loc, sTy.getBody()[i], rhs, ArrayRef<int64_t>{(int64_t)i});
       Value v;
       if constexpr (std::is_same_v<SrcOp, arith::CmpIOp>)
-        v = LLVM::ICmpOp::create(
-            rewriter, loc, outVecTy,
-            convertCmpIPredicate(op.getPredicate()), a, b);
+        v = LLVM::ICmpOp::create(rewriter, loc, outVecTy,
+                                 convertCmpIPredicate(op.getPredicate()), a, b);
       else // andi
         v = LLVM::AndOp::create(rewriter, loc, a, b);
       result = LLVM::InsertValueOp::create(rewriter, loc, outSt, result, v,
@@ -3283,22 +3276,33 @@ struct AppleMmaFragmentIntBinaryConversion : public ConvertOpToLLVMPattern<SrcOp
     using A = arith::CmpIPredicate;
     using L = LLVM::ICmpPredicate;
     switch (p) {
-    case A::eq: return L::eq;
-    case A::ne: return L::ne;
-    case A::slt: return L::slt;
-    case A::sle: return L::sle;
-    case A::sgt: return L::sgt;
-    case A::sge: return L::sge;
-    case A::ult: return L::ult;
-    case A::ule: return L::ule;
-    case A::ugt: return L::ugt;
-    case A::uge: return L::uge;
+    case A::eq:
+      return L::eq;
+    case A::ne:
+      return L::ne;
+    case A::slt:
+      return L::slt;
+    case A::sle:
+      return L::sle;
+    case A::sgt:
+      return L::sgt;
+    case A::sge:
+      return L::sge;
+    case A::ult:
+      return L::ult;
+    case A::ule:
+      return L::ule;
+    case A::ugt:
+      return L::ugt;
+    case A::uge:
+      return L::uge;
     }
     llvm_unreachable("bad CmpIPredicate");
   }
 };
 
-// select(i1-mask fragment, f32 fragment, f32 fragment) → per-slot vector select.
+// select(i1-mask fragment, f32 fragment, f32 fragment) → per-slot vector
+// select.
 struct AppleMmaFragmentSelectConversion
     : public ConvertOpToLLVMPattern<arith::SelectOp> {
   using ConvertOpToLLVMPattern<arith::SelectOp>::ConvertOpToLLVMPattern;
@@ -3314,12 +3318,12 @@ struct AppleMmaFragmentSelectConversion
       return failure();
     Value result = LLVM::UndefOp::create(rewriter, loc, sTy);
     for (size_t i = 0; i < sTy.getBody().size(); ++i) {
-      Value c = LLVM::ExtractValueOp::create(rewriter, loc, cTy.getBody()[i],
-                                             cond, ArrayRef<int64_t>{(int64_t)i});
-      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i], tv,
-                                             ArrayRef<int64_t>{(int64_t)i});
-      Value b = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i], fv,
-                                             ArrayRef<int64_t>{(int64_t)i});
+      Value c = LLVM::ExtractValueOp::create(
+          rewriter, loc, cTy.getBody()[i], cond, ArrayRef<int64_t>{(int64_t)i});
+      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
+                                             tv, ArrayRef<int64_t>{(int64_t)i});
+      Value b = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
+                                             fv, ArrayRef<int64_t>{(int64_t)i});
       Value v = LLVM::SelectOp::create(rewriter, loc, c, a, b);
       result = LLVM::InsertValueOp::create(rewriter, loc, sTy, result, v,
                                            ArrayRef<int64_t>{(int64_t)i});
@@ -5256,8 +5260,7 @@ struct ConvertTritonAppleGPUToLLVMPass
     // slice (fla) fall through to the generic flat per-thread struct.
     auto fragmentEligible = computeFragmentEligibleTypes(mod);
     typeConverter.addConversion(
-        [ctx, fragmentEligible](
-            RankedTensorType type) -> std::optional<Type> {
+        [ctx, fragmentEligible](RankedTensorType type) -> std::optional<Type> {
           auto enc = dyn_cast<AppleMmaEncodingAttr>(type.getEncoding());
           if (!enc || !fragmentEligible.count(type))
             return std::nullopt;

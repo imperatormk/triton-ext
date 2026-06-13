@@ -243,6 +243,11 @@ static llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
   return eligible;
 }
 
+static Value emitFragShuffle(ConversionPatternRewriter &rewriter, Location loc,
+                             ModuleOp mod, Value val, Value srcLaneI16);
+static Value emitLaneId(ConversionPatternRewriter &rewriter, Location loc,
+                        ModuleOp mod);
+
 // ConvertLayoutOp for DotOperandEncoding or blocked→blocked:
 //
 // - DotOperandEncoding target: identity pass-through (elements same per thread)
@@ -355,6 +360,19 @@ struct ConvertLayoutOpAppleConversion
     if (shape.size() == 1) {
       return convertLayout1D(op, adaptor, rewriter, srcEnc, dstEnc, srcTy,
                              dstTy, loc, ctx, mod);
+    }
+
+    // #mma (fragment) -> W-blocked store epilogue: when StoreShuffleLayout has
+    // re-laid the store into the within-simdgroup "W" layout, the convert moves
+    // every C element to a lane in the SAME simdgroup it already occupies, so it
+    // needs no shared memory. Lower it as a register-only air.simd_shuffle
+    // restripe (oracle-validated in tools/fragment-oracle) instead of the TG
+    // scatter/gather below. On any unexpected shape we fall through to the
+    // (always-correct) TG path.
+    if (srcMmaEnc && !cvtNeedsSharedMemory(srcTy, dstTy)) {
+      if (succeeded(convertMmaToWShuffle(op, adaptor, rewriter, srcMmaEnc,
+                                         dstEnc, srcTy, dstTy, loc, ctx, mod)))
+        return success();
     }
 
     // ND blocked->blocked: handle rank>=2 by operating on the trailing two
@@ -893,6 +911,141 @@ struct ConvertLayoutOpAppleConversion
     } else {
       rewriter.replaceOp(op, dstElems[0]);
     }
+    return success();
+  }
+
+  // #mma fragment -> W-blocked register shuffle restripe (store epilogue).
+  // Each W destination element (row,col) is gathered from the #mma physical
+  // lane that owns tile-local (row%8, col%8) via air.simd_shuffle on the
+  // col-parity register. Pure registers, no shared memory, no barriers.
+  // Validated bit-exact in tools/fragment-oracle (store-restripe case).
+  LogicalResult convertMmaToWShuffle(ttg::ConvertLayoutOp op, OpAdaptor adaptor,
+                                     ConversionPatternRewriter &rewriter,
+                                     AppleMmaEncodingAttr srcMmaEnc,
+                                     ttg::BlockedEncodingAttr dstEnc,
+                                     RankedTensorType srcTy,
+                                     RankedTensorType dstTy, Location loc,
+                                     MLIRContext *ctx, ModuleOp mod) const {
+    unsigned rank = srcTy.getShape().size();
+    if (rank < 2)
+      return failure();
+    unsigned rd = rank - 2, cd = rank - 1;
+    for (unsigned d = 0; d < rd; ++d)
+      if (srcTy.getShape()[d] != 1)
+        return failure();
+
+    // The fragment source must be the vectorized <64 x f32> struct.
+    Value src = adaptor.getSrc();
+    auto sStructTy = dyn_cast<LLVMStructType>(src.getType());
+    if (!sStructTy || sStructTy.getBody().empty() ||
+        !isa<VectorType>(sStructTy.getBody()[0]))
+      return failure();
+
+    auto outTy = getTypeConverter()->convertType(dstTy);
+    auto outSt = dyn_cast_or_null<LLVMStructType>(outTy);
+    if (!outSt)
+      return failure();
+    Type fragElemTy = cast<VectorType>(sStructTy.getBody()[0]).getElementType();
+    if (!fragElemTy.isF32())
+      return failure();
+
+    auto i16Ty = IntegerType::get(ctx, 16);
+
+    // Per-lane W base (row,col). The W layout is tile-aligned within each warp,
+    // so dstEnc's per-register offsets plus this lane's base give the absolute
+    // (row,col) every output element lands on.
+    Value laneId = emitLaneId(rewriter, loc, mod);
+    auto tpw = dstEnc.getThreadsPerWarp();
+    auto spt = dstEnc.getSizePerThread();
+    auto order = dstEnc.getOrder();
+    int64_t tM = tpw[rd], tN = tpw[cd];
+    int64_t sM = spt[rd], sN = spt[cd];
+    bool colFastest = (order[0] == cd);
+    Value tN_v = arith::ConstantIntOp::create(rewriter, loc, tN, 32);
+    Value tM_v = arith::ConstantIntOp::create(rewriter, loc, tM, 32);
+    Value lR, lC;
+    if (colFastest) {
+      lR = arith::DivUIOp::create(rewriter, loc, laneId, tN_v);
+      lC = arith::RemUIOp::create(rewriter, loc, laneId, tN_v);
+    } else {
+      lR = arith::RemUIOp::create(rewriter, loc, laneId, tM_v);
+      lC = arith::DivUIOp::create(rewriter, loc, laneId, tM_v);
+    }
+    Value sM_v = arith::ConstantIntOp::create(rewriter, loc, sM, 32);
+    Value sN_v = arith::ConstantIntOp::create(rewriter, loc, sN, 32);
+    Value laneRow = arith::MulIOp::create(rewriter, loc, lR, sM_v);
+    Value laneCol = arith::MulIOp::create(rewriter, loc, lC, sN_v);
+
+    auto dstOffsets = emitOffsetForLayout(dstEnc, dstTy);
+    if (dstOffsets.size() != outSt.getBody().size())
+      return failure();
+
+    auto srcInfo = applegpu::getAppleMmaFragmentInfo(srcTy, srcMmaEnc);
+    SmallVector<Value> frags;
+    for (unsigned i = 0; i < sStructTy.getBody().size(); ++i)
+      frags.push_back(ExtractValueOp::create(rewriter, loc,
+                                             sStructTy.getBody()[i], src,
+                                             ArrayRef<int64_t>{(int64_t)i}));
+
+    auto bit = [&](Value v, int64_t shift) -> Value {
+      Value s = arith::ShRUIOp::create(
+          rewriter, loc, v,
+          arith::ConstantIntOp::create(rewriter, loc, shift, 32));
+      return arith::AndIOp::create(
+          rewriter, loc, s,
+          arith::ConstantIntOp::create(rewriter, loc, 1, 32));
+    };
+    auto shl = [&](Value v, int64_t shift) -> Value {
+      return arith::ShLIOp::create(
+          rewriter, loc, v,
+          arith::ConstantIntOp::create(rewriter, loc, shift, 32));
+    };
+
+    Value result = UndefOp::create(rewriter, loc, outSt);
+    for (size_t i = 0; i < dstOffsets.size(); ++i) {
+      int64_t rOff = dstOffsets[i][rd], cOff = dstOffsets[i][cd];
+      Value absRow = arith::AddIOp::create(
+          rewriter, loc, laneRow,
+          arith::ConstantIntOp::create(rewriter, loc, rOff, 32));
+      Value absCol = arith::AddIOp::create(
+          rewriter, loc, laneCol,
+          arith::ConstantIntOp::create(rewriter, loc, cOff, 32));
+      // tile-local (row%8, col%8) drive the #mma physical source lane:
+      //   srcLane = L0:(col>>1) L1:row L2:(row>>1) L3:(col>>2) L4:(row>>2)
+      Value tRow = arith::AndIOp::create(
+          rewriter, loc, absRow,
+          arith::ConstantIntOp::create(rewriter, loc, 7, 32));
+      Value tCol = arith::AndIOp::create(
+          rewriter, loc, absCol,
+          arith::ConstantIntOp::create(rewriter, loc, 7, 32));
+      Value srcLane = arith::OrIOp::create(
+          rewriter, loc,
+          arith::OrIOp::create(
+              rewriter, loc,
+              arith::OrIOp::create(rewriter, loc, bit(tCol, 1),
+                                   shl(bit(tRow, 0), 1)),
+              shl(bit(tRow, 1), 2)),
+          arith::OrIOp::create(rewriter, loc, shl(bit(tCol, 2), 3),
+                               shl(bit(tRow, 2), 4)));
+      Value srcLane16 =
+          arith::TruncIOp::create(rewriter, loc, i16Ty, srcLane);
+
+      // Which fragment register holds (absRow,absCol). fragIdx is constant per
+      // owned tile; for the W store one frag per 8x8 tile, vecIdx = col parity.
+      int64_t fragIdx, vecIdx;
+      applegpu::appleMmaFragmentSlot(rOff, cOff, srcInfo, fragIdx, vecIdx);
+      if (fragIdx >= (int64_t)frags.size())
+        return failure();
+      Value vIdx = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+      Value scalar =
+          LLVM::ExtractElementOp::create(rewriter, loc, frags[fragIdx], vIdx);
+      Value shuffled = emitFragShuffle(rewriter, loc, mod, scalar, srcLane16);
+      if (shuffled.getType() != outSt.getBody()[i])
+        return failure();
+      result = InsertValueOp::create(rewriter, loc, outSt, result, shuffled,
+                                     ArrayRef<int64_t>{(int64_t)i});
+    }
+    rewriter.replaceOp(op, result);
     return success();
   }
 

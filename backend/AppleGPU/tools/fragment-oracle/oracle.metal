@@ -27,12 +27,20 @@ using namespace metal;
 constant uint COL_CLR = 0x9;  // bits L0,L3  -> clear for col-replicate
 constant uint ROW_CLR = 0x16; // bits L1,L2,L4 -> clear for row-replicate
 
+// Source #mma physical lane owning tile (row,col), and the reg holding it.
+static uint mmaSrcLane(uint row, uint col) {
+    uint L1 = row & 1, L2 = (row >> 1) & 1, L4 = (row >> 2) & 1;
+    uint L0 = (col >> 1) & 1, L3 = (col >> 2) & 1;
+    return (L0 << 0) | (L1 << 1) | (L2 << 2) | (L3 << 3) | (L4 << 4);
+}
+
 kernel void frag_oracle(device const float *inPat   [[buffer(0)]], // 8x8 row-major
                         device float       *loadOut [[buffer(1)]], // [lane*2+reg]
                         device float       *colOut  [[buffer(2)]],
                         device float       *rowOut  [[buffer(3)]],
                         device float       *expOut  [[buffer(4)]],
                         constant uint      &mutate  [[buffer(5)]], // 0=correct; else negative control
+                        device float       *epiOut  [[buffer(6)]], // store-restripe [Tw*2+r]
                         uint lane [[thread_index_in_simdgroup]])
 {
     // Negative-control mutation: if mutate!=0, deliberately swap the two clear
@@ -76,5 +84,22 @@ kernel void frag_oracle(device const float *inPat   [[buffer(0)]], // 8x8 row-ma
         float sliceVal = simd_shuffle(reg[0], src); // reg[0] at src holds in[row][0]
         expOut[lane * 2 + 0] = sliceVal;
         expOut[lane * 2 + 1] = sliceVal;
+    }
+
+    // store-restripe (#mma -> W blocked): the W layout (threadsPerWarp=[8,4],
+    // sizePerThread=[1,2], order=[1,0]) gives W-lane T the tile row T/4 and
+    // cols (T%4)*2 + {0,1}. Each owned (row,col) is gathered from the #mma
+    // physical lane that holds it via air.simd_shuffle on the col-parity reg.
+    // mutate!=0 corrupts srcLane (drop L1) so the restripe MUST fail.
+    {
+        uint wrow = lane / 4;
+        uint wcolBase = (lane % 4) * 2;
+        for (uint r = 0; r < 2; ++r) {
+            uint wcol = wcolBase + r;
+            uint src = mmaSrcLane(wrow, wcol);
+            if (mutate) src &= ~0x2u; // drop L1 -> wrong source lane
+            float v = simd_shuffle(reg[wcol & 1], src);
+            epiOut[lane * 2 + r] = v;
+        }
     }
 }

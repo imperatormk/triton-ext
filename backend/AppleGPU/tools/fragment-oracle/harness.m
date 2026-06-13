@@ -49,6 +49,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     id<MTLBuffer> bCol  = [dev newBufferWithLength:64*4 options:MTLResourceStorageModeShared];
     id<MTLBuffer> bRow  = [dev newBufferWithLength:64*4 options:MTLResourceStorageModeShared];
     id<MTLBuffer> bExp  = [dev newBufferWithLength:64*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bEpi  = [dev newBufferWithLength:64*4 options:MTLResourceStorageModeShared];
     float *pat = bIn.contents;
     for (uint r=0;r<8;r++) for (uint c=0;c<8;c++) pat[r*8+c] = (float)(r*8+c+1);
 
@@ -59,18 +60,22 @@ int main(int argc, char **argv) { @autoreleasepool {
     [enc setBuffer:bIn offset:0 atIndex:0]; [enc setBuffer:bLoad offset:0 atIndex:1];
     [enc setBuffer:bCol offset:0 atIndex:2]; [enc setBuffer:bRow offset:0 atIndex:3];
     [enc setBuffer:bExp offset:0 atIndex:4]; [enc setBytes:&mutate length:4 atIndex:5];
+    [enc setBuffer:bEpi offset:0 atIndex:6];
     [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
     [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if (cb.error) { NSLog(@"dispatch err %@", cb.error); return 1; }
 
     // CPU references, indexed [lane*2+reg].
-    float rLoad[64], rCol[64], rRow[64], rExp[64];
+    float rLoad[64], rCol[64], rRow[64], rExp[64], rEpi[64];
     for (uint lane=0;lane<32;lane++) for (uint R=0;R<2;R++) {
         uint row,col; slotOf(lane,R,&row,&col);
         rLoad[lane*2+R] = pat[row*8+col];           // identity load
         rCol [lane*2+R] = pat[row*8+0];             // col-replicate: in[r][0]
         rRow [lane*2+R] = pat[0*8+col];             // row-replicate: in[0][c]
         rExp [lane*2+R] = pat[row*8+0];             // expand_dims slice s[row]
+        // store-restripe: W-lane `lane` reg R owns tile (lane/4, (lane%4)*2+R).
+        uint wrow = lane/4, wcol = (lane%4)*2 + R;
+        rEpi [lane*2+R] = pat[wrow*8+wcol];
     }
 
     printf("== Fragment-ABI hardware-layout oracle (8x8 simdgroup tile) ==\n");
@@ -79,6 +84,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     ok &= cmpSlots("col-replicate", bCol.contents,  rCol);
     ok &= cmpSlots("row-replicate", bRow.contents,  rRow);
     ok &= cmpSlots("expand_dims",   bExp.contents,  rExp);
+    ok &= cmpSlots("store-restripe",bEpi.contents,  rEpi);
 
     // Negative control: with mutate=1 the shuffle masks are deliberately
     // swapped, so col/row-replicate MUST fail. If they pass, the oracle is not
@@ -89,14 +95,15 @@ int main(int argc, char **argv) { @autoreleasepool {
     [enc setBuffer:bIn offset:0 atIndex:0]; [enc setBuffer:bLoad offset:0 atIndex:1];
     [enc setBuffer:bCol offset:0 atIndex:2]; [enc setBuffer:bRow offset:0 atIndex:3];
     [enc setBuffer:bExp offset:0 atIndex:4]; [enc setBytes:&mutate length:4 atIndex:5];
+    [enc setBuffer:bEpi offset:0 atIndex:6];
     [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
     [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
-    int colWrong=0,rowWrong=0;
-    float *gc=bCol.contents,*gr=bRow.contents;
-    for (int i=0;i<64;i++){ if(gc[i]!=rCol[i])colWrong++; if(gr[i]!=rRow[i])rowWrong++; }
-    int negOk = (colWrong>0 && rowWrong>0);
-    printf("  [neg-control] %s (swapped masks: col %d/64 row %d/64 wrong -> expected nonzero)\n",
-           negOk?"PASS":"FAIL", colWrong, rowWrong);
+    int colWrong=0,rowWrong=0,epiWrong=0;
+    float *gc=bCol.contents,*gr=bRow.contents,*ge=bEpi.contents;
+    for (int i=0;i<64;i++){ if(gc[i]!=rCol[i])colWrong++; if(gr[i]!=rRow[i])rowWrong++; if(ge[i]!=rEpi[i])epiWrong++; }
+    int negOk = (colWrong>0 && rowWrong>0 && epiWrong>0);
+    printf("  [neg-control] %s (swapped masks: col %d/64 row %d/64 epi %d/64 wrong -> expected nonzero)\n",
+           negOk?"PASS":"FAIL", colWrong, rowWrong, epiWrong);
     ok &= negOk;
 
     printf("== ORACLE %s ==\n", ok ? "PASS" : "FAIL");

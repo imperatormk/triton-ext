@@ -3,6 +3,7 @@
 // Lowers TritonGPU IR → LLVM IR for Apple MPS using shared Triton patterns
 // and an Apple-specific TargetInfo.
 
+#include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
 #include "TritonAppleGPUToLLVM/TargetInfo.h"
@@ -16,6 +17,7 @@
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
@@ -42,6 +44,204 @@ using namespace mlir;
 using namespace mlir::LLVM;
 using namespace mlir::arith;
 namespace ttg = mlir::triton::gpu;
+
+// A use of an AppleMma-encoded value is "dot-chain" if it keeps the value on
+// the simdgroup register path: as the dot accumulator (C), carried through the
+// scf.for loop, or unpacked to #blocked by a convert_layout. Any other consumer
+// (elementwise arith/math, broadcast/expand from a #mma slice, integer #mma)
+// needs the generic flat per-thread layout, so its type stays out of the
+// fragment ABI. The decision is per-type and conservative: a type is
+// fragment-eligible only if EVERY #mma value of that exact type in the module
+// is consumed solely by dot-chain ops.
+static bool isAppleMmaTensor(Type t) {
+  auto rt = dyn_cast<RankedTensorType>(t);
+  // The fragment ABI carries <64 x f32> simdgroup_matrix fragments, so only f32
+  // #mma accumulators qualify; bf16/i32 #mma tensors keep the flat layout.
+  return rt && isa<AppleMmaEncodingAttr>(rt.getEncoding()) &&
+         rt.getElementType().isF32();
+}
+
+// Fragment-ABI candidate predicate for the kkt elementwise/mask chain. SEPARATE
+// from isAppleMmaTensor (which is load-bearing on the f32 GATE-A/B dot path):
+// admits the f32 accumulator AND the rank-2 i32/i1 #mma temporaries that the kkt
+// op-web builds (cmpi index compares, andi/select masks) so they can ride the
+// same per-lane simdgroup slot map. bf16/i64 #mma and slice<#mma> stay flat.
+static bool isFragmentCandidateTensor(Type t) {
+  auto rt = dyn_cast<RankedTensorType>(t);
+  if (!rt || !isa<AppleMmaEncodingAttr>(rt.getEncoding()) || rt.getRank() != 2)
+    return false;
+  Type elt = rt.getElementType();
+  return elt.isF32() || elt.isInteger(32) || elt.isInteger(1);
+}
+
+static llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
+  llvm::DenseSet<Type> eligible;
+  llvm::DenseSet<Type> blocked;
+
+  // The accumulator reaches this pass after SCF→ControlFlow, so the loop carry
+  // is a cf.br/cf.cond_br block-argument forward, not an scf.yield. The kkt
+  // op-web additionally keeps the fragment on the register path through
+  // expand_dims (slice<#mma>→#mma), broadcast (col/row replicate), and the
+  // per-slot elementwise mask ops (cmpi/andi/select + the f32 binary/unary
+  // ops). Each of those has a fragment lowering, so recognizing them here is
+  // what flips the atomic gate that admits kkt's accumulator type.
+  auto isDotChainUse = [](Operation *user, Value v) -> bool {
+    if (isa<triton::DotOp>(user))
+      return true; // dot consumes #mma only as accumulator C
+    if (isa<scf::YieldOp>(user) || isa<scf::ForOp>(user) ||
+        isa<cf::BranchOp>(user) || isa<cf::CondBranchOp>(user))
+      return true;
+    if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(user)) {
+      auto resTy = dyn_cast<RankedTensorType>(cvt.getType());
+      return resTy && !isa<AppleMmaEncodingAttr>(resTy.getEncoding());
+    }
+    // Fragment elementwise / view consumers (kkt chain). A use is clean ONLY if
+    // the consumer is fully fragment-lowerable: its #mma result is a fragment
+    // candidate AND every ranked-tensor operand is itself a same-encoding
+    // fragment candidate (or, for expand_dims, a slice of the #mma parent).
+    // This rejects mixed-layout elementwise (e.g. chunk_delta_h's
+    // `load(#blocked) - dot(#mma)`) which has no per-slot fragment lowering and
+    // would otherwise be wrongly admitted, then fall back to a flat pack and
+    // crash. broadcast/expand_dims take a single operand.
+    auto sameMmaFragmentOperands = [](Operation *u) {
+      for (Value o : u->getOperands()) {
+        auto rt = dyn_cast<RankedTensorType>(o.getType());
+        if (!rt)
+          continue; // scalar operand (none expected here)
+        if (!isFragmentCandidateTensor(rt))
+          return false;
+      }
+      return true;
+    };
+    if (isa<arith::CmpIOp, arith::AndIOp, arith::SelectOp, arith::AddFOp,
+            arith::SubFOp, arith::MulFOp, arith::DivFOp, arith::NegFOp,
+            math::ExpOp>(user)) {
+      bool mmaResult = false;
+      for (Value r : user->getResults())
+        if (isFragmentCandidateTensor(r.getType()))
+          mmaResult = true;
+      return mmaResult && sameMmaFragmentOperands(user);
+    }
+    if (isa<triton::BroadcastOp>(user)) {
+      auto resTy = dyn_cast<RankedTensorType>(user->getResult(0).getType());
+      auto srcTy =
+          dyn_cast<RankedTensorType>(user->getOperand(0).getType());
+      return resTy && srcTy && isFragmentCandidateTensor(resTy) &&
+             isFragmentCandidateTensor(srcTy);
+    }
+    if (auto ed = dyn_cast<triton::ExpandDimsOp>(user)) {
+      auto resTy = dyn_cast<RankedTensorType>(ed.getType());
+      return resTy && isFragmentCandidateTensor(resTy);
+    }
+    return false;
+  };
+
+  // A fragment-candidate value can only live on the fragment path if its
+  // PRODUCER emits a fragment struct. The dot, the fragment elementwise/view
+  // patterns, a splat constant, and a loop-carried block argument all do. A
+  // convert_layout INTO #mma (e.g. chunk_delta_h materializes b_v as #blocked
+  // then converts to #mma for `load - dot`) has no fragment lowering and yields
+  // a flat struct, so any type that some value reaches via such a producer must
+  // stay flat — otherwise the flat producer's element count collides with the
+  // fragment struct slot count at pack time.
+  auto isFragmentProducer = [](Value v) -> bool {
+    if (isa<BlockArgument>(v))
+      return true; // loop carry / entry forward
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      return true;
+    if (isa<triton::DotOp, triton::ExpandDimsOp, triton::BroadcastOp,
+            arith::CmpIOp, arith::AndIOp, arith::SelectOp, arith::AddFOp,
+            arith::SubFOp, arith::MulFOp, arith::DivFOp, arith::NegFOp,
+            math::ExpOp>(def))
+      return true;
+    if (auto c = dyn_cast<arith::ConstantOp>(def)) {
+      auto sp = dyn_cast<DenseElementsAttr>(c.getValue());
+      return sp && sp.isSplat();
+    }
+    return false;
+  };
+
+  // Fixpoint over candidate VALUES, then collapse to TYPES. A fragment chain is
+  // admitted atomically: a value is "bad" if its producer can't emit a fragment
+  // struct or any consumer isn't a recognized fragment op; badness then
+  // propagates BOTH ways across the fragment elementwise/view web (a bad result
+  // poisons the op's #mma operands and vice-versa) so a chain is never half
+  // admitted (which previously left a flat producer feeding a fragment consumer
+  // and crashed at pack time). A type is eligible only if EVERY value of that
+  // type is good.
+  llvm::SmallVector<Value> candidates;
+  llvm::DenseSet<Value> bad;
+  auto collect = [&](Value v) {
+    if (isFragmentCandidateTensor(v.getType()))
+      candidates.push_back(v);
+  };
+  mod.walk([&](Operation *op) {
+    for (Value res : op->getResults())
+      collect(res);
+    for (Region &reg : op->getRegions())
+      for (Block &blk : reg)
+        for (BlockArgument arg : blk.getArguments())
+          collect(arg);
+  });
+
+  llvm::SmallVector<Value> worklist;
+  auto poison = [&](Value v) {
+    if (isFragmentCandidateTensor(v.getType()) && bad.insert(v).second)
+      worklist.push_back(v);
+  };
+  for (Value v : candidates) {
+    if (!isFragmentProducer(v)) {
+      poison(v);
+      continue;
+    }
+    for (OpOperand &use : v.getUses())
+      if (!isDotChainUse(use.getOwner(), v)) {
+        poison(v);
+        break;
+      }
+  }
+  // Type→values index: the type converter decides the ABI per TYPE, so badness
+  // is a per-type property — if ANY value of a type is bad, EVERY value of it
+  // must be (otherwise a flat producer of that type would feed a fragment
+  // consumer, or vice-versa, and crash). So poison propagates three ways:
+  // through a fragment op's operands, through its results, and across all
+  // same-type siblings.
+  llvm::DenseMap<Type, SmallVector<Value>> byType;
+  for (Value v : candidates)
+    byType[v.getType()].push_back(v);
+
+  auto isFragmentOp = [](Operation *o) {
+    return isa<triton::ExpandDimsOp, triton::BroadcastOp, arith::CmpIOp,
+               arith::AndIOp, arith::SelectOp, arith::AddFOp, arith::SubFOp,
+               arith::MulFOp, arith::DivFOp, arith::NegFOp, math::ExpOp>(o);
+  };
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (Value sib : byType[v.getType()])
+      poison(sib);
+    if (Operation *def = v.getDefiningOp()) {
+      if (isFragmentOp(def))
+        for (Value o : def->getOperands())
+          poison(o);
+    }
+    for (OpOperand &use : v.getUses())
+      if (isFragmentOp(use.getOwner()))
+        for (Value r : use.getOwner()->getResults())
+          poison(r);
+  }
+
+  llvm::DenseSet<Type> present;
+  for (Value v : candidates) {
+    present.insert(v.getType());
+    if (bad.count(v))
+      blocked.insert(v.getType());
+  }
+  for (Type t : present)
+    if (!blocked.count(t))
+      eligible.insert(t);
+  return eligible;
+}
 
 // ConvertLayoutOp for DotOperandEncoding or blocked→blocked:
 //
@@ -131,7 +331,12 @@ struct ConvertLayoutOpAppleConversion
     // fp16/bf16 cases, which is exactly why those route through here instead).
     // Pointer-element tensors stay on the TG path: the upstream shuffle
     // pattern cannot move !tt.ptr elements.
-    if (!isa<triton::PointerType>(srcTy.getElementType()) &&
+    // #mma sources stay on the in-tree TG-scatter epilogue: the upstream
+    // simd-shuffle pattern builds a ColumnAction from the source LinearLayout
+    // and asserts on the fragment struct's element count (LinearLayout.cpp
+    // ColumnAction::apply). The TG-scatter path reads the fragment via the
+    // (fragIdx, vecIdx) slot map and is correct (just slower).
+    if (!srcMmaEnc && !isa<triton::PointerType>(srcTy.getElementType()) &&
         !cvtNeedsSharedMemory(srcTy, dstTy))
       return failure();
 
@@ -440,10 +645,36 @@ struct ConvertLayoutOpAppleConversion
     // Unpack source elements
     Value src = adaptor.getSrc();
     SmallVector<Value> srcElems;
-    if (auto sTy = dyn_cast<LLVMStructType>(src.getType())) {
-      for (unsigned i = 0; i < sTy.getBody().size(); ++i)
+    auto sStructTy = dyn_cast<LLVMStructType>(src.getType());
+    bool srcFragment =
+        srcMmaEnc && sStructTy && !sStructTy.getBody().empty() &&
+        isa<VectorType>(sStructTy.getBody()[0]);
+    if (srcFragment) {
+      // #mma fragment struct → per-element scalars via the (fragIdx, vecIdx)
+      // slot map, so the downstream TG-scatter epilogue sees flat scalars.
+      auto info = applegpu::getAppleMmaFragmentInfo(srcTy, srcMmaEnc);
+      auto f32Ty = Float32Type::get(ctx);
+      SmallVector<Value> frags;
+      for (unsigned i = 0; i < sStructTy.getBody().size(); ++i)
+        frags.push_back(
+            ExtractValueOp::create(rewriter, loc, sStructTy.getBody()[i], src,
+                                   ArrayRef<int64_t>{(int64_t)i}));
+      srcElems.resize(srcCoords.size());
+      for (size_t i = 0; i < srcCoords.size(); ++i) {
+        int64_t fragIdx, vecIdx;
+        applegpu::appleMmaFragmentSlot(srcCoords[i].first, srcCoords[i].second,
+                                       info, fragIdx, vecIdx);
+        Value frag = (fragIdx < (int64_t)frags.size())
+                         ? frags[fragIdx]
+                         : frags.empty() ? Value() : frags[0];
+        Value vIdx = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+        srcElems[i] =
+            LLVM::ExtractElementOp::create(rewriter, loc, f32Ty, frag, vIdx);
+      }
+    } else if (sStructTy) {
+      for (unsigned i = 0; i < sStructTy.getBody().size(); ++i)
         srcElems.push_back(
-            ExtractValueOp::create(rewriter, loc, sTy.getBody()[i], src,
+            ExtractValueOp::create(rewriter, loc, sStructTy.getBody()[i], src,
                                    ArrayRef<int64_t>{(int64_t)i}));
     } else {
       srcElems = {src};
@@ -2544,6 +2775,407 @@ struct ExternElementwiseOpAppleConversion
   }
 };
 
+// Fragment ABI elementwise: when an f32 #mma value carries the fragment struct,
+// apply the op per fragment vector (<64 x f32>). The struct layout is identical
+// across operands of the same #mma type, so a binary op is a lane-wise vector
+// op on matching slots and a unary op maps over the slots. Fires only when the
+// converted operand/result types are the fragment struct; otherwise defers to
+// the generic flat elementwise lowering.
+template <typename SrcOp, typename LLVMOp>
+struct AppleMmaFragmentBinaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
+  using ConvertOpToLLVMPattern<SrcOp>::ConvertOpToLLVMPattern;
+  using OpAdaptor = typename SrcOp::Adaptor;
+
+  static LLVMStructType fragStruct(Type t) {
+    auto s = dyn_cast_or_null<LLVMStructType>(t);
+    if (s && !s.getBody().empty() && isa<VectorType>(s.getBody()[0]))
+      return s;
+    return nullptr;
+  }
+
+  LogicalResult
+  matchAndRewrite(SrcOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    Value lhs = adaptor.getLhs(), rhs = adaptor.getRhs();
+    auto sTy = fragStruct(lhs.getType());
+    if (!sTy || fragStruct(rhs.getType()) != sTy)
+      return failure();
+    Value result = LLVM::UndefOp::create(rewriter, loc, sTy);
+    for (size_t i = 0; i < sTy.getBody().size(); ++i) {
+      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
+                                             lhs, ArrayRef<int64_t>{(int64_t)i});
+      Value b = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
+                                             rhs, ArrayRef<int64_t>{(int64_t)i});
+      Value v = LLVMOp::create(rewriter, loc, a, b);
+      result = LLVM::InsertValueOp::create(rewriter, loc, sTy, result, v,
+                                           ArrayRef<int64_t>{(int64_t)i});
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+template <typename SrcOp, typename LLVMOp>
+struct AppleMmaFragmentUnaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
+  using ConvertOpToLLVMPattern<SrcOp>::ConvertOpToLLVMPattern;
+  using OpAdaptor = typename SrcOp::Adaptor;
+
+  static LLVMStructType fragStruct(Type t) {
+    auto s = dyn_cast_or_null<LLVMStructType>(t);
+    if (s && !s.getBody().empty() && isa<VectorType>(s.getBody()[0]))
+      return s;
+    return nullptr;
+  }
+
+  LogicalResult
+  matchAndRewrite(SrcOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    Value in = adaptor.getOperands()[0];
+    auto sTy = fragStruct(in.getType());
+    if (!sTy)
+      return failure();
+    Value result = LLVM::UndefOp::create(rewriter, loc, sTy);
+    for (size_t i = 0; i < sTy.getBody().size(); ++i) {
+      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i], in,
+                                             ArrayRef<int64_t>{(int64_t)i});
+      Value v = LLVMOp::create(rewriter, loc, a);
+      result = LLVM::InsertValueOp::create(rewriter, loc, sTy, result, v,
+                                           ArrayRef<int64_t>{(int64_t)i});
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// ── Fragment-ABI integer/mask + view lowerings (kkt op-web) ──────────────
+//
+// These keep the i32/i1/f32 kkt temporaries on the simdgroup register path so
+// the f32 accumulator never leaves the <64 x ELT> fragment struct. expand_dims
+// is a pure local reg-pack (slice flat scalar → its (row,col) fragment slot);
+// broadcast is the validated scalar simd_shuffle replicate (oracle-proven);
+// cmpi/andi/select are per-slot lane-wise vector ops.
+
+static LLVMStructType fragStructOf(Type t) {
+  auto s = dyn_cast_or_null<LLVMStructType>(t);
+  if (s && !s.getBody().empty() && isa<VectorType>(s.getBody()[0]))
+    return s;
+  return nullptr;
+}
+
+// air.simd_shuffle.<ty>(val, i16 srcLane): pull `val` from absolute lane
+// `srcLane`. Scalar-only (matches the fragment-oracle recipe). f32 native;
+// i32/i1 go through the s.i32 form (i1 zext/trunc around it).
+static Value emitFragShuffle(ConversionPatternRewriter &rewriter, Location loc,
+                             ModuleOp mod, Value val, Value srcLaneI16) {
+  auto *ctx = mod.getContext();
+  Type vt = val.getType();
+  auto i16Ty = IntegerType::get(ctx, 16);
+  auto declare = [&](StringRef name, Type ty) -> LLVMFuncOp {
+    if (auto fn = mod.lookupSymbol<LLVMFuncOp>(name))
+      return fn;
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointToStart(mod.getBody());
+    auto fnTy = LLVMFunctionType::get(ty, {ty, i16Ty}, false);
+    auto fn =
+        LLVMFuncOp::create(rewriter, mod.getLoc(), name, fnTy, Linkage::External);
+    SmallVector<Attribute> pass{StringAttr::get(ctx, "convergent"),
+                                StringAttr::get(ctx, "noduplicate"),
+                                StringAttr::get(ctx, "nounwind"),
+                                StringAttr::get(ctx, "willreturn")};
+    fn.setPassthroughAttr(ArrayAttr::get(ctx, pass));
+    return fn;
+  };
+  if (vt.isF32()) {
+    auto fn = declare("air.simd_shuffle.f32", vt);
+    return LLVM::CallOp::create(rewriter, loc, fn,
+                                ValueRange{val, srcLaneI16})
+        .getResult();
+  }
+  auto i32Ty = IntegerType::get(ctx, 32);
+  Value asI32 = val;
+  bool isBool = vt.isInteger(1);
+  if (isBool)
+    asI32 = LLVM::ZExtOp::create(rewriter, loc, i32Ty, val);
+  else if (!vt.isInteger(32))
+    asI32 = LLVM::ZExtOp::create(rewriter, loc, i32Ty, val);
+  auto fn = declare("air.simd_shuffle.s.i32", i32Ty);
+  Value sh = LLVM::CallOp::create(rewriter, loc, fn,
+                                  ValueRange{asI32, srcLaneI16})
+                 .getResult();
+  if (isBool)
+    return LLVM::TruncOp::create(rewriter, loc, vt, sh);
+  if (!vt.isInteger(32))
+    return LLVM::TruncOp::create(rewriter, loc, vt, sh);
+  return sh;
+}
+
+// thread_index_in_simdgroup (lane id, i32).
+static Value emitLaneId(ConversionPatternRewriter &rewriter, Location loc,
+                        ModuleOp mod) {
+  auto i32Ty = IntegerType::get(mod.getContext(), 32);
+  LLVMFuncOp fn = mod.lookupSymbol<LLVMFuncOp>("air.thread_index_in_simdgroup");
+  if (!fn) {
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointToStart(mod.getBody());
+    fn = LLVMFuncOp::create(rewriter, mod.getLoc(),
+                            "air.thread_index_in_simdgroup",
+                            LLVMFunctionType::get(i32Ty, {}, false),
+                            Linkage::External);
+  }
+  return LLVM::CallOp::create(rewriter, loc, fn, ValueRange{}).getResult();
+}
+
+// expand_dims: slice<#mma> (flat per-thread scalars) → #mma fragment struct.
+// Layout-preserving: the slice flat element k corresponds to result offset
+// (row_k,col_k); pack it into that lane's fragment slot. No cross-lane move.
+struct AppleMmaExpandDimsConversion
+    : public ConvertOpToLLVMPattern<triton::ExpandDimsOp> {
+  using ConvertOpToLLVMPattern<triton::ExpandDimsOp>::ConvertOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(triton::ExpandDimsOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    auto resTy = cast<RankedTensorType>(op.getType());
+    auto enc = dyn_cast<AppleMmaEncodingAttr>(resTy.getEncoding());
+    if (!enc)
+      return failure();
+    auto outTy = getTypeConverter()->convertType(resTy);
+    auto sTy = fragStructOf(outTy);
+    if (!sTy)
+      return failure();
+
+    // Flat slice source scalars (NOT a fragment struct).
+    SmallVector<Value> srcElems;
+    Value src = adaptor.getSrc();
+    if (auto inSt = dyn_cast<LLVMStructType>(src.getType()))
+      for (unsigned i = 0; i < inSt.getBody().size(); ++i)
+        srcElems.push_back(LLVM::ExtractValueOp::create(
+            rewriter, loc, inSt.getBody()[i], src, ArrayRef<int64_t>{(int64_t)i}));
+    else
+      srcElems.push_back(src);
+
+    // expand_dims is layout-preserving: enumerate the SLICE source's per-thread
+    // offsets (1D, kept dim) — these match the flat source struct element count
+    // exactly — and insert the expand axis to recover each element's (row,col)
+    // home in the result #mma fragment. (The result's own emitOffsetForLayout
+    // counts register-broadcast copies and would over-count vs the flat slice.)
+    auto sliceTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto sliceOffsets = emitOffsetForLayout(sliceTy.getEncoding(), sliceTy);
+    if (sliceOffsets.size() != srcElems.size())
+      return failure();
+    unsigned axis = op.getAxis();
+    auto info = applegpu::getAppleMmaFragmentInfo(resTy, enc);
+    Type eltTy = applegpu::getAppleMmaFragmentElemType(ctx, resTy);
+
+    SmallVector<Value> frags(sTy.getBody().size());
+    for (size_t i = 0; i < frags.size(); ++i)
+      frags[i] = LLVM::UndefOp::create(rewriter, loc, sTy.getBody()[i]);
+    for (size_t k = 0; k < sliceOffsets.size(); ++k) {
+      int64_t kept = sliceOffsets[k][0];
+      int64_t row = (axis == 1) ? kept : 0; // expand axis 1 → Mx1 (kept=row)
+      int64_t col = (axis == 1) ? 0 : kept; // expand axis 0 → 1xN (kept=col)
+      int64_t fragIdx, vecIdx;
+      applegpu::appleMmaFragmentSlot(row, col, info, fragIdx, vecIdx);
+      if (fragIdx >= (int64_t)frags.size())
+        continue;
+      Value v = srcElems[k];
+      if (v.getType() != eltTy) {
+        if (eltTy.isInteger(1) && !v.getType().isInteger(1))
+          v = LLVM::TruncOp::create(rewriter, loc, eltTy, v);
+      }
+      Value vIdx = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
+      frags[fragIdx] = LLVM::InsertElementOp::create(rewriter, loc,
+                                                     sTy.getBody()[fragIdx],
+                                                     frags[fragIdx], v, vIdx);
+    }
+    Value res = LLVM::UndefOp::create(rewriter, loc, sTy);
+    for (size_t i = 0; i < frags.size(); ++i)
+      res = LLVM::InsertValueOp::create(rewriter, loc, sTy, res, frags[i],
+                                        ArrayRef<int64_t>{(int64_t)i});
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
+
+// broadcast: Mx1→MxN (col-replicate) or 1xN→MxN (row-replicate) on a #mma
+// fragment, via the oracle-validated scalar simd_shuffle network.
+//   col-replicate out[r][c]=in[r][0]: srcLane = T & ~0b01001, srcReg 0 → regs.
+//   row-replicate out[r][c]=in[0][c]: srcLane = T & ~0b10110, srcReg = R.
+struct AppleMmaBroadcastConversion
+    : public ConvertOpToLLVMPattern<triton::BroadcastOp> {
+  using ConvertOpToLLVMPattern<triton::BroadcastOp>::ConvertOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(triton::BroadcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    auto resTy = cast<RankedTensorType>(op.getType());
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto enc = dyn_cast<AppleMmaEncodingAttr>(resTy.getEncoding());
+    if (!enc)
+      return failure();
+    auto outTy = getTypeConverter()->convertType(resTy);
+    auto sTy = fragStructOf(outTy);
+    auto inSt = fragStructOf(adaptor.getSrc().getType());
+    if (!sTy || !inSt)
+      return failure();
+
+    int64_t srcRows = srcTy.getShape()[0], srcCols = srcTy.getShape()[1];
+    bool colReplicate = (srcCols == 1); // Mx1 → MxN
+    bool rowReplicate = (srcRows == 1); // 1xN → MxN
+    if (!colReplicate && !rowReplicate)
+      return failure();
+
+    auto mod = op->getParentOfType<ModuleOp>();
+    Value lane = emitLaneId(rewriter, loc, mod);
+    auto i16Ty = IntegerType::get(ctx, 16);
+    // clear masks: col-replicate clears L0,L3 (0b01001=9); row-replicate clears
+    // L1,L2,L4 (0b10110=22).
+    int64_t clr = colReplicate ? 0x9 : 0x16;
+    Value clrV = arith::ConstantIntOp::create(rewriter, loc, ~clr & 0x1f, 32);
+    Value srcLane32 = arith::AndIOp::create(rewriter, loc, lane, clrV);
+    Value srcLane16 = arith::TruncIOp::create(rewriter, loc, i16Ty, srcLane32);
+
+    auto resInfo = applegpu::getAppleMmaFragmentInfo(resTy, enc);
+    auto srcInfo = applegpu::getAppleMmaFragmentInfo(srcTy, enc);
+    Type vecTy = sTy.getBody()[0];
+
+    SmallVector<Value> outFrags(sTy.getBody().size());
+    for (size_t i = 0; i < outFrags.size(); ++i)
+      outFrags[i] = LLVM::UndefOp::create(rewriter, loc, sTy.getBody()[i]);
+
+    Value srcStruct = adaptor.getSrc();
+    SmallVector<Value> srcFrags;
+    for (unsigned i = 0; i < inSt.getBody().size(); ++i)
+      srcFrags.push_back(LLVM::ExtractValueOp::create(
+          rewriter, loc, inSt.getBody()[i], srcStruct,
+          ArrayRef<int64_t>{(int64_t)i}));
+
+    auto resOffsets = emitOffsetForLayout(enc, resTy);
+    for (auto &off : resOffsets) {
+      int64_t r = off[0], c = off[1];
+      int64_t outFrag, outVec;
+      applegpu::appleMmaFragmentSlot(r, c, resInfo, outFrag, outVec);
+      if (outFrag >= (int64_t)outFrags.size())
+        continue;
+      // Source slot: col-replicate reads (r,0); row-replicate reads (0,c).
+      int64_t sr = colReplicate ? r : 0;
+      int64_t sc = colReplicate ? 0 : c;
+      int64_t inFrag, inVec;
+      applegpu::appleMmaFragmentSlot(sr, sc, srcInfo, inFrag, inVec);
+      if (inFrag >= (int64_t)srcFrags.size())
+        inFrag = 0;
+      Value inIdx = arith::ConstantIntOp::create(rewriter, loc, inVec, 32);
+      Value scalar = LLVM::ExtractElementOp::create(
+          rewriter, loc, srcFrags[inFrag], inIdx);
+      Value shuffled = emitFragShuffle(rewriter, loc, mod, scalar, srcLane16);
+      Value outIdx = arith::ConstantIntOp::create(rewriter, loc, outVec, 32);
+      outFrags[outFrag] = LLVM::InsertElementOp::create(
+          rewriter, loc, vecTy, outFrags[outFrag], shuffled, outIdx);
+    }
+    Value res = LLVM::UndefOp::create(rewriter, loc, sTy);
+    for (size_t i = 0; i < outFrags.size(); ++i)
+      res = LLVM::InsertValueOp::create(rewriter, loc, sTy, res, outFrags[i],
+                                        ArrayRef<int64_t>{(int64_t)i});
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
+
+// Per-slot integer binary (cmpi/andi) on #mma fragments. Like the f32 binary
+// pattern but the result element type may differ from operands (cmpi: i32→i1).
+template <typename SrcOp>
+struct AppleMmaFragmentIntBinaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
+  using ConvertOpToLLVMPattern<SrcOp>::ConvertOpToLLVMPattern;
+  using OpAdaptor = typename SrcOp::Adaptor;
+  LogicalResult
+  matchAndRewrite(SrcOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    Value lhs = adaptor.getLhs(), rhs = adaptor.getRhs();
+    auto sTy = fragStructOf(lhs.getType());
+    if (!sTy || fragStructOf(rhs.getType()) != sTy)
+      return failure();
+    auto resTy = dyn_cast<RankedTensorType>(op.getType());
+    if (!resTy)
+      return failure();
+    auto outTy = this->getTypeConverter()->convertType(resTy);
+    auto outSt = fragStructOf(outTy);
+    if (!outSt)
+      return failure();
+    Type outVecTy = outSt.getBody()[0];
+    Value result = LLVM::UndefOp::create(rewriter, loc, outSt);
+    for (size_t i = 0; i < sTy.getBody().size(); ++i) {
+      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
+                                             lhs, ArrayRef<int64_t>{(int64_t)i});
+      Value b = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i],
+                                             rhs, ArrayRef<int64_t>{(int64_t)i});
+      Value v;
+      if constexpr (std::is_same_v<SrcOp, arith::CmpIOp>)
+        v = LLVM::ICmpOp::create(
+            rewriter, loc, outVecTy,
+            convertCmpIPredicate(op.getPredicate()), a, b);
+      else // andi
+        v = LLVM::AndOp::create(rewriter, loc, a, b);
+      result = LLVM::InsertValueOp::create(rewriter, loc, outSt, result, v,
+                                           ArrayRef<int64_t>{(int64_t)i});
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+  static LLVM::ICmpPredicate convertCmpIPredicate(arith::CmpIPredicate p) {
+    using A = arith::CmpIPredicate;
+    using L = LLVM::ICmpPredicate;
+    switch (p) {
+    case A::eq: return L::eq;
+    case A::ne: return L::ne;
+    case A::slt: return L::slt;
+    case A::sle: return L::sle;
+    case A::sgt: return L::sgt;
+    case A::sge: return L::sge;
+    case A::ult: return L::ult;
+    case A::ule: return L::ule;
+    case A::ugt: return L::ugt;
+    case A::uge: return L::uge;
+    }
+    llvm_unreachable("bad CmpIPredicate");
+  }
+};
+
+// select(i1-mask fragment, f32 fragment, f32 fragment) → per-slot vector select.
+struct AppleMmaFragmentSelectConversion
+    : public ConvertOpToLLVMPattern<arith::SelectOp> {
+  using ConvertOpToLLVMPattern<arith::SelectOp>::ConvertOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(arith::SelectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    Value cond = adaptor.getCondition();
+    Value tv = adaptor.getTrueValue(), fv = adaptor.getFalseValue();
+    auto sTy = fragStructOf(tv.getType());
+    auto cTy = fragStructOf(cond.getType());
+    if (!sTy || !cTy || fragStructOf(fv.getType()) != sTy)
+      return failure();
+    Value result = LLVM::UndefOp::create(rewriter, loc, sTy);
+    for (size_t i = 0; i < sTy.getBody().size(); ++i) {
+      Value c = LLVM::ExtractValueOp::create(rewriter, loc, cTy.getBody()[i],
+                                             cond, ArrayRef<int64_t>{(int64_t)i});
+      Value a = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i], tv,
+                                             ArrayRef<int64_t>{(int64_t)i});
+      Value b = LLVM::ExtractValueOp::create(rewriter, loc, sTy.getBody()[i], fv,
+                                             ArrayRef<int64_t>{(int64_t)i});
+      Value v = LLVM::SelectOp::create(rewriter, loc, c, a, b);
+      result = LLVM::InsertValueOp::create(rewriter, loc, sTy, result, v,
+                                           ArrayRef<int64_t>{(int64_t)i});
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 // ── Pipeliner async copy lowering ────────────────────────────────────────
 //
 // Lower ttg.async_copy_global_to_local → synchronous per-element copy
@@ -4464,6 +5096,21 @@ struct ConvertTritonAppleGPUToLLVMPass
           return LLVM::LLVMPointerType::get(ctx, 0);
         });
 
+    // Fragment ABI: pure dot-chain #mma tensors carry their simdgroup_matrix
+    // fragments as !llvm.struct<(vector<64xf32> x F)> so O3 keeps the
+    // accumulator vectorized (no SROA-to-scalar → no occupancy collapse).
+    // Gated by consumer analysis: #mma tensors fed to elementwise/broadcast/
+    // slice (fla) fall through to the generic flat per-thread struct.
+    auto fragmentEligible = computeFragmentEligibleTypes(mod);
+    typeConverter.addConversion(
+        [ctx, fragmentEligible](
+            RankedTensorType type) -> std::optional<Type> {
+          auto enc = dyn_cast<AppleMmaEncodingAttr>(type.getEncoding());
+          if (!enc || !fragmentEligible.count(type))
+            return std::nullopt;
+          return getAppleMmaFragmentType(ctx, type, enc);
+        });
+
     // Membar analysis: insert barriers between conflicting TG memory accesses.
     {
       ModuleAllocation allocation(mod);
@@ -4681,6 +5328,36 @@ struct ConvertTritonAppleGPUToLLVMPass
     POPULATE_FLOAT_OP(arith::SIToFPOp, LLVM::SIToFPOp);
     POPULATE_FLOAT_OP(arith::FPToSIOp, LLVM::FPToSIOp);
 #undef POPULATE_FLOAT_OP
+
+    // Fragment-ABI f32 elementwise (per <64 x f32> fragment vector). Higher
+    // benefit so it wins over the generic flat lowering when the operands are
+    // fragment structs; defers otherwise.
+    patterns.add<AppleMmaFragmentBinaryConversion<arith::AddFOp, LLVM::FAddOp>>(
+        typeConverter, patternBenefitDefault + 5);
+    patterns.add<AppleMmaFragmentBinaryConversion<arith::SubFOp, LLVM::FSubOp>>(
+        typeConverter, patternBenefitDefault + 5);
+    patterns.add<AppleMmaFragmentBinaryConversion<arith::MulFOp, LLVM::FMulOp>>(
+        typeConverter, patternBenefitDefault + 5);
+    patterns.add<AppleMmaFragmentBinaryConversion<arith::DivFOp, LLVM::FDivOp>>(
+        typeConverter, patternBenefitDefault + 5);
+    patterns.add<AppleMmaFragmentUnaryConversion<arith::NegFOp, LLVM::FNegOp>>(
+        typeConverter, patternBenefitDefault + 5);
+    patterns.add<AppleMmaFragmentUnaryConversion<math::ExpOp, LLVM::ExpOp>>(
+        typeConverter, patternBenefitDefault + 5);
+
+    // Fragment-ABI integer/mask + view lowerings (kkt op-web). Higher benefit
+    // than the generic flat view/arith lowerings so they fire on fragment
+    // structs and defer (return failure) otherwise.
+    patterns.add<AppleMmaExpandDimsConversion>(typeConverter,
+                                               patternBenefitDefault + 5);
+    patterns.add<AppleMmaBroadcastConversion>(typeConverter,
+                                              patternBenefitDefault + 5);
+    patterns.add<AppleMmaFragmentIntBinaryConversion<arith::CmpIOp>>(
+        typeConverter, patternBenefitDefault + 5);
+    patterns.add<AppleMmaFragmentIntBinaryConversion<arith::AndIOp>>(
+        typeConverter, patternBenefitDefault + 5);
+    patterns.add<AppleMmaFragmentSelectConversion>(typeConverter,
+                                                   patternBenefitDefault + 5);
 
     // ExternElementwiseOp: lower libdevice calls to LLVM intrinsics.
     // Inductor emits libdevice.exp, libdevice.sin, etc. which on CUDA

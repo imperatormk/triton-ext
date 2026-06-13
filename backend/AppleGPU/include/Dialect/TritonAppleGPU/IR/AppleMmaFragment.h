@@ -16,14 +16,13 @@ namespace mlir::triton::applegpu {
 struct AppleMmaFragmentInfo {
   int64_t warpsM = 1;
   int64_t warpsN = 1;
-  int64_t ownM = 1;   // owned tile rows
-  int64_t ownN = 1;   // owned tile cols
+  int64_t ownM = 1;     // owned tile rows
+  int64_t ownN = 1;     // owned tile cols
   int64_t numFrags = 1; // ownM * ownN
 };
 
-inline AppleMmaFragmentInfo
-getAppleMmaFragmentInfo(RankedTensorType ty,
-                        AppleMmaEncodingAttr enc) {
+inline AppleMmaFragmentInfo getAppleMmaFragmentInfo(RankedTensorType ty,
+                                                    AppleMmaEncodingAttr enc) {
   AppleMmaFragmentInfo info;
   auto wpc = enc.getWarpsPerCTA();
   unsigned rank = ty.getRank();

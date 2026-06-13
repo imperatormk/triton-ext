@@ -177,9 +177,20 @@ class StoreShuffleLayoutPass
       SmallVector<unsigned> spt{1, 2};
       SmallVector<unsigned> tpw{8, 4};
       SmallVector<unsigned> ord{1, 0};
-      auto wEnc = ttg::BlockedEncodingAttr::get(
-          ctx, spt, tpw, SmallVector<unsigned>(wpc.begin(), wpc.end()), ord,
-          blkEnc.getCGALayout());
+      SmallVector<unsigned> warps(wpc.begin(), wpc.end());
+
+      int numWarps = ttg::lookupNumWarps(mod);
+      int curWarps = 1;
+      for (unsigned w : warps)
+        curWarps *= w;
+      if (numWarps % curWarps == 0) {
+        unsigned factor = numWarps / curWarps;
+        if (factor > 1)
+          warps[ord[0]] *= factor;
+      }
+
+      auto wEnc = ttg::BlockedEncodingAttr::get(ctx, spt, tpw, warps, ord,
+                                                blkEnc.getCGALayout());
       auto wType = RankedTensorType::get(shape, dstTy.getElementType(), wEnc);
 
       // Only proceed when the mma -> W convert is genuinely within-simdgroup

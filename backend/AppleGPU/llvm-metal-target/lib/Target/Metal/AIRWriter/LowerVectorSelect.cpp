@@ -34,6 +34,10 @@ namespace llvm {
 namespace metal {
 
 void lowerVectorSelects(Module &M) {
+  // Debug knob: skip the blend rewrite so raw vector-condition selects reach
+  // FunctionWriter, exercising the bitcode SELECT/VSELECT encoding path.
+  if (getenv("AIR_DISABLE_LVS"))
+    return;
   SmallVector<SelectInst *, 16> Sels;
   for (Function &F : M)
     for (BasicBlock &BB : F)

@@ -31,6 +31,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 
 namespace mlir::triton::applegpu {
@@ -178,13 +179,12 @@ static bool srcStride64BAligned(Value src) {
 // Copy that the LLVM lowering keeps on the async DMA path with a rect-clamped
 // source tile: rect mask, other = 0, f32, aligned stride, at least 768 staged
 // elements per warp in the loop, and a staging tile no thicker than 32 (BK).
-static bool copyIsRectDMA(ttg::AsyncCopyGlobalToLocalOp copy) {
+static bool copyIsRectDMA(ttg::AsyncCopyGlobalToLocalOp copy, scf::ForOp loop) {
   if (!copy.getMask() || !maskIsRect(copy.getMask()))
     return false;
   auto srcTy = cast<RankedTensorType>(copy.getSrc().getType());
   if (srcTy.getRank() != 2)
     return false;
-  auto loop = copy->getParentOfType<scf::ForOp>();
   if (!loop)
     return false;
   int64_t elems = 0;
@@ -250,13 +250,43 @@ struct WidenPipelinedStaging
       slotBytes += b;
       minSlot = minSlot ? std::min(minSlot, b) : b;
       if (copy.getMask() && !maskIsUniform(copy.getMask()) &&
-          copyIsRectDMA(copy))
+          copyIsRectDMA(copy, loop))
         rects.push_back(copy);
     });
     if (slotBytes == 0 || slotBytes + minSlot > kTGBudgetBytes)
       return;
     for (auto copy : rects)
       copy->setAttr("applegpu.rect_dma", UnitAttr::get(copy.getContext()));
+    for (auto copy : prologueCopies(loop))
+      if (copy.getMask() && !maskIsUniform(copy.getMask()) &&
+          copyIsRectDMA(copy, loop))
+        copy->setAttr("applegpu.rect_dma", UnitAttr::get(copy.getContext()));
+  }
+
+  // The pipeliner's prologue prefill: async copies emitted before the loop in
+  // the same block whose commit token feeds a loop init arg. They clamp the
+  // same boundary as the matching in-loop copy, so they are rect-eligible on
+  // exactly the same conditions; the body-only walk above never sees them.
+  static SmallVector<ttg::AsyncCopyGlobalToLocalOp>
+  prologueCopies(scf::ForOp loop) {
+    SmallVector<ttg::AsyncCopyGlobalToLocalOp> out;
+    DenseSet<Value> initArgs(loop.getInitArgs().begin(),
+                             loop.getInitArgs().end());
+    for (Operation &op : *loop->getBlock()) {
+      if (&op == loop.getOperation())
+        break;
+      auto copy = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(&op);
+      if (!copy)
+        continue;
+      bool feedsLoop = initArgs.contains(copy.getToken());
+      for (Operation *user : copy.getToken().getUsers())
+        if (auto commit = dyn_cast<ttg::AsyncCommitGroupOp>(user))
+          if (initArgs.contains(commit.getAsyncToken()))
+            feedsLoop = true;
+      if (feedsLoop)
+        out.push_back(copy);
+    }
+    return out;
   }
 
   // local_load -> convert_layout(blocked -> blocked) with the load's only

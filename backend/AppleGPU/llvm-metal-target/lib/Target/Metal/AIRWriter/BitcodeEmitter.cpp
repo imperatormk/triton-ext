@@ -1472,8 +1472,17 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
     // Fix kernel argument metadata to match actual pointee types.
     fixKernelArgMetadata(M, PTM);
 
-    if (getenv("METAL_DUMP_PREWRITE"))
-      M.print(llvm::errs(), nullptr);
+    if (const char *pw = getenv("METAL_DUMP_PREWRITE")) {
+      // A path value writes the prewrite module there; otherwise stderr.
+      if (pw[0] && strcmp(pw, "1") != 0) {
+        std::error_code EC;
+        llvm::raw_fd_ostream os(pw, EC);
+        if (!EC)
+          M.print(os, nullptr);
+      } else {
+        M.print(llvm::errs(), nullptr);
+      }
+    }
 
     ValueEnumerator E(M, PTM);
 

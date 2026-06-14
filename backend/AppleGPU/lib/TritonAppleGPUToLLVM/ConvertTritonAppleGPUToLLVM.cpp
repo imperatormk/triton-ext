@@ -75,6 +75,77 @@ static bool isFragmentCandidateTensor(Type t) {
   return elt.isF32() || elt.isInteger(32) || elt.isInteger(1);
 }
 
+// A rank-2 f16/bf16 #mma tensor. This is NOT a general fragment candidate (it
+// must NOT enter the kkt elementwise web, which would reintroduce the
+// bf16-#mma elementwise scalarization leak) — it is admitted to the fragment
+// ABI ONLY as the narrow dot-accumulator epilogue: the f16/bf16 GEMM
+// accumulates in <64 x f32>, then `arith.truncf : f32#mma -> f16/bf16#mma`
+// narrows the result before the convert_layout to #blocked. Carrying that
+// truncf result as a <64 x half/bf16> fragment (instead of poisoning the f32
+// accumulator's type, which scalarized the whole loop) is what puts f16/bf16
+// GEMM on the same fragment baseline as f32.
+static bool isHalfMmaTensor(Type t) {
+  auto rt = dyn_cast<RankedTensorType>(t);
+  if (!rt || !isa<AppleMmaEncodingAttr>(rt.getEncoding()) || rt.getRank() != 2)
+    return false;
+  Type elt = rt.getElementType();
+  return elt.isF16() || elt.isBF16();
+}
+
+// True iff `op` is the f16/bf16 accumulator-epilogue truncf: a TruncFOp from an
+// f32 #mma fragment candidate to an f16/bf16 #mma, whose result feeds only a
+// convert_layout to a non-#mma layout (the store epilogue), AND whose f32 #mma
+// input is produced DIRECTLY by a dot (or a loop-carried dot accumulator).
+//
+// The direct-dot requirement is load-bearing: it admits the GEMM epilogue
+// (dot -> truncf -> store) but REJECTS solve_tril's merge kernel
+// (dot -> negf -> truncf -> store). With an intervening elementwise op the
+// mid-end sinks it through the truncf (negf(truncf) == truncf(negf)), leaving a
+// `fsub <64 x bfloat>` on the simdgroup bf16 fragment — which, combined with
+// the bf16 round-trip bitcast, crashes the AGX PSO materializer
+// (agx-crash-trunk/solve_tril_bf16_merge_pso_crash). The pure dot accumulator
+// has no such elementwise op on the fragment, so it stays safe.
+static bool isAccumTruncEpilogue(Operation *op) {
+  auto tf = dyn_cast<arith::TruncFOp>(op);
+  if (!tf)
+    return false;
+  if (!isFragmentCandidateTensor(tf.getIn().getType()) ||
+      !isHalfMmaTensor(tf.getType()))
+    return false;
+  // The narrowed result must feed EXACTLY ONE convert_layout to a non-#mma
+  // layout — the single store epilogue of a GEMM. fla's chunk_delta_h
+  // recurrence truncates an intermediate h and fans it out to several
+  // convert_layouts (one of which re-feeds a dot), and the multiple distinct
+  // #blocked targets don't share one fragment slot map → a flat/fragment slot
+  // mismatch at pack time. Requiring a single blocked consumer keeps this on
+  // the pure GEMM store narrow.
+  ttg::ConvertLayoutOp theCvt;
+  for (Operation *user : tf->getUsers()) {
+    auto cvt = dyn_cast<ttg::ConvertLayoutOp>(user);
+    if (!cvt)
+      return false;
+    auto resTy = dyn_cast<RankedTensorType>(cvt.getType());
+    if (!resTy || isa<AppleMmaEncodingAttr>(resTy.getEncoding()))
+      return false;
+    if (theCvt)
+      return false; // more than one consumer
+    theCvt = cvt;
+  }
+  if (!theCvt)
+    return false;
+  // The f32 #mma input must come straight from a dot accumulator: either a
+  // tt.dot result, or a block argument (the scf.for / cf loop carry of the
+  // accumulator). Any other producer (negf/add/... on the #mma, as in
+  // solve_tril's merge kernel) is rejected — the mid-end sinks the elementwise
+  // op through the truncf onto a bf16 simdgroup fragment, which crashes the AGX
+  // PSO materializer.
+  Value in = tf.getIn();
+  if (isa<BlockArgument>(in))
+    return true;
+  Operation *def = in.getDefiningOp();
+  return def && isa<triton::DotOp>(def);
+}
+
 static llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
   llvm::DenseSet<Type> eligible;
   llvm::DenseSet<Type> blocked;
@@ -96,6 +167,10 @@ static llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
       auto resTy = dyn_cast<RankedTensorType>(cvt.getType());
       return resTy && !isa<AppleMmaEncodingAttr>(resTy.getEncoding());
     }
+    // f16/bf16 accumulator epilogue: the f32 fragment narrowed to f16/bf16
+    // before the store convert. Keeps the f32 accumulator on the fragment path.
+    if (isAccumTruncEpilogue(user))
+      return true;
     // Fragment elementwise / view consumers (kkt chain). A use is clean ONLY if
     // the consumer is fully fragment-lowerable: its #mma result is a fragment
     // candidate AND every ranked-tensor operand is itself a same-encoding
@@ -155,11 +230,25 @@ static llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
             arith::SubFOp, arith::MulFOp, arith::DivFOp, arith::NegFOp,
             math::ExpOp>(def))
       return true;
+    if (isAccumTruncEpilogue(def))
+      return true; // the f16/bf16 truncf emits a fragment struct
     if (auto c = dyn_cast<arith::ConstantOp>(def)) {
       auto sp = dyn_cast<DenseElementsAttr>(c.getValue());
       return sp && sp.isSplat();
     }
     return false;
+  };
+
+  // The f16/bf16 truncf-epilogue result rides the fragment ABI alongside the
+  // f32 candidates, but is NOT an isFragmentCandidateTensor (so it can't be
+  // dragged into the kkt elementwise web). It is collected/poisoned separately.
+  auto isCollectible = [](Value v) -> bool {
+    if (isFragmentCandidateTensor(v.getType()))
+      return true;
+    if (!isHalfMmaTensor(v.getType()))
+      return false;
+    Operation *def = v.getDefiningOp();
+    return def && isAccumTruncEpilogue(def);
   };
 
   // Fixpoint over candidate VALUES, then collapse to TYPES. A fragment chain is
@@ -173,7 +262,7 @@ static llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
   llvm::SmallVector<Value> candidates;
   llvm::DenseSet<Value> bad;
   auto collect = [&](Value v) {
-    if (isFragmentCandidateTensor(v.getType()))
+    if (isCollectible(v))
       candidates.push_back(v);
   };
   mod.walk([&](Operation *op) {
@@ -187,7 +276,7 @@ static llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
 
   llvm::SmallVector<Value> worklist;
   auto poison = [&](Value v) {
-    if (isFragmentCandidateTensor(v.getType()) && bad.insert(v).second)
+    if (isCollectible(v) && bad.insert(v).second)
       worklist.push_back(v);
   };
   for (Value v : candidates) {
@@ -670,7 +759,18 @@ struct ConvertLayoutOpAppleConversion
       // #mma fragment struct → per-element scalars via the (fragIdx, vecIdx)
       // slot map, so the downstream TG-scatter epilogue sees flat scalars.
       auto info = applegpu::getAppleMmaFragmentInfo(srcTy, srcMmaEnc);
-      auto f32Ty = Float32Type::get(ctx);
+      auto fragElemTy =
+          cast<VectorType>(sStructTy.getBody()[0]).getElementType();
+      // The fragment carries f32 even for an f16/bf16 #mma accumulator (the
+      // narrowing is deferred here). Narrow each EXTRACTED SCALAR to the dst
+      // element type — a scalar fptrunc the AGX JIT compiles correctly, unlike
+      // a vector bf16 round-trip on the simdgroup register.
+      Type dstElemTy = getTypeConverter()->convertType(dstTy.getElementType());
+      bool narrowScalar = fragElemTy != dstElemTy &&
+                          isa<FloatType>(fragElemTy) &&
+                          isa<FloatType>(dstElemTy) &&
+                          dstElemTy.getIntOrFloatBitWidth() <
+                              fragElemTy.getIntOrFloatBitWidth();
       SmallVector<Value> frags;
       for (unsigned i = 0; i < sStructTy.getBody().size(); ++i)
         frags.push_back(ExtractValueOp::create(rewriter, loc,
@@ -685,8 +785,11 @@ struct ConvertLayoutOpAppleConversion
                      : frags.empty()                   ? Value()
                                                        : frags[0];
         Value vIdx = arith::ConstantIntOp::create(rewriter, loc, vecIdx, 32);
-        srcElems[i] =
-            LLVM::ExtractElementOp::create(rewriter, loc, f32Ty, frag, vIdx);
+        Value sc = LLVM::ExtractElementOp::create(rewriter, loc, fragElemTy,
+                                                  frag, vIdx);
+        if (narrowScalar)
+          sc = arith::TruncFOp::create(rewriter, loc, dstElemTy, sc);
+        srcElems[i] = sc;
       }
     } else if (sStructTy) {
       for (unsigned i = 0; i < sStructTy.getBody().size(); ++i)
@@ -1036,7 +1139,15 @@ struct ConvertLayoutOpAppleConversion
       Value scalar =
           LLVM::ExtractElementOp::create(rewriter, loc, frags[fragIdx], vIdx);
       Value shuffled = emitFragShuffle(rewriter, loc, mod, scalar, srcLane16);
-      if (shuffled.getType() != outSt.getBody()[i])
+      // f16/bf16 accumulator: the fragment is f32; narrow the shuffled scalar
+      // to the dst element type (a scalar fptrunc, off the simdgroup register).
+      Type outElemTy = outSt.getBody()[i];
+      if (shuffled.getType() != outElemTy &&
+          isa<FloatType>(shuffled.getType()) && isa<FloatType>(outElemTy) &&
+          outElemTy.getIntOrFloatBitWidth() <
+              shuffled.getType().getIntOrFloatBitWidth())
+        shuffled = arith::TruncFOp::create(rewriter, loc, outElemTy, shuffled);
+      if (shuffled.getType() != outElemTy)
         return failure();
       result = InsertValueOp::create(rewriter, loc, outSt, result, shuffled,
                                      ArrayRef<int64_t>{(int64_t)i});
@@ -3174,6 +3285,40 @@ struct AppleMmaFragmentUnaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
   }
 };
 
+// f16/bf16 accumulator-epilogue truncf on a fragment struct: a FORWARD. The
+// f16/bf16 #mma result rides the same <64 x f32> accumulator fragment as the
+// f32 input (getAppleMmaFragmentElemType keeps it f32), so this truncf is a
+// no-op at the fragment level — the actual f32 -> f16/bf16 narrowing is emitted
+// per-element on the EXTRACTED SCALAR in the #mma->#blocked store convert
+// (ConvertLayoutOpAppleConversion), keeping the accumulator vectorized and the
+// narrowing off the simdgroup register. Matches only when in/out are the same
+// f32 fragment struct; defers otherwise so the generic flat truncf still runs.
+struct AppleMmaFragmentTruncFConversion
+    : public ConvertOpToLLVMPattern<arith::TruncFOp> {
+  using ConvertOpToLLVMPattern<arith::TruncFOp>::ConvertOpToLLVMPattern;
+
+  static LLVMStructType fragStruct(Type t) {
+    auto s = dyn_cast_or_null<LLVMStructType>(t);
+    if (s && !s.getBody().empty() && isa<VectorType>(s.getBody()[0]))
+      return s;
+    return nullptr;
+  }
+
+  LogicalResult
+  matchAndRewrite(arith::TruncFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Value in = adaptor.getIn();
+    auto inTy = fragStruct(in.getType());
+    if (!inTy)
+      return failure();
+    auto outTy = fragStruct(getTypeConverter()->convertType(op.getType()));
+    if (outTy != inTy)
+      return failure();
+    rewriter.replaceOp(op, in);
+    return success();
+  }
+};
+
 // ── Fragment-ABI integer/mask + view lowerings (kkt op-web) ──────────────
 //
 // These keep the i32/i1/f32 kkt temporaries on the simdgroup register path so
@@ -3217,16 +3362,28 @@ static Value emitFragShuffle(ConversionPatternRewriter &rewriter, Location loc,
         .getResult();
   }
   auto i32Ty = IntegerType::get(ctx, 32);
+  // f16/bf16 fragments shuffle through the i32 form by bitcasting to a 16-bit
+  // integer first (ZExt on a float is invalid IR); the integer round-trips the
+  // bit pattern exactly, then bitcast back to the float type.
+  bool isFloat16 = vt.isF16() || vt.isBF16();
   Value asI32 = val;
   bool isBool = vt.isInteger(1);
-  if (isBool)
+  if (isFloat16) {
+    Value asI16 =
+        LLVM::BitcastOp::create(rewriter, loc, IntegerType::get(ctx, 16), val);
+    asI32 = LLVM::ZExtOp::create(rewriter, loc, i32Ty, asI16);
+  } else if (isBool || !vt.isInteger(32)) {
     asI32 = LLVM::ZExtOp::create(rewriter, loc, i32Ty, val);
-  else if (!vt.isInteger(32))
-    asI32 = LLVM::ZExtOp::create(rewriter, loc, i32Ty, val);
+  }
   auto fn = declare("air.simd_shuffle.s.i32", i32Ty);
   Value sh =
       LLVM::CallOp::create(rewriter, loc, fn, ValueRange{asI32, srcLaneI16})
           .getResult();
+  if (isFloat16) {
+    Value asI16 =
+        LLVM::TruncOp::create(rewriter, loc, IntegerType::get(ctx, 16), sh);
+    return LLVM::BitcastOp::create(rewriter, loc, vt, asI16);
+  }
   if (isBool)
     return LLVM::TruncOp::create(rewriter, loc, vt, sh);
   if (!vt.isInteger(32))
@@ -5782,6 +5939,8 @@ struct ConvertTritonAppleGPUToLLVMPass
         typeConverter, patternBenefitDefault + 5);
     patterns.add<AppleMmaFragmentUnaryConversion<math::ExpOp, LLVM::ExpOp>>(
         typeConverter, patternBenefitDefault + 5);
+    patterns.add<AppleMmaFragmentTruncFConversion>(typeConverter,
+                                                   patternBenefitDefault + 5);
 
     // Fragment-ABI integer/mask + view lowerings (kkt op-web). Higher benefit
     // than the generic flat view/arith lowerings so they fire on fragment

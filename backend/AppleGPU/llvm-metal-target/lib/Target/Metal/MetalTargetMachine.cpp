@@ -267,3 +267,24 @@ MetalTargetMachine::getTargetTransformInfo(const Function &F) const {
 MetalTargetLowering::MetalTargetLowering(const MetalTargetMachine &TM,
                                          const MetalSubtarget &STI)
     : TargetLowering(TM, STI) {}
+
+bool MetalTargetLowering::isLegalAddressingMode(const DataLayout &DL,
+                                                const AddrMode &AM, Type *Ty,
+                                                unsigned AS,
+                                                Instruction *I) const {
+  if (!APInt(64, AM.BaseOffs).isSignedIntN(32))
+    return false;
+
+  if (AM.BaseGV)
+    return !AM.BaseOffs && !AM.HasBaseReg && !AM.Scale;
+
+  switch (AM.Scale) {
+  case 0:
+    break;
+  case 1:
+    break;
+  default:
+    return false;
+  }
+  return true;
+}

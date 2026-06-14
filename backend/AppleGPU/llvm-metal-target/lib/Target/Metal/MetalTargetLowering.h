@@ -24,6 +24,10 @@ class MetalTargetLowering : public TargetLowering {
 public:
   explicit MetalTargetLowering(const MetalTargetMachine &TM,
                                const MetalSubtarget &STI);
+
+  bool isLegalAddressingMode(const DataLayout &DL, const AddrMode &AM, Type *Ty,
+                             unsigned AS,
+                             Instruction *I = nullptr) const override;
 };
 
 } // end namespace llvm

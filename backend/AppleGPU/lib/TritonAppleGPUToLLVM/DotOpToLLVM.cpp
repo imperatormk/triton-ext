@@ -2596,8 +2596,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                  Value rowStride, Value colStride,
                                  Value baseRow, Value baseCol, int64_t tileRow,
                                  int64_t tileCol, Value extraRow = nullptr,
-                                 Value extraCol = nullptr) -> Value {
-      Value refPtr = ptrs[0];
+                                 Value extraCol = nullptr,
+                                 Value refPtrOverride = nullptr) -> Value {
+      Value refPtr = refPtrOverride ? refPtrOverride : ptrs[0];
       int64_t refRowOff = offsets[0][0];
       int64_t refColOff = offsets[0][1];
 
@@ -3485,21 +3486,28 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // Runtime-K tile loaders: same as loadATile/loadBTile but the K offset
         // is a runtime Value (tk*8) folded into computeTileDevPtr's free extra
         // offset (A's column / B's row), so the load follows the loop IV.
-        auto loadATileRT = [&](int64_t k, Value tkElemOff) -> Value {
+        // The K offset rides a loop-carried A/B reference pointer (aKRef/bKRef)
+        // advanced by kUnroll*8 K-elements per trip, so the per-trip device
+        // address is a pointer-increment recurrence (ptr += const) instead of a
+        // fresh mul(tk,stride)+gep rebuild. tkElemOff is kept only as a fallback
+        // for callers that have no carried base (none on the rolled path).
+        auto loadATileRT = [&](int64_t k, Value tkElemOff,
+                               Value aKRef = nullptr) -> Value {
           Value aTilePtr = computeTileDevPtr(
               aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
               k * warpsM * 8, /*tileCol=*/0, warpRowElem,
-              /*extraCol=*/tkElemOff);
+              /*extraCol=*/aKRef ? nullptr : tkElemOff, aKRef);
           return isIntInput
                      ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
                      : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape, aDevStride,
                                      zeroOff, aDevTranspose);
         };
-        auto loadBTileRT = [&](Value tkElemOff, int64_t j) -> Value {
+        auto loadBTileRT = [&](Value tkElemOff, int64_t j,
+                               Value bKRef = nullptr) -> Value {
           Value bTilePtr = computeTileDevPtr(
               bPtrs, bOffsets, bRowStride, bColStride, bBaseRow, bBaseCol,
-              /*tileRow=*/0, j * warpsN * 8, /*extraRow=*/tkElemOff,
-              warpColElem);
+              /*tileRow=*/0, j * warpsN * 8,
+              /*extraRow=*/bKRef ? nullptr : tkElemOff, warpColElem, bKRef);
           return isIntInput
                      ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
                      : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape, bDevStride,
@@ -3540,6 +3548,20 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             return matC_tiles[k][j];
           };
 
+          // Advance a device pointer by `kElems` K-elements: along A's column
+          // axis (extraCol -> colStride) and B's row axis (extraRow ->
+          // rowStride). A loop-invariant constant GEP, so the per-trip pointer
+          // step is a single ptr += const recurrence (no mul(tk,stride) rebuild).
+          auto advanceK = [&](Value ptr, Value stride, int64_t kElems) -> Value {
+            Value off = arith::MulIOp::create(
+                rewriter, loc,
+                arith::ConstantIntOp::create(rewriter, loc, kElems, 64), stride);
+            return LLVM::GEPOp::create(rewriter, loc, devPtrTy, devGepElemTy,
+                                       ptr, ArrayRef<LLVM::GEPArg>{off});
+          };
+          bool carryKPtr = !isIntInput;
+          Value aKRefInit = aPtrs[0], bKRefInit = bPtrs[0];
+
           Block *curBlock = rewriter.getInsertionBlock();
           Block::iterator curPoint = rewriter.getInsertionPoint();
           Block *exitBlock = curBlock->splitBlock(curPoint);
@@ -3553,6 +3575,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           hdrArgLocs.push_back(loc);
           for (int64_t a = 0; a < nAcc; ++a) {
             hdrArgTys.push_back(matTy);
+            hdrArgLocs.push_back(loc);
+          }
+          // Loop-carried A/B reference pointers (strength-reduced K address).
+          int64_t aKArgIdx = 1 + nAcc, bKArgIdx = 2 + nAcc;
+          if (carryKPtr) {
+            hdrArgTys.push_back(devPtrTy);
+            hdrArgLocs.push_back(loc);
+            hdrArgTys.push_back(devPtrTy);
             hdrArgLocs.push_back(loc);
           }
           for (size_t a = 0; a < hdrArgTys.size(); ++a)
@@ -3570,6 +3600,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           for (int64_t k = 0; k < ownM; ++k)
             for (int64_t j = 0; j < ownN; ++j)
               entryArgs.push_back(accInit(k, j));
+          if (carryKPtr) {
+            entryArgs.push_back(aKRefInit);
+            entryArgs.push_back(bKRefInit);
+          }
           LLVM::BrOp::create(rewriter, loc, entryArgs, header);
 
           // Header: while (tk < tilesK) -> body else -> exit.
@@ -3594,19 +3628,33 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             for (int64_t j = 0; j < ownN; ++j)
               acc[k][j] = header->getArgument(1 + k * ownN + j);
           }
+          Value aKRef = carryKPtr ? header->getArgument(aKArgIdx) : nullptr;
+          Value bKRef = carryKPtr ? header->getArgument(bKArgIdx) : nullptr;
           for (int64_t u = 0; u < kUnroll; ++u) {
-            // sub-step K index = (tk + u); element offset = (tk + u) * 8.
-            Value subIdx =
-                (u == 0) ? tkIv
-                         : arith::AddIOp::create(rewriter, loc, tkIv,
-                                                 arith::ConstantIntOp::create(
-                                                     rewriter, loc, u, 32));
-            Value tkElemOff = arith::MulIOp::create(rewriter, loc, subIdx, c8);
+            // sub-step within the trip: the carried A/B pointers already encode
+            // K=tk; advance by the compile-time-constant u*8 K-elements for the
+            // sub-step (folds into the load GEP, no runtime mul).
+            Value aSub = aKRef, bSub = bKRef;
+            Value tkElemOff = nullptr;
+            if (carryKPtr) {
+              if (u > 0) {
+                aSub = advanceK(aKRef, aColStride, u * 8);
+                bSub = advanceK(bKRef, bRowStride, u * 8);
+              }
+            } else {
+              Value subIdx =
+                  (u == 0) ? tkIv
+                           : arith::AddIOp::create(
+                                 rewriter, loc, tkIv,
+                                 arith::ConstantIntOp::create(rewriter, loc, u,
+                                                              32));
+              tkElemOff = arith::MulIOp::create(rewriter, loc, subIdx, c8);
+            }
             SmallVector<Value> matA_cur(ownM);
             for (int64_t k = 0; k < ownM; ++k)
-              matA_cur[k] = loadATileRT(k, tkElemOff);
+              matA_cur[k] = loadATileRT(k, tkElemOff, aSub);
             for (int64_t j = 0; j < ownN; ++j) {
-              Value matB = loadBTileRT(tkElemOff, j);
+              Value matB = loadBTileRT(tkElemOff, j, bSub);
               for (int64_t k = 0; k < ownM; ++k)
                 acc[k][j] = LLVM::CallOp::create(
                                 rewriter, loc, devMmaFn,
@@ -3623,6 +3671,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           for (int64_t k = 0; k < ownM; ++k)
             for (int64_t j = 0; j < ownN; ++j)
               backArgs.push_back(acc[k][j]);
+          if (carryKPtr) {
+            backArgs.push_back(advanceK(aKRef, aColStride, kUnroll * 8));
+            backArgs.push_back(advanceK(bKRef, bRowStride, kUnroll * 8));
+          }
           LLVM::BrOp::create(rewriter, loc, backArgs, header);
 
           // Exit: harvest the final accumulators from the header-forwarded

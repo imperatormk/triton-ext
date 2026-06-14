@@ -17,6 +17,8 @@
 #include "MetadataWriter.h"
 #include "MetalConstraints.h"
 #include "ValueEnumerator.h"
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/LLVMBitCodes.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
 #include "llvm/IR/Instructions.h"
@@ -36,6 +38,29 @@ void emitConstantsBlock(BitstreamWriter &W, ValueEnumerator &E,
 void emitFunctionBlock(BitstreamWriter &W, const Function &F,
                        ValueEnumerator &E, const MetadataEnumerator &MD) {
   W.EnterSubblock(bitc::FUNCTION_BLOCK_ID, 5);
+
+  // Emit blocks in reverse-post-order so every value's definition precedes its
+  // uses in the instruction stream. The relative value-ID encoding (GetID =
+  // CurInstID - absID) cannot represent a forward reference: a use whose
+  // operand is defined in a later-emitted block underflows the unsigned
+  // subtraction and corrupts the bitstream ("Invalid record"). LLVM permits a
+  // value to be used in a block that is laid out textually before its defining
+  // block (as long as the def dominates the use), so textual order is unsafe;
+  // RPO from the entry guarantees def-before-use. Unreachable blocks are
+  // appended so they are still emitted.
+  SmallVector<const BasicBlock *, 8> BBOrder;
+  {
+    SmallPtrSet<const BasicBlock *, 8> Seen;
+    if (!F.isDeclaration()) {
+      for (const BasicBlock *BB :
+           ReversePostOrderTraversal<const Function *>(&F))
+        if (Seen.insert(BB).second)
+          BBOrder.push_back(BB);
+      for (const BasicBlock &BB : F)
+        if (Seen.insert(&BB).second)
+          BBOrder.push_back(&BB);
+    }
+  }
 
   // Build local value ID map
   DenseMap<const Value *, unsigned> LocalMap;
@@ -57,8 +82,8 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         FuncConsts.push_back(C);
       }
   };
-  for (auto &BB : F)
-    for (auto &I : BB) {
+  for (const BasicBlock *BB : BBOrder)
+    for (auto &I : *BB) {
       for (auto &Op : I.operands())
         CollectConst(Op);
       // The shuffle mask is not an operand in-memory but is referenced by
@@ -68,8 +93,8 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
     }
 
   // Instruction results
-  for (auto &BB : F)
-    for (auto &I : BB)
+  for (const BasicBlock *BB : BBOrder)
+    for (auto &I : *BB)
       if (!I.getType()->isVoidTy())
         LocalMap[&I] = NextID++;
 
@@ -93,19 +118,15 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
   };
 
   // DECLAREBLOCKS
-  unsigned NumBBs = 0;
-  for (auto &BB : F)
-    (void)BB, NumBBs++;
-  SmallVector<uint64_t, 1> DV = {NumBBs};
+  SmallVector<uint64_t, 1> DV = {BBOrder.size()};
   W.EmitRecord(bitc::FUNC_CODE_DECLAREBLOCKS, DV);
 
   // Function constants
   emitConstantsBlock(W, E, FuncConsts, 5);
 
-  // BB index helper
-  SmallVector<const BasicBlock *, 8> BBList;
-  for (auto &BB : F)
-    BBList.push_back(&BB);
+  // BB index helper. Indices follow the emitted (RPO) order so branch/phi
+  // block references stay consistent with the stream the reader rebuilds.
+  SmallVector<const BasicBlock *, 8> BBList(BBOrder.begin(), BBOrder.end());
   auto BBIdx = [&](const BasicBlock *BB) -> unsigned {
     for (unsigned I = 0; I < BBList.size(); I++)
       if (BBList[I] == BB)
@@ -118,8 +139,8 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
   // an InstructionList in parallel) can index it via Record[0].
   SmallVector<std::pair<unsigned, const Instruction *>, 8> Attached;
   unsigned EmittedIdx = 0;
-  for (auto &BB : F) {
-    for (auto &I : BB) {
+  for (const BasicBlock *BB : BBOrder) {
+    for (auto &I : *BB) {
       SmallVector<uint64_t, 16> V;
 
       if (auto *BO = dyn_cast<BinaryOperator>(&I)) {

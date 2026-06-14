@@ -1308,6 +1308,9 @@ static Value emitAppleRedundantThreadPredicate(
 }
 
 // Combine two predicates with AND, handling null values.
+static Value extractFirstElemScalar(Value tensor, bool peelModulo);
+static bool extractFirstElemConst(Value tensor, int64_t &out, bool peelModulo);
+
 static Value maybeAnd(ConversionPatternRewriter &rewriter, Location loc,
                       Value a, Value b) {
   if (!a)
@@ -2299,6 +2302,155 @@ struct AtomicCASOpAppleConversion
 //
 // This pattern uses a conditional branch: if (mask) store(val, ptr), which
 // is safe regardless of the pointer value when the mask is false.
+// Interior-tile fast path for masked stores.
+//
+// A GEMM C-store carries a rectangular boundary mask
+// `(om[:,None] < M) & (on[None,:] < N)` so edge tiles don't write past the
+// matrix. For PROVABLY-FULL (interior) tiles every per-element predicate is
+// all-true, yet the lowering still emits a 64-way per-element predicated store
+// chain that burns ALU. This derives a single simdgroup-uniform guard
+// `tile_fully_in_bounds` from the mask so the caller can branch to an unmasked
+// store for interior tiles while keeping the predicated path for genuine edges.
+//
+// The guard is `(rowFirst + BM) <= rowBound && (colFirst + BN) <= colBound`
+// (AND every uniform i1 leaf), where rowFirst/colFirst are the smallest tile
+// indices and BM/BN the tile extents (the non-1 cmp result dims). It is
+// CONSERVATIVE: any leaf we cannot recognize as a uniform splat or a
+// `cmp slt(idx, splat(bound))` row/col bound makes this return null, so the
+// store keeps the exact existing masked path. Returns null when the mask is not
+// a recognizable full rectangular boundary mask.
+static Value computeRectStoreFullGuard(triton::StoreOp op,
+                                       ConversionPatternRewriter &rewriter,
+                                       Location loc) {
+  Value mask = op.getMask();
+  if (!mask)
+    return nullptr;
+
+  Value rowBound, rowFirst, colBound, colFirst;
+  int64_t rowExtent = 0, colExtent = 0;
+  int64_t rowFirstConst = 0, colFirstConst = 0;
+  bool hasRow = false, hasCol = false;
+  SmallVector<Value, 2> uniforms;
+
+  // Walk the AND-tree of the mask; every leaf must be either a uniform i1 splat
+  // or a single-axis `cmp slt(idx, splat(bound))`.
+  SmallVector<Value, 8> work{mask};
+  while (!work.empty()) {
+    Value cur = work.pop_back_val();
+    auto *def = cur.getDefiningOp();
+    if (!def)
+      return nullptr;
+    if (auto andOp = dyn_cast<arith::AndIOp>(def)) {
+      work.push_back(andOp.getLhs());
+      work.push_back(andOp.getRhs());
+      continue;
+    }
+    if (auto bc = dyn_cast<triton::BroadcastOp>(def)) {
+      work.push_back(bc.getSrc());
+      continue;
+    }
+    if (auto splat = dyn_cast<triton::SplatOp>(def)) {
+      Value s = splat.getSrc();
+      if (!s.getType().isInteger(1))
+        return nullptr;
+      uniforms.push_back(s);
+      continue;
+    }
+    auto cmp = dyn_cast<arith::CmpIOp>(def);
+    if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt)
+      return nullptr;
+    auto resTy = dyn_cast<RankedTensorType>(cmp.getType());
+    if (!resTy || resTy.getRank() != 2)
+      return nullptr;
+    bool boundsCols;
+    if (resTy.getDimSize(0) == 1 && resTy.getDimSize(1) > 1)
+      boundsCols = true;
+    else if (resTy.getDimSize(1) == 1 && resTy.getDimSize(0) > 1)
+      boundsCols = false;
+    else
+      return nullptr;
+    int64_t extent = boundsCols ? resTy.getDimSize(1) : resTy.getDimSize(0);
+    Value bound = extractFirstElemScalar(cmp.getRhs(), false);
+    if (!bound)
+      return nullptr;
+    Value first = extractFirstElemScalar(cmp.getLhs(), false);
+    int64_t firstConst = 0;
+    if (!first && !extractFirstElemConst(cmp.getLhs(), firstConst, false))
+      return nullptr;
+    if (boundsCols) {
+      if (hasCol)
+        return nullptr;
+      hasCol = true;
+      colBound = bound;
+      colFirst = first;
+      colFirstConst = firstConst;
+      colExtent = extent;
+    } else {
+      if (hasRow)
+        return nullptr;
+      hasRow = true;
+      rowBound = bound;
+      rowFirst = first;
+      rowFirstConst = firstConst;
+      rowExtent = extent;
+    }
+  }
+
+  if (!hasRow && !hasCol)
+    return nullptr;
+
+  auto i64Ty = rewriter.getI64Type();
+  auto toI64 = [&](Value v) -> Value {
+    Value r = rewriter.getRemappedValue(v);
+    if (!r)
+      return nullptr;
+    if (r.getType() != i64Ty)
+      r = LLVM::SExtOp::create(rewriter, loc, i64Ty, r);
+    return r;
+  };
+
+  // Per-axis guard: firstScalar + extent <= bound  (both sides as i64).
+  auto axisGuard = [&](Value boundV, Value firstV, int64_t firstConst,
+                       int64_t extent) -> Value {
+    Value b = toI64(boundV);
+    if (!b)
+      return nullptr;
+    Value f;
+    if (firstV) {
+      f = toI64(firstV);
+      if (!f)
+        return nullptr;
+    } else {
+      f = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                   rewriter.getI64IntegerAttr(firstConst));
+    }
+    Value ext = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                         rewriter.getI64IntegerAttr(extent));
+    Value hi = LLVM::AddOp::create(rewriter, loc, i64Ty, f, ext);
+    return LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::sle, hi, b);
+  };
+
+  Value guard;
+  if (hasRow) {
+    guard = axisGuard(rowBound, rowFirst, rowFirstConst, rowExtent);
+    if (!guard)
+      return nullptr;
+  }
+  if (hasCol) {
+    Value g = axisGuard(colBound, colFirst, colFirstConst, colExtent);
+    if (!g)
+      return nullptr;
+    guard = guard ? LLVM::AndOp::create(rewriter, loc, guard, g) : g;
+  }
+  for (Value u : uniforms) {
+    Value ru = rewriter.getRemappedValue(u);
+    if (!ru)
+      return nullptr;
+    guard = LLVM::AndOp::create(rewriter, loc, guard, ru);
+  }
+  return guard;
+}
+
 struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -2350,37 +2502,61 @@ struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
       regMask = freeVarMasks[StringAttr::get(rewriter.getContext(), "reg")];
     }
 
-    for (size_t i = 0; i < ptrs.size(); ++i) {
-      // Skip redundant register-replicated elements: a non-canonical register
-      // index holds the same value as its canonical sibling and addresses the
-      // same location, so storing it is just a duplicate write.
-      if (!isCanonicalIndex(i, regMask))
-        continue;
+    // Emit the per-element store sequence. When dropElemMask is set the
+    // boundary store mask is dropped (the tile is provably full); the
+    // redundant-thread predicate still applies since it guards replicated
+    // writers, not bounds.
+    auto emitStores = [&](bool dropElemMask) {
+      for (size_t i = 0; i < ptrs.size(); ++i) {
+        if (!isCanonicalIndex(i, regMask))
+          continue;
 
-      // Combine the redundant-thread predicate with the per-element store mask.
-      Value mask;
-      if (!masks.empty() && masks[i])
-        mask = maybeAnd(rewriter, loc, threadPred, masks[i]);
-      else
-        mask = threadPred;
+        Value mask = threadPred;
+        if (!dropElemMask && !masks.empty() && masks[i])
+          mask = maybeAnd(rewriter, loc, threadPred, masks[i]);
 
-      if (mask) {
-        // Use conditional branch: if (mask) store(val, ptr)
-        // This avoids the read-modify-write of LoadStoreToLLVM which
-        // causes data corruption when masked-out pointers alias valid data.
-        auto *curBlock = rewriter.getInsertionBlock();
-        auto curPoint = rewriter.getInsertionPoint();
-        auto *endBlock = curBlock->splitBlock(curPoint);
-        auto *thenBlock = rewriter.createBlock(endBlock);
-        rewriter.setInsertionPointToEnd(curBlock);
-        LLVM::CondBrOp::create(rewriter, loc, mask, thenBlock, endBlock);
-        rewriter.setInsertionPointToEnd(thenBlock);
-        LLVM::StoreOp::create(rewriter, loc, vals[i], ptrs[i]);
-        LLVM::BrOp::create(rewriter, loc, endBlock);
-        rewriter.setInsertionPointToStart(endBlock);
-      } else {
-        LLVM::StoreOp::create(rewriter, loc, vals[i], ptrs[i]);
+        if (mask) {
+          auto *curBlock = rewriter.getInsertionBlock();
+          auto curPoint = rewriter.getInsertionPoint();
+          auto *endBlock = curBlock->splitBlock(curPoint);
+          auto *thenBlock = rewriter.createBlock(endBlock);
+          rewriter.setInsertionPointToEnd(curBlock);
+          LLVM::CondBrOp::create(rewriter, loc, mask, thenBlock, endBlock);
+          rewriter.setInsertionPointToEnd(thenBlock);
+          LLVM::StoreOp::create(rewriter, loc, vals[i], ptrs[i]);
+          LLVM::BrOp::create(rewriter, loc, endBlock);
+          rewriter.setInsertionPointToStart(endBlock);
+        } else {
+          LLVM::StoreOp::create(rewriter, loc, vals[i], ptrs[i]);
+        }
       }
+    };
+
+    // Interior-tile fast path: if the boundary mask is a full rectangular mask
+    // and the tile is provably (at runtime, simdgroup-uniformly) fully in
+    // bounds, branch to a maskless store and skip the per-element predication.
+    Value fullGuard =
+        !masks.empty() ? computeRectStoreFullGuard(op, rewriter, loc) : nullptr;
+    if (fullGuard) {
+      auto *curBlock = rewriter.getInsertionBlock();
+      auto curPoint = rewriter.getInsertionPoint();
+      auto *contBlock = curBlock->splitBlock(curPoint);
+      auto *fullBlock = rewriter.createBlock(contBlock);
+      auto *edgeBlock = rewriter.createBlock(contBlock);
+      rewriter.setInsertionPointToEnd(curBlock);
+      LLVM::CondBrOp::create(rewriter, loc, fullGuard, fullBlock, edgeBlock);
+
+      rewriter.setInsertionPointToEnd(fullBlock);
+      emitStores(/*dropElemMask=*/true);
+      LLVM::BrOp::create(rewriter, loc, contBlock);
+
+      rewriter.setInsertionPointToEnd(edgeBlock);
+      emitStores(/*dropElemMask=*/false);
+      LLVM::BrOp::create(rewriter, loc, contBlock);
+
+      rewriter.setInsertionPointToStart(contBlock);
+    } else {
+      emitStores(/*dropElemMask=*/false);
     }
     rewriter.eraseOp(op);
     return success();
@@ -4347,6 +4523,71 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     return LLVM::SMinOp::create(rewriter, loc, rem, capV);
   }
 
+  // Interior-tile fullness guard for the rect-clamped DMA load: a uniform i1
+  // that is true exactly when every bounded axis is fully in range, so the
+  // source clamp + residual zero-fill are no-ops and we can fire the maskless
+  // full-tile DMA (byte-identical to the --even path).
+  //
+  // Per axis the guard is `first + extent <= bound`. The K axis is bounded too
+  // (A's mask is `(om<M)&(kk<K)`, B's is `(kk<K)&(on<N)`), so the LAST partial
+  // K-tile — where `kk + BK > K` on a ragged-K shape — makes the K-axis guard
+  // false and correctly keeps the clamped path. Uniform leaves (pipeliner
+  // K-guards) must also be true. Returns null if any scalar cannot be remapped,
+  // in which case the caller keeps the unconditional clamped DMA.
+  static Value emitRectFullGuard(ConversionPatternRewriter &rewriter,
+                                 Location loc, const RectMaskInfo &rectMask,
+                                 int64_t tileRows, int64_t tileCols) {
+    auto i64Ty = rewriter.getI64Type();
+    auto axisGuard = [&](Value boundV, Value firstV, int64_t firstConst,
+                         int64_t extent) -> Value {
+      Value b = rewriter.getRemappedValue(boundV);
+      if (!b)
+        return nullptr;
+      if (b.getType() != i64Ty)
+        b = LLVM::SExtOp::create(rewriter, loc, i64Ty, b);
+      Value f;
+      if (firstV) {
+        f = rewriter.getRemappedValue(firstV);
+        if (!f)
+          return nullptr;
+        if (f.getType() != i64Ty)
+          f = LLVM::SExtOp::create(rewriter, loc, i64Ty, f);
+      } else {
+        f = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                     rewriter.getI64IntegerAttr(firstConst));
+      }
+      Value ext = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                           rewriter.getI64IntegerAttr(extent));
+      Value hi = LLVM::AddOp::create(rewriter, loc, i64Ty, f, ext);
+      return LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::sle, hi,
+                                  b);
+    };
+
+    Value guard;
+    if (rectMask.hasRow) {
+      guard = axisGuard(rectMask.rowBound, rectMask.rowFirst,
+                        rectMask.rowFirstConst, tileRows);
+      if (!guard)
+        return nullptr;
+    }
+    if (rectMask.hasCol) {
+      Value g = axisGuard(rectMask.colBound, rectMask.colFirst,
+                          rectMask.colFirstConst, tileCols);
+      if (!g)
+        return nullptr;
+      guard = guard ? (Value)LLVM::AndOp::create(rewriter, loc, guard, g) : g;
+    }
+    if (!guard)
+      return nullptr;
+    for (Value u : rectMask.uniforms) {
+      Value ru = rewriter.getRemappedValue(u);
+      if (!ru)
+        return nullptr;
+      guard = LLVM::AndOp::create(rewriter, loc, guard, ru);
+    }
+    return guard;
+  }
+
   // Runtime tile-origin + row-stride extraction fallback.
   //
   // When the syntactic IR walk (extractAsyncCopyPtrInfo) cannot reconstruct a
@@ -4512,38 +4753,6 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     tileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty, tileVec,
                                             heightVal, idx1);
 
-    // Rect-mask clamp: shrink the source tile to its in-bounds remainder; the
-    // skipped remainder of the dst slot is zeroed explicitly after the fire.
-    Value srcTileVec = tileVec;
-    Value srcWForZero, srcHForZero, srcHBand;
-    if (useRectClamp && rectMask) {
-      Value srcW = widthVal, srcH = heightVal;
-      Value rowRemFull;
-      if (rectMask->hasCol) {
-        Value colRem =
-            emitRemaining(rewriter, loc, rectMask->colBound, rectMask->colFirst,
-                          rectMask->colFirstConst, tileCols);
-        srcW = LLVM::MulOp::create(rewriter, loc, i64Ty, colRem, elemBytesVal);
-      }
-      if (rectMask->hasRow) {
-        srcH =
-            emitRemaining(rewriter, loc, rectMask->rowBound, rectMask->rowFirst,
-                          rectMask->rowFirstConst, tileRows);
-      }
-      srcTileVec = LLVM::UndefOp::create(rewriter, loc, vec2i64Ty);
-      srcTileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
-                                                 srcTileVec, srcW, idx0);
-      srcTileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
-                                                 srcTileVec, srcH, idx1);
-      srcWForZero = srcW;
-      srcHBand = srcH;
-      srcHForZero =
-          rowRemFull
-              ? rowRemFull
-              : LLVM::ConstantOp::create(rewriter, loc, i64Ty,
-                                         rewriter.getI64IntegerAttr(tileRows));
-    }
-
     Value zeroI64 = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
                                              rewriter.getI64IntegerAttr(0));
     Value offsetVec = LLVM::UndefOp::create(rewriter, loc, vec2i64Ty);
@@ -4563,52 +4772,114 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
          vec2i64Ty, vec2i64Ty, i32Ty});
 
     Value evAlloca = createEventAlloca(op, rewriter);
-    if (srcWForZero) {
-      emitResidualZero(rewriter, loc, mod, dstBase, tileRows, tileCols,
-                       elemBytes, srcWForZero, srcHForZero);
-      Value z = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
-                                         rewriter.getI64IntegerAttr(0));
-      Value wPos = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::sgt,
-                                        srcWForZero, z);
-      Value hPos = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::sgt,
-                                        srcHBand, z);
-      Value nonEmpty = LLVM::AndOp::create(rewriter, loc, wPos, hPos);
-      llvmGuard = llvmGuard ? (Value)LLVM::AndOp::create(rewriter, loc,
-                                                         llvmGuard, nonEmpty)
-                            : nonEmpty;
-    }
-    // Mask is dropped: the (possibly rect-clamped) src tile plus clamp 0
-    // covers the boundary; a uniform guard gates the whole copy below.
-    if (llvmGuard) {
+
+    // Build the (residual-zero + optionally-guarded) async copy for a given
+    // source tile. `clampTile` runs the rect clamp + residual zero-fill; the
+    // full-tile arm passes the compile-const tileVec and skips both, emitting
+    // exactly what the maskless --even path does.
+    auto emitCopy = [&](bool clampTile, Value baseGuard) {
+      Value srcTileVec = tileVec;
+      Value guard = baseGuard;
+      if (clampTile && useRectClamp && rectMask) {
+        Value srcW = widthVal, srcH = heightVal;
+        if (rectMask->hasCol) {
+          Value colRem = emitRemaining(rewriter, loc, rectMask->colBound,
+                                       rectMask->colFirst,
+                                       rectMask->colFirstConst, tileCols);
+          srcW =
+              LLVM::MulOp::create(rewriter, loc, i64Ty, colRem, elemBytesVal);
+        }
+        if (rectMask->hasRow) {
+          srcH = emitRemaining(rewriter, loc, rectMask->rowBound,
+                               rectMask->rowFirst, rectMask->rowFirstConst,
+                               tileRows);
+        }
+        srcTileVec = LLVM::UndefOp::create(rewriter, loc, vec2i64Ty);
+        srcTileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
+                                                   srcTileVec, srcW, idx0);
+        srcTileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
+                                                   srcTileVec, srcH, idx1);
+        Value srcHForZero = LLVM::ConstantOp::create(
+            rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileRows));
+        emitResidualZero(rewriter, loc, mod, dstBase, tileRows, tileCols,
+                         elemBytes, srcW, srcHForZero);
+        Value z = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                           rewriter.getI64IntegerAttr(0));
+        Value wPos = LLVM::ICmpOp::create(rewriter, loc,
+                                          LLVM::ICmpPredicate::sgt, srcW, z);
+        Value hPos = LLVM::ICmpOp::create(rewriter, loc,
+                                          LLVM::ICmpPredicate::sgt, srcH, z);
+        Value nonEmpty = LLVM::AndOp::create(rewriter, loc, wPos, hPos);
+        guard = guard
+                    ? (Value)LLVM::AndOp::create(rewriter, loc, guard, nonEmpty)
+                    : nonEmpty;
+      }
+      if (guard) {
+        auto *parentBlock = rewriter.getInsertionBlock();
+        auto insertPt = rewriter.getInsertionPoint();
+        auto *thenBlock = rewriter.createBlock(
+            parentBlock->getParent(), std::next(Region::iterator(parentBlock)));
+        auto *afterBlock = rewriter.createBlock(
+            parentBlock->getParent(), std::next(Region::iterator(thenBlock)));
+        afterBlock->getOperations().splice(afterBlock->begin(),
+                                           parentBlock->getOperations(),
+                                           insertPt, parentBlock->end());
+        rewriter.setInsertionPointToEnd(parentBlock);
+        LLVM::CondBrOp::create(rewriter, loc, guard, thenBlock, afterBlock);
+        rewriter.setInsertionPointToStart(thenBlock);
+        Value event = LLVM::CallOp::create(
+                          rewriter, loc, asyncCopyFn,
+                          ValueRange{one64, one64, dstBase, dstStrideBytes,
+                                     one64, tileVec, srcBase, srcStrideBytes,
+                                     one64, srcTileVec, offsetVec, clamp})
+                          .getResult();
+        LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
+        LLVM::BrOp::create(rewriter, loc, ValueRange{}, afterBlock);
+        rewriter.setInsertionPointToStart(afterBlock);
+      } else {
+        Value event = LLVM::CallOp::create(
+                          rewriter, loc, asyncCopyFn,
+                          ValueRange{one64, one64, dstBase, dstStrideBytes,
+                                     one64, tileVec, srcBase, srcStrideBytes,
+                                     one64, srcTileVec, offsetVec, clamp})
+                          .getResult();
+        LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
+      }
+    };
+
+    // Interior-tile fast path: when the rect mask proves the tile is fully in
+    // bounds (incl. a non-partial K-tile) the clamp + residual zero are no-ops,
+    // so fire the maskless full-tile DMA; edge tiles keep the clamped DMA.
+    Value fullGuard =
+        (useRectClamp && rectMask)
+            ? emitRectFullGuard(rewriter, loc, *rectMask, tileRows, tileCols)
+            : nullptr;
+    if (fullGuard) {
       auto *parentBlock = rewriter.getInsertionBlock();
       auto insertPt = rewriter.getInsertionPoint();
-      auto *thenBlock = rewriter.createBlock(
+      auto *fullBlock = rewriter.createBlock(
           parentBlock->getParent(), std::next(Region::iterator(parentBlock)));
-      auto *afterBlock = rewriter.createBlock(
-          parentBlock->getParent(), std::next(Region::iterator(thenBlock)));
-      afterBlock->getOperations().splice(afterBlock->begin(),
-                                         parentBlock->getOperations(), insertPt,
-                                         parentBlock->end());
+      auto *edgeBlock = rewriter.createBlock(
+          parentBlock->getParent(), std::next(Region::iterator(fullBlock)));
+      auto *contBlock = rewriter.createBlock(
+          parentBlock->getParent(), std::next(Region::iterator(edgeBlock)));
+      contBlock->getOperations().splice(contBlock->begin(),
+                                        parentBlock->getOperations(), insertPt,
+                                        parentBlock->end());
       rewriter.setInsertionPointToEnd(parentBlock);
-      LLVM::CondBrOp::create(rewriter, loc, llvmGuard, thenBlock, afterBlock);
-      rewriter.setInsertionPointToStart(thenBlock);
-      Value event = LLVM::CallOp::create(
-                        rewriter, loc, asyncCopyFn,
-                        ValueRange{one64, one64, dstBase, dstStrideBytes, one64,
-                                   tileVec, srcBase, srcStrideBytes, one64,
-                                   srcTileVec, offsetVec, clamp})
-                        .getResult();
-      LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
-      LLVM::BrOp::create(rewriter, loc, ValueRange{}, afterBlock);
-      rewriter.setInsertionPointToStart(afterBlock);
+      LLVM::CondBrOp::create(rewriter, loc, fullGuard, fullBlock, edgeBlock);
+
+      rewriter.setInsertionPointToEnd(fullBlock);
+      emitCopy(/*clampTile=*/false, llvmGuard);
+      LLVM::BrOp::create(rewriter, loc, ValueRange{}, contBlock);
+
+      rewriter.setInsertionPointToEnd(edgeBlock);
+      emitCopy(/*clampTile=*/true, llvmGuard);
+      LLVM::BrOp::create(rewriter, loc, ValueRange{}, contBlock);
+
+      rewriter.setInsertionPointToStart(contBlock);
     } else {
-      Value event = LLVM::CallOp::create(
-                        rewriter, loc, asyncCopyFn,
-                        ValueRange{one64, one64, dstBase, dstStrideBytes, one64,
-                                   tileVec, srcBase, srcStrideBytes, one64,
-                                   srcTileVec, offsetVec, clamp})
-                        .getResult();
-      LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
+      emitCopy(/*clampTile=*/true, llvmGuard);
     }
 
     // Token IS this copy's event slot; the matching async_wait waits on it.
@@ -4941,51 +5212,6 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     tileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty, tileVec,
                                             heightVal, idx1);
 
-    // Rect-mask clamp: source tile shrinks to the in-bounds remainder; the
-    // skipped remainder of this warp's dst band is zeroed after the fire
-    // (the DMA writes only the src-tile intersection, no fill).
-    Value srcTileVec = tileVec;
-    Value srcWForZero, srcHForZero;
-    if (useRectClamp) {
-      Value srcW = widthVal, srcH = heightVal;
-      if (rectMask.hasCol) {
-        Value colRem =
-            emitRemaining(rewriter, loc, rectMask.colBound, rectMask.colFirst,
-                          rectMask.colFirstConst, tileCols);
-        Value eb = LLVM::ConstantOp::create(
-            rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(elemBytes));
-        srcW = LLVM::MulOp::create(rewriter, loc, i64Ty, colRem, eb);
-      }
-      Value rowRemFull;
-      if (rectMask.hasRow) {
-        srcH =
-            emitRemaining(rewriter, loc, rectMask.rowBound, rectMask.rowFirst,
-                          rectMask.rowFirstConst, tileRows);
-      }
-      srcTileVec = LLVM::UndefOp::create(rewriter, loc, vec2i64Ty);
-      srcTileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
-                                                 srcTileVec, srcW, idx0);
-      srcTileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
-                                                 srcTileVec, srcH, idx1);
-      srcWForZero = srcW;
-      srcHForZero =
-          rowRemFull
-              ? rowRemFull
-              : LLVM::ConstantOp::create(rewriter, loc, i64Ty,
-                                         rewriter.getI64IntegerAttr(tileRows));
-      Value z = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
-                                         rewriter.getI64IntegerAttr(0));
-      Value wPos = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::sgt,
-                                        srcW, z);
-      Value hPos = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::sgt,
-                                        srcH, z);
-      Value nonEmpty = LLVM::AndOp::create(rewriter, loc, wPos, hPos);
-      llvmMaskScalar =
-          llvmMaskScalar ? (Value)LLVM::AndOp::create(rewriter, loc,
-                                                      llvmMaskScalar, nonEmpty)
-                         : nonEmpty;
-    }
-
     // Offset = <0, 0>
     Value zeroI64 = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
                                              rewriter.getI64IntegerAttr(0));
@@ -5018,57 +5244,113 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     // shared slot (see createEventAlloca).
     Value evAlloca = createEventAlloca(op, rewriter);
 
-    if (srcWForZero)
-      emitResidualZero(rewriter, loc, mod, dstBase, tileRows, tileCols,
-                       elemBytes, srcWForZero, srcHForZero);
+    // Build the (rect clamp + residual zero) optionally-guarded async copy for
+    // a source tile. The full-tile arm passes the compile-const tileVec and
+    // skips the clamp + residual zero, emitting exactly the maskless --even
+    // DMA.
+    auto emitCopy = [&](bool clampTile, Value baseGuard) {
+      Value srcTileVec = tileVec;
+      Value guard = baseGuard;
+      if (clampTile && useRectClamp) {
+        Value srcW = widthVal, srcH = heightVal;
+        if (rectMask.hasCol) {
+          Value colRem =
+              emitRemaining(rewriter, loc, rectMask.colBound, rectMask.colFirst,
+                            rectMask.colFirstConst, tileCols);
+          Value eb = LLVM::ConstantOp::create(
+              rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(elemBytes));
+          srcW = LLVM::MulOp::create(rewriter, loc, i64Ty, colRem, eb);
+        }
+        if (rectMask.hasRow) {
+          srcH =
+              emitRemaining(rewriter, loc, rectMask.rowBound, rectMask.rowFirst,
+                            rectMask.rowFirstConst, tileRows);
+        }
+        srcTileVec = LLVM::UndefOp::create(rewriter, loc, vec2i64Ty);
+        srcTileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
+                                                   srcTileVec, srcW, idx0);
+        srcTileVec = LLVM::InsertElementOp::create(rewriter, loc, vec2i64Ty,
+                                                   srcTileVec, srcH, idx1);
+        Value srcHForZero = LLVM::ConstantOp::create(
+            rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileRows));
+        emitResidualZero(rewriter, loc, mod, dstBase, tileRows, tileCols,
+                         elemBytes, srcW, srcHForZero);
+        Value z = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                           rewriter.getI64IntegerAttr(0));
+        Value wPos = LLVM::ICmpOp::create(rewriter, loc,
+                                          LLVM::ICmpPredicate::sgt, srcW, z);
+        Value hPos = LLVM::ICmpOp::create(rewriter, loc,
+                                          LLVM::ICmpPredicate::sgt, srcH, z);
+        Value nonEmpty = LLVM::AndOp::create(rewriter, loc, wPos, hPos);
+        guard = guard
+                    ? (Value)LLVM::AndOp::create(rewriter, loc, guard, nonEmpty)
+                    : nonEmpty;
+      }
+      if (guard) {
+        auto *parentBlock = rewriter.getInsertionBlock();
+        auto insertPt = rewriter.getInsertionPoint();
+        auto *thenBlock = rewriter.createBlock(
+            parentBlock->getParent(), std::next(Region::iterator(parentBlock)));
+        auto *afterBlock = rewriter.createBlock(
+            parentBlock->getParent(), std::next(Region::iterator(thenBlock)));
+        afterBlock->getOperations().splice(afterBlock->begin(),
+                                           parentBlock->getOperations(),
+                                           insertPt, parentBlock->end());
+        rewriter.setInsertionPointToEnd(parentBlock);
+        LLVM::CondBrOp::create(rewriter, loc, guard, thenBlock, afterBlock);
+        rewriter.setInsertionPointToStart(thenBlock);
+        Value event = LLVM::CallOp::create(
+                          rewriter, loc, asyncCopyFn,
+                          ValueRange{one64, one64, dstBase, dstStrideBytes,
+                                     one64, tileVec, srcBase, srcStrideBytes,
+                                     one64, srcTileVec, offsetVec, clamp})
+                          .getResult();
+        LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
+        LLVM::BrOp::create(rewriter, loc, ValueRange{}, afterBlock);
+        rewriter.setInsertionPointToStart(afterBlock);
+      } else {
+        Value event = LLVM::CallOp::create(
+                          rewriter, loc, asyncCopyFn,
+                          ValueRange{one64, one64, dstBase, dstStrideBytes,
+                                     one64, tileVec, srcBase, srcStrideBytes,
+                                     one64, srcTileVec, offsetVec, clamp})
+                          .getResult();
+        LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
+      }
+    };
 
-    if (llvmMaskScalar) {
-      // Masked path: gate the async DMA on the scalar boolean.
-      // When mask is false (boundary), skip the DMA entirely.
-      // Use if/then/else: if (mask) { async_copy; store event } else { skip }
+    // Interior-tile fast path: when the rect mask proves the tile fully in
+    // bounds (incl. a non-partial K-tile) the clamp + residual zero are no-ops,
+    // so fire the maskless full-tile DMA; edge tiles keep the clamped DMA.
+    Value fullGuard = useRectClamp ? emitRectFullGuard(rewriter, loc, rectMask,
+                                                       tileRows, tileCols)
+                                   : nullptr;
+    if (fullGuard) {
       auto *parentBlock = rewriter.getInsertionBlock();
       auto insertPt = rewriter.getInsertionPoint();
-
-      auto *thenBlock = rewriter.createBlock(
+      auto *fullBlock = rewriter.createBlock(
           parentBlock->getParent(), std::next(Region::iterator(parentBlock)));
-      auto *afterBlock = rewriter.createBlock(
-          parentBlock->getParent(), std::next(Region::iterator(thenBlock)));
-
-      // Move everything after the current insertion point to afterBlock
-      afterBlock->getOperations().splice(afterBlock->begin(),
-                                         parentBlock->getOperations(), insertPt,
-                                         parentBlock->end());
-
-      // Conditional branch: if mask_scalar → thenBlock, else → afterBlock
+      auto *edgeBlock = rewriter.createBlock(
+          parentBlock->getParent(), std::next(Region::iterator(fullBlock)));
+      auto *contBlock = rewriter.createBlock(
+          parentBlock->getParent(), std::next(Region::iterator(edgeBlock)));
+      contBlock->getOperations().splice(contBlock->begin(),
+                                        parentBlock->getOperations(), insertPt,
+                                        parentBlock->end());
       rewriter.setInsertionPointToEnd(parentBlock);
-      LLVM::CondBrOp::create(rewriter, loc, llvmMaskScalar, thenBlock,
-                             afterBlock);
+      LLVM::CondBrOp::create(rewriter, loc, fullGuard, fullBlock, edgeBlock);
 
-      // thenBlock: emit async copy + store event + branch to afterBlock
-      rewriter.setInsertionPointToStart(thenBlock);
-      Value event = LLVM::CallOp::create(
-                        rewriter, loc, asyncCopyFn,
-                        ValueRange{one64, one64, dstBase, dstStrideBytes, one64,
-                                   tileVec, srcBase, srcStrideBytes, one64,
-                                   srcTileVec, offsetVec, clamp})
-                        .getResult();
-      LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
-      LLVM::BrOp::create(rewriter, loc, ValueRange{}, afterBlock);
+      rewriter.setInsertionPointToEnd(fullBlock);
+      emitCopy(/*clampTile=*/false, llvmMaskScalar);
+      LLVM::BrOp::create(rewriter, loc, ValueRange{}, contBlock);
 
-      // Continue in afterBlock. The else (mask false) branch falls through
-      // without storing, leaving the entry-block zero-init event in the slot;
-      // air.wait_simdgroup_events on it is a no-op (the masked tile is a
-      // boundary the consumer does not read).
-      rewriter.setInsertionPointToStart(afterBlock);
+      rewriter.setInsertionPointToEnd(edgeBlock);
+      emitCopy(/*clampTile=*/true, llvmMaskScalar);
+      LLVM::BrOp::create(rewriter, loc, ValueRange{}, contBlock);
+
+      rewriter.setInsertionPointToStart(contBlock);
     } else {
-      // Unmasked: always emit async DMA
-      Value event = LLVM::CallOp::create(
-                        rewriter, loc, asyncCopyFn,
-                        ValueRange{one64, one64, dstBase, dstStrideBytes, one64,
-                                   tileVec, srcBase, srcStrideBytes, one64,
-                                   srcTileVec, offsetVec, clamp})
-                        .getResult();
-      LLVM::StoreOp::create(rewriter, loc, event, evAlloca);
+      emitCopy(/*clampTile=*/true, llvmMaskScalar);
     }
 
     // The token IS this copy's event slot. async_wait waits on exactly the

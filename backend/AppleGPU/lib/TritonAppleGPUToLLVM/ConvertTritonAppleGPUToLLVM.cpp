@@ -313,11 +313,16 @@ static llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
       if (isFragmentOp(def))
         for (Value o : def->getOperands())
           poison(o);
+      if (isAccumTruncEpilogue(def))
+        poison(cast<arith::TruncFOp>(def).getIn());
     }
-    for (OpOperand &use : v.getUses())
+    for (OpOperand &use : v.getUses()) {
       if (isFragmentOp(use.getOwner()))
         for (Value r : use.getOwner()->getResults())
           poison(r);
+      if (isAccumTruncEpilogue(use.getOwner()))
+        poison(use.getOwner()->getResult(0));
+    }
   }
 
   llvm::DenseSet<Type> present;

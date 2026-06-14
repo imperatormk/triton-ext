@@ -177,7 +177,7 @@ static bool srcStride64BAligned(Value src) {
 
 // Copy that the LLVM lowering keeps on the async DMA path with a rect-clamped
 // source tile: rect mask, other = 0, f32, aligned stride, at least 768 staged
-// elements per warp in the loop, and a thin (<=16) staging tile.
+// elements per warp in the loop, and a staging tile no thicker than 32 (BK).
 static bool copyIsRectDMA(ttg::AsyncCopyGlobalToLocalOp copy) {
   if (!copy.getMask() || !maskIsRect(copy.getMask()))
     return false;
@@ -198,7 +198,7 @@ static bool copyIsRectDMA(ttg::AsyncCopyGlobalToLocalOp copy) {
     if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
       warps = std::max<int64_t>(a.getInt(), 1);
   if (elems / warps < 768 ||
-      std::min(srcTy.getDimSize(0), srcTy.getDimSize(1)) > 16)
+      std::min(srcTy.getDimSize(0), srcTy.getDimSize(1)) > 32)
     return false;
   if (copy.getOther()) {
     auto cst = copy.getOther().getDefiningOp<arith::ConstantOp>();
@@ -238,8 +238,9 @@ struct WidenPipelinedStaging
     });
   }
 
-  // Rect-masked copies ride the clamped DMA only where its per-step cost
-  // pays: staging small enough to keep more than one threadgroup resident.
+  // Rect-masked copies ride the clamped DMA when the staging slots plus one
+  // rotation slot fit the threadgroup budget; above that the loop keeps the
+  // scalar device->TG roundtrip.
   static void stampRectCopies(scf::ForOp loop) {
     int64_t slotBytes = 0, minSlot = 0;
     SmallVector<ttg::AsyncCopyGlobalToLocalOp> rects;
@@ -252,7 +253,7 @@ struct WidenPipelinedStaging
           copyIsRectDMA(copy))
         rects.push_back(copy);
     });
-    if (slotBytes == 0 || slotBytes + minSlot > kAsymPreferBytes)
+    if (slotBytes == 0 || slotBytes + minSlot > kTGBudgetBytes)
       return;
     for (auto copy : rects)
       copy->setAttr("applegpu.rect_dma", UnitAttr::get(copy.getContext()));

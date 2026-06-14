@@ -2591,13 +2591,12 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // null) folded into the tile address. The device-MMA path uses them to add
     // the per-warp MMA tile origin (warpRow*8 / warpCol*8) so each warp loads
     // only the operand tiles for the C tiles it actually owns.
-    auto computeTileDevPtr = [&](SmallVector<Value> &ptrs,
-                                 SmallVector<SmallVector<unsigned>> &offsets,
-                                 Value rowStride, Value colStride,
-                                 Value baseRow, Value baseCol, int64_t tileRow,
-                                 int64_t tileCol, Value extraRow = nullptr,
-                                 Value extraCol = nullptr,
-                                 Value refPtrOverride = nullptr) -> Value {
+    auto computeTileDevPtr =
+        [&](SmallVector<Value> &ptrs,
+            SmallVector<SmallVector<unsigned>> &offsets, Value rowStride,
+            Value colStride, Value baseRow, Value baseCol, int64_t tileRow,
+            int64_t tileCol, Value extraRow = nullptr, Value extraCol = nullptr,
+            Value refPtrOverride = nullptr) -> Value {
       Value refPtr = refPtrOverride ? refPtrOverride : ptrs[0];
       int64_t refRowOff = offsets[0][0];
       int64_t refColOff = offsets[0][1];
@@ -3489,8 +3488,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // The K offset rides a loop-carried A/B reference pointer (aKRef/bKRef)
         // advanced by kUnroll*8 K-elements per trip, so the per-trip device
         // address is a pointer-increment recurrence (ptr += const) instead of a
-        // fresh mul(tk,stride)+gep rebuild. tkElemOff is kept only as a fallback
-        // for callers that have no carried base (none on the rolled path).
+        // fresh mul(tk,stride)+gep rebuild. tkElemOff is kept only as a
+        // fallback for callers that have no carried base (none on the rolled
+        // path).
         auto loadATileRT = [&](int64_t k, Value tkElemOff,
                                Value aKRef = nullptr) -> Value {
           Value aTilePtr = computeTileDevPtr(
@@ -3551,11 +3551,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           // Advance a device pointer by `kElems` K-elements: along A's column
           // axis (extraCol -> colStride) and B's row axis (extraRow ->
           // rowStride). A loop-invariant constant GEP, so the per-trip pointer
-          // step is a single ptr += const recurrence (no mul(tk,stride) rebuild).
-          auto advanceK = [&](Value ptr, Value stride, int64_t kElems) -> Value {
+          // step is a single ptr += const recurrence (no mul(tk,stride)
+          // rebuild).
+          auto advanceK = [&](Value ptr, Value stride,
+                              int64_t kElems) -> Value {
             Value off = arith::MulIOp::create(
                 rewriter, loc,
-                arith::ConstantIntOp::create(rewriter, loc, kElems, 64), stride);
+                arith::ConstantIntOp::create(rewriter, loc, kElems, 64),
+                stride);
             return LLVM::GEPOp::create(rewriter, loc, devPtrTy, devGepElemTy,
                                        ptr, ArrayRef<LLVM::GEPArg>{off});
           };
@@ -3644,10 +3647,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             } else {
               Value subIdx =
                   (u == 0) ? tkIv
-                           : arith::AddIOp::create(
-                                 rewriter, loc, tkIv,
-                                 arith::ConstantIntOp::create(rewriter, loc, u,
-                                                              32));
+                           : arith::AddIOp::create(rewriter, loc, tkIv,
+                                                   arith::ConstantIntOp::create(
+                                                       rewriter, loc, u, 32));
               tkElemOff = arith::MulIOp::create(rewriter, loc, subIdx, c8);
             }
             SmallVector<Value> matA_cur(ownM);

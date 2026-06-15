@@ -2313,7 +2313,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           std::max(maxStripsEst * 8 * std::max(KpadEst, NpadEst),
                    (M / 8) * 8 * NpadEst) *
           4;
-      tgGridFitsBudget = residentEst <= kTGResidentBudgetBytes;
+      int64_t stagedBytes = 0;
+      bool smemLive = true;
+      if (auto a = mod->getAttrOfType<BoolAttr>("applegpu.smem_live"))
+        smemLive = a.getValue();
+      if (smemLive)
+        if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.shared"))
+          stagedBytes = (int64_t)a.getValue().getZExtValue();
+      tgGridFitsBudget = residentEst + stagedBytes <= kTGResidentBudgetBytes;
     }
     if (useDeviceA && useDeviceB && (M / 8) > 1 && tgGridFitsBudget) {
       useDeviceA = false;

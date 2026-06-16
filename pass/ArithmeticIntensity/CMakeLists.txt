@@ -26,12 +26,18 @@ add_mlir_library(${PROJECT_NAME}
     TritonExtensionSupport
 )
 
+# --no-as-needed/--as-needed force-keep libtriton on GNU ld; Apple ld lacks
+# those flags and keeps it anyway, so link TRITON_LIB plainly on macOS.
+if(APPLE)
+  set(_triton_lib_link ${TRITON_LIB})
+else()
+  set(_triton_lib_link -Wl,--no-as-needed ${TRITON_LIB} -Wl,--as-needed)
+endif()
+
 target_link_libraries(${PROJECT_NAME}
   PUBLIC
     TritonExtensionSupport
-    -Wl,--no-as-needed
-    ${TRITON_LIB}
-    -Wl,--as-needed
+    ${_triton_lib_link}
     # ... MLIR libs ...
 )
 

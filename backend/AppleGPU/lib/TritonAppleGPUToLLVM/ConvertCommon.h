@@ -8,9 +8,9 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Value.h"
+#include "triton/Analysis/AxisInfo.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
-#include "triton/Analysis/AxisInfo.h"
 
 namespace mlir::triton::applegpu {
 
@@ -25,7 +25,8 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod);
 Value emitFragShuffle(ConversionPatternRewriter &rewriter, Location loc,
                       ModuleOp mod, Value val, Value srcLaneI16);
 // thread_index_in_simdgroup (lane id, i32).
-Value emitLaneId(ConversionPatternRewriter &rewriter, Location loc, ModuleOp mod);
+Value emitLaneId(ConversionPatternRewriter &rewriter, Location loc,
+                 ModuleOp mod);
 
 // Predicate selecting the canonical thread per redundant free-variable group.
 Value emitAppleRedundantThreadPredicate(

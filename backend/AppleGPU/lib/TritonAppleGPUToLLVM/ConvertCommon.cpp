@@ -1,3 +1,4 @@
+#include "ConvertCommon.h"
 #include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
@@ -30,7 +31,6 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "ConvertCommon.h"
 
 namespace mlir::triton::applegpu {
 
@@ -128,17 +128,18 @@ static bool isAccumTruncEpilogue(Operation *op) {
   }
   if (!theCvt)
     return false;
-  // The f32 #mma input must come straight from a dot accumulator: either a
-  // tt.dot result, or a block argument (the scf.for / cf loop carry of the
-  // accumulator). Any other producer (negf/add/... on the #mma, as in
-  // solve_tril's merge kernel) is rejected — the mid-end sinks the elementwise
-  // op through the truncf onto a bf16 simdgroup fragment, which crashes the AGX
-  // PSO materializer.
+  // Accept the dot accumulator and an elementwise epilogue on it (loop carry,
+  // tt.dot, or arith op).
   Value in = tf.getIn();
   if (isa<BlockArgument>(in))
     return true;
   Operation *def = in.getDefiningOp();
-  return def && isa<triton::DotOp>(def);
+  if (def && isa<triton::DotOp>(def))
+    return true;
+  if (def && def->getDialect() ==
+                 in.getContext()->getLoadedDialect<arith::ArithDialect>())
+    return true;
+  return false;
 }
 
 llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
@@ -389,8 +390,8 @@ Value emitAppleRedundantThreadPredicate(
   return pred;
 }
 
-Value maybeAnd(ConversionPatternRewriter &rewriter, Location loc,
-                      Value a, Value b) {
+Value maybeAnd(ConversionPatternRewriter &rewriter, Location loc, Value a,
+               Value b) {
   if (!a)
     return b;
   if (!b)
@@ -399,7 +400,7 @@ Value maybeAnd(ConversionPatternRewriter &rewriter, Location loc,
 }
 
 Value emitFragShuffle(ConversionPatternRewriter &rewriter, Location loc,
-                             ModuleOp mod, Value val, Value srcLaneI16) {
+                      ModuleOp mod, Value val, Value srcLaneI16) {
   auto *ctx = mod.getContext();
   Type vt = val.getType();
   auto i16Ty = IntegerType::get(ctx, 16);
@@ -454,7 +455,7 @@ Value emitFragShuffle(ConversionPatternRewriter &rewriter, Location loc,
 
 // thread_index_in_simdgroup (lane id, i32).
 Value emitLaneId(ConversionPatternRewriter &rewriter, Location loc,
-                        ModuleOp mod) {
+                 ModuleOp mod) {
   auto i32Ty = IntegerType::get(mod.getContext(), 32);
   LLVMFuncOp fn = mod.lookupSymbol<LLVMFuncOp>("air.thread_index_in_simdgroup");
   if (!fn) {

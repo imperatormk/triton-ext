@@ -53,7 +53,8 @@ int64_t tgPadForType(Type elemTy);
 // Compute padded stride: only pad when stride is a multiple of 8 (likely
 // bank-conflicting) AND total buffer size stays within 32KB TG budget.
 // budget_bytes: estimated remaining TG budget for this buffer.
-int64_t paddedStride(int64_t stride, int64_t budget_bytes, int64_t pad = TG_PAD);
+int64_t paddedStride(int64_t stride, int64_t budget_bytes,
+                     int64_t pad = TG_PAD);
 
 Type getSimdgroupMatrixType(MLIRContext *ctx);
 

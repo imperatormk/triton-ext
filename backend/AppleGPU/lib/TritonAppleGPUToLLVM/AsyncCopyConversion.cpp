@@ -1,3 +1,4 @@
+#include "ConvertCommon.h"
 #include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
@@ -30,7 +31,6 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "ConvertCommon.h"
 
 namespace mlir::triton::applegpu {
 
@@ -467,7 +467,6 @@ static bool extractFlatAsyncCopyPtrInfo(triton::AddPtrOp addptrOp,
   // first index; the wrap contributes nothing, so default start = 0.
   return true;
 }
-
 
 // Conservative compile-time proof that the INNER (dim-1) index of a 2D source
 // pointer tensor is unit-stride, i.e. adjacent columns are adjacent in memory.
@@ -1813,7 +1812,7 @@ struct AppleBarrierOpConversion
 // Defined out of the anonymous namespace: the pass driver also reconstructs
 // async-copy pointer info to tag rect_stride_64b before lowering.
 bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info,
-                                    bool allowModulo) {
+                             bool allowModulo) {
   auto *addptrOp = ptrTensor.getDefiningOp();
   if (!addptrOp || !isa<triton::AddPtrOp>(addptrOp))
     return false;

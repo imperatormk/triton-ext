@@ -1,3 +1,4 @@
+#include "ConvertCommon.h"
 #include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
@@ -30,7 +31,6 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "ConvertCommon.h"
 
 namespace mlir::triton::applegpu {
 
@@ -623,9 +623,9 @@ struct AtomicCASOpAppleConversion
     Value byteOffset = LLVM::AndOp::create(rewriter, loc, ptrInt, three64);
     Value byteOffset32 =
         LLVM::TruncOp::create(rewriter, loc, i32Ty, byteOffset);
-    Value shift = LLVM::ShlOp::create(
-        rewriter, loc, byteOffset32,
-        arith::ConstantIntOp::create(rewriter, loc, 3, 32));
+    Value shift =
+        LLVM::ShlOp::create(rewriter, loc, byteOffset32,
+                            arith::ConstantIntOp::create(rewriter, loc, 3, 32));
 
     Value mask16 = arith::ConstantIntOp::create(rewriter, loc, 0xFFFF, 32);
     Value mask = LLVM::ShlOp::create(rewriter, loc, mask16, shift);

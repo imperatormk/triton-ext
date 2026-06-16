@@ -1,7 +1,8 @@
-// DotOpBlockedConversion: lower tt.dot with blocked encoding on C (batch-aware).
-#include "DotCommon.h"
+// DotOpBlockedConversion: lower tt.dot with blocked encoding on C
+// (batch-aware).
 #include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
+#include "DotCommon.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
 #include "TritonAppleGPUTransforms/Passes.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"

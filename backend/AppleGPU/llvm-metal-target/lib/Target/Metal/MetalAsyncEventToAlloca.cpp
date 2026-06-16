@@ -37,8 +37,10 @@ static constexpr StringLiteral
 static bool asyncEventToAlloca(Module &M) {
   bool Changed = false;
 
-  // Insert no-op bitcasts before async-copy / wait-event pointer args so the
-  // writer's PointeeTypeMap sees a fresh typed-pointer slot per call site.
+  // async-copy params are i8* (byte DMA); a bitcast from the typed source would
+  // change the pointee, which the AIR typed-pointer writer rejects, so route
+  // those args through ptrtoint->inttoptr. wait-events keeps the no-op bitcast.
+  Type *I64 = Type::getInt64Ty(M.getContext());
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
@@ -59,9 +61,16 @@ static bool asyncEventToAlloca(Module &M) {
             continue;
           if (isa<BitCastInst>(Arg))
             continue;
-          auto *BC = CastInst::Create(Instruction::BitCast, Arg, Arg->getType(),
-                                      "", CI->getIterator());
-          CI->setArgOperand(K, BC);
+          if (IsAsyncCopy) {
+            auto *PI = new PtrToIntInst(Arg, I64, "", CI->getIterator());
+            auto *IP =
+                new IntToPtrInst(PI, Arg->getType(), "", CI->getIterator());
+            CI->setArgOperand(K, IP);
+          } else {
+            auto *BC = CastInst::Create(Instruction::BitCast, Arg,
+                                        Arg->getType(), "", CI->getIterator());
+            CI->setArgOperand(K, BC);
+          }
           Changed = true;
         }
       }

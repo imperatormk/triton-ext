@@ -389,57 +389,37 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // simdgroup_matrix_8x8_load reads at constant pitch, so emit SG loads
     // from the buffer the local_load reads. Returns {base ptr (addrspace 3),
     // row pitch elems}; null base means unprovable -> registers fallback.
-    //
-    // multiSlot: the strip is one rotating slot of a multi-stage pipeline
-    // alloc (memdesc_index into a rank-3 local_alloc with >=2 stage slots).
-    // Slots are disjoint and the index rotates s % stages, so the next
-    // K-step's copy targets a different slot than this step's reads, and the
-    // step in between always executes an async_wait barrier before its own
-    // loads, which already separates these reads from the next write to the
-    // SAME slot (two steps later). Single-slot staging (num_stages==2) keeps
-    // the post-load barrier.
-    auto isMultiSlotStaging = [](ttg::LocalLoadOp localLoad) -> bool {
-      auto idxOp = localLoad.getSrc().getDefiningOp<ttg::MemDescIndexOp>();
-      if (!idxOp)
-        return false;
-      auto alloc = idxOp.getSrc().getDefiningOp<ttg::LocalAllocOp>();
-      if (!alloc || alloc.getSrc())
-        return false;
-      auto allocTy = cast<ttg::MemDescType>(alloc.getType());
-      return allocTy.getRank() == 3 && allocTy.getShape()[0] >= 2;
-    };
     auto resolveSmemOperand =
         [&](Value tritonVal,
-            RankedTensorType opTy) -> std::tuple<Value, int64_t, bool> {
+            RankedTensorType opTy) -> std::pair<Value, int64_t> {
       Value src = tritonVal;
       if (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
         src = cvt.getSrc();
       auto localLoad = src.getDefiningOp<ttg::LocalLoadOp>();
       if (!localLoad)
-        return {Value(), 0, false};
+        return {Value(), 0};
       auto memTy = dyn_cast<ttg::MemDescType>(localLoad.getSrc().getType());
       if (!memTy || memTy.getRank() != 2)
-        return {Value(), 0, false};
+        return {Value(), 0};
       if (memTy.getShape() != opTy.getShape() ||
           memTy.getElementType() != opTy.getElementType())
-        return {Value(), 0, false};
+        return {Value(), 0};
       if (isa<IntegerType>(memTy.getElementType()))
-        return {Value(), 0, false};
+        return {Value(), 0};
       auto shEnc =
           dyn_cast<ttg::SwizzledSharedEncodingAttr>(memTy.getEncoding());
       if (!shEnc || shEnc.getMaxPhase() != 1)
-        return {Value(), 0, false};
+        return {Value(), 0};
       auto shOrder = shEnc.getOrder();
       if (shOrder.size() != 2 || shOrder[0] != 1)
-        return {Value(), 0, false};
+        return {Value(), 0};
       Value llStruct = rewriter.getRemappedValue(localLoad.getSrc());
       if (!llStruct)
-        return {Value(), 0, false};
+        return {Value(), 0};
       auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
           loc, llStruct,
           getTypeConverter()->convertType(memTy.getElementType()), rewriter);
-      return {smemObj.getBase(), memTy.getShape()[1],
-              isMultiSlotStaging(localLoad)};
+      return {smemObj.getBase(), memTy.getShape()[1]};
     };
 
     auto [elemsA, aOffsets, aSrcEnc] =
@@ -752,14 +732,11 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // bank-conflict at small K pitches like 16/32 f32).
     Value aSmemBase, bSmemBase;
     int64_t aSmemPitch = 0, bSmemPitch = 0;
-    bool aSmemMultiSlot = false, bSmemMultiSlot = false;
     if (!tgGridFitsBudget) {
       if (!useDeviceA)
-        std::tie(aSmemBase, aSmemPitch, aSmemMultiSlot) =
-            resolveSmemOperand(op.getA(), aType);
+        std::tie(aSmemBase, aSmemPitch) = resolveSmemOperand(op.getA(), aType);
       if (!useDeviceB)
-        std::tie(bSmemBase, bSmemPitch, bSmemMultiSlot) =
-            resolveSmemOperand(op.getB(), bType);
+        std::tie(bSmemBase, bSmemPitch) = resolveSmemOperand(op.getB(), bType);
     }
     bool useSmemA = !useDeviceA && static_cast<bool>(aSmemBase);
     bool useSmemB = !useDeviceB && static_cast<bool>(bSmemBase);
@@ -1612,14 +1589,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         // pipeline copy can overwrite the staging strip mid-read (silent
         // corruption, K-iteration-count dependent). Loading first and fencing
         // once keeps the MMA off the barrier's critical path so the next
-        // copies overlap the math.
-        //
-        // With multi-slot staging (num_stages>=3) the next K-step's copy
-        // targets a DIFFERENT slot than these reads, and the step in between
-        // executes an async_wait barrier before its own loads, which already
-        // separates these reads from the next write to the same slot two
-        // steps later. The post-load barrier is then redundant and elided;
-        // single-slot staging keeps it.
+        // copies overlap the math. The barrier is required for multi-slot
+        // staging too: the pipeliner prefetches num_stages-1 ahead, so the
+        // copy that overwrites THIS slot is emitted in the same loop body,
+        // right after these reads, with no async_wait between them.
         SmallVector<SmallVector<Value>> matA(ownM);
         for (int64_t k = 0; k < ownM; ++k) {
           matA[k].resize(tilesK);
@@ -1632,11 +1605,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
           for (int64_t j = 0; j < ownN; ++j)
             matB[tk][j] = loadBTile(tk, j);
         }
-        bool slotsRotate =
-            (!useSmemA || aSmemMultiSlot) && (!useSmemB || bSmemMultiSlot);
-        if (!slotsRotate)
-          LLVM::CallOp::create(rewriter, loc, tgBarrFn,
-                               ValueRange{fenceTG, execMod});
+        LLVM::CallOp::create(rewriter, loc, tgBarrFn,
+                             ValueRange{fenceTG, execMod});
         for (int64_t tk = 0; tk < tilesK; ++tk)
           for (int64_t j = 0; j < ownN; ++j)
             for (int64_t k = 0; k < ownM; ++k)

@@ -123,26 +123,18 @@ static Value createCompletedEventSlot(Operation *op, RewriterBase &rewriter) {
 
 // air.simdgroup_async_copy_2d is a SIMDGROUP-cooperative DMA: each warp issues
 // its own copy with a single WARP-UNIFORM tile origin and waits its own event.
-// When warpsPerCTA[outerDim] > 1 the staged pipeline buffer's outer (slowest)
-// dim is split across warps, but the warp-uniform origin makes every warp
-// redundantly DMA the WHOLE tile into the same shared region. Those concurrent
-// copies write-write race: a per-simdgroup air.wait_simdgroup_events only
-// drains the issuing warp's own copy, and the threadgroup barrier after the
-// wait fences regular threadgroup stores, not the async DMA engine's writes, so
-// a sibling warp can read the buffer before another warp's still-in-flight copy
-// has finished (verified: both the partitioned A operand and the replicated B
-// operand of the matmul_layer_norm 32x64x16 nw4 kernel corrupt nondeterminis-
-// tically). The AIR JIT has no cooperative-copy lowering that merges/serializes
-// them. Keep any such multi-warp-outer-dim copy on the layout-exact synchronous
-// copy (real threadgroup stores, which the membar passes order correctly).
-// Single-warp-per-outer-dim copies (warpsPerCTA[outerDim] == 1) are race-free
-// and stay on the fast async DMA path.
-//
-// CAVEAT: this predicate is deliberately BROAD: it also routes correct nw>=2
-// GEMM operand copies to the sync path, a PERF (not correctness) regression on
-// those configs, because a tighter race-vs-safe discriminator could not be
-// proven sound here. The proper fix is a cooperative multi-warp async copy (or
-// a narrower predicate); tracked as the async-vs-sync path unification rework.
+// When warpsPerCTA[outerDim] > 1 the staged buffer is consumed by every warp.
+// The race-free contract is that each warp both ISSUES the (byte-identical)
+// full-tile copy and WAITS its OWN per-simdgroup event before reading: the
+// per-simdgroup air.wait_simdgroup_events then drains the warp's own in-flight
+// copy, so no warp reads the region before its DMA lands. The earlier
+// warp-0-only form (single warp issues, siblings wait empty event slots) was
+// the bug: a sibling warp drained nothing and the post-wait threadgroup barrier
+// fences regular TG stores, not the DMA engine's writes, so it could read the
+// buffer before warp 0's copy finished (nondeterministic corruption, seen on
+// the slice_scatter bmm and matmul_layer_norm 32x64x16 nw4 kernels). This
+// predicate is retained as the cross-warp signal for any future partitioned
+// (per-warp-exclusive band) lowering; the current path lets every warp issue.
 static bool asyncCopyOuterDimCrossWarp(ttg::AsyncCopyGlobalToLocalOp op) {
   auto srcTy = op.getSrc().getType();
   auto enc = srcTy.getEncoding();
@@ -160,9 +152,18 @@ static bool asyncCopyOuterDimCrossWarp(ttg::AsyncCopyGlobalToLocalOp op) {
   return warpsPerCTA[outerDim] > 1;
 }
 
-// Predicate selecting the first simdgroup (tid < 32). A multi-warp-outer copy
-// fires from this one warp only so the redundant whole-tile copies do not
-// write-write race on the shared region; the staging barrier publishes.
+// Detect whether a tensor value's def chain contains a modulo (arith.remui /
+// arith.remsi). The async-DMA fast path below reconstructs each row's device
+// address as `basePtr + rowStart*stride + ...` with a single constant stride,
+// which is only valid when the index is an affine function of the program/
+// thread coordinates. Inductor's mm template wraps row/col indices with
+// `(pid*BLOCK + arange) % M` (the standard bounds-wrapping idiom); that modulo
+// makes the per-row stride non-constant (it folds back to the tensor origin at
+// the wrap), so the linear DMA reads the wrong rows for any program_id > 0.
+// When detected we fall back to the synchronous per-element copy, which uses
+// each element's own (already-correct) pointer and is modulo-safe.
+// Predicate selecting the first simdgroup (tid < 32). Used by the affine
+// cross-warp copy, which fires its single large-tile DMA from one warp.
 static Value emitWarp0Pred(ttg::AsyncCopyGlobalToLocalOp op,
                            ConversionPatternRewriter &rewriter, Location loc) {
   auto *ctx = op.getContext();
@@ -190,16 +191,46 @@ static Value emitWarp0Pred(ttg::AsyncCopyGlobalToLocalOp op,
                               c32);
 }
 
-// Detect whether a tensor value's def chain contains a modulo (arith.remui /
-// arith.remsi). The async-DMA fast path below reconstructs each row's device
-// address as `basePtr + rowStart*stride + ...` with a single constant stride,
-// which is only valid when the index is an affine function of the program/
-// thread coordinates. Inductor's mm template wraps row/col indices with
-// `(pid*BLOCK + arange) % M` (the standard bounds-wrapping idiom); that modulo
-// makes the per-row stride non-constant (it folds back to the tensor origin at
-// the wrap), so the linear DMA reads the wrong rows for any program_id > 0.
-// When detected we fall back to the synchronous per-element copy, which uses
-// each element's own (already-correct) pointer and is modulo-safe.
+// Runtime simdgroup (warp) index within the threadgroup: tid.x / 32.
+static Value emitWarpId(Operation *op, ConversionPatternRewriter &rewriter,
+                        Location loc) {
+  auto *ctx = op->getContext();
+  auto mod = op->getParentOfType<ModuleOp>();
+  auto i32Ty = IntegerType::get(ctx, 32);
+  auto arrI32x3Ty = LLVM::LLVMArrayType::get(i32Ty, 3);
+  auto tidFnTy = LLVMFunctionType::get(arrI32x3Ty, {}, false);
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(mod.getBody());
+    if (!mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup"))
+      LLVMFuncOp::create(rewriter, mod.getLoc(),
+                         "air.thread_position_in_threadgroup", tidFnTy,
+                         Linkage::External);
+  }
+  auto tidFn =
+      mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup");
+  Value tidStruct =
+      LLVM::CallOp::create(rewriter, loc, tidFn, ValueRange{}).getResult();
+  Value tid = LLVM::ExtractValueOp::create(rewriter, loc, i32Ty, tidStruct,
+                                           ArrayRef<int64_t>{0});
+  Value c32 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                       rewriter.getI32IntegerAttr(32));
+  return LLVM::UDivOp::create(rewriter, loc, i32Ty, tid, c32);
+}
+
+// Total simdgroups in the threadgroup = product(warpsPerCTA). The cross-warp
+// async copy partitions the row dimension across this many warps.
+static int64_t totalWarps(ttg::AsyncCopyGlobalToLocalOp op) {
+  auto enc = op.getSrc().getType().getEncoding();
+  auto blocked = dyn_cast_or_null<ttg::BlockedEncodingAttr>(enc);
+  if (!blocked)
+    return 1;
+  int64_t n = 1;
+  for (auto w : blocked.getWarpsPerCTA())
+    n *= w;
+  return n;
+}
+
 static bool defChainContainsModulo(Value v, unsigned budget = 128) {
   llvm::SmallVector<Value, 16> worklist;
   llvm::SmallPtrSet<Operation *, 32> visited;
@@ -1048,15 +1079,34 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     Value dstStrideBytes = LLVM::ConstantOp::create(
         rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileWidthBytes));
 
-    // Cross-warp copies fire from one simdgroup only: tid<32 issues the whole
-    // tile, the zero-init event slot makes other warps' waits no-ops and the
-    // staging barrier publishes.
-    int64_t bandRows = tileRows;
-    if (warp0Fire) {
-      Value w0 = emitWarp0Pred(op, rewriter, loc);
-      llvmGuard = llvmGuard
-                      ? (Value)LLVM::AndOp::create(rewriter, loc, llvmGuard, w0)
-                      : w0;
+    // Cross-warp copies: every simdgroup issues the identical full-tile DMA and
+    // waits its OWN per-simdgroup event (see the affine path). The warp-0-only
+    // form raced because sibling warps never drained the in-flight copy. We
+    // PARTITION the row dimension across the threadgroup's warps so each warp
+    // DMAs an exclusive band (1x total traffic). Rect-clamped edge tiles keep
+    // the full-tile copy (their residual-zero fill assumes the whole tile).
+    int64_t nWarps = warp0Fire ? totalWarps(op) : 1;
+    bool partition =
+        warp0Fire && !useRectClamp && nWarps > 1 && tileRows % nWarps == 0;
+    int64_t bandRows = partition ? tileRows / nWarps : tileRows;
+
+    if (partition) {
+      Value wId = emitWarpId(op, rewriter, loc);
+      Value wId64 = LLVM::ZExtOp::create(rewriter, loc, i64Ty, wId);
+      Value bandRowsVal = LLVM::ConstantOp::create(
+          rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(bandRows));
+      Value bandStartRow =
+          LLVM::MulOp::create(rewriter, loc, i64Ty, wId64, bandRowsVal);
+      Value srcBandOff = LLVM::MulOp::create(rewriter, loc, i64Ty, bandStartRow,
+                                             srcStrideBytes);
+      srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(),
+                                    IntegerType::get(ctx, 8), srcBase,
+                                    ArrayRef<LLVM::GEPArg>{srcBandOff});
+      Value dstBandOff = LLVM::MulOp::create(rewriter, loc, i64Ty, bandStartRow,
+                                             dstStrideBytes);
+      dstBase = LLVM::GEPOp::create(rewriter, loc, dstBase.getType(),
+                                    IntegerType::get(ctx, 8), dstBase,
+                                    ArrayRef<LLVM::GEPArg>{dstBandOff});
     }
 
     Value widthVal = LLVM::ConstantOp::create(
@@ -1494,11 +1544,37 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
         LLVM::getSharedMemoryObjectFromStruct(loc, llDst, elemTy, rewriter);
     Value dstBase = smemObj.getBase();
 
-    // Cross-warp copies fire from one simdgroup only (tid<32); zero-init
-    // event slots keep other warps' waits no-ops, the staging barrier
-    // publishes.
-    int64_t bandRows = tileRows;
-    if (outerCrossWarp) {
+    // Cross-warp copies: PARTITION the row dimension across the threadgroup's
+    // warps so each simdgroup DMAs an EXCLUSIVE band and waits its OWN
+    // per-simdgroup event (1x total traffic, no warp reads another warp's
+    // band). The earlier warp-0-only form raced: siblings waited empty event
+    // slots and the post-wait threadgroup barrier fences regular TG stores, not
+    // the DMA engine, so a sibling could read warp 0's still-in-flight band.
+    // Partition only on an even row split; otherwise fall back to warp-0-only
+    // firing.
+    int64_t nWarps = outerCrossWarp ? totalWarps(op) : 1;
+    bool partition =
+        outerCrossWarp && !useRectClamp && nWarps > 1 && tileRows % nWarps == 0;
+    int64_t bandRows = partition ? tileRows / nWarps : tileRows;
+
+    if (partition) {
+      Value wId = emitWarpId(op, rewriter, loc);
+      Value wId64 = LLVM::ZExtOp::create(rewriter, loc, i64Ty, wId);
+      Value bandRowsVal = LLVM::ConstantOp::create(
+          rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(bandRows));
+      Value bandStartRow =
+          LLVM::MulOp::create(rewriter, loc, i64Ty, wId64, bandRowsVal);
+      Value srcBandOff = LLVM::MulOp::create(rewriter, loc, i64Ty, bandStartRow,
+                                             srcStrideBytes);
+      srcBase = LLVM::GEPOp::create(rewriter, loc, srcBase.getType(),
+                                    IntegerType::get(ctx, 8), srcBase,
+                                    ArrayRef<LLVM::GEPArg>{srcBandOff});
+      Value dstBandOff = LLVM::MulOp::create(rewriter, loc, i64Ty, bandStartRow,
+                                             dstStrideBytes);
+      dstBase = LLVM::GEPOp::create(rewriter, loc, dstBase.getType(),
+                                    IntegerType::get(ctx, 8), dstBase,
+                                    ArrayRef<LLVM::GEPArg>{dstBandOff});
+    } else if (outerCrossWarp) {
       Value w0 = emitWarp0Pred(op, rewriter, loc);
       llvmMaskScalar =
           llvmMaskScalar

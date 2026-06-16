@@ -10,6 +10,7 @@
 #include "Metal.h"
 #include "MetalAddressSpaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Constants.h"
@@ -21,6 +22,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/InitializePasses.h"
 
 using namespace llvm;
@@ -66,6 +68,137 @@ static bool eraseDeadThreadgroupGlobals(Module &M) {
   for (GlobalVariable *GV : Dead)
     GV->eraseFromParent();
   return !Dead.empty();
+}
+
+static std::optional<int64_t> constInt(Value *V) {
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return C->getSExtValue();
+  return std::nullopt;
+}
+
+// Shrink a threadgroup global whose upstream reservation is larger than the
+// bytes its DMA-staged tiles actually occupy. The Triton allocate-shared-memory
+// pass conservatively over-provisions `global_smem` (a 64x64 fp32 dot stages
+// two 8KB operands = 16KB but the reservation lands at 24KB). The dead tail is
+// real threadgroup memory counting against the 32KB Metal cap, so a kernel
+// needing 16KB but reserving 24KB keeps only one threadgroup resident per core
+// where two would fit -- a direct occupancy (and thus throughput) loss.
+//
+// The written region is defined by the async-DMA copies: each
+// air.simdgroup_async_copy_2d destination is a constant-offset tile of
+// (rowStride * rows) bytes; the high-water mark is the max tile end. A dynamic-
+// index GEP touches bytes we cannot statically pin down -- it is only sound to
+// skip when an async copy established the region it must fall inside (the DMA
+// dot path: copies write the tile, dynamic GEPs read/store within it). If the
+// global has NO async-copy writer (e.g. the int8 dot stages entirely through
+// `store float` via dynamic GEPs, widening 1-byte ints to f32 with no
+// async_copy_2d), nothing bounds those bytes, so we bail and keep the original
+// size rather than clip live staging.
+static constexpr StringLiteral kAsyncCopy2D("air.simdgroup_async_copy_2d");
+
+static bool shrinkOverAllocatedThreadgroupGlobals(Module &M) {
+  const DataLayout &DL = M.getDataLayout();
+
+  SmallVector<std::pair<GlobalVariable *, int64_t>, 4> ToShrink;
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.getAddressSpace() != metal::AS::Threadgroup)
+      continue;
+    auto *AT = dyn_cast<ArrayType>(GV.getValueType());
+    if (!AT || !AT->getElementType()->isIntegerTy(8))
+      continue;
+    int64_t CurBytes = AT->getNumElements();
+    if (CurBytes <= 16)
+      continue;
+
+    int64_t HighWater = 0;
+    bool Bail = false;
+    bool SawDynamicGEP = false;
+    bool SawAsyncCopy = false;
+
+    SmallVector<std::pair<User *, int64_t>, 16> Work;
+    for (User *U : GV.users())
+      Work.push_back({U, 0});
+    SmallPtrSet<User *, 16> Seen;
+    while (!Work.empty() && !Bail) {
+      auto [U, Base] = Work.pop_back_val();
+      if (!Seen.insert(U).second)
+        continue;
+      if (auto *GEP = dyn_cast<GEPOperator>(U)) {
+        APInt Off(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+        if (!GEP->accumulateConstantOffset(DL, Off)) {
+          SawDynamicGEP = true;
+          continue;
+        }
+        for (User *UU : GEP->users())
+          Work.push_back({UU, Base + Off.getSExtValue()});
+        continue;
+      }
+      if (isa<BitCastOperator>(U) || isa<AddrSpaceCastOperator>(U)) {
+        for (User *UU : U->users())
+          Work.push_back({UU, Base});
+        continue;
+      }
+      if (auto *CB = dyn_cast<CallBase>(U)) {
+        Function *Callee = CB->getCalledFunction();
+        if (Callee && Callee->getName().starts_with(kAsyncCopy2D)) {
+          // copy_2d(i64, i64, dest, i64 rowStrideBytes, i64, <2 x i64> shape,
+          //         ...): the staged tile is rowStrideBytes * shape[1].
+          auto Stride = constInt(CB->getArgOperand(3));
+          int64_t Rows = 0;
+          if (auto *Shape = dyn_cast<ConstantDataVector>(CB->getArgOperand(5)))
+            Rows = Shape->getElementAsInteger(1);
+          else if (auto *CV = dyn_cast<ConstantVector>(CB->getArgOperand(5))) {
+            if (auto *E = dyn_cast<ConstantInt>(CV->getOperand(1)))
+              Rows = E->getSExtValue();
+          }
+          if (!Stride || Rows <= 0) {
+            Bail = true;
+            break;
+          }
+          SawAsyncCopy = true;
+          HighWater = std::max(HighWater, Base + *Stride * Rows);
+          continue;
+        }
+      }
+      // Any other concrete consumer (load/store/non-copy call) at a known base
+      // contributes at least one element; if it sits past what the copies
+      // cover we cannot prove the tail dead, so bail.
+      if (Base < 0 || Base >= CurBytes) {
+        Bail = true;
+        break;
+      }
+      HighWater = std::max(HighWater, Base + 1);
+    }
+
+    // A dynamic GEP is only bounded if an async copy established its region;
+    // with no copy on the global, its touched bytes are unprovable -> keep
+    // size.
+    if (SawDynamicGEP && !SawAsyncCopy)
+      Bail = true;
+
+    if (Bail || HighWater <= 0)
+      continue;
+
+    int64_t NewBytes = (HighWater + 15) & ~15;
+    if (NewBytes <= 0 || NewBytes >= CurBytes)
+      continue;
+
+    ToShrink.push_back({&GV, NewBytes});
+  }
+
+  for (auto &[GV, NewBytes] : ToShrink) {
+    auto *ElemTy = cast<ArrayType>(GV->getValueType())->getElementType();
+    auto *NewTy = ArrayType::get(ElemTy, NewBytes);
+    auto *NewGV = new GlobalVariable(
+        M, NewTy, GV->isConstant(), GV->getLinkage(),
+        GV->hasInitializer() ? UndefValue::get(NewTy) : nullptr, "", GV,
+        GV->getThreadLocalMode(), metal::AS::Threadgroup);
+    NewGV->takeName(GV);
+    NewGV->setAlignment(GV->getAlign().valueOrOne());
+    GV->replaceAllUsesWith(ConstantExpr::getBitCast(NewGV, GV->getType()));
+    GV->eraseFromParent();
+  }
+  return !ToShrink.empty();
 }
 
 // Collect the basic blocks that actually access a threadgroup global, walking
@@ -278,6 +411,11 @@ static bool tgGlobalCoalesce(Module &M) {
   // Reclaim dead threadgroup globals (e.g. the unused upstream global_smem
   // swizzle scratch) before/independently of the cvt/dot merge below.
   bool Changed = eraseDeadThreadgroupGlobals(M);
+
+  // Trim the dead tail off threadgroup globals the upstream allocator
+  // over-provisioned, so a tile that stages 16KB doesn't reserve 24KB and
+  // halve occupancy. Bails on any reference it cannot statically bound.
+  Changed |= shrinkOverAllocatedThreadgroupGlobals(M);
 
   // Overlay mutually-disjoint MMA staging buffers (distinct dots'
   // __tg_dot_ab_*) onto one shared slot before the cvt merge picks a target, so

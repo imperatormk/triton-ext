@@ -1074,7 +1074,9 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     Value llDst = adaptor.getResult();
     auto smemObj =
         LLVM::getSharedMemoryObjectFromStruct(loc, llDst, elemTy, rewriter);
-    Value dstBase = smemObj.getBase();
+    // Apply the memdesc slice/index offset (rotating staging slot) the matching
+    // local_load reads from; bare getBase() stages every slot to slot 0.
+    Value dstBase = smemObj.getShmemAffineBase(loc, rewriter, dstTy);
 
     Value dstStrideBytes = LLVM::ConstantOp::create(
         rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileWidthBytes));
@@ -1273,6 +1275,28 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
 
     auto shape = srcTy.getShape();
     bool canAsyncDMA = (shape.size() == 2);
+
+    // An async DMA into a single-slot staging buffer races across pipelined
+    // K-steps (membar orders the sync scatter but not the in-flight DMA), so
+    // force the membar-ordered sync copy when the dest is one slot.
+    bool singleSlotLoopStaging = false;
+    {
+      Value dst = op.getResult();
+      bool viaIndex = false;
+      while (auto idx = dst.getDefiningOp<ttg::MemDescIndexOp>()) {
+        dst = idx.getSrc();
+        viaIndex = true;
+      }
+      if (viaIndex)
+        if (auto alloc = dst.getDefiningOp<ttg::LocalAllocOp>()) {
+          auto ty = cast<ttg::MemDescType>(alloc.getType());
+          if (ty.getRank() >= 1 && ty.getShape().front() == 1)
+            singleSlotLoopStaging = true;
+        }
+    }
+    if (singleSlotLoopStaging)
+      canAsyncDMA = false;
+
     // A multi-warp-outer staged copy (warpsPerCTA[outer]>1) cannot fire from
     // every warp: identical whole-tile copies write-write race on the same
     // bytes. Fire from one simdgroup only (tid<32), the staging barrier
@@ -1461,8 +1485,8 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       // contiguous-row copy reads the tile transposed. Require a positive
       // unit-inner-stride proof; otherwise use the layout-exact sync copy.
       bool innerUnit = innerDimIsUnitStride(op.getSrc());
-      bool runtimeSafe =
-          (shape.size() == 2) && funcModuloSafe && noLiveBoundary && innerUnit;
+      bool runtimeSafe = (shape.size() == 2) && funcModuloSafe &&
+                         noLiveBoundary && innerUnit && !singleSlotLoopStaging;
       if (runtimeSafe) {
         if (succeeded(
                 lowerAsyncFromRuntimePtrs(op, adaptor, rewriter, useRectClamp,
@@ -1542,7 +1566,13 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     Value llDst = adaptor.getResult();
     auto smemObj =
         LLVM::getSharedMemoryObjectFromStruct(loc, llDst, elemTy, rewriter);
-    Value dstBase = smemObj.getBase();
+    // The destination is a memdesc slice/index (e.g. the pipeliner's rotating
+    // staging slot): its slot/sub-view offset lives in smemObj's offsets, NOT
+    // in the bare base pointer. The matching local_load applies that offset
+    // (getShmemOffset), so the DMA must write the SAME affine base or it stages
+    // every slot to slot 0 — desyncing the rotating buffer and feeding the dot
+    // stale operands (num_stages>=2, >1 K-iteration).
+    Value dstBase = smemObj.getShmemAffineBase(loc, rewriter, dstTy);
 
     // Cross-warp copies: PARTITION the row dimension across the threadgroup's
     // warps so each simdgroup DMAs an EXCLUSIVE band and waits its OWN

@@ -146,9 +146,11 @@ bool writeMetallib(Module &M, PointeeTypeMap &PTM, raw_ostream &OS,
   // air_minor tracks the target macOS major.
   MetallibOptions Opts = OptsIn;
   Opts.Version = MetalVersion::fromTriple(M.getTargetTriple().str());
+  // Opaque/v2 is air.version 2.9 (air64_v29, opaque-native).
+  if (Opts.OpaquePointers)
+    Opts.Version = MetalVersion::fromOSMajor(17);
 
-  // Emit bitcode with typed pointers (the whole point of this project)
-  auto Bitcode = emitMetalBitcode(M, PTM);
+  auto Bitcode = emitMetalBitcode(M, PTM, Opts.OpaquePointers);
   auto WrappedBC = wrapBitcode(Bitcode);
   auto Hash = SHA256::hash(ArrayRef<uint8_t>(WrappedBC));
 

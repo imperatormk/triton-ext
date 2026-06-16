@@ -18,6 +18,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
 
 using namespace llvm;
 
@@ -74,6 +75,8 @@ static void writeMetallibImpl(Module &M, raw_pwrite_stream &OS) {
   // the module's triple, falling back to macOS 16 when none is present.
   metal::MetallibOptions Opts;
   Opts.Version = metal::MetalVersion::fromTriple(M.getTargetTriple().str());
+  if (const char *E = ::getenv("AIR_OPAQUE_PTRS"))
+    Opts.OpaquePointers = StringRef(E) == "1";
   metal::writeMetallib(M, PTM, OS, Opts);
 }
 

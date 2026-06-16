@@ -45,10 +45,14 @@ void emitTypeBlock(BitstreamWriter &W, ValueEnumerator &E) {
     } else if (T->isLabelTy()) {
       W.EmitRecord(bitc::TYPE_CODE_LABEL, V);
     } else if (isa<PointerType>(T)) {
-      // Entry.pointee is the typed pointer's pointee
-      V.push_back(E.typeIdx(Entry.pointee));
-      V.push_back(cast<PointerType>(T)->getAddressSpace());
-      W.EmitRecord(bitc::TYPE_CODE_POINTER, V);
+      if (E.OpaquePointers || !Entry.pointee) {
+        V.push_back(cast<PointerType>(T)->getAddressSpace());
+        W.EmitRecord(bitc::TYPE_CODE_OPAQUE_POINTER, V);
+      } else {
+        V.push_back(E.typeIdx(Entry.pointee));
+        V.push_back(cast<PointerType>(T)->getAddressSpace());
+        W.EmitRecord(bitc::TYPE_CODE_POINTER, V);
+      }
     } else if (auto *VT = dyn_cast<FixedVectorType>(T)) {
       V.push_back(VT->getNumElements());
       V.push_back(E.typeIdx(VT->getElementType()));

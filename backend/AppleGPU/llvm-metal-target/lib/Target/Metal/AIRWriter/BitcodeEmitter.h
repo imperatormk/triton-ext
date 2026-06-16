@@ -24,7 +24,8 @@ namespace metal {
 /// instead of opaque pointer records (code 25).
 ///
 /// This replaces LLVM's WriteBitcodeToFile for Metal targets.
-std::vector<uint8_t> emitMetalBitcode(llvm::Module &M, PointeeTypeMap &PTM);
+std::vector<uint8_t> emitMetalBitcode(llvm::Module &M, PointeeTypeMap &PTM,
+                                      bool OpaquePointers = false);
 
 /// Lower ConstantExpr operands to real instructions. Must run BEFORE
 /// buildPointeeTypeMap: GEPs materialized here need PointeeTypeMap entries,

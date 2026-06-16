@@ -23,8 +23,9 @@ using namespace llvm;
 namespace llvm {
 namespace metal {
 
-ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
-    : PTM(PTM) {
+ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM,
+                                 bool OpaquePointers)
+    : PTM(PTM), OpaquePointers(OpaquePointers) {
   auto &Ctx = M.getContext();
 
   // ── Phase 1: Infer pointee types for pointer Types ─────────────────
@@ -168,7 +169,9 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
         // For TG (AS 3) byte globals, keep GEP's own result element type -
         // the byte global stays as [N x i8] and GEP results must be i8*.
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-          if (GEP->getType()->isPointerTy()) {
+          if (OpaquePointers) {
+            addType(GEP->getSourceElementType());
+          } else if (GEP->getType()->isPointerTy()) {
             Type *ResultPointee = GEP->getResultElementType();
             unsigned AddrSpace = GEP->getType()->getPointerAddressSpace();
             if (AddrSpace != 3 || !ResultPointee->isIntegerTy(8)) {
@@ -292,6 +295,13 @@ unsigned ValueEnumerator::ptrTypeIdxForValue(const Value *V) {
 }
 
 unsigned ValueEnumerator::ptrTypeIdx(Type *PtrTy, Type *Pointee) {
+  if (OpaquePointers) {
+    TypeEntry E{PtrTy, nullptr};
+    auto It = typeMap.find(E);
+    if (It != typeMap.end())
+      return It->second;
+    return addEntry(E);
+  }
   TypeEntry E{PtrTy, Pointee};
   auto It = typeMap.find(E);
   if (It != typeMap.end())

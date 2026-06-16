@@ -47,6 +47,10 @@ struct MetallibOptions {
   // macOS-16 (26-era) values so behavior is unchanged when no OS info is
   // available. See MetalVersion.h.
   MetalVersion Version = MetalVersion::fromOSMajor(16);
+  // When set, emit opaque-pointer (MODULE_CODE_VERSION 2) bitcode instead of
+  // the typed-pointer v1 encoding, skipping the PointeeTypeMap pipeline. OFF by
+  // default; the typed path is unchanged until every opaque encoding path lands.
+  bool OpaquePointers = false;
 };
 
 // Write the module as a metallib to the output stream.

@@ -186,7 +186,8 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         // all terminal users (following GEP chains) consume float. If any
         // terminal user is a non-float load/store/atomic, keep i32.
         Type *GepSrcTy = GEP->getSourceElementType();
-        if (GEP->getPointerAddressSpace() == metal::AS::Device &&
+        if (!E.OpaquePointers &&
+            GEP->getPointerAddressSpace() == metal::AS::Device &&
             GepSrcTy->isIntegerTy(32)) {
           // Walk GEP chains to find terminal (non-GEP) users
           bool AllTerminalFloat = true;

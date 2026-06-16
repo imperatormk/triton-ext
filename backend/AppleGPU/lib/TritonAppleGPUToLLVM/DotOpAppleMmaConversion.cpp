@@ -1,7 +1,7 @@
 // DotOpAppleMmaConversion: lower tt.dot with AppleMmaEncoding on C (rank-2).
-#include "DotCommon.h"
 #include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
+#include "DotCommon.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
 #include "TritonAppleGPUTransforms/Passes.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"

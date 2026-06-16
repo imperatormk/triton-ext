@@ -1,3 +1,4 @@
+#include "ConvertCommon.h"
 #include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
@@ -30,7 +31,6 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "ConvertCommon.h"
 
 namespace mlir::triton::applegpu {
 
@@ -40,7 +40,6 @@ using namespace mlir::arith;
 namespace ttg = mlir::triton::gpu;
 
 namespace {
-
 
 // Safe tt.store lowering: use conditional branch instead of read-modify-write.
 //
@@ -279,10 +278,10 @@ struct SafeLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
 
 void populateMemoryOpPatterns(LLVMTypeConverter &typeConverter,
                               RewritePatternSet &patterns) {
-  patterns.add<SafeStoreOpConversion>(typeConverter,
-                                      PatternBenefit(patternBenefitDefault + 10));
-  patterns.add<SafeLoadOpConversion>(typeConverter,
-                                     PatternBenefit(patternBenefitDefault + 10));
+  patterns.add<SafeStoreOpConversion>(
+      typeConverter, PatternBenefit(patternBenefitDefault + 10));
+  patterns.add<SafeLoadOpConversion>(
+      typeConverter, PatternBenefit(patternBenefitDefault + 10));
 }
 
 } // namespace mlir::triton::applegpu

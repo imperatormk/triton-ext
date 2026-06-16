@@ -118,8 +118,7 @@ void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Value val,
-                              Value pred) const {
+                              Value ctaId, Value val, Value pred) const {
   assert(!ctaId && "Apple does not support cross-CTA transfers");
   if (pred) {
     auto *curBlock = rewriter.getInsertionBlock();
@@ -138,8 +137,8 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
 }
 
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Type elemTy,
-                              Value pred, Operation *localLoadOp) const {
+                              Value ctaId, Type elemTy, Value pred,
+                              Operation *localLoadOp) const {
   assert(!ctaId && "Apple does not support cross-CTA transfers");
   return LLVM::LoadOp::create(rewriter, loc, elemTy, ptr).getResult();
 }

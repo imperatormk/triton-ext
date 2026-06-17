@@ -1,0 +1,320 @@
+//===- MetalTGBarrierInsert.cpp - Insert TG memory barriers ---------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "MetalTGBarrierInsert.h"
+#include "Metal.h"
+#include "MetalAddressSpaces.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/PostDominators.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
+#include "llvm/InitializePasses.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "metal-tg-barrier-insert"
+
+// Metal threadgroup address space.
+
+// AIR barrier intrinsic names (new and legacy).
+static constexpr StringLiteral kBarrier("air.wg.barrier");
+static constexpr StringLiteral kBarrierOld("air.threadgroup.barrier");
+
+static bool isTGStore(const Instruction *I) {
+  if (auto *SI = dyn_cast<StoreInst>(I))
+    return SI->getPointerAddressSpace() == metal::AS::Threadgroup;
+  return false;
+}
+
+static bool isTGLoad(const Instruction *I) {
+  if (auto *LI = dyn_cast<LoadInst>(I))
+    return LI->getPointerAddressSpace() == metal::AS::Threadgroup;
+  return false;
+}
+
+static bool isBarrierCall(const Instruction *I) {
+  if (auto *CI = dyn_cast<CallInst>(I))
+    if (const Function *F = CI->getCalledFunction()) {
+      StringRef N = F->getName();
+      return N == kBarrier || N == kBarrierOld;
+    }
+  return false;
+}
+
+static CallInst *createBarrier(IRBuilder<> &B, Module &M) {
+  LLVMContext &Ctx = M.getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  FunctionType *FTy =
+      FunctionType::get(Type::getVoidTy(Ctx), {I32, I32}, false);
+  FunctionCallee FC = M.getOrInsertFunction(kBarrier, FTy);
+  return B.CreateCall(FC, {ConstantInt::get(I32, 2), ConstantInt::get(I32, 1)});
+}
+
+static bool predecessorEndsWithBarrier(BasicBlock *BB) {
+  if (auto *Pred = BB->getSinglePredecessor())
+    if (auto *Term = Pred->getTerminator())
+      if (Instruction *Prev = Term->getPrevNode())
+        if (isBarrierCall(Prev))
+          return true;
+  return false;
+}
+
+static void ensureBarrierBeforeConditionalBranch(CondBrInst *BI, Module &M,
+                                                 bool &Changed) {
+  auto *Parent = BI->getParent();
+  if (Instruction *Prev = BI->getPrevNode())
+    if (isBarrierCall(Prev))
+      return;
+  if (predecessorEndsWithBarrier(Parent))
+    return;
+
+  Parent->splitBasicBlock(BI, Parent->getName() + ".tgbr");
+  IRBuilder<> B(Parent->getTerminator());
+  createBarrier(B, M);
+  Changed = true;
+}
+
+static bool tgBarrierInsert(Module &M) {
+  bool Changed = false;
+
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    // Collect blocks with TG stores and loads.
+    SmallPtrSet<BasicBlock *, 8> TGStoreBlocks, TGLoadBlocks;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        if (isTGStore(&I))
+          TGStoreBlocks.insert(&BB);
+        if (isTGLoad(&I))
+          TGLoadBlocks.insert(&BB);
+      }
+    }
+    if (TGStoreBlocks.empty())
+      continue;
+
+    // Conditional-branch successor targets (barrier divergence risk).
+    SmallPtrSet<BasicBlock *, 8> CondTargets;
+    for (BasicBlock &BB : F) {
+      if (auto *BI = dyn_cast<CondBrInst>(BB.getTerminator())) {
+        CondTargets.insert(BI->getSuccessor(0));
+        CondTargets.insert(BI->getSuccessor(1));
+      }
+    }
+
+    // A barrier may only be inserted where EVERY thread executes it; a
+    // divergent barrier desynchronizes the threadgroup. CondTargets catches
+    // direct conditional successors, but blocks reached through further
+    // unconditional edges (the optimizer's sink-split blocks) are still
+    // divergently executed. Compute divergent regions: forward-taint values
+    // from the per-thread index intrinsics, then mark every block between a
+    // taint-conditioned branch and its reconvergence point (immediate
+    // postdominator) as divergent. Insertion stays allowed everywhere else
+    // (loop bodies executed by all threads must keep their barriers).
+    PostDominatorTree PDT;
+    PDT.recalculate(F);
+    SmallPtrSet<const Value *, 32> Tainted;
+    {
+      SmallVector<const Instruction *, 32> Work;
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *CI = dyn_cast<CallInst>(&I))
+            if (Function *Callee = CI->getCalledFunction())
+              if (Callee->getName().contains("thread_position") ||
+                  Callee->getName().contains("thread_index"))
+                if (Tainted.insert(CI).second)
+                  Work.push_back(CI);
+      while (!Work.empty()) {
+        const Instruction *I = Work.pop_back_val();
+        for (const User *U : I->users())
+          if (auto *UI = dyn_cast<Instruction>(U))
+            if (Tainted.insert(UI).second)
+              Work.push_back(UI);
+      }
+    }
+    SmallPtrSet<BasicBlock *, 16> Divergent;
+    for (BasicBlock &BB : F) {
+      auto *BI = dyn_cast<CondBrInst>(BB.getTerminator());
+      if (!BI || !Tainted.count(BI->getCondition()))
+        continue;
+      BasicBlock *Reconv = nullptr;
+      if (auto *Node = PDT.getNode(&BB))
+        if (auto *IPDom = Node->getIDom())
+          Reconv = IPDom->getBlock();
+      SmallVector<BasicBlock *, 8> Stack(succ_begin(&BB), succ_end(&BB));
+      while (!Stack.empty()) {
+        BasicBlock *Cur = Stack.pop_back_val();
+        if (Cur == Reconv || !Divergent.insert(Cur).second)
+          continue;
+        for (BasicBlock *S : successors(Cur))
+          Stack.push_back(S);
+      }
+    }
+    auto uniformlyExecuted = [&](BasicBlock *BB) {
+      return !Divergent.count(BB);
+    };
+
+    // Strategy 1: barrier before TG stores in non-conditional-target blocks.
+    // Within a block, only the first TG store in a "store burst" needs the
+    // barrier; subsequent consecutive stores by the same thread cannot race
+    // with the prior barrier-protected region. A new TG load resets the
+    // burst (the load might consume a value that needs fresh synchronisation
+    // before the next store).
+    for (BasicBlock &BB : F) {
+      if (!TGStoreBlocks.count(&BB) || CondTargets.count(&BB) ||
+          !uniformlyExecuted(&BB))
+        continue;
+      bool BarrierActive = false;
+      for (auto It = BB.begin(); It != BB.end(); ++It) {
+        if (isBarrierCall(&*It)) {
+          BarrierActive = true;
+          continue;
+        }
+        if (isTGLoad(&*It)) {
+          BarrierActive = false;
+          continue;
+        }
+        if (!isTGStore(&*It))
+          continue;
+        if (BarrierActive)
+          continue;
+        IRBuilder<> B(&*It);
+        createBarrier(B, M);
+        Changed = true;
+        BarrierActive = true;
+      }
+    }
+
+    // Strategy 2: barrier before any conditional branch whose true successor
+    // writes TG memory, so all threads participate.
+    for (BasicBlock &BB : F) {
+      auto *BI = dyn_cast<CondBrInst>(BB.getTerminator());
+      if (!BI || !uniformlyExecuted(&BB))
+        continue;
+      // Either successor: the optimizer freely inverts branch polarity.
+      if (TGStoreBlocks.count(BI->getSuccessor(0)) ||
+          TGStoreBlocks.count(BI->getSuccessor(1)))
+        ensureBarrierBeforeConditionalBranch(BI, M, Changed);
+    }
+
+    // Strategy 3: WAR hazard - barrier between TG load and TG store.
+    for (BasicBlock &BB : F) {
+      if (!TGLoadBlocks.count(&BB) || !uniformlyExecuted(&BB))
+        continue;
+
+      bool SeenUnguardedLoad = false;
+      for (auto It = BB.begin(); It != BB.end(); ++It) {
+        if (isTGLoad(&*It)) {
+          SeenUnguardedLoad = true;
+        } else if (isBarrierCall(&*It)) {
+          SeenUnguardedLoad = false;
+        } else if (isTGStore(&*It) && SeenUnguardedLoad) {
+          IRBuilder<> B(&*It);
+          createBarrier(B, M);
+          Changed = true;
+          SeenUnguardedLoad = false;
+        }
+      }
+
+      if (!SeenUnguardedLoad)
+        continue;
+
+      Instruction *Term = BB.getTerminator();
+      bool SuccHasTGStore = false;
+      for (unsigned I = 0; I < Term->getNumSuccessors(); ++I) {
+        BasicBlock *Succ = Term->getSuccessor(I);
+        if (TGStoreBlocks.count(Succ)) {
+          SuccHasTGStore = true;
+          break;
+        }
+        Instruction *SuccTerm = Succ->getTerminator();
+        if (isa<CondBrInst>(SuccTerm) || isa<UncondBrInst>(SuccTerm)) {
+          for (unsigned J = 0; J < SuccTerm->getNumSuccessors(); ++J) {
+            if (TGStoreBlocks.count(SuccTerm->getSuccessor(J))) {
+              bool SuccHasBarrier = false;
+              for (Instruction &SI : *Succ)
+                if (isBarrierCall(&SI)) {
+                  SuccHasBarrier = true;
+                  break;
+                }
+              if (!SuccHasBarrier)
+                SuccHasTGStore = true;
+            }
+          }
+        }
+      }
+
+      if (SuccHasTGStore) {
+        // Barrier immediately before a conditional branch in the same block
+        // crashes Metal's GPU JIT. Split off so they live in separate blocks.
+        if (isa<CondBrInst>(Term)) {
+          BB.splitBasicBlock(Term, BB.getName() + ".war");
+          IRBuilder<> B(BB.getTerminator());
+          createBarrier(B, M);
+        } else {
+          IRBuilder<> B(Term);
+          createBarrier(B, M);
+        }
+        Changed = true;
+      }
+    }
+
+    // Strategy 4: coalesce redundant consecutive barriers within a block.
+    // Two barrier calls separated only by instructions that touch neither
+    // threadgroup memory nor any call are equivalent to a single barrier: the
+    // first already synchronised the threadgroup and nothing observable to
+    // other threads happened in between, so the second is a no-op. Removing it
+    // is the dominant per-K-step saving in the MMA dot lowering, which emits a
+    // barrier at the end of one phase and the start of the next.
+    for (BasicBlock &BB : F) {
+      Instruction *PrevBarrier = nullptr;
+      SmallVector<Instruction *, 8> ToErase;
+      for (Instruction &I : BB) {
+        if (isBarrierCall(&I)) {
+          if (PrevBarrier)
+            ToErase.push_back(&I);
+          else
+            PrevBarrier = &I;
+          continue;
+        }
+        if (isTGStore(&I) || isTGLoad(&I) || isa<CallInst>(I) ||
+            I.mayReadOrWriteMemory())
+          PrevBarrier = nullptr;
+      }
+      for (Instruction *I : ToErase) {
+        I->eraseFromParent();
+        Changed = true;
+      }
+    }
+  }
+
+  return Changed;
+}
+
+PreservedAnalyses MetalTGBarrierInsertPass::run(Module &M,
+                                                ModuleAnalysisManager &AM) {
+  return tgBarrierInsert(M) ? PreservedAnalyses::none()
+                            : PreservedAnalyses::all();
+}
+
+bool MetalTGBarrierInsertLegacy::runOnModule(Module &M) {
+  return tgBarrierInsert(M);
+}
+
+char MetalTGBarrierInsertLegacy::ID = 0;
+
+INITIALIZE_PASS(MetalTGBarrierInsertLegacy, DEBUG_TYPE,
+                "Metal Threadgroup Barrier Insertion", false, false)
+
+ModulePass *llvm::createMetalTGBarrierInsertLegacyPass() {
+  return new MetalTGBarrierInsertLegacy();
+}

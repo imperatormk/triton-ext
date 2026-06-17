@@ -1843,7 +1843,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             backArgs.push_back(advanceK(aKRef, aColStride, kUnroll * 8));
             backArgs.push_back(advanceK(bKRef, bRowStride, kUnroll * 8));
           }
-          LLVM::BrOp::create(rewriter, loc, backArgs, header);
+          auto latchBr = LLVM::BrOp::create(rewriter, loc, backArgs, header);
+          Builder mdBuilder(ctx);
+          auto unrollMD = LLVM::LoopUnrollAttr::get(
+              ctx, mdBuilder.getBoolAttr(true), {}, {}, {}, {}, {}, {});
+          auto loopMD =
+              LLVM::LoopAnnotationAttr::get(ctx, {}, {}, {}, unrollMD, {}, {},
+                                            {}, {}, {}, {}, {}, {}, {}, {}, {});
+          latchBr.setLoopAnnotationAttr(loopMD);
 
           // Exit: harvest the final accumulators from the header-forwarded
           // args.

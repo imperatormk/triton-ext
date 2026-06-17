@@ -486,7 +486,9 @@ struct AtomicRMWOpAppleConversion
         return failure();
       }
     } else {
-      return failure();
+      return rewriter.notifyMatchFailure(
+          op, "Apple GPU has only 32-bit atomics (i64/f64 atomic_rmw "
+              "unsupported)");
     }
 
     if (!tensorTy) {

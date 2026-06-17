@@ -124,6 +124,14 @@ struct DemoteWideAccumulator
     }
     if (targets.empty())
       return;
+    // demote() erases a block argument (and its matching branch operand),
+    // shifting every higher index down. Process each block's targets
+    // highest-index-first so the remaining (lower) indices stay valid.
+    llvm::stable_sort(targets, [](const auto &a, const auto &b) {
+      if (a.first != b.first)
+        return a.first < b.first;
+      return a.second > b.second;
+    });
     for (auto [blk, argIdx] : targets)
       demote(func, blk, argIdx);
 

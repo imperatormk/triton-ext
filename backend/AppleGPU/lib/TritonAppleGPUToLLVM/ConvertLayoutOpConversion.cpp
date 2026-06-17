@@ -944,9 +944,17 @@ struct ConvertLayoutOpAppleConversion
       auto wpc = enc.getWarpsPerCTA()[0];
       Value tpwSpt = arith::ConstantIntOp::create(rewriter, loc, tpw * spt, 32);
       Value sptV = arith::ConstantIntOp::create(rewriter, loc, spt, 32);
+      Value tpwV = arith::ConstantIntOp::create(rewriter, loc, tpw, 32);
+      Value wpcV = arith::ConstantIntOp::create(rewriter, loc, wpc, 32);
+      // Clamp the physical warp/lane into this layout's logical extent: when
+      // warpsPerCTA[0] < the threadgroup's warp count (the dim-0 span is
+      // smaller than the physical grid), raw warpId would index past the buffer
+      // slot.
+      Value warpIdx = arith::RemUIOp::create(rewriter, loc, warpId, wpcV);
+      Value laneIdx = arith::RemUIOp::create(rewriter, loc, laneId, tpwV);
       Value base = arith::AddIOp::create(
-          rewriter, loc, arith::MulIOp::create(rewriter, loc, warpId, tpwSpt),
-          arith::MulIOp::create(rewriter, loc, laneId, sptV));
+          rewriter, loc, arith::MulIOp::create(rewriter, loc, warpIdx, tpwSpt),
+          arith::MulIOp::create(rewriter, loc, laneIdx, sptV));
       return base;
     };
 

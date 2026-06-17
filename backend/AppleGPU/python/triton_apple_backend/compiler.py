@@ -183,6 +183,7 @@ class MPSOptions:
     instrumentation_mode: str = "none"
     sanitize_overflow: bool = False
     allowed_dot_input_precisions: tuple = ("ieee", )
+    supported_fp8_dtypes: tuple = ()
 
     def hash(self):
         return hashlib.md5(str(self.__dict__).encode()).hexdigest()

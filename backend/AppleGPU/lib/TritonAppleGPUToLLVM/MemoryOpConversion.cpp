@@ -246,22 +246,14 @@ struct SafeLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
         Value other = others.empty() ? LLVM::ZeroOp::create(rewriter, loc,
                                                             sTy.getBody()[i])
                                      : others[i];
-        // Conditional load via branch to avoid accessing invalid pointers
-        // when the mask is false (e.g., rindex >= M with M < RBLOCK).
-        auto *curBlock = rewriter.getInsertionBlock();
-        auto curPoint = rewriter.getInsertionPoint();
-        auto *endBlock = curBlock->splitBlock(curPoint);
-        auto *thenBlock = rewriter.createBlock(endBlock);
-        endBlock->addArgument(sTy.getBody()[i], loc);
-        rewriter.setInsertionPointToEnd(curBlock);
-        LLVM::CondBrOp::create(rewriter, loc, masks[i], thenBlock, ValueRange{},
-                               endBlock, ValueRange{other});
-        rewriter.setInsertionPointToEnd(thenBlock);
+        // Branch-free masked load: the branch form's merge block let O3
+        // SimplifyCFG drop the masked-store guards (div7 corruption). Load
+        // unconditionally and discard masked-out lanes with a value select;
+        // an OOB device load on AGX returns garbage but does not fault.
         Value val =
             LLVM::LoadOp::create(rewriter, loc, sTy.getBody()[i], ptrs[i]);
-        LLVM::BrOp::create(rewriter, loc, ValueRange{val}, endBlock);
-        rewriter.setInsertionPointToStart(endBlock);
-        loaded.push_back(endBlock->getArgument(0));
+        val = LLVM::SelectOp::create(rewriter, loc, masks[i], val, other);
+        loaded.push_back(val);
       } else {
         loaded.push_back(
             LLVM::LoadOp::create(rewriter, loc, sTy.getBody()[i], ptrs[i]));

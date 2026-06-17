@@ -107,6 +107,27 @@ struct ConvertLayoutOpAppleConversion
       }
     }
 
+    // A 1-D convert between #ttg.slice encodings (the reduce-result restripe,
+    // e.g. slice<dim=1,#blocked[8,4]> -> slice<dim=1,#blocked[32,1]>) routes
+    // through the linear-layout-indexed TG scatter/gather. The upstream smem
+    // path miscompiles this restripe: it derives the store and gather smem
+    // slots from inconsistent warp/lane formulas (store collapses the reduce
+    // dim, gather does not), so half the rows read a stale slot and a -inf
+    // reduce-init leaks into the result.
+    if (srcTy.getShape().size() == 1 &&
+        isa<ttg::SliceEncodingAttr>(srcTy.getEncoding()) &&
+        isa<ttg::SliceEncodingAttr>(dstTy.getEncoding()) &&
+        !isa<triton::PointerType>(srcTy.getElementType()) &&
+        cvtNeedsSharedMemory(srcTy, dstTy) &&
+        srcTy.getEncoding() != dstTy.getEncoding()) {
+      auto loc = op.getLoc();
+      auto *ctx = op.getContext();
+      auto mod = op->getParentOfType<ModuleOp>();
+      return convertLayout1DGeneric(op, adaptor, rewriter, srcTy.getEncoding(),
+                                    dstTy.getEncoding(), srcTy, dstTy, loc, ctx,
+                                    mod);
+    }
+
     // blocked→blocked redistribution via TG scatter/gather, plus the
     // #mma (AppleMma) → #blocked C-output conversion (see mma branch below).
     auto srcEnc = dyn_cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
@@ -1013,6 +1034,120 @@ struct ConvertLayoutOpAppleConversion
     if (!outTy)
       return failure();
 
+    if (auto outSt = dyn_cast<LLVMStructType>(outTy)) {
+      if (outSt.getBody().size() != dstElems.size())
+        return failure();
+      Value result = UndefOp::create(rewriter, loc, outSt);
+      for (size_t i = 0; i < dstElems.size(); ++i)
+        result =
+            InsertValueOp::create(rewriter, loc, outSt, result, dstElems[i],
+                                  ArrayRef<int64_t>{(int64_t)i});
+      rewriter.replaceOp(op, result);
+    } else {
+      rewriter.replaceOp(op, dstElems[0]);
+    }
+    return success();
+  }
+
+  // 1D convert for arbitrary distributed encodings (e.g. #ttg.slice). The smem
+  // slot for each register is the element's actual tensor index (from
+  // emitIndices), so the scatter store and gather load address the same slot by
+  // construction — unlike the parametric warp/lane formula in computeBase1D,
+  // which only holds for the contiguous blocked layout.
+  LogicalResult convertLayout1DGeneric(ttg::ConvertLayoutOp op,
+                                       OpAdaptor adaptor,
+                                       ConversionPatternRewriter &rewriter,
+                                       Attribute srcEnc, Attribute dstEnc,
+                                       RankedTensorType srcTy,
+                                       RankedTensorType dstTy, Location loc,
+                                       MLIRContext *ctx, ModuleOp mod) const {
+    int64_t numElems = srcTy.getShape()[0];
+    auto elemTy = getTypeConverter()->convertType(srcTy.getElementType());
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto i64Ty = IntegerType::get(ctx, 64);
+    auto tgPtrTy = LLVMPointerType::get(ctx, 3);
+    if (isa<LLVMPointerType>(elemTy))
+      return failure();
+    Type tgElemTy = elemTy;
+
+    TargetInfo targetInfo;
+    auto srcIndices = emitIndices(loc, rewriter, targetInfo, srcEnc, srcTy,
+                                  /*withCTA=*/false);
+    auto dstIndices = emitIndices(loc, rewriter, targetInfo, dstEnc, dstTy,
+                                  /*withCTA=*/false);
+
+    std::string tgName =
+        ("__tg_cvt_" + llvm::Twine(getCvtPoolKey(tgElemTy))).str();
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(mod.getBody());
+      auto existing = mod.lookupSymbol<LLVM::GlobalOp>(tgName);
+      if (!existing) {
+        auto arrTy = LLVMArrayType::get(tgElemTy, numElems);
+        LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy, false,
+                               Linkage::Internal, tgName, Attribute(), 4, 3u);
+      } else if (auto exAT = dyn_cast<LLVMArrayType>(existing.getGlobalType());
+                 exAT && (int64_t)exAT.getNumElements() < numElems) {
+        existing.setGlobalTypeAttr(
+            TypeAttr::get(LLVMArrayType::get(tgElemTy, numElems)));
+      }
+    }
+    auto tgGlobal = mod.lookupSymbol<LLVM::GlobalOp>(tgName);
+    Value tgPtr =
+        LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy, tgGlobal.getName());
+
+    auto barrFnTy =
+        LLVMFunctionType::get(LLVMVoidType::get(ctx), {i32Ty, i32Ty}, false);
+    LLVMFuncOp tgBarrFn;
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(mod.getBody());
+      if (auto fn = mod.lookupSymbol<LLVMFuncOp>("air.threadgroup.barrier"))
+        tgBarrFn = fn;
+      else
+        tgBarrFn = LLVMFuncOp::create(rewriter, mod.getLoc(),
+                                      "air.threadgroup.barrier", barrFnTy,
+                                      Linkage::External);
+    }
+
+    Value src = adaptor.getSrc();
+    SmallVector<Value> srcElems;
+    if (auto sTy = dyn_cast<LLVMStructType>(src.getType())) {
+      for (unsigned i = 0; i < sTy.getBody().size(); ++i)
+        srcElems.push_back(
+            ExtractValueOp::create(rewriter, loc, sTy.getBody()[i], src,
+                                   ArrayRef<int64_t>{(int64_t)i}));
+    } else {
+      srcElems = {src};
+    }
+    if (srcElems.size() != srcIndices.size())
+      return failure();
+
+    Value fenceTG = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+    Value execMod = arith::ConstantIntOp::create(rewriter, loc, 4, 32);
+    LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+    for (size_t i = 0; i < srcElems.size(); ++i) {
+      Value idx64 =
+          arith::ExtUIOp::create(rewriter, loc, i64Ty, srcIndices[i].front());
+      Value gep = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, tgElemTy, tgPtr,
+                                      ArrayRef<LLVM::GEPArg>{idx64});
+      LLVM::StoreOp::create(rewriter, loc, srcElems[i], gep);
+    }
+    LLVM::CallOp::create(rewriter, loc, tgBarrFn, ValueRange{fenceTG, execMod});
+
+    SmallVector<Value> dstElems;
+    for (size_t i = 0; i < dstIndices.size(); ++i) {
+      Value idx64 =
+          arith::ExtUIOp::create(rewriter, loc, i64Ty, dstIndices[i].front());
+      Value gep = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, tgElemTy, tgPtr,
+                                      ArrayRef<LLVM::GEPArg>{idx64});
+      dstElems.push_back(
+          LLVM::LoadOp::create(rewriter, loc, tgElemTy, gep).getResult());
+    }
+
+    auto outTy = getTypeConverter()->convertType(dstTy);
+    if (!outTy)
+      return failure();
     if (auto outSt = dyn_cast<LLVMStructType>(outTy)) {
       if (outSt.getBody().size() != dstElems.size())
         return failure();

@@ -1,6 +1,6 @@
 # Apple GPU Backend for Triton
 
-Out-of-tree Apple GPU (Metal) backend for the Triton compiler, built as a
+Out-of-tree Apple GPU (AIR) backend for the Triton compiler, built as a
 triton-ext plugin.
 
 ## Architecture
@@ -14,7 +14,7 @@ triton-ext/backend/AppleGPU/
   │           ├── compiler.py    TTIR → TTGIR → LLVM IR → metallib
   │           ├── driver.py      MPS GPU dispatch, buffer binding, scalar packing
   │           └── metal_utils.m  ObjC++ Metal bridge (compiled at install time)
-  └── llvm-metal-target/         LLVM IR → Metal AIR → metallib compiler
+  └── llvm-metal-target/         LLVM IR → AIR → metallib compiler
 ```
 
 ## Prerequisites

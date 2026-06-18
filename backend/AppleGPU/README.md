@@ -28,8 +28,8 @@ triton-ext/backend/AppleGPU/
 ### 1. Build Triton from source
 
 ```bash
-git clone https://github.com/triton-lang/triton.git ~/projects/oss/triton-main
-cd ~/projects/oss/triton-main
+git clone https://github.com/triton-lang/triton.git
+cd triton
 
 # Create venv
 python3.12 -m venv pytorch25-venv
@@ -69,24 +69,64 @@ git checkout apple-gpu
 make build
 ```
 
-This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/` and the
-`metal-llc` binary under `build/bin/` via the nested
-`backend/AppleGPU/llvm-metal-target/` project. No separate cmake invocation is
-needed.
+This configures (if needed) and builds `libapplegpu_backend.dylib` (or `.so`)
+under `build/lib/` and the `metal-llc` binary under `build/bin/`. `make build`
+auto-discovers the Triton + LLVM artifacts via `ci/pick-local-artifact.py`; if
+they are not present it errors with `Missing artifact directories`.
 
-### 4. Install the Python backend
+**Building against a source build of Triton + LLVM** (no CI artifacts): invoke
+cmake directly, pointing at your trees, then build only this extension's
+targets:
 
 ```bash
-cd backend/AppleGPU/python
-pip install -e . --no-build-isolation
+cmake -S . -B build -G Ninja \
+  -DTRITON_SOURCE_DIR=<triton repo>  \
+  -DTRITON_BUILD_DIR=<triton repo>/build/cmake.<...>  \
+  -DTRITON_LIB=<triton repo>/python/triton/_C/libtriton.so \
+  -DLLVM_TABLEGEN_EXE=<llvm-project>/build/bin/llvm-tblgen
+# (export LLVM_INSTALL_DIR=<pinned llvm dir> so MLIR/LLVM cmake packages resolve)
+
+ninja -C build metal-llc libapplegpu_backend.dylib
 ```
 
-### 5. Run
+`cmake` always *configures* every extension
+(`dialect pass backend language extensions`); naming the targets keeps the
+*build* to AppleGPU only.
+
+### 4. Run
+
+Set the environment (run from the repo root, so `$PWD` resolves the build). The
+dylib in `TRITON_PLUGIN_PATHS` and the `triton_apple_backend` on `PYTHONPATH`
+must come from the same build.
 
 ```bash
-export TRITON_PLUGIN_PATHS=~/projects/oss/triton-ext/build/lib/libTritonAppleGPUBackend.dylib
+export METAL_LLC_PATH=$PWD/build/bin/metal-llc
+export TRITON_PLUGIN_PATHS=$PWD/build/lib/libapplegpu_backend.dylib
+export TRITON_PASS_PLUGIN_PATH=$TRITON_PLUGIN_PATHS
+export PYTHONPATH=$PWD/backend/AppleGPU/python
+```
 
-python your_triton_script.py  # kernels run on MPS
+Then save this as `vecadd.py` and run `python vecadd.py`:
+
+```python
+import torch, triton, triton.language as tl
+
+@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = tl.load(y_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, x + y, mask=mask)
+
+n = 4096
+x = torch.randn(n, device="mps")
+y = torch.randn(n, device="mps")
+out = torch.empty_like(x)
+add_kernel[(triton.cdiv(n, 1024),)](x, y, out, n, BLOCK=1024)
+torch.mps.synchronize()
+assert (out - (x + y)).abs().max().item() == 0.0
+print("vecadd ok")
 ```
 
 ## What's included

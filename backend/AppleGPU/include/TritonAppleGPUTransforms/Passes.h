@@ -8,7 +8,7 @@ namespace mlir::triton::applegpu {
 // Threadgroup-resident operand budget for the dot TG path (32KB Metal cap
 // minus convert-scratch margin). Shared by the lowering gates and the
 // WidenPipelinedStaging widen gate; they must not drift.
-inline constexpr int64_t kTGResidentBudgetBytes = 30720;
+inline constexpr int64_t kTGResidentBudgetBytes = 32768;
 
 // Rewrite tt.dot with BlockedEncoding → AppleMmaEncoding
 std::unique_ptr<mlir::Pass> createAccelerateAppleMatmulPass();
@@ -22,10 +22,6 @@ std::unique_ptr<mlir::Pass> createStoreShuffleLayoutPass();
 
 // Grow num_stages=2 pipelined dot staging to 2 rotating SMEM slots
 std::unique_ptr<mlir::Pass> createWidenPipelinedStagingPass();
-
-// Scalarize a wide loop-carried literal-struct phi to per-element allocas so
-// IPSCCP (O3) does not non-terminate on the wide aggregate.
-std::unique_ptr<mlir::Pass> createDemoteWideAccumulatorPass();
 
 } // namespace mlir::triton::applegpu
 

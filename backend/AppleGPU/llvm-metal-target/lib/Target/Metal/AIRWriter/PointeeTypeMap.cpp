@@ -28,6 +28,27 @@ AnalysisKey PointeeTypeAnalysis::Key;
 
 static bool isIntegerDevicePointer(Value *Ptr);
 
+// An atomic intrinsic call pins its pointer operand to the intrinsic's element
+// type (i32/f32), overriding any GEP/byte-buffer source type. Return that type
+// when Ptr is fed to an `air.atomic.*` call as the pointer operand.
+static Type *atomicPointeeFromUsers(Value *Ptr) {
+  for (auto *U : Ptr->users()) {
+    auto *CI = dyn_cast<CallInst>(U);
+    if (!CI || !CI->getCalledFunction())
+      continue;
+    StringRef Name = CI->getCalledFunction()->getName();
+    if (!Name.starts_with("air.atomic."))
+      continue;
+    if (CI->arg_size() == 0 || CI->getArgOperand(0) != Ptr)
+      continue;
+    if (Name.ends_with(".i32"))
+      return Type::getInt32Ty(Ptr->getContext());
+    if (Name.ends_with(".f32"))
+      return Type::getFloatTy(Ptr->getContext());
+  }
+  return nullptr;
+}
+
 // Infer pointee from usage: load/store/GEP, then GEP source type and atomic
 // intrinsic name inference.
 Type *PointeeTypeMap::inferFromUsage(Value *Ptr) {
@@ -237,7 +258,13 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
           continue;
         if (PN->getType()->getPointerAddressSpace() != AS::Device)
           continue;
-        PTM.set(PN, F32);
+        // A phi feeding an atomic intrinsic must carry the atomic's element
+        // type (i32/f32); collapsing it to float* makes the phi's typed-pointer
+        // slot disagree with the atomic callee's i32* param -> invalid record.
+        if (Type *AtomicTy = atomicPointeeFromUsers(PN))
+          PTM.set(PN, AtomicTy);
+        else
+          PTM.set(PN, F32);
       }
 
   // Phase 3: Global variables

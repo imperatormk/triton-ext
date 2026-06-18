@@ -710,15 +710,10 @@ struct AtomicCASOpAppleConversion
     auto i32Ty = IntegerType::get(ctx, 32);
     auto i1Ty = IntegerType::get(ctx, 1);
 
-    // air.atomic.global.cmpxchg.weak.i32 signature:
-    // (ptr, &expected, desired, succ_order, fail_order, scope, vol). The
-    // mem_flags-bearing 8-arg form Metal's own front end emits crashes the AGX
-    // PSO compiler (TypeFinder null-deref) for our writer's module shape, so we
-    // use this 7-arg form and rely on the order args for cross-group ordering.
-    // TODO: this 7-arg form only weakly honours the order operands -> a rare
-    // ~1/12 cold flake on acquire/release CAS. The principled fix (emit the
-    // canonical 8-arg form + metal::_atomic struct_type_info metadata) is in
-    // triton-main/CAS_CANONICAL_ATOMIC_TODO.md.
+    // 7-arg form (ptr, &expected, desired, succ_order, fail_order, scope, vol):
+    // the canonical 8-arg mem_flags form crashes the AGX PSO compiler
+    // (TypeFinder null-deref). The 7-arg form only weakly honours the order
+    // operands -> rare cold flake on acquire/release CAS.
     {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(mod.getBody());

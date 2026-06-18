@@ -117,11 +117,9 @@ struct GetNumProgramsOpAppleConversion
   }
 };
 
-// Lower triton::FuncOp → LLVM::LLVMFuncOp for Apple Metal kernels.
-// Metal passes scalar kernel args via setBytes as constant-addrspace(2)
-// pointers, so scalar args become `i32 addrspace(2)*` with explicit entry
-// loads (matches `xcrun metal` for `constant T&`). Pointer args (addrspace 1 =
-// device) pass through unchanged.
+// Lower triton::FuncOp → LLVM::LLVMFuncOp for Apple Metal kernels. Scalar args
+// become `i32 addrspace(2)*` with explicit entry loads (Metal's setBytes /
+// `constant T&`); device pointer args (addrspace 1) pass through unchanged.
 struct AppleFuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -193,11 +191,9 @@ struct AppleFuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
         oldArg.setType(newArgTypes[i]);
         auto origTy = getTypeConverter()->convertType(
             funcOp.getFunctionType().getInput(i));
-        // Volatile so the load is never eliminated: the opaque addrspace(2)
-        // pointer loses the arg's original width, and scalar-buffer-packing
-        // recovers it from this load's result type. A dead load would force the
-        // pass to guess the width, mis-size the slot, and corrupt every
-        // following scalar's byte offset.
+        // Volatile so the load is never eliminated: scalar-buffer-packing
+        // recovers the arg's width from this load's result type; a dead load
+        // would mis-size the slot and corrupt later scalar offsets.
         Value loaded = LLVM::LoadOp::create(rewriter, loc, origTy, oldArg,
                                             /*alignment=*/0,
                                             /*isVolatile=*/true);

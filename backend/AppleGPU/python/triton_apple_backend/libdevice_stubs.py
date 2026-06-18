@@ -47,12 +47,10 @@ def _round_to_int(y):
 
 @triton.jit
 def _pow_mag(ax, y):
-    # |ax|**y computed with a compensated product to retain precision for
-    # large exponents (Metal has no f64, so a plain exp(y*log(ax)) in f32 is
-    # too lossy for e.g. x**1000). Work in base 2: ax**y = 2**(y*log2(ax)).
-    # Compute t = y*log2(ax) as a (hi, lo) double-single pair so the rounding
-    # error of the product is carried into the exponent, then evaluate
-    # 2**t = 2**ki * 2**frac, keeping the exp2 argument small.
+    # |ax|**y via compensated product (Metal has no f64; plain f32
+    # exp(y*log(ax)) is too lossy for large exponents). Base 2:
+    # ax**y = 2**(y*log2(ax)), with t = y*log2(ax) as a (hi, lo) double-single
+    # pair, then 2**t = 2**ki * 2**frac to keep the exp2 argument small.
     lg = tl.log2(ax)
     hi = y * lg
     e = tl.math.fma(y, lg, -hi)  # exact rounding error of the product
@@ -64,10 +62,9 @@ def _pow_mag(ax, y):
 
 @triton.jit
 def _pow(x, y):
-    # exp(y*log(x)) is only valid for x > 0. For x < 0 with an integer
-    # exponent, pow is real-valued: |x|**y, negated when y is odd. For x < 0
-    # with a non-integer exponent the result is NaN (IEEE / metal::pow). x == 0
-    # is handled below via exp2(y*log2(0)) -> 0 / inf as expected.
+    # exp(y*log(x)) is only valid for x > 0. x < 0: |x|**y, negated for odd
+    # integer y, NaN for non-integer y (IEEE / metal::pow). x == 0 handled via
+    # exp2(y*log2(0)) -> 0 / inf.
     ax = tl.abs(x)
     mag = _pow_mag(ax, y)
     # Sign for negative base: -1 when y is an odd integer, +1 when even, NaN
@@ -265,10 +262,8 @@ def _fast_gelu(x):
 @triton.jit
 def _cyl_bessel_i0(x):
     # Modified Bessel function I0, Abramowitz & Stegun 9.8.1 / 9.8.2.
-    # I0 is even, so work in |x|. Split at 3.75: a polynomial in (x/3.75)^2
-    # for the small range, an asymptotic exp(ax)/sqrt(ax) * poly(3.75/ax) for
-    # the large range. Single-precision accurate (|err| < ~1.6e-7), which is
-    # all f32 (and Metal, which has no f64) can carry anyway.
+    # Even; work in |x|. Split at 3.75: polynomial in (x/3.75)^2 for small,
+    # asymptotic exp(ax)/sqrt(ax) * poly(3.75/ax) for large. |err| < ~1.6e-7.
     ax = tl.abs(x)
     small = ax < 3.75
     # --- small branch: t = (x/3.75)^2 ---

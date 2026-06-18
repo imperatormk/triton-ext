@@ -68,11 +68,9 @@ static std::vector<uint8_t> wrapBitcode(const std::vector<uint8_t> &BC) {
   writeU32(RSO, Size);       // bitcode size (true, word-aligned length)
   writeU32(RSO, 0xFFFFFFFF); // CPU type
   RSO.write(reinterpret_cast<const char *>(BC.data()), BC.size());
-  // Pad to 16-align the whole wrapped section: metal-objdump's reader needs
-  // read-ahead slack past the declared bitstream end, else "truncated module".
-  // Slack is trailing zeros, not counted in the wrapper size, so the embedded
-  // module is unchanged. Force a full block when already aligned for nonzero
-  // slack.
+  // Pad to 16-align the wrapped section: metal-objdump needs read-ahead slack
+  // past the declared bitstream end, else "truncated module". Force a full
+  // block when already aligned so slack is always nonzero.
   size_t SectionSoFar = 20u + BC.size();
   size_t Pad = (16u - (SectionSoFar % 16u)) % 16u;
   if (Pad == 0)

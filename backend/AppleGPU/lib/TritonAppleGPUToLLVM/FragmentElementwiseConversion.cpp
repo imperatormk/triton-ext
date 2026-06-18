@@ -113,11 +113,9 @@ struct AppleMmaFragmentUnaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
   }
 };
 
-// f16/bf16 epilogue truncf on a fragment struct: a FORWARD (no-op). The
-// f16/bf16 #mma result rides the same <64 x f32> accumulator fragment as f32,
-// so the actual narrowing is emitted per-element on the extracted scalar in the
-// #mma->#blocked store convert (ConvertLayoutOpAppleConversion), keeping the
-// accumulator off the simdgroup register. Matches only same f32 in/out struct.
+// f16/bf16 epilogue truncf on a fragment struct: a no-op forward. The result
+// rides the same <64 x f32> accumulator fragment; narrowing happens per-element
+// in the #mma->#blocked store convert. Matches only same f32 in/out struct.
 struct AppleMmaFragmentTruncFConversion
     : public ConvertOpToLLVMPattern<arith::TruncFOp> {
   using ConvertOpToLLVMPattern<arith::TruncFOp>::ConvertOpToLLVMPattern;

@@ -54,17 +54,9 @@ Value makeI64Vec2(OpBuilder &b, Location loc, int64_t a, int64_t b_val);
 Value makeI64(OpBuilder &b, Location loc, int64_t v);
 Value makeI1False(OpBuilder &b, Location loc);
 
-// The air.simdgroup_matrix_8x8_{load,store} intrinsic signature changed at
-// macOS 16:
-//   macOS <= 15 (canonical, matching Metal's metal_simdgroup_matrix header):
-//     load:  (ptr, i64 elements_per_row, <2 x i64> origin, i1 transpose)
-//     store: (<64 x T>, ptr, i64 elements_per_row, <2 x i64> origin, i1
-//     transpose)
-//   macOS >= 16 (3-vector shape/stride/offset form, current shipping target):
-//     load:  (ptr, <2 x i64> shape, <2 x i64> stride, <2 x i64> origin)
-//     store: (<64 x T>, ptr, <2 x i64> shape, <2 x i64> stride, <2 x i64>
-//     origin)
-// Selected at runtime via TRITON_MPS_TARGET_OS_MAJOR (default 16 = 3-vector).
+// air.simdgroup_matrix_8x8_{load,store} signature differs by OS: macOS<=15 uses
+// (elements_per_row, origin, transpose); macOS>=16 uses 3-vector
+// shape/stride/origin. Selected via TRITON_MPS_TARGET_OS_MAJOR (default 16).
 unsigned getTargetOSMajor();
 bool useCanonicalSimdgroupSig();
 

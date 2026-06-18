@@ -159,11 +159,8 @@ void lowerConstantExprs(Module &M) {
   }
 }
 
-// A pointer phi's record carries one pointee type; every incoming value must
-// resolve to it. Globals (typed as their value type) and differently-typed
-// GEP chains as incomings make the reader reject the record ("Invalid phi
-// record"); wrap such incomings in an identity bitcast typed to the phi's
-// pointee. The bitcast lands in the incoming block before its terminator.
+// A pointer phi's record carries one pointee type; wrap incomings that resolve
+// to a different type in an identity bitcast so the reader accepts the record.
 static void fixPhiIncomingTypes(Module &M, PointeeTypeMap &PTM) {
   for (auto &F : M) {
     if (F.isDeclaration())
@@ -236,29 +233,11 @@ static void fixPhiIncomingTypes(Module &M, PointeeTypeMap &PTM) {
   }
 }
 
-// GEP source-element-type normalization. The Metal v1 reader requires a GEP's
-// explicit source element type to equal the typed pointee of its base pointer,
-// else "Explicit gep type does not match pointee type of pointer operand". O3
-// emits four violating shapes, dispatched per-GEP:
-//   1. Vector-pointee `gep <NxT>, p, i, j` -> linearize to `gep T, p, i*N+j`
-//      (the typed-pointer machinery has no vector-pointee slot).
-//   2. MMA element-mismatch `gep half/i8/i32, p` (device/TG) -> retype to float
-//      for same-size i32, else identity-bitcast base typed to the source.
-//      MMA-modules only; a genuine i32 buffer (PTM pointee == i32) is left
-//      alone.
-//   3. Byte-stride `gep [Nxi8]/i8, p` (non-global) -> rescale to the base's PTM
-//      pointee when the stride divides, else identity-bitcast base. All
-//      modules.
-//   4. Array-global `gep elem, @GV, i` -> handled separately by
-//      normalizeArrayGlobalGEPs, which must run AFTER lowerConstantExprs.
-//
-// Phase ordering is load-bearing: phase 1 (vector) runs module-wide FIRST
-// because it produces fresh half/i8 GEPs that shapes 2/3 must then see. Phase 2
-// is one-shot (a half/i8 base-bitcast leaves the source type unchanged, so a
-// fixpoint would emit redundant bitcasts). Phase 3 iterates to a fixpoint
-// (retyping changes dependent GEPs' pointees). On overlap an i8/half device/TG
-// GEP matches both 2 and 3; phase 2 runs entirely first and claims it (after
-// which shape 3's `Pointee != SrcTy` test no longer fires).
+// Normalize GEP source element types to match the base pointer's typed pointee
+// (the Metal v1 reader rejects mismatches). Phase ordering is load-bearing:
+// phase 1 (vector linearization) runs module-wide first so phases 2/3 see the
+// fresh half/i8 GEPs; phase 2 (MMA retype) is one-shot; phase 3 (byte-stride)
+// iterates to a fixpoint. Shape 4 (array globals) is normalizeArrayGlobalGEPs.
 static void normalizeGEPs(Module &M, PointeeTypeMap &PTM) {
   auto &Ctx = M.getContext();
   Type *FloatTy = Type::getFloatTy(Ctx);
@@ -449,11 +428,8 @@ static void lowerCmpIntrinsics(Module &M) {
   }
 }
 
-// A `<N x ptr>` from O3 vectorizing a select over pointers has only one pointee
-// slot in the AIR type table, but the scalar operands can carry conflicting
-// pointees, so the TYPE_CODE_VECTOR element disagrees → "Invalid record". These
-// vectors only ever get ptrtoint'd and stored, so lower the whole `<N x ptr>`
-// web to `<N x i64>` (no pointee typing needed) instead of scalarizing.
+// A `<N x ptr>` has only one pointee slot in the AIR type table but its scalar
+// operands can carry conflicting pointees; lower the whole web to `<N x i64>`.
 static void lowerVectorPointerToInt(Module &M) {
   auto isPtrVec = [](Type *T) -> FixedVectorType * {
     auto *VT = dyn_cast<FixedVectorType>(T);
@@ -1269,11 +1245,8 @@ static void removeRedundantBitcasts(Module &M, PointeeTypeMap &PTM) {
 }
 
 // normalizeGEPs shape 4: rewrite single-index element GEPs on array globals to
-// 2-index array GEPs. A global's pointee is its array value type (e.g.
-// [2 x i32]); `gep i32, @GV, %idx` disagrees → "Explicit gep type does not
-// match pointee type of pointer operand". Handles element-typed and byte-typed
-// constant indices. Must run AFTER lowerConstantExprs to cover materialized
-// constexpr GEPs.
+// 2-index array GEPs matching the global's array pointee. Must run AFTER
+// lowerConstantExprs to cover materialized constexpr GEPs.
 static void normalizeArrayGlobalGEPs(Module &M) {
   Type *I64Ty = Type::getInt64Ty(M.getContext());
   for (auto &F : M) {

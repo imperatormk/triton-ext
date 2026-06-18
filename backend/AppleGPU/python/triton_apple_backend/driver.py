@@ -38,13 +38,11 @@ def _materialize_offline_error(metallib_bytes, name=None):
     """Replay a metallib through the offline Metal toolchain to surface the real
     lowering error behind an opaque in-process PSO failure.
 
-    The PSO compiler runs out-of-process (MTLCompilerService), so the real
-    LLVM/AIR error never reaches our NSError; the offline tools reproduce it.
-    metal-objdump -d runs the bitcode verifier (precise error) and runs first;
-    xcrun metallib is the blunter cross-check. Returns a combined diagnostic
-    str (incl. saved metallib path) or None. Best-effort: failures are swallowed.
-    With METAL_PSO_FAIL_DIR set, the failing metallib + a .txt sidecar persist to
-    a stable, named location so the config survives inductor's reaped tempdir.
+    The PSO compiler runs out-of-process, so the real LLVM/AIR error never
+    reaches our NSError. metal-objdump -d (bitcode verifier) runs first, then
+    xcrun metallib as a cross-check. Returns a combined diagnostic str (incl.
+    saved metallib path) or None; best-effort. METAL_PSO_FAIL_DIR persists the
+    failing metallib + .txt sidecar past inductor's reaped tempdir.
     """
     import subprocess as _sp
     import tempfile as _tf
@@ -225,10 +223,10 @@ class MPSUtils:
             else:
                 module = self._metal.load_metallib(bytes(metallib_bytes))
                 function = module.get_function(name)
-            # n_max_threads MUST be the PSO's real maxTotalThreadsPerThreadgroup:
-            # triton drops configs needing more threads. A cross-warp smem kernel
-            # is only correct when ALL warps launch; capping threads silently
-            # leaves smem slots unwritten -> racy, nondeterministic results.
+            # n_max_threads MUST be the PSO's real
+            # maxTotalThreadsPerThreadgroup so triton drops over-thread configs:
+            # a cross-warp smem kernel is only correct when ALL warps launch;
+            # capping threads leaves smem slots unwritten -> nondeterministic.
             max_threads = getattr(function,
                                   'max_total_threads_per_threadgroup', 1024)
             return module, function, 0, 0, max_threads
@@ -306,9 +304,7 @@ class MPSLauncher:
 
         # Classify each expanded arg as pointer or scalar. All scalars pack into
         # ONE device buffer; IR param order is [pointers..., packed_scalar_buf].
-        # Tuple args flatten recursively to leaves; _flat_arg_keep[i] marks which
-        # flattened leaves are real GPU args (constexpr-inside-tuple leaves are
-        # present in flat_args but must NOT be passed to the kernel).
+        # Tuples flatten to leaves; _flat_arg_keep masks out constexpr leaves.
         self.ptr_indices = []  # indices into the KEPT slice of flat_args
         self.scalar_indices = []  # indices into the KEPT slice of flat_args
         self.scalar_types = []  # type strings for scalars (for packing)
@@ -361,9 +357,8 @@ class MPSLauncher:
                  launch_metadata, launch_enter_hook, launch_exit_hook, *args):
 
         # The kernel needs exactly num_warps*warp_size threads; fewer breaks
-        # cross-warp smem cooperation (unwritten slots -> nondeterministic).
-        # load_binary already drops over-budget configs; if we still reach
-        # dispatch with a deficit, fail loudly rather than cap and return wrong.
+        # cross-warp smem cooperation (unwritten slots -> nondeterministic). Fail
+        # loud rather than cap (load_binary should already have dropped this).
         max_threads = getattr(function, 'max_total_threads_per_threadgroup',
                               1024)
         if self._requested_threads > max_threads:

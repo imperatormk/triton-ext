@@ -126,13 +126,9 @@ struct ConvertLayoutOpAppleConversion
     if (!dstEnc || (!srcEnc && !srcMmaEnc))
       return failure();
 
-    // Within-simdgroup (or pure register-shuffle) converts need no shared
-    // memory: defer to the upstream simd_shuffle pattern. Exceptions stay on
-    // the in-tree TG path below:
-    //   - !tt.ptr elements: the shuffle pattern can't move them.
-    //   - #mma sources: the shuffle pattern's ColumnAction asserts on the
-    //     fragment struct element count (LinearLayout.cpp ColumnAction::apply);
-    //     the TG-scatter slot map is correct (just slower).
+    // Defer no-shared-memory converts to upstream simd_shuffle. Exceptions stay
+    // on the TG path: !tt.ptr elements (shuffle can't move them) and #mma
+    // sources (shuffle's ColumnAction asserts on the fragment element count).
     if (!srcMmaEnc && !isa<triton::PointerType>(srcTy.getElementType()) &&
         !cvtNeedsSharedMemory(srcTy, dstTy))
       return failure();
@@ -152,22 +148,17 @@ struct ConvertLayoutOpAppleConversion
                              dstTy, loc, ctx, mod);
     }
 
-    // #mma -> W-blocked store epilogue: every C element stays in its own
-    // simdgroup, so lower as a register-only air.simd_shuffle restripe
-    // (oracle-validated in tools/fragment-oracle). Any unexpected shape falls
-    // through to the always-correct TG path below.
+    // #mma -> W-blocked store epilogue: lower as a register-only simd_shuffle
+    // restripe; unexpected shapes fall through to the TG path below.
     if (srcMmaEnc && !cvtNeedsSharedMemory(srcTy, dstTy)) {
       if (succeeded(convertMmaToWShuffle(op, adaptor, rewriter, srcMmaEnc,
                                          dstEnc, srcTy, dstTy, loc, ctx, mod)))
         return success();
     }
 
-    // ND blocked->blocked on the trailing two dims; rank>2 requires leading
-    // dims size 1 (single rows x cols tile). Upstream
-    // transferWithinBlockSwizzling miscompiles fp16/bf16 replicated layouts
-    // here (stores <2 x half> at a 2-byte stride, reads back at 4-byte,
-    // corrupting the row+16 slot); our fully-scalar (row,col) scatter/gather is
-    // correct regardless of replication.
+    // ND blocked->blocked on trailing two dims; rank>2 requires leading dims
+    // size 1. Upstream transferWithinBlockSwizzling miscompiles fp16/bf16
+    // replicated layouts here, so use a fully-scalar (row,col) scatter/gather.
     unsigned rank = shape.size();
     if (rank < 2)
       return failure();
@@ -264,11 +255,8 @@ struct ConvertLayoutOpAppleConversion
     int64_t tgStripSize = stripRows * cols;
     int64_t tgSize = tgStripSize;
     // Pool all 2D convert scatter/gathers into ONE shared TG global per
-    // element-type key, sized to the running max. Each convert is fully fenced
-    // (scatter, barrier, gather, barrier), so live ranges are disjoint and can
-    // alias one buffer - keeping the addrspace(3) footprint at a single tile
-    // (what kept the fused fp16 epilogue's 3x 64x64 buffers under the 32KB
-    // cap).
+    // element-type key, sized to the running max. Each convert is fully fenced,
+    // so live ranges are disjoint and can alias one buffer.
     std::string tgName =
         ("__tg_cvt_" + llvm::Twine(getCvtPoolKey(tgElemTy))).str();
     {
@@ -369,13 +357,10 @@ struct ConvertLayoutOpAppleConversion
       return {bR, bC, pred};
     };
 
-    // Per-lane base (row,col) for an AppleMma source. emitOffsetForLayout fixes
-    // lane=0/warp=0, so the lane+warp contribution is added here. Physical
-    // per-lane storage (column-major warp tiling, 8x8 tile step per warp):
+    // Per-lane base (row,col) for an AppleMma source; adds the lane+warp
+    // contribution emitOffsetForLayout omits. Physical per-lane storage:
     //   phys_row = L1 | (L2<<1) | (L4<<2)
     //   phys_col = (L0<<1) | (L3<<2)        (register supplies col bit 0)
-    // Enumerated offsets cover exactly the in-bounds MxN positions ->
-    // pred=true.
     auto makeBaseMma =
         [&](AppleMmaEncodingAttr enc) -> std::tuple<Value, Value, Value> {
       auto wpc = enc.getWarpsPerCTA();
@@ -602,10 +587,8 @@ struct ConvertLayoutOpAppleConversion
         dstByRow[rOff].push_back(i);
       }
       // Single-strip fast path: whole tile fits one TG pass, so every dst row
-      // is unconditionally in-strip and both selects collapse to the gathered
-      // value
-      // - emit plain GEP+load. This elides the select/icmp chain that is ~99%
-      // of a 128x128x64 dot's #mma->#blocked output convert IR.
+      // is unconditionally in-strip; emit plain GEP+load and elide the
+      // select/icmp chain.
       bool singleStrip = (numStrips == 1);
       Value zeroIdx = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
       for (int64_t rOff : dstRowOrder) {

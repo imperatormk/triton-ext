@@ -10,29 +10,8 @@ include "TritonAppleGPUDialect.td"
 //===----------------------------------------------------------------------===//
 //
 // Encoding for tensors produced by simdgroup_multiply_accumulate on Apple GPUs.
-//
-// Empirically verified layout (verify_simdgroup.metal, M1):
-//   32 threads per simdgroup, each owns 2 elements of an 8x8 output tile.
-//   lane T, reg R → row = (T >> 3) + R*4,  col = T & 7
-//
-// Layout grid (one 8x8 tile):
-//      col: 0  1  2  3  4  5  6  7
-// row 0:    0  1  2  3  4  5  6  7   ← lanes 0-7,  reg 0
-// row 1:    8  9 10 11 12 13 14 15   ← lanes 8-15, reg 0
-// row 2:   16 17 18 19 20 21 22 23
-// row 3:   24 25 26 27 28 29 30 31
-// row 4:    0  1  2  3  4  5  6  7   ← lanes 0-7,  reg 1
-// row 5:    8  9 10 11 12 13 14 15
-// row 6:   16 17 18 19 20 21 22 23
-// row 7:   24 25 26 27 28 29 30 31   ← lanes 24-31,reg 1
-//
-// LinearLayout XOR basis vectors:
-//   lane  bit 0 → col bit 0 ┐
-//   lane  bit 1 → col bit 1 ├ 8 cols
-//   lane  bit 2 → col bit 2 ┘
-//   lane  bit 3 → row bit 0 ┐
-//   lane  bit 4 → row bit 1 ┘ 4 row groups
-//   reg   bit 0 → row bit 2   2 halves (rows 0-3 vs 4-7)
+// Apple simdgroup 8x8 MMA layout (M1, 32 threads, 2 regs each):
+//   lane T, reg R -> row = (T >> 3) + R*4,  col = T & 7
 
 def AppleMmaEncodingAttr : AttrDef<TritonAppleGPU_Dialect, "AppleMmaEncoding",
     [DeclareAttrInterfaceMethods<DistributedEncodingTrait>,

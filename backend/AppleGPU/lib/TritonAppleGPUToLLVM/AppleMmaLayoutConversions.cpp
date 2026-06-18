@@ -1,11 +1,5 @@
-// AppleMmaEncodingAttr::toLinearLayout
-//
-// Converts Apple simdgroup MMA encoding → LinearLayout used throughout
-// the Triton compiler for layout propagation, conversion insertion,
-// and shared memory access analysis.
-//
-// Verified layout (verify_simdgroup.metal, M1 hardware):
-//   lane T, reg R → row = (T >> 3) + R*4,  col = T & 7
+// AppleMmaEncodingAttr::toLinearLayout: Apple simdgroup MMA encoding →
+// LinearLayout. Verified on M1: lane T, reg R → row = (T>>3)+R*4, col = T&7.
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "mlir/IR/MLIRContext.h"
@@ -34,13 +28,9 @@ AppleMmaEncodingAttr::toLinearLayout(llvm::ArrayRef<int64_t> shape) const {
   auto dimCol = dimNames[1]; // "dim1"
 
   // ── Single 8×8 simdgroup tile ─────────────────────────────────────────
-  // PHYSICAL layout matches the simdgroup_matrix per-lane storage so the
-  // #mma<->simdgroup_matrix bridge is lane-local (extract/insert at 0,1):
-  //   phys_row = L[1] | (L[2]<<1) | (L[4]<<2)
-  //   phys_col = (L[0]<<1) | (L[3]<<2) | R
-  // It is UNCONDITIONAL: every C-accumulator bridge site is lane-local against
-  // it, so forcing the logical layout (row = (T>>3)+R*4, col = T&7) here would
-  // miscompile those bridges. Logical bases kept for reference only.
+  // PHYSICAL layout matches simdgroup_matrix per-lane storage so the
+  // #mma<->simdgroup_matrix bridge is lane-local. It is UNCONDITIONAL: forcing
+  // the logical layout here would miscompile the C-accumulator bridges.
   bool physLayout = true;
   std::vector<std::vector<int32_t>> registerBases =
       physLayout ? std::vector<std::vector<int32_t>>{{0, 1}}

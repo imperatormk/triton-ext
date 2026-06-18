@@ -77,11 +77,9 @@ struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
     auto masks = maskOperand ? unpackElems(maskOperand, rewriter, loc)
                              : SmallVector<Value>{};
 
-    // When the tensor is replicated across lanes/warps (more threads than
-    // elements, e.g. a 64-thread group writing a 1-element reduction), every
-    // redundant thread computes the same destination pointer and they race;
-    // a thread with a stale replica can win and corrupt the result. Predicate
-    // so only the canonical owner stores, and skip register-replicated copies.
+    // Replicated tensors (more threads than elements) make redundant threads
+    // race on the same destination pointer; predicate so only the canonical
+    // owner stores, and skip register-replicated copies.
     Value threadPred;
     uint32_t regMask = 0;
     if (isa<RankedTensorType>(op.getPtr().getType())) {

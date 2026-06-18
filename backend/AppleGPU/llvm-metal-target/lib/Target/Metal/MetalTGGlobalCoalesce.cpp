@@ -45,17 +45,9 @@ static bool moduleHasMMA(Module &M) {
   return false;
 }
 
-// Erase threadgroup-address-space globals that have no remaining uses. The
-// upstream Triton allocate-shared-memory pass sizes a `global_smem` swizzle
-// scratch for every layout conversion (e.g. the #mma->#blocked C-output
-// convert), but the Apple backend lowers those conversions in-tree through its
-// own __tg_cvt_/__tg_dot_ab buffers, leaving `global_smem` declared but never
-// loaded or stored. A dead threadgroup global still consumes the per-
-// threadgroup memory budget at AIR layout assignment (the 32KB Metal cap), so
-// for a wide f32 C tile the dead 32KB global_smem alone exhausts the budget and
-// the kernel will not launch. Removing zero-use threadgroup globals reclaims
-// that space; it is always safe (no use can observe the removal) and shrinks
-// the footprint of every GEMM whose conversions are handled in-tree.
+// Erase zero-use threadgroup globals (e.g. the unused upstream global_smem
+// swizzle scratch). A dead TG global still counts against the 32KB Metal cap
+// and can block kernel launch; removal is always safe.
 static bool eraseDeadThreadgroupGlobals(Module &M) {
   SmallVector<GlobalVariable *, 4> Dead;
   for (GlobalVariable &GV : M.globals()) {
@@ -76,35 +68,16 @@ static std::optional<int64_t> constInt(Value *V) {
   return std::nullopt;
 }
 
-// Shrink a threadgroup global whose upstream reservation is larger than the
-// bytes its DMA-staged tiles actually occupy. The Triton allocate-shared-memory
-// pass conservatively over-provisions `global_smem` (a 64x64 fp32 dot stages
-// two 8KB operands = 16KB but the reservation lands at 24KB). The dead tail is
-// real threadgroup memory counting against the 32KB Metal cap, so a kernel
-// needing 16KB but reserving 24KB keeps only one threadgroup resident per core
-// where two would fit -- a direct occupancy (and thus throughput) loss.
-//
-// The written region is defined by the async-DMA copies: each
-// air.simdgroup_async_copy_2d destination is a constant-offset tile of
-// (rowStride * rows) bytes; the high-water mark is the max tile end. A dynamic-
-// index GEP touches bytes we cannot statically pin down -- it is only sound to
-// skip when an async copy established the region it must fall inside (the DMA
-// dot path: copies write the tile, dynamic GEPs read/store within it). If the
-// global has NO async-copy writer (e.g. the int8 dot stages entirely through
-// `store float` via dynamic GEPs, widening 1-byte ints to f32 with no
-// async_copy_2d), nothing bounds those bytes, so we bail and keep the original
-// size rather than clip live staging.
+// Trim the dead tail off a TG global the upstream allocator over-provisioned,
+// so a tile staging 16KB doesn't reserve 24KB and halve occupancy. The live
+// region's high-water mark is the max async-copy tile end. A dynamic-index GEP
+// is only safe to skip when an async copy established the region it falls
+// inside; without an async-copy writer nothing bounds those bytes, so bail.
 static constexpr StringLiteral kAsyncCopy2D("air.simdgroup_async_copy_2d");
 
 // Conservative compile-time upper bound on the unsigned value of an integer SSA
-// value, for statically bounding a dynamic threadgroup GEP index. Returns
-// nullopt when no finite bound is provable. The vector-staged GEMM staging path
-// (no async copy) addresses `@global_smem` with a thread-derived index of the
-// form zext(shl(or(and(tid,C1), and(tid,C2)), S)): `and X, C` is bounded by C,
-// `or` by the bitwise-or of the bounds, `shl`/`mul`-by-const scale the bound,
-// and `zext` preserves it. Bounding that index proves the staged region's
-// high-water mark so the dead reservation tail can be trimmed even without an
-// async copy to anchor the region.
+// value, for statically bounding a dynamic TG GEP index (the vector-staged GEMM
+// thread-derived index). Returns nullopt when no finite bound is provable.
 static std::optional<uint64_t> staticMaxUnsigned(Value *V, unsigned Depth = 0) {
   if (auto *CI = dyn_cast<ConstantInt>(V))
     return CI->getZExtValue();
@@ -178,13 +151,10 @@ static std::optional<uint64_t> staticMaxUnsigned(Value *V, unsigned Depth = 0) {
   return std::nullopt;
 }
 
-// True when every transitive consumer of a (dynamic) threadgroup GEP is an
-// air.simdgroup_matrix_8x8_load READ (possibly through further constant GEPs /
-// bitcasts). Such a GEP only reads staged bytes the operand stores already
-// wrote, so it cannot extend the buffer's live region past the write high-water
-// and is safe to skip when its tid-derived index is not statically boundable.
-// Returns false on any store, async copy, non-MMA call, or unrecognized user
-// (those must be accounted for explicitly).
+// True when every transitive consumer of a (dynamic) TG GEP is an
+// air.simdgroup_matrix_8x8_load READ. Such a GEP only reads already-written
+// staged bytes, so it can't extend the live region and is safe to skip when its
+// tid-derived index is not statically boundable. False on any other user.
 static bool gepFeedsOnlyMMAReads(Value *V) {
   SmallVector<Value *, 16> Work{V};
   SmallPtrSet<Value *, 16> Seen;
@@ -245,18 +215,9 @@ static bool shrinkOverAllocatedThreadgroupGlobals(Module &M) {
         APInt Off(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
         if (!GEP->accumulateConstantOffset(DL, Off)) {
           SawDynamicGEP = true;
-          // The vector-staged GEMM path indexes the byte arena with a single
-          // thread-derived dynamic index. Two distinct dynamic GEP shapes reach
-          // the staging global:
-          //   (a) the operand-store GEPs (`getelementptr i8, base, i64 %idx`)
-          //       whose %idx is a boundable and/or/shl of tid -> bound them and
-          //       fold the reach into the high-water;
-          //   (b) the MMA-load address GEPs (`getelementptr [4 x i8], base, i64
-          //       %idx`) feeding only air.simdgroup_matrix_8x8_load. Those are
-          //       READS of bytes the stores already wrote; their tid index is
-          //       not boundable here (tid.x has no IR bound
-          //       pre-AIRSystemValues) but they cannot extend the live region
-          //       past the write high- water, so they are safe to skip.
+          // MMA-load address GEPs only read already-written bytes (their tid
+          // index isn't boundable pre-AIRSystemValues) so they can't extend the
+          // live region; skip them. Operand-store GEPs are bounded below.
           if (gepFeedsOnlyMMAReads(GEP))
             continue;
           int64_t DynMaxByte = 0;
@@ -329,10 +290,8 @@ static bool shrinkOverAllocatedThreadgroupGlobals(Module &M) {
       HighWater = std::max(HighWater, Base + AccessBytes);
     }
 
-    // A dynamic GEP whose index could not be statically bounded leaves its
-    // touched bytes unprovable unless an async copy established the region.
-    // A bounded dynamic GEP (vector-staged GEMM thread index) already folded
-    // its reach into HighWater above, so it does not force a bail.
+    // An unbounded dynamic GEP leaves its touched bytes unprovable unless an
+    // async copy established the region. (Bounded GEPs already folded above.)
     if (SawUnboundedDynGEP && !SawAsyncCopy)
       Bail = true;
     (void)SawDynamicGEP;
@@ -374,10 +333,7 @@ static void collectUseBlocks(GlobalVariable *GV,
     if (!Seen.insert(U).second)
       continue;
     if (auto *I = dyn_cast<Instruction>(U)) {
-      // A pointer-producing instruction (GEP/bitcast/addrspacecast) is just a
-      // re-addressing of the same buffer - the AppleGPU lowering materializes
-      // the global address into a %__base__ GEP in the entry block, then GEPs
-      // off that per dot. Don't count the address-computation block as a use;
+      // Pointer re-addressing (GEP/bitcast/addrspacecast) is not itself a use;
       // recurse to the loads/stores/MMA calls that actually touch the buffer.
       if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
           isa<AddrSpaceCastInst>(I)) {
@@ -405,18 +361,11 @@ static bool functionHasBarrier(Function &F) {
   return false;
 }
 
-// Two same-typed MMA staging buffers (__tg_dot_ab_*) created for distinct dots
-// are each live only inside their own dot's barrier-bracketed region. When one
-// dot's region is entirely dominated-after the other's (disjoint use-block sets
-// + strict dominance ordering, with a threadgroup barrier between), the two can
-// share a single buffer instead of each consuming its own slot of the 32KB TG
-// budget. This is the same lifetime-overlay idea as the cvt->dot merge below,
-// extended across dots. Returns true if any merge happened.
-//
-// Safety: the lowering brackets every dot's staging with air.wg.barrier, so a
-// strict block-dominance ordering between two disjoint use-block sets implies a
-// barrier separates the last write of the survivor's prior tenant from the
-// first write of the next, which is exactly the reuse condition Metal requires.
+// Overlay two same-typed __tg_dot_ab_* staging buffers from distinct dots onto
+// one slot when their barrier-bracketed regions are disjoint (disjoint
+// use-blocks + strict dominance ordering with a TG barrier between). The
+// barrier separates the prior tenant's last write from the next's first write,
+// which is the reuse condition Metal requires. Returns true on any merge.
 static bool mergeDisjointDotBuffers(Module &M) {
   SmallVector<GlobalVariable *, 4> Dots;
   for (GlobalVariable &GV : M.globals()) {
@@ -486,12 +435,9 @@ static bool mergeDisjointDotBuffers(Module &M) {
       for (BasicBlock *BA : A.Blocks)
         if (BA == BB || !DT.dominates(BA, BB))
           return false;
-    // Require a threadgroup barrier that every A use-block dominates and that
-    // dominates every B use-block: this barrier sits between A's last access
-    // and B's first, so reusing A's slot for B can't race a stale A access.
-    // Use a barrier in its own block (not an A- or B-use block) so block-level
-    // dominance unambiguously orders it after all A accesses and before all B
-    // accesses (no intra-block instruction-order reasoning needed).
+    // Require a TG barrier in its own block (not an A/B use-block) that all A
+    // use-blocks dominate and that dominates all B use-blocks: it sits between
+    // A's last access and B's first, so reusing A's slot for B can't race.
     for (Instruction *Bar : Barriers) {
       BasicBlock *BarBB = Bar->getParent();
       if (A.Blocks.count(BarBB) || B.Blocks.count(BarBB))
@@ -516,10 +462,8 @@ static bool mergeDisjointDotBuffers(Module &M) {
   };
 
   bool Changed = false;
-  // Greedy: keep a list of survivor buffers; fold each subsequent buffer into
-  // the first survivor whose region is strictly disjoint-before it (so the
-  // survivor is dead by the time this buffer is live). Only same element type
-  // (no bitcast needed for a clean reuse).
+  // Greedy: fold each buffer into the first same-typed survivor whose region is
+  // disjoint from it (so the survivor is dead by the time this buffer is live).
   for (size_t I = 1; I < Infos.size(); ++I) {
     DotInfo &Cur = Infos[I];
     auto *CurAT = cast<ArrayType>(Cur.GV->getValueType());

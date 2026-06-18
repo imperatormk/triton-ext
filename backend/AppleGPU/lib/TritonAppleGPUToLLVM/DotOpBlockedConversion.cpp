@@ -80,13 +80,10 @@ static unsigned mortonBitsPerDim(int64_t wM, int64_t wN) {
     return 0;
   return log2(wM);
 }
-// Alias a dot's TG scatter buffer into the module-wide global_smem arena rather
-// than stacking a fresh __tg_dot_ab global on top. The convert_layout scratch
-// in global_smem is dead during the dot (operand converts feed it in registers,
-// the output convert runs after), so overlapping is safe and keeps the
-// addrspace(3) footprint at max(convert,dot) - stacking overflowed the 32KB cap
-// for batched int8 dot3d. Grows global_smem (and the ttg.shared attr the
-// convert budgeter reads) if needed. Null if global_smem is unavailable.
+// Alias a dot's TG scatter buffer into global_smem rather than stacking a fresh
+// __tg_dot_ab global (which overflowed the 32KB cap for batched int8 dot3d).
+// The convert_layout scratch there is dead during the dot, so overlap is safe.
+// Grows global_smem (and the ttg.shared attr) if needed. Null if unavailable.
 static Value getOrGrowSharedArena(ConversionPatternRewriter &rewriter,
                                   Location loc, ModuleOp mod,
                                   int64_t neededBytes) {
@@ -332,11 +329,9 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       auto loadOp = src.getDefiningOp<tt::LoadOp>();
       if (!loadOp)
         return {};
-      // A masked load fills OOB lanes in registers, but the device-direct
-      // simdgroup_matrix_8x8_load.p1 reads raw device memory and can't see the
-      // masking - it would feed the MMA unmasked bytes (100% mismatch on masked
-      // tl.dot). Decline the device path so the operand goes through TG
-      // scatter, preserving the register-side fill.
+      // The device-direct simdgroup load reads raw memory and can't see a
+      // load's register-side mask fill, so decline the device path for masked
+      // loads and route through TG scatter (else masked tl.dot miscompiles).
       if (loadOp.getMask())
         return {};
       Value ptrTensor = loadOp.getPtr();
@@ -533,16 +528,11 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     auto cWpcEarly = cEnc.getWarpsPerCTA();
     int64_t matWarpsCEarly = cWpcEarly[rowDim] * cWpcEarly[colDim];
 
-    // Async copy is default-on but disabled (→ per-element scatter) when either
-    // correctness condition holds:
-    //   - integer element type: async writes raw bytes but MMA loads read f32,
-    //     so the int8 byte-width mismatch corrupts data.
-    //   - matWarpsCEarly>1 without a disjoint row partition: identical
-    //     whole-strip copies from multiple simdgroups race on the same TG
-    //     bytes. For matWarpsCEarly in {2,4,8} each warp copies its own
-    //     8/nWarps-row band (disjoint), so copies can't race.
-    // Per-operand use is gated further below (batch==1, counts match,
-    // row-major, computable strides).
+    // Async copy is default-on but disabled (-> per-element scatter) for
+    // correctness when either: integer element type (async writes raw bytes but
+    // MMA loads read f32, corrupting int8); or matWarpsCEarly>1 without a
+    // disjoint row partition (multi-simdgroup whole-strip copies race). For
+    // matWarpsCEarly in {2,4,8} each warp copies its own band, so no race.
     int64_t dmaPartitionWarps =
         (matWarpsCEarly == 2 || matWarpsCEarly == 4 || matWarpsCEarly == 8)
             ? matWarpsCEarly
@@ -713,13 +703,10 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     int64_t phase3Strips = useDoubleBufB ? 2 : 1;
     int64_t tgSizeNeeded = std::max(tgStripSize, phase3Strips * 8 * Npad);
     int64_t tgSize = tgSizeNeeded * batchSize;
-    // Alias the scatter buffer into global_smem to overlap convert_layout
-    // scratch (fixes the batched int8 dot3d 32KB overflow). Restricted to
-    // integer dots: those are the OOR cases AND an int8 kernel's only other TG
-    // consumer is a separate __tg_cvt pool, so global_smem carries only this
-    // dot's f32 GEPs. Float dots can share global_smem with converts that GEP
-    // it at another element type; mixing typed GEPs on one global trips the
-    // metallib reader, so they keep their own typed __tg_dot_ab global.
+    // Alias the scatter buffer into global_smem (fixes the batched int8 dot3d
+    // 32KB overflow). Integer dots only: those are the OOR cases and carry only
+    // f32 GEPs on global_smem. Float dots keep a typed __tg_dot_ab global since
+    // mixing typed GEPs on one global trips the metallib reader.
     Value ptrTG;
     if (isa<IntegerType>(aElemTy))
       ptrTG = getOrGrowSharedArena(rewriter, loc, mod, tgSize * 4);
@@ -880,9 +867,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     };
 
     // Runtime batch-offset pointer for SIMD matrix load/store. Each batch slice
-    // gets its own tgStripSize TG region (no cross-warp contamination). When
-    // batchSize > numBatchWarps, an unrolled batch loop processes several
-    // batches per warp (see below).
+    // gets its own tgStripSize TG region (no cross-warp contamination).
     auto cWpc = cEnc.getWarpsPerCTA();
     int64_t matWarpsC = cWpc[rowDim] * cWpc[colDim];
     int64_t numTotalWarps = 1;
@@ -1032,8 +1017,7 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
     // Scatter elements into TG for an 8-row strip. scatterTy = f32 for C,
     // native for A/B. Sequential batch mode (curBatchRound>=0): only the
-    // current batch's elements scatter to the TG base (compile-time filter
-    // without batch warps, runtime filter with). Warp-distributed mode
+    // current batch's elements scatter to the TG base. Warp-distributed
     // (curBatchRound<0): all elements scatter, each to its elemBatchTGOffset
     // region.
     auto stripScatter = [&](Value baseRow, Value baseCol,

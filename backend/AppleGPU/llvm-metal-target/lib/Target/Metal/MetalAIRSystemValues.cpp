@@ -169,11 +169,9 @@ static bool airSystemValues(Module &M) {
             EV->replaceAllUsesWith(Components[std::min(Idx, 2u)]);
             EV->eraseFromParent();
           }
-          // Remaining whole-aggregate users (e.g. a `freeze [3 x i32]` the
-          // mid-end inserts at -O2/-O3) must see the real system value, not
-          // undef. Rebuild the [3 x i32] from Components before the call - //
-          // RAUW'ing undef here poisons a freeze-separated extractvalue and
-          // yields garbage div/rem inputs.
+          // Whole-aggregate users (e.g. a freeze the mid-end inserts at
+          // -O2/-O3) must see the real system value: rebuild the [3 x i32] from
+          // Components.
           if (!CI->use_empty()) {
             IRBuilder<> B(CI);
             Value *Agg = UndefValue::get(CI->getType());

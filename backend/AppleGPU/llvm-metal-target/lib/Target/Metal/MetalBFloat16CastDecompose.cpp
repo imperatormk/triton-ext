@@ -37,11 +37,9 @@ static bool bfloat16CastDecompose(Module &M) {
   };
 
   // Phase 0: decompose fptrunc f32->bf16 (RTNE) and fpext bf16->f32 as integer
-  // bit manipulation; the native casts are miscompiled by the GPU JIT.
-  //
-  // No NaN-quieting branch: under fast_math_enable (implies nnan) the AGX JIT
-  // miscompiles the `fcmp uno`+`select` bitcast chain (corrupts adjacent lanes
-  // to NaN in the bf16 atomic-add CAS loop). RTNE truncation is correct here.
+  // bit manipulation; the native casts are miscompiled by the GPU JIT. No
+  // NaN-quieting branch: under fast_math the AGX JIT miscompiles the
+  // `fcmp uno`+`select` chain (corrupts adjacent lanes in the bf16 CAS loop).
   for (Function &F : M) {
     for (BasicBlock &BB : F) {
       for (auto It = BB.begin(); It != BB.end();) {
@@ -82,10 +80,9 @@ static bool bfloat16CastDecompose(Module &M) {
   }
 
   // Phase 0.5: sink a vector `bitcast <N x i16> -> <N x bfloat>` through its
-  // extractelement users to scalars. AGX JIT miscompiles multi-lane extraction
-  // of a narrow <N x i16> register (narrowed from a simdgroup_matrix f32 accum)
-  // to zero. If the i16 vector is a `trunc <N x i32>`, sink the trunc too so
-  // the extract reads the full-width register. Half-precision: same shape.
+  // extractelement users to scalars; AGX JIT miscompiles multi-lane extraction
+  // of a narrow <N x i16> register to zero. If the i16 vector is a
+  // `trunc <N x i32>`, sink the trunc too so the extract reads full width.
   for (Function &F : M) {
     SmallVector<Instruction *, 8> DeadBC;
     for (BasicBlock &BB : F) {

@@ -824,6 +824,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     auto [bBaseRow, bBaseCol] = makeBase(bSrcEnc, K, N);
     auto [cBaseRow, cBaseCol] = makeBaseMma(cMmaEnc, M, N);
 
+    auto aOffsetsL = aOffsets, bOffsetsL = bOffsets;
+    Value aBaseRowL = aBaseRow, aBaseColL = aBaseCol;
+    Value bBaseRowL = bBaseRow, bBaseColL = bBaseCol;
+
     // TG buffer for C scatter/load (always) and A/B scatter (TG path).
     unsigned id = getDotCounter(ctx)++;
     int64_t pad = tgPadForType(aElemTy);
@@ -1245,7 +1249,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                             aOff);
         }
         Value aTilePtr = computeTileDevPtr(
-            aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
+            aPtrs, aOffsetsL, aRowStride, aColStride, aBaseRowL, aBaseColL,
             k * warpsM * 8, tk * 8, warpRowElem, nullptr);
         return isIntInput ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
                           : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
@@ -1258,8 +1262,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                             bOff);
         }
         Value bTilePtr = computeTileDevPtr(
-            bPtrs, bOffsets, bRowStride, bColStride, bBaseRow, bBaseCol, tk * 8,
-            j * warpsN * 8, nullptr, warpColElem);
+            bPtrs, bOffsetsL, bRowStride, bColStride, bBaseRowL, bBaseColL,
+            tk * 8, j * warpsN * 8, nullptr, warpColElem);
         return isIntInput ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
                           : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape,
                                           bDevStride, zeroOff, bDevTranspose);
@@ -1319,7 +1323,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         auto loadATileRT = [&](int64_t k, Value tkElemOff,
                                Value aKRef = nullptr) -> Value {
           Value aTilePtr = computeTileDevPtr(
-              aPtrs, aOffsets, aRowStride, aColStride, aBaseRow, aBaseCol,
+              aPtrs, aOffsetsL, aRowStride, aColStride, aBaseRowL, aBaseColL,
               k * warpsM * 8, /*tileCol=*/0, warpRowElem,
               /*extraCol=*/aKRef ? nullptr : tkElemOff, aKRef);
           return isIntInput
@@ -1330,7 +1334,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         auto loadBTileRT = [&](Value tkElemOff, int64_t j,
                                Value bKRef = nullptr) -> Value {
           Value bTilePtr = computeTileDevPtr(
-              bPtrs, bOffsets, bRowStride, bColStride, bBaseRow, bBaseCol,
+              bPtrs, bOffsetsL, bRowStride, bColStride, bBaseRowL, bBaseColL,
               /*tileRow=*/0, j * warpsN * 8,
               /*extraRow=*/bKRef ? nullptr : tkElemOff, warpColElem, bKRef);
           return isIntInput

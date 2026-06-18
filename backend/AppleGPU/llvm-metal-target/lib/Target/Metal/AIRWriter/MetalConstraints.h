@@ -9,14 +9,8 @@
 #ifndef LLVM_LIB_TARGET_METAL_AIRWRITER_METALCONSTRAINTS_H
 #define LLVM_LIB_TARGET_METAL_AIRWRITER_METALCONSTRAINTS_H
 
-/// Metal GPU constraints by address space and context.
-///
-/// Centralizes the rules currently sprinkled across 15+ passes:
-/// - Which types are valid per address space
-/// - When barriers/volatile/bitcasts are needed
-/// - MMA-specific overrides
-///
-/// Passes query this instead of reimplementing the same checks.
+/// Metal GPU constraints (valid types per address space, barrier/volatile
+/// rules, MMA overrides), centralized so passes query instead of reimplement.
 
 #include "../MetalAddressSpaces.h"
 #include "llvm/IR/Type.h"

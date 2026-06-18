@@ -23,8 +23,6 @@ using namespace llvm;
 
 #define DEBUG_TYPE "metal-device-loads-volatile"
 
-// Metal device address space.
-
 static bool isDeviceLoad(const Instruction *I) {
   if (auto *LI = dyn_cast<LoadInst>(I))
     return LI->getPointerAddressSpace() == metal::AS::Device;
@@ -49,8 +47,8 @@ static void collectCASPtrs(Function &F,
               CasPtrs.insert(CI->getArgOperand(0));
 }
 
-// True if Ptr transparently derives from any value in CasPtrs via
-// GEP / bitcast / addrspacecast / ptrtoint+inttoptr / unique select+phi.
+// True if V transparently derives from any CasPtrs value via
+// GEP/bitcast/addrspacecast/ptrtoint+inttoptr/select+phi.
 // Mirrors the reach walker in MetalAliasAnnotate.cpp.
 static bool reachesCASPtr(const Value *V,
                           const SmallPtrSetImpl<const Value *> &CasPtrs,
@@ -93,9 +91,8 @@ static bool deviceLoadsVolatile(Module &M) {
       continue;
 
     // CAS atomics: mark device loads/stores volatile only if their pointer
-    // derives from a cmpxchg call's pointer operand. Apple's cas_spin oracle
-    // (Sub-track B) shows even loads inside the CAS critical section need
-    // no volatile when they touch unrelated buffers.
+    // derives from a cmpxchg call's pointer operand. Loads touching unrelated
+    // buffers need no volatile even inside the CAS critical section.
     SmallPtrSet<const Value *, 4> CasPtrs;
     collectCASPtrs(F, CasPtrs);
     if (!CasPtrs.empty()) {

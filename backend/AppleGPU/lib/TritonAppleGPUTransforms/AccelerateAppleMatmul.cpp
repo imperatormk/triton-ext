@@ -1,21 +1,6 @@
-// AccelerateAppleMatmul: rewrite tt.dot ops to use AppleMmaEncodingAttr
-//
-// This is the Triton GPU lowering pass that replaces the generic
-// BlockedEncoding on dot ops with AppleMmaEncoding, enabling
-// simdgroup_multiply_accumulate code generation.
-//
-// Mirrors AccelerateAMDMatmul.cpp (BlockedToMFMA) for Apple.
-//
-// Pipeline position:
-//   make_ttgir: TritonGPU IR → Apple MMA tiled TritonGPU IR
-//
-// What it does:
-//   1. Find all tt.dot ops
-//   2. Check that element types are supported (f16, bf16, f32)
-//   3. Replace output encoding: BlockedEncoding → AppleMmaEncoding
-//   4. Keep A/B as BlockedEncoding (strip DotOperandEncoding if present)
-//   5. Insert ConvertLayoutOp on output to convert back to user's expected
-//   layout
+// AccelerateAppleMatmul: rewrite tt.dot to AppleMmaEncoding so the output gets
+// simdgroup_multiply_accumulate codegen. A/B stay BlockedEncoding; the result
+// is converted back to the user's layout. Mirrors AMD's BlockedToMFMA.
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "mlir/IR/PatternMatch.h"
@@ -36,24 +21,59 @@ using namespace mlir;
 using namespace mlir::triton::applegpu;
 
 namespace {
-// Determine warpsPerCTA for a given dot op shape and total warp count.
-// Apple simdgroup tile = 8x8, so:
-//   warpsM = ceil(M / 8), warpsN = ceil(N / 8), capped by numWarps.
+// warpsPerCTA for a dot shape and warp count. Apple simdgroup tile = 8x8.
 SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps) {
-  unsigned warpsM = std::max<int64_t>(1, M / 8);
-  unsigned warpsN = std::max<int64_t>(1, N / 8);
+  unsigned tilesM = std::max<int64_t>(1, M / 8);
+  unsigned tilesN = std::max<int64_t>(1, N / 8);
 
-  // Clamp to numWarps budget (prefer square allocation)
-  while (warpsM * warpsN > (unsigned)numWarps) {
-    if (warpsM > warpsN)
-      warpsM /= 2;
-    else
-      warpsN /= 2;
+  unsigned bestM = 1, bestN = 1;
+  unsigned bestProduct = 1;
+  unsigned bestOperandFrags = tilesM + tilesN;
+  unsigned bestBalance = std::max(tilesM, tilesN) - std::min(tilesM, tilesN);
+  unsigned bestWarpBalance = 1;
+
+  // Use as many warps as legally tile the CTA, then pick the split with the
+  // smallest per-warp A/B working set (the split changes how many A/B simdgroup
+  // tiles are live around the MMA loop on rectangular GEMMs).
+  for (unsigned wm = 1; wm <= tilesM; ++wm) {
+    if (tilesM % wm != 0)
+      continue;
+    for (unsigned wn = 1; wn <= tilesN; ++wn) {
+      if (tilesN % wn != 0)
+        continue;
+      unsigned product = wm * wn;
+      if (product > (unsigned)numWarps)
+        continue;
+
+      unsigned ownM = tilesM / wm;
+      unsigned ownN = tilesN / wn;
+      unsigned operandFrags = ownM + ownN;
+      unsigned balance = std::max(ownM, ownN) - std::min(ownM, ownN);
+      unsigned warpBalance = std::min(wm, wn);
+
+      bool better = product > bestProduct;
+      if (!better && product == bestProduct)
+        better = operandFrags < bestOperandFrags;
+      if (!better && product == bestProduct && operandFrags == bestOperandFrags)
+        better = balance < bestBalance;
+      if (!better && product == bestProduct &&
+          operandFrags == bestOperandFrags && balance == bestBalance)
+        better = warpBalance > bestWarpBalance;
+      if (!better)
+        continue;
+
+      bestM = wm;
+      bestN = wn;
+      bestProduct = product;
+      bestOperandFrags = operandFrags;
+      bestBalance = balance;
+      bestWarpBalance = warpBalance;
+    }
   }
-  return {warpsM, warpsN};
+
+  return {bestM, bestN};
 }
 
-// Check if element type is supported by simdgroup_multiply_accumulate
 bool isSupportedDotType(mlir::Type elemTy) {
   return elemTy.isF16() || elemTy.isBF16() || elemTy.isF32();
 }
@@ -71,11 +91,9 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     auto cType = cast<RankedTensorType>(dot.getC().getType());
     auto aType = cast<RankedTensorType>(dot.getA().getType());
 
-    // Already converted — skip
     if (isa<AppleMmaEncodingAttr>(cType.getEncoding()))
       return failure();
 
-    // Check supported element types
     if (!isSupportedDotType(aType.getElementType()))
       return failure();
 
@@ -85,8 +103,8 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
 
     int64_t M = shape[0], N = shape[1];
 
-    // Skip if tile doesn't divide evenly into 8x8 simdgroup tiles,
-    // or if too small for meaningful warp tiling.
+    // Tile must divide into 8x8 simdgroup tiles and be large enough to
+    // warp-tile.
     if (M % 8 != 0 || N % 8 != 0)
       return failure();
     if (M < 16 || N < 16)
@@ -94,27 +112,17 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
 
     int64_t K = aType.getShape()[1];
 
-    // K must be a multiple of the simdgroup MMA K-tile (8). A valid tl.dot
-    // already constrains K to a power of two >= 16, so this is always true in
-    // practice; the guard is here so any future non-tile-aligned K fails
-    // cleanly instead of silently corrupting the accumulation.
+    // K must be a multiple of the simdgroup MMA K-tile (8); a non-aligned K
+    // would silently corrupt the accumulation. Always true for a valid tl.dot.
     if (K % 8 != 0)
       return failure();
 
-    // Create AppleMmaEncoding for the result only.
-    // A and B keep their blocked encoding — DotOpToLLVM handles the
-    // mismatch by scattering blocked inputs through TG while producing
-    // MMA-encoded output. Only one ConvertLayoutOp (result → blocked)
-    // is needed downstream, vs 4 if we converted all operands.
-    // Previously this pass bailed out for non-square warpsPerCTA (e.g. [2,1]
-    // from num_warps=2) and for K > 32, on the theory that the core
-    // ConvertLayoutOp(mma->blocked) shared-memory path corrupted those cases.
-    // That has since been fixed upstream in transferSwizzlingLocalMemImpl: a
-    // full M/N/K/num_warps numeric sweep (square and non-square wpc, K up to
-    // 128) now matches torch matmul bit-for-bit (max_err = 0.0). The only
-    // remaining failures are OutOfResources for over-budget threadgroup memory,
-    // which the autotuner discards. So both guards are removed; oversized tiles
-    // fail cleanly via the shared-memory budget rather than corrupting.
+    // MMA encoding on the result only; A/B stay blocked. DotOpToLLVM scatters
+    // the blocked inputs through TG, so only one result->blocked
+    // ConvertLayoutOp is needed downstream (vs 4 if all operands were
+    // converted). Non-square wpc and large K are correct here (fixed in
+    // transferSwizzlingLocalMemImpl); oversized tiles fail cleanly via the
+    // shared-memory budget.
     auto wpc = warpsPerTileApple(M, N, numWarps);
     auto mmaEnc = AppleMmaEncodingAttr::get(ctx, wpc);
 
@@ -123,9 +131,9 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
 
     auto loc = dot.getLoc();
 
-    // If A/B have DotOperandEncoding, strip it back to plain blocked.
-    // DotOperandEncoding's parent must match the result encoding, but
-    // we're changing the result to AppleMma while keeping A/B blocked.
+    // Strip any DotOperandEncoding on A/B back to plain blocked: its parent
+    // must match the result encoding, but we keep A/B blocked while C becomes
+    // MMA.
     auto stripDotOpEnc = [&](Value operand) -> Value {
       auto ty = cast<RankedTensorType>(operand.getType());
       if (auto dotEnc =
@@ -143,7 +151,6 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     Value newA = stripDotOpEnc(dot.getA());
     Value newB = stripDotOpEnc(dot.getB());
 
-    // Convert C to MMA encoding (it's the accumulator)
     Value newC = dot.getC();
     if (auto cvt = newC.getDefiningOp<ttg::ConvertLayoutOp>()) {
       if (cvt.getSrc().getType() == newCType)
@@ -155,7 +162,6 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
       newC = ttg::ConvertLayoutOp::create(rewriter, loc, newCType, dot.getC());
     }
 
-    // Create new dot: blocked A, blocked B, AppleMma C → AppleMma result
     auto newDot = tt::DotOp::create(rewriter, loc, newCType, newA, newB, newC,
                                     dot.getInputPrecisionAttr(),
                                     dot.getMaxNumImpreciseAccAttr());
@@ -201,14 +207,12 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
   }
 };
 
-// The pass
 struct AccelerateAppleMatmul
     : public ::impl::AccelerateAppleMatmulBase<AccelerateAppleMatmul> {
 
   void runOnOperation() override {
     auto mod = getOperation();
 
-    // Get numWarps from module attribute
     int numWarps = ttg::lookupNumWarps(mod);
 
     RewritePatternSet patterns(&getContext());

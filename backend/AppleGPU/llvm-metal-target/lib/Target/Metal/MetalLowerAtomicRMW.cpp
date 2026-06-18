@@ -19,11 +19,8 @@ using namespace llvm;
 
 #define DEBUG_TYPE "metal-lower-atomic-rmw"
 
-// Metal address spaces. Inlined here (rather than pulled from a separate
-// header) since this pass only needs the threadgroup constant.
-
-// Build an AIR atomic intrinsic name with the same sign-prefix rules Apple's
-// `air::atomicName` helper uses.
+// Build an AIR atomic intrinsic name following Apple's `air::atomicName`
+// sign-prefix rules.
 static std::string buildAtomicName(bool IsGlobal, AtomicRMWInst::BinOp Op,
                                    bool IsFloat) {
   std::string Name = "air.atomic.";

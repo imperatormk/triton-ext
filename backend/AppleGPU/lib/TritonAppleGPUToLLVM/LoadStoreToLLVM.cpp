@@ -32,9 +32,8 @@ static SmallVector<Value> unpackElems(Value v, OpBuilder &b, Location loc) {
   return {v};
 }
 
-// Pack a list of values into an LLVM struct of the same types.
-// Always packs, even for a single element, to match the type converter's
-// struct<(T)> expectation for 1-element tensors.
+// Pack values into an LLVM struct. Always packs (even 1 element) to match the
+// type converter's struct<(T)> expectation for 1-element tensors.
 static Value packElems(ArrayRef<Value> elems, OpBuilder &b, Location loc) {
   SmallVector<Type> tys;
   for (auto v : elems)

@@ -66,16 +66,11 @@ struct ConvertTritonAppleGPUToLLVMPass
     TargetInfo targetInfo;
     TritonGPUToLLVMTypeConverter typeConverter(ctx, targetInfo);
 
-    // Thread the async-DMA completion event through the !ttg.async.token SSA
-    // value instead of throwing it away as i32 0. The Triton software
-    // pipeliner double/triple-buffers the K-loop and carries "which buffer's
-    // copy to wait on" through a token that is a scf.for iter_arg, so it
-    // alternates buffers each iteration. Mapping the token to the event-slot
-    // pointer (ptr addrspace(0), the thread-local alloca that holds the
-    // simdgroup event handle) lets air.wait_simdgroup_events wait on exactly
-    // the copy whose token the wait consumes; the loop-carried iter_arg then
-    // selects the correct alternating buffer. Registered last so it overrides
-    // the upstream i32 mapping (TypeConverter tries conversions newest-first).
+    // Map !ttg.async.token to the event-slot pointer (ptr addrspace(0), the
+    // thread-local alloca holding the simdgroup event handle) instead of i32 0,
+    // so air.wait_simdgroup_events waits on exactly the copy the token names
+    // (the pipeliner's loop-carried iter_arg selects the alternating buffer).
+    // Registered last to override the upstream i32 mapping (newest-first).
     typeConverter.addConversion(
         [ctx](triton::gpu::AsyncTokenType type) -> std::optional<Type> {
           return LLVM::LLVMPointerType::get(ctx, 0);
@@ -123,14 +118,10 @@ struct ConvertTritonAppleGPUToLLVMPass
       }
     }
 
-    // Pre-compute MMA threadgroup memory usage from tt.dot ops.
-    // Each dot creates a __tg_dot_ab TG buffer with potential bank-conflict
-    // padding (TG_PAD extra elements per row). Must account for the padded
-    // size so ConvertLayoutOp can correctly budget the 32KB TG limit.
-    // The IR pipeline coalesces all dot TG globals into one (taking the max),
-    // so total MMA TG cost = max over all dots.
-    // Set as module attribute so ConvertLayoutOp can account for it in
-    // the 32KB TG budget when sizing its own TG buffers.
+    // Pre-compute MMA threadgroup usage (max over all dots, since the pipeline
+    // coalesces __tg_dot_ab globals into one) and record it as a module attr,
+    // so ConvertLayoutOp can subtract it from the 32KB TG budget. Must account
+    // for bank-conflict padding (TG_PAD).
     {
       int64_t maxMmaBytes = 0;
       mod.walk([&](mlir::triton::DotOp dot) {
@@ -157,37 +148,27 @@ struct ConvertTritonAppleGPUToLLVMPass
                      IntegerAttr::get(IntegerType::get(ctx, 64), maxMmaBytes));
     }
 
-    // ttg.shared reserves global_smem for whatever the kernel's standard shared
-    // path needs (reductions, scans, gathers, histograms). The AppleMma
-    // convert_layout lowering allocates its own __tg_cvt_ buffers instead of
-    // using global_smem, so in a kernel with no such consumer the reservation
-    // is dead (llc strips it via use_empty), yet it would otherwise be
-    // subtracted from the convert's TG budget and force it into many tiny
-    // strips. Detect the live consumers once here (the ops are lowered by
-    // sibling patterns in the same conversion run, so checking after would
-    // race) and record whether global_smem is actually needed.
+    // global_smem is only live if the kernel has a standard shared-path
+    // consumer (reduce/scan/gather/histogram, or a dot staging through it).
+    // When dead, llc strips it, so it must NOT be subtracted from the convert's
+    // TG budget (else the convert is forced into many tiny strips). Detect
+    // consumers now -     // checking after the sibling lowerings run would
+    // race.
     {
       bool smemLive = false;
       mod.walk([&](Operation *o) {
         if (isa<mlir::triton::ReduceOp, mlir::triton::ScanOp,
                 mlir::triton::GatherOp, mlir::triton::HistogramOp>(o))
           smemLive = true;
-        // A software-pipelined float dot stages its A/B operands through a
-        // ttg.local_alloc backed by global_smem (the async-copy buffers the
-        // K-loop reads). Those GEPs keep the reservation live (llc cannot strip
-        // it), so the convert budgeter must subtract that global_smem from its
-        // 32KB threadgroup budget. Otherwise the output convert grants itself a
-        // single full-tile __tg_cvt strip and the two together overflow (e.g.
-        // 128x64x16 fp32: 16KB global_smem + 28KB f32 convert = 45KB).
+        // A pipelined float dot stages A/B through a ttg.local_alloc backed by
+        // global_smem, keeping the reservation live (e.g. 128x64x16 fp32:
+        // 16KB global_smem + 28KB convert = 45KB overflow if not subtracted).
         if (isa<ttg::LocalAllocOp>(o))
           smemLive = true;
-        // An integer (int8) dot aliases its A/B scatter buffer into global_smem
-        // (DotOpToLLVM getOrGrowSharedArena), so its GEPs keep the reservation
-        // live and llc cannot strip it. The convert budgeter must subtract that
-        // global_smem from its 32KB threadgroup budget, otherwise the output
-        // convert over-allocates its __tg_cvt strip and the two together
-        // overflow (e.g. 64x128x128 int8: 16KB global_smem + 24KB i32 convert =
-        // 40KB).
+        // An int8 dot aliases its A/B scatter buffer into global_smem
+        // (getOrGrowSharedArena), keeping the reservation live (e.g.
+        // 64x128x128 int8: 16KB global_smem + 24KB i32 convert = 40KB
+        // overflow).
         if (auto dot = dyn_cast<mlir::triton::DotOp>(o)) {
           auto aTy = cast<RankedTensorType>(dot.getA().getType());
           if (isa<IntegerType>(aTy.getElementType()))
@@ -292,7 +273,7 @@ struct ConvertTritonAppleGPUToLLVMPass
     mlir::triton::populateViewOpToLLVMPatterns(typeConverter, patterns,
                                                patternBenefitDefault + 1);
     // Expand math::ErfOp to polynomial approximation before MathToLLVM
-    // (there is no llvm.erf intrinsic — NVIDIA uses libdevice, we expand
+    // (there is no llvm.erf intrinsic - NVIDIA uses libdevice, we expand
     // inline)
     mlir::populatePolynomialApproximateErfPattern(patterns);
     mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
@@ -317,12 +298,10 @@ struct ConvertTritonAppleGPUToLLVMPass
     if (failed(applyPartialConversion(mod, target, std::move(patterns))))
       signalPassFailure();
 
-    // Async-wait cleanup. AsyncWaitOp lowers a wait_simdgroup_events per
-    // token unconditionally because at pattern time it cannot know whether
-    // any copy in the kernel takes the DMA path (a loop wait converts before
-    // the loop's copies). When the finished module has no DMA call at all,
-    // the waits guard nothing and the AIR JIT refuses to materialize the
-    // intrinsic, so strip them and the dead declaration here.
+    // Async-wait cleanup: AsyncWaitOp emits a wait_simdgroup_events per token
+    // unconditionally (it can't know at pattern time if any copy took the DMA
+    // path). With no DMA call at all the waits guard nothing and the AIR JIT
+    // refuses to materialize them, so strip the waits and dead decl here.
     bool hasDMACall = false;
     mod.walk([&](LLVM::CallOp call) {
       if (call.getCallee() == "air.simdgroup_async_copy_2d.p3i8.p1i8")
@@ -343,19 +322,10 @@ struct ConvertTritonAppleGPUToLLVMPass
             decl.erase();
     }
 
-    // Fix up llvm.loop_annotation on llvm.br / llvm.cond_br ops.
-    //
-    // The ControlFlowToLLVM BranchOpLowering copies cf.br attrs via
-    // setAttrs(getAttrDictionary()), but the loop_annotation attr name
-    // in the CF dict is "llvm.loop_annotation" (discardable, dialect-
-    // prefixed), while the LLVM BrOp's inherent property is named
-    // "loop_annotation" (no prefix). setAttrs doesn't match them, so
-    // the attr stays discardable and getLoopAnnotationAttr() returns
-    // null, causing translateModuleToLLVMIR to drop the !llvm.loop
-    // metadata.
-    //
-    // Walk all branch ops and move the discardable attr to the proper
-    // inherent property.
+    // Move loop_annotation from the discardable "llvm.loop_annotation" attr
+    // (how ControlFlowToLLVM copies it from cf.br) to the LLVM BrOp's inherent
+    // "loop_annotation" property; otherwise getLoopAnnotationAttr() is null and
+    // translateModuleToLLVMIR drops the !llvm.loop metadata.
     mod.walk([](LLVM::BrOp brOp) {
       if (auto attr = brOp->getAttrOfType<LLVM::LoopAnnotationAttr>(
               "llvm.loop_annotation")) {
@@ -403,17 +373,9 @@ struct ConvertTritonAppleGPUToLLVMPass
   }
 };
 
-// LowerGPUToAirPass
-//
-// Converts remaining gpu.thread_id / gpu.block_dim ops (emitted by shared
-// Triton patterns like make_range / SPMD) to air intrinsics / constants so
-// the MLIR module is pure LLVM dialect before llvm::toModule().
-//
-//   gpu.thread_id x  →  call @air.dispatch_thread_id[0]() : i32, index_cast
-//   gpu.thread_id y/z → arith.constant 0 : index
-//   gpu.block_dim x  →  arith.constant <numThreads> : index   (from module
-//   attr) gpu.block_dim y/z → arith.constant 1 : index
-//
+// LowerGPUToAirPass: convert remaining gpu.thread_id / gpu.block_dim ops
+// (from shared make_range / SPMD patterns) to air intrinsics / constants so
+// the module is pure LLVM dialect before llvm::toModule().
 struct LowerGPUToAirPass
     : public PassWrapper<LowerGPUToAirPass, OperationPass<ModuleOp>> {
 
@@ -454,19 +416,11 @@ struct LowerGPUToAirPass
 
     IRRewriter rewriter(ctx);
 
-    // gpu.thread_id/block_dim return `index` type. Downstream users (e.g.
-    // make_range) have already been lowered to LLVM i64/i32 ops by this
-    // point. We need to produce a value of the same `index` type and let
-    // the existing index-to-llvm lowering handle it — but that already
-    // ran. So we emit LLVM ops directly:
-    //   gpu.thread_id x → llvm.call @air.dispatch_thread_id[0]() → i32
-    //                   → llvm.zext i32 → i64  (index = i64 in LLVM)
-    //   gpu.thread_id y/z → llvm.mlir.constant(0 : i64)
-    //   gpu.block_dim x  → llvm.mlir.constant(totalThreads : i64)
-    //   gpu.block_dim y/z → llvm.mlir.constant(1 : i64)
-    //
-    // The `index` type maps to i64 in the LLVM type system (index-bitwidth=0
-    // means native pointer width = 64-bit on Apple Silicon).
+    // index-to-llvm already ran, so emit LLVM i64 ops directly (index = i64,
+    // pointer width on Apple Silicon):
+    //   gpu.thread_id x   -> air.thread_position[0] -> zext i32->i64
+    //   gpu.thread_id y/z -> constant 0
+    //   gpu.block_dim x   -> constant totalThreads;  y/z -> constant 1
     auto i64Ty = IntegerType::get(ctx, 64);
 
     mod.walk([&](Operation *op) {
@@ -481,10 +435,6 @@ struct LowerGPUToAirPass
                   .getResult();
           Value i32val = LLVM::ExtractValueOp::create(
               rewriter, loc, i32Ty, tidStruct, ArrayRef<int64_t>{0});
-          // Extend i32 → i64 to match `index` type (pointer width on Apple
-          // Silicon). Users of gpu.thread_id were already lowered to expect i64
-          // via index_to_llvm; the extra SSA is fine since _add_air_metadata's
-          // renumbering handles it.
           replacement = LLVM::ZExtOp::create(rewriter, loc, i64Ty, i32val);
         } else {
           replacement = LLVM::ConstantOp::create(rewriter, loc, i64Ty,

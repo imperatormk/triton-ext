@@ -45,18 +45,13 @@ constexpr unsigned ASThreadgroup = 3;
 constexpr unsigned PtrPhiLimit = 32;
 } // namespace
 
-// ── IRUtil helpers ───────────────────────────────────────────────────────
-// Anonymous-TU statics; only the helpers used by the TG-global-GEP-rewrite
-// logic below are kept here.
-
 namespace {
 
-// Strip identity-noise ops (xor X,0 / add X,0 / or X,0 / sub X,0, either
-// operand order) that the Triton layout lowering threads through threadgroup
-// byte offsets. They don't change the value but lengthen the use chain past
-// computeKnownBits's default recursion depth, hiding provable alignment — which
-// makes the byte-global retype path conservatively bail and leave an i8 array
-// (and dynamic i8 GEPs) that the Metal GPU JIT then refuses to materialize.
+// Strip identity-noise ops (xor/add/or/sub X,0) that the Triton layout lowering
+// threads through threadgroup byte offsets. They lengthen the use chain past
+// computeKnownBits's recursion depth, hiding provable alignment - which makes
+// the byte-global retype path bail and leave dynamic i8 GEPs the Metal GPU JIT
+// refuses to materialize.
 static Value *stripIdentityIntOps(Value *V) {
   for (;;) {
     auto *BO = dyn_cast<BinaryOperator>(V);
@@ -79,13 +74,10 @@ static Value *stripIdentityIntOps(Value *V) {
   }
 }
 
-// Provable power-of-two alignment (min count of trailing zero bits) of an
-// integer SSA value. computeKnownBits caps recursion at depth 6, which the
-// long index chains the Triton layout lowering emits routinely exceed — so the
-// byte-global retype path conservatively bails and leaves dynamic i8 GEPs the
-// Metal GPU JIT refuses to materialize. This walks only the alignment-relevant
-// integer ops with a generous depth so the common strided-offset shapes
-// (shl/mul-by-const, add/or/and of aligned terms, select, zext) are provable.
+// Provable power-of-two alignment (min trailing zero bits) of an integer SSA
+// value. Walks alignment-relevant integer ops at a generous depth where
+// computeKnownBits (depth-6 cap) bails on the long index chains the Triton
+// layout lowering emits.
 static unsigned minTrailingZeros(Value *V, unsigned Depth = 0) {
   Type *Ty = V->getType();
   if (!Ty->isIntegerTy())
@@ -121,7 +113,6 @@ static unsigned minTrailingZeros(Value *V, unsigned Depth = 0) {
       return std::min(minTrailingZeros(A, Depth + 1),
                       minTrailingZeros(B, Depth + 1));
     case Instruction::And:
-      // result trailing zeros ≥ max of the two operands' trailing zeros.
       return std::max(minTrailingZeros(A, Depth + 1),
                       minTrailingZeros(B, Depth + 1));
     default:
@@ -149,40 +140,26 @@ static void collectTGByteGlobals(Module &M,
   }
 }
 
-// Decide whether a set of constant byte offsets into a threadgroup arena
-// represents genuine *buffer boundaries* (the triton allocator packs a few
-// time-disjoint sub-buffers, each worth splitting into its own typed global)
-// or merely *unrolled element addressing* (the mid-end constant-folds a
-// strided access `base + k*elemSize` into many constant-offset GEPs — these
-// all belong to ONE buffer and must NOT be split, or each tail-sized slice
-// becomes its own global and the threadgroup budget explodes ~30x).
-//
-// The discriminator is structural, not a count threshold: unrolled addressing
-// yields a DENSE run (every adjacent gap is a small element/vector stride, so
-// the slots are physically contiguous in one buffer), whereas true sub-buffer
-// boundaries are SPARSE — time-disjoint reuse buffers have unrelated sizes, so
-// at least one gap is *large* (a jump no single element/vector access could
-// span). The stride need NOT be uniform: a real unrolled run mixes 8-byte
-// scalar, 16-byte vec, and 4-byte sub-element gaps. The signal is the presence
-// of a large gap, not stride irregularity. `Offsets` must be sorted+deduped and
-// exclude 0.
+// Distinguish genuine sub-buffer *boundaries* (time-disjoint allocator buffers
+// worth splitting into their own typed global) from *unrolled element
+// addressing* (one buffer's strided GEPs that must NOT split, or each
+// tail-sized slice becomes its own global and the threadgroup budget explodes
+// ~30x). The discriminator is a wide gap, not a count: a real boundary leaves a
+// gap wider than any single access; unrolled addressing is a dense run of small
+// gaps. `Offsets` must be sorted+deduped and exclude 0.
 static bool offsetsAreBufferBoundaries(ArrayRef<int64_t> Offsets) {
   if (Offsets.empty())
     return false;
   if (Offsets.size() == 1)
-    return true; // a single interior boundary is always a real split point
-  // The widest natural threadgroup access is a 16-byte vec4. Any gap wider than
-  // that cannot be two adjacent element slots of one buffer, so it marks a real
-  // sub-buffer boundary. A run whose every gap is <= 16 bytes is dense unrolled
-  // element addressing of ONE buffer and must NOT be split (else each
-  // tail-sized slice becomes its own global and the threadgroup budget explodes
-  // ~30x — see cummax scan2d: 27 contiguous i64 slots with mixed 4/8/16-byte
-  // gaps would split into 27 globals = 124 KB).
+    return true;
+  // Widest natural TG access is a 16-byte vec4; a wider gap marks a real
+  // boundary. (cummax scan2d: 27 i64 slots with mixed 4/8/16-byte gaps would
+  // otherwise split into 27 globals = 124 KB.)
   constexpr int64_t kMaxElementStride = 16;
   for (size_t i = 1; i < Offsets.size(); ++i)
     if (Offsets[i] - Offsets[i - 1] > kMaxElementStride)
-      return true; // a wide gap => genuine sub-buffer boundary
-  return false;    // all gaps small => dense unrolled run of one buffer
+      return true;
+  return false;
 }
 
 static void collectTGTypedGlobals(Module &M,
@@ -193,13 +170,11 @@ static void collectTGTypedGlobals(Module &M,
     auto *AT = dyn_cast<ArrayType>(GV.getValueType());
     if (!AT || AT->getElementType()->isIntegerTy(8))
       continue;
-    // Only genuine MMA operand scratch (__tg_dot_ab_*) is a valid merge target
-    // for the byte arena. Other typed threadgroup globals - notably the
-    // convert_layout scratch (__tg_cvt_*) - are independent live buffers; the
-    // byte arena (e.g. a multi-warp scan's i64 index + f32 value partials) must
-    // not be overlaid onto them, which would alias distinct live data and route
-    // f32/f16 stores through an i64-typed global the Metal JIT cannot
-    // materialize.
+    // Only MMA operand scratch (__tg_dot_ab_*) is a valid merge target. Other
+    // typed TG globals (e.g. convert_layout scratch __tg_cvt_*) are independent
+    // live buffers; overlaying the byte arena onto them aliases distinct live
+    // data and routes mismatched-width stores through a global the Metal JIT
+    // cannot materialize.
     if (!GV.getName().starts_with("__tg_dot_ab_"))
       continue;
     Out.push_back(&GV);
@@ -214,9 +189,9 @@ static Type *inferElementType(Value *V) {
     if (auto *LI = dyn_cast<LoadInst>(U))
       return LI->getType();
     // A staging arena fed only by async-copy / simdgroup-matrix intrinsics has
-    // no scalar loads or stores at all (the even-K fast path); the AIR pointer
-    // suffix still pins the element type, and leaving it uninferred would skip
-    // retyping while float GEPs index the byte global (PSO materialize fail).
+    // no scalar loads/stores; the AIR pointer suffix still pins the element
+    // type. Leaving it uninferred would skip retyping while float GEPs index
+    // the byte global (PSO materialize fail).
     if (auto *CI = dyn_cast<CallInst>(U)) {
       if (Function *F = CI->getCalledFunction()) {
         StringRef Name = F->getName();
@@ -272,11 +247,10 @@ static void collectI8Geps(Value *V, SmallVectorImpl<GetElementPtrInst *> &Out) {
   }
 }
 
-// Walks loads/stores transitively reached through GEPs of V and inserts an
-// identity bitcast immediately before each non-i8 access. Used by
-// retypeByteGlobals when the byte global can't be safely retyped (mixed access
-// types, or any unaligned dynamic byte GEP) — the writer still emits a single
-// typed global, but per-site bitcasts preserve scalar/sub-element semantics.
+// Inserts an identity bitcast before each non-i8 load/store reached through
+// GEPs of V. Used when the byte global can't be safely retyped (mixed access
+// types, or an unaligned dynamic byte GEP): per-site bitcasts preserve
+// sub-element semantics while the writer still emits one typed global.
 static bool insertIdentityBitcastsAtNonByteAccesses(Value *Root) {
   bool Changed = false;
   std::function<void(Value *)> Walk = [&](Value *V) {
@@ -353,18 +327,11 @@ static bool scalarizeVec1Users(Value *V, Type *I32Ty) {
   return Changed;
 }
 
-// Replace a `load <N x i1>` whose result is only consumed by constant-index
-// `extractelement`s with scalar byte loads + bit extraction. Triton's bool
-// reductions store individual bools into threadgroup memory and reload them as
-// a wide packed-bool vector, then read back a few lanes. The Apple AGX
-// AIR->ISA lowering hits a fatal error ("report_fatal_error", surfaced to the
-// runtime as XPC_ERROR_CONNECTION_INTERRUPTED during PSO creation) on any
-// `<N x i1>` threadgroup load.
-//
-// In LLVM's memory model a vector of i1 is BIT-PACKED (independent of the i1
-// alloc size), so lane K lives in byte K/8 at bit K%8. We load the containing
-// byte and extract the bit; the common case (bools stored one-per-byte and read
-// back at lane multiples of 8) reduces to a plain byte load + low-bit trunc.
+// Replace a `load <N x i1>` consumed only by constant-index extractelements
+// with scalar byte loads + bit extraction. The Apple AGX AIR->ISA lowering
+// report_fatal_error's (surfaced as XPC_ERROR_CONNECTION_INTERRUPTED during PSO
+// creation) on any `<N x i1>` threadgroup load. In LLVM's memory model an i1
+// vector is bit-packed, so lane K lives in byte K/8 at bit K%8.
 static bool narrowVectorI1Loads(Function &F) {
   bool Changed = false;
   SmallVector<LoadInst *, 4> Targets;
@@ -458,11 +425,10 @@ static bool foldExtractInsert(Module &M) {
 } // namespace
 
 // ── TG global GEP rewrite ─────────────────────────────────────────────────
-// Retypes [N x i8] threadgroup globals into typed arrays based on usage
-// inference, and rewrites byte-offset GEPs into element-index GEPs. Six
-// sub-stages run in sequence (see comments below). Must run BEFORE the
-// other MetalPrepare behaviors since retyping TG globals + their GEPs may
-// produce new patterns the later stages need to normalize.
+// Retypes [N x i8] threadgroup globals into typed arrays via usage inference
+// and rewrites byte-offset GEPs into element-index GEPs. Several sub-stages run
+// in sequence. Runs BEFORE the other MetalPrepare stages, which normalize the
+// patterns retyping produces.
 
 namespace {
 
@@ -473,10 +439,8 @@ static bool rewriteByteGEPs(GlobalVariable *OldGV, GlobalVariable *NewGV,
                             unsigned ElemSize, LLVMContext &Ctx,
                             uint64_t ExtraElemOffset = 0) {
   bool Changed = false;
-  // When the byte arena is concatenated after the MMA scratch, every element
-  // index must be shifted by ExtraElemOffset so the arena lands at its slot in
-  // the merged buffer.  addOff folds the shift in (constant-folded when the
-  // index is constant).
+  // ExtraElemOffset shifts each element index so a concatenated arena lands at
+  // its slot in the merged buffer.
   auto addOff = [&](IRBuilder<> &B, Value *Idx) -> Value * {
     if (ExtraElemOffset == 0)
       return Idx;
@@ -587,28 +551,21 @@ splitMixedByteGlobals(Module &M,
     uint64_t TotalBytes = OldAT->getNumElements();
 
     SmallPtrSet<Type *, 4> AllScalarTypes;
-    // Distinct *byte sizes* among the accesses. Same-size scalar types
-    // (e.g. i16 / half / bfloat, or i32 / float) are type-pun views of the same
-    // physical slots — the mid-end freely bitcasts between them — so they must
-    // NOT trigger a type-split: doing so would scatter a store and its matching
-    // load into separate typed globals at different threadgroup addresses,
-    // breaking the buffer's store->load aliasing. A genuine mixed buffer (the
-    // triton allocator packing time-disjoint buffers of different element
-    // widths, e.g. an i64 index next to an f32 value) has >1 distinct size.
+    // Distinct *byte sizes* among accesses. Same-size scalar types (i16/half/
+    // bfloat, or i32/float) are type-pun views of the same slots, so they must
+    // NOT trigger a split - that would scatter a store and its load into
+    // separate globals at different TG addresses, breaking store->load
+    // aliasing. A genuine mixed buffer (e.g. i64 index next to f32 value) has
+    // >1 size.
     SmallSet<uint64_t, 4> AllScalarSizes;
     SmallVector<int64_t, 4> ConstOffsets;
-    // A wide (>1 byte) element type indexed by a runtime value directly off the
-    // arena base (offset 0). The allocator overlaps time-disjoint buffers in
-    // one byte arena, so this buffer's dynamic slots may run past an interior
-    // constant offset that belongs to a later, time-disjoint reuse buffer.
+    // A wide (>1 byte) runtime-indexed access off the arena base (offset 0):
+    // the offset-0 buffer's dynamic slots may run past an interior constant
+    // offset belonging to a later time-disjoint reuse buffer, so it must be
+    // sized to span all its slots, not truncated at the first split offset.
+    // Triton emits these as i8 GEPs feeding a typed op, so the width lives on
+    // the memory op.
     bool WideRuntimeBaseBuffer = false;
-    // Helper: a wide (>1 byte) scalar access whose pointer is a dynamic
-    // (runtime-indexed) slot of the offset-0 buffer means that buffer's dynamic
-    // slots can run past an interior constant offset belonging to a later,
-    // time-disjoint reuse buffer. Such a base buffer must be sized to span all
-    // its slots, not truncated at the first split offset. Triton emits these as
-    // byte (i8) GEPs feeding a typed load/store, so the access WIDTH lives on
-    // the memory op, not the GEP source element type.
     auto flagWideBaseAccess = [&](Type *AccessTy, int64_t BaseOff,
                                   bool UnderDynamic) {
       if (BaseOff == 0 && UnderDynamic &&
@@ -665,10 +622,8 @@ splitMixedByteGlobals(Module &M,
         };
     CollectTypes(GV, 0, /*UnderDynamic=*/false);
 
-    // Split only a genuinely heterogeneous buffer: one that mixes scalar
-    // accesses of *different byte widths*. A buffer touched by several scalar
-    // types that all share one width (i16/half/bfloat, or i32/float) is a
-    // single typed slot under bitcasts and must stay one global.
+    // Split only a buffer mixing scalar accesses of *different byte widths*;
+    // same-width types are one typed slot under bitcasts and stay one global.
     if (AllScalarSizes.size() <= 1 || ConstOffsets.empty())
       continue;
 
@@ -679,17 +634,14 @@ splitMixedByteGlobals(Module &M,
     // Only split when the constant offsets are genuine sub-buffer boundaries,
     // not the dense uniformly-strided run the mid-end emits when it unrolls a
     // strided access (splitting that would allocate a tail-sized global per
-    // element slot — a ~30x threadgroup budget explosion).
+    // element slot - a ~30x threadgroup budget explosion).
     if (!offsetsAreBufferBoundaries(ConstOffsets))
       continue;
 
-    // Size of the base (offset-0) typed global. Normally it ends at the first
-    // constant offset. But when the offset-0 buffer is a wide runtime-indexed
-    // buffer it may span past interior offsets that belong to time-disjoint
-    // reuse buffers; size it to the last (largest) offset so its dynamic slots
-    // are not truncated. The interior reuse buffers still split off into their
-    // own typed globals, which Metal places at independent threadgroup
-    // addresses, so the (source) byte overlap is harmless.
+    // Base (offset-0) global normally ends at the first offset. A wide
+    // runtime-indexed base may span past interior offsets, so size it to the
+    // last offset; the interior reuse buffers still split into their own
+    // globals at independent TG addresses, so the byte overlap is harmless.
     int64_t BaseRegionEnd =
         WideRuntimeBaseBuffer ? ConstOffsets.back() : ConstOffsets.front();
 
@@ -757,39 +709,16 @@ splitMixedByteGlobals(Module &M,
   return Changed;
 }
 
-// Returns true when the threadgroup byte arena (\p GV) is live at the SAME TIME
-// as the MMA scratch buffer, so the two must NOT be overlapped at offset 0.
-//
-// Two cases make the byte arena concurrently live:
-//
-//   1. It is read/written directly by air.simdgroup_matrix_8x8_load/store
-//      (the opt-in TRITON_SHARED_MMA path that feeds the MMA from shared).
-//
-//   2. It is the destination of an air.simdgroup_async_copy_2d.  That is the
-//      software-pipeline (num_stages>=2) staging buffer: the prefetch DMA for
-//      a future loop iteration writes the byte arena WHILE the current dot is
-//      scattering its operands/accumulator into the MMA scratch.  With
-//      multi-buffering (num_stages>=3) the arena holds more than one live slot,
-//      so an MMA scratch overlapped at offset 0 stomps the prefetched operand
-//      tile and corrupts the next iteration (bug #46).  The plain-load scatter
-//      path reads the arena into registers, but those reads are NOT ordered
-//      before the concurrent prefetch writes, so the regions still alias-clash;
-//      keying off the async-copy destination captures every pipelined dot.
-//
-//   3. It is written by a plain StoreInst reached through a DYNAMIC-INDEX GEP.
-//      That is the sync (TRITON_DMA_DISABLE / no-DMA) twin of case 2: when the
-//      pipeline prefetch is lowered without async-copy, the per-element
-//      prefetch writes the arena with a `store <N x T>` through the
-//      rotating-slot GEP (a dynamic loop-carried index selects the live
-//      buffer).  That store runs WHILE the current dot scatters into the MMA
-//      scratch, so an offset-0 overlay stomps the prefetched tile exactly as in
-//      case 2.  Keying off a dynamic-index GEP store (not a constant-offset
-//      one) captures the rotating slot while leaving scan/conv overlays, which
-//      write CONSTANT offsets, on the cheaper offset-0 path.
-//
-// In either case mergeByteMMA concatenates (MMA buffer AFTER the arena) instead
-// of aliasing.  For non-pipelined kernels the arena has neither user and the
-// cheaper offset-0 overlap is kept.
+// True when the byte arena (\p GV) is live at the SAME TIME as the MMA scratch,
+// so the two must NOT be overlapped at offset 0 (bug #46); mergeByteMMA
+// concatenates instead. Three concurrency signals:
+//   1. read/written directly by air.simdgroup_matrix_8x8_load/store.
+//   2. destination of air.simdgroup_async_copy (pipeline staging buffer: the
+//      prefetch DMA writes the arena while the current dot scatters into MMA
+//      scratch; multi-buffering keeps >1 live slot).
+//   3. written by a plain store through a DYNAMIC-INDEX GEP (the no-DMA twin of
+//      case 2: rotating-slot prefetch). Constant-offset stores (scan/conv
+//      overlays) keep SawDynGEP false and stay on the offset-0 path.
 static bool concurrentWithMMAScratch(Value *V, SmallPtrSetImpl<Value *> &Seen,
                                      bool SawDynGEP) {
   if (!Seen.insert(V).second)
@@ -808,10 +737,6 @@ static bool concurrentWithMMAScratch(Value *V, SmallPtrSetImpl<Value *> &Seen,
         }
       }
     } else if (auto *SI = dyn_cast<StoreInst>(U)) {
-      // Sync rotating-slot prefetch store: a plain store into the arena through
-      // a dynamic-index GEP is the live-arena signal that mirrors the
-      // async-copy destination above.  Constant-offset stores (scan/conv
-      // overlays) keep SawDynGEP false and stay on the offset-0 overlay.
       if (SawDynGEP && SI->getPointerOperand() == V)
         return true;
     } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
@@ -833,23 +758,15 @@ static bool mergeByteMMA(Module &M,
   if (ByteGlobals.empty())
     return false;
 
-  // Count convert_layout scratch (__tg_cvt_*) globals. collectTGTypedGlobals
-  // lists only __tg_dot_ab_* as the MMA target, so a kernel that has one
-  // genuine dot scratch PLUS one or more cvt buffers (e.g. conv and uint4x2
-  // mixed-mm) reaches here with MMAGlobals.size()==1. Overlaying the byte arena
-  // onto the dot scratch at offset 0 there aliases the concurrently-live cvt
-  // buffers and corrupts results (conv produced NaNs), so that combination must
-  // bail.
-  //
-  // But a scan (cummax) has NO __tg_dot_ab_* and exactly one cvt buffer that is
-  // time-disjoint from the scan's byte arena (the convert finishes, a barrier,
-  // then the scan reuses the same threadgroup region). Overlaying the arena's
-  // index partials onto that cvt scratch is what kept these kernels under the
-  // 32KB threadgroup budget. Re-enable that single-cvt overlay as the merge
-  // target when there is no dot scratch, and require an EXACT element-type
-  // match below so an f32/f16 value region is never routed through an i64-typed
-  // cvt global (the cummin index miscompile: mismatched-width stores fail
-  // Metal's materializeAll and alias distinct live data).
+  // Count convert_layout scratch (__tg_cvt_*) globals. A kernel with a genuine
+  // dot scratch PLUS cvt buffers (conv, uint4x2 mixed-mm) reaches here with
+  // MMAGlobals.size()==1; overlaying the arena onto the dot scratch there
+  // aliases the live cvt buffers and corrupts results (conv NaNs), so it bails.
+  // But a scan (cummax) has no dot scratch and one time-disjoint cvt buffer;
+  // overlaying the arena onto it keeps the kernel under the 32KB TG budget.
+  // That single-cvt overlay requires an EXACT element-type match below, else an
+  // f32/f16 region routes through an i64-typed cvt global (cummin miscompile:
+  // mismatched-width stores fail materializeAll and alias distinct live data).
   GlobalVariable *CvtGV = nullptr;
   unsigned CvtCount = 0;
   for (auto &GV : M.globals()) {
@@ -865,18 +782,11 @@ static bool mergeByteMMA(Module &M,
   if (MMAGlobals.size() != 1) {
     if (!MMAGlobals.empty() || CvtCount != 1)
       return false;
-    // Only overlay onto a WIDE cvt scratch (element alloc size > 1 byte). The
-    // cummax case this path exists for has a [N x i64] cvt buffer that is
-    // time-disjoint from the scan byte arena, so overlaying the arena's i64
-    // index region onto it is safe and keeps the kernel under the 32KB
-    // threadgroup budget. A single-byte cvt buffer ([N x i8]) is the actively
-    // live convert_layout staging for an int8 cast/cat/trans kernel, NOT
-    // disjoint reuse scratch: its i8 element trivially "exactly matches" the
-    // byte arena's inferred i8 element, so the merge would replaceAllUsesWith
-    // the in-use cvt global and the Metal RAUW aborts. Gating on a wider-than-
-    // byte cvt element excludes exactly those int8 crashers while keeping the
-    // i64 cummax overlay, and leaves the dot+cvt bail (MMAGlobals.size()==1)
-    // below untouched so conv / uint4x2 mixed-mm still bail.
+    // Only overlay onto a WIDE cvt scratch (element alloc size > 1 byte): the
+    // [N x i64] cummax cvt buffer is time-disjoint reuse scratch, safe to
+    // overlay. A single-byte ([N x i8]) cvt buffer is actively-live int8
+    // convert_layout staging whose i8 element "exactly matches" the arena's
+    // inferred i8, so the merge would RAUW the in-use global and Metal aborts.
     auto *CvtAT = dyn_cast<ArrayType>(CvtGV->getValueType());
     if (!CvtAT ||
         M.getDataLayout().getTypeAllocSize(CvtAT->getElementType()) <= 1)
@@ -929,12 +839,9 @@ static bool mergeByteMMA(Module &M,
     auto *BAT = cast<ArrayType>(ByteGlobals[I]->getValueType());
     uint64_t BBytes = BAT->getNumElements();
     Type *Inferred = inferElementType(ByteGlobals[I]);
-    // The cvt overlay must be exact: only a byte region whose element type is
-    // bit-identical to the cvt scratch may share its storage. The i32<->float
-    // relaxation and the size-based fallback below are for genuine MMA operand
-    // scratch (__tg_dot_ab_*), where every region is the same width as the dot
-    // tile; allowing them for a cvt target is what overlaid a wide value region
-    // onto a narrower-or-wider cvt buffer and corrupted the scan index.
+    // The cvt overlay must be exact (bit-identical element type). The
+    // i32<->float relaxation and size-based fallback are only for MMA operand
+    // scratch; allowing them for a cvt target corrupted the scan index.
     bool TypeMatch =
         Inferred && (Inferred == MMAElemTy ||
                      (!CvtOverlay &&
@@ -974,15 +881,11 @@ static bool mergeByteMMA(Module &M,
     MergeElemSize = 4;
   }
 
-  // If the byte arena is live at the same time as the MMA scratch (pipeline
-  // staging via async-copy, or the shared-direct MMA path), concatenate the two
-  // regions instead of overlapping them at offset 0 (bug #46).  The MMA scratch
-  // is kept at offset 0 (its air.simdgroup_matrix_8x8_load/store read a
-  // CONSTANT global base; a non-zero constant-GEP base makes the Metal PSO
-  // compiler fail to materialize), and the byte arena is shifted to start right
-  // after it.  The arena's accesses are already dynamic GEPs, so a constant
-  // element offset is harmless.  Non-pipelined kernels keep the cheaper
-  // offset-0 overlap.
+  // When the arena is concurrently live with the MMA scratch, concatenate (bug
+  // #46): keep MMA scratch at offset 0 (its load/store need a CONSTANT base; a
+  // non-zero constant-GEP base fails Metal PSO materialize) and shift the arena
+  // after it. The arena's accesses are dynamic GEPs, so the constant element
+  // offset is harmless.
   SmallPtrSet<Value *, 16> SeenMMA;
   bool ByteIsMMA = concurrentWithMMAScratch(ByteGV, SeenMMA, false);
   uint64_t ByteElemCount = (ByteBytes + MergeElemSize - 1) / MergeElemSize;
@@ -1002,16 +905,11 @@ static bool mergeByteMMA(Module &M,
                          ByteGV, GlobalVariable::NotThreadLocal, ASThreadgroup);
   MergedGV->setAlignment(ByteGV->getAlign());
 
-  // Rewrite the byte arena's accesses onto the merged buffer, shifted by
-  // ByteOffset elements (0 in the overlap case, MMAElemCount in the concat case
-  // so the arena sits right after the MMA scratch).
   Changed |= rewriteByteGEPs(ByteGV, MergedGV, ByteAT, MergedAT, MergeElemTy,
                              MergeElemSize, Ctx, ByteOffset);
 
   if (ByteGV->use_empty())
     ByteGV->eraseFromParent();
-  // MMA scratch stays at offset 0 of the merged buffer (constant base) so its
-  // air.simdgroup_matrix_8x8_load/store keep a materializable constant base.
   MMAGV->replaceAllUsesWith(MergedGV);
   MMAGV->eraseFromParent();
 
@@ -1036,10 +934,9 @@ static bool retypeByteGlobals(Module &M) {
 
   for (auto *GV : ByteGlobals) {
     expandConstantExprUsers(GV);
-    // A threadgroup byte-global with no remaining users is dead: some autotune
-    // configs declare @global_smem but never touch it. Left in place it stays
-    // an untyped [N x i8] addrspace(3) global, which metal-objdump rejects as a
-    // truncated module. Erase it instead.
+    // A dead TG byte-global (some autotune configs declare @global_smem but
+    // never touch it) stays an untyped [N x i8] addrspace(3) global, which
+    // metal-objdump rejects as a truncated module. Erase it.
     if (GV->use_empty()) {
       GV->eraseFromParent();
       Changed = true;
@@ -1048,12 +945,6 @@ static bool retypeByteGlobals(Module &M) {
     Type *StoreTy = inferElementType(GV);
     if (!StoreTy)
       continue;
-
-    // Sub-track K (Task 3): mixed-access-types early-out (StoreTypes.size()>1
-    // → bitcast bypass) had zero firings on the full MPS suite — current
-    // Triton-MLIR lowering never produces a single byte-global with multiple
-    // distinct scalar/vector access types post-MMA-merge. Dropped. Unaligned
-    // byte-GEP fallback below is the remaining bitcast bypass.
 
     Changed |= scalarizeVec1Users(GV, I32);
     Changed |= foldExtractInsert(M);
@@ -1069,12 +960,10 @@ static bool retypeByteGlobals(Module &M) {
     if (ElemTy->isBFloatTy())
       ElemTy = Type::getHalfTy(Ctx);
 
-    // When the inferred type is a vector (e.g. <4 x i32> / <8 x half>), Metal's
-    // typed bitcode rejects a vector-element threadgroup global — and any mix
-    // of a vector pointee with the scalar GEPs the same global is also accessed
-    // by fails PSO creation. Always demote to a scalar element type. Prefer a
-    // same-sized scalar type already used by a sibling GEP (so all GEPs share
-    // one consistent pointee); otherwise fall back to the vector's own scalar.
+    // Metal's typed bitcode rejects a vector-element TG global (and mixing a
+    // vector pointee with scalar GEPs fails PSO creation). Demote to a scalar:
+    // prefer a same-sized scalar already used by a sibling GEP so all GEPs
+    // share one pointee, else the vector's own scalar.
     if (auto *VT = dyn_cast<FixedVectorType>(ElemTy)) {
       Type *ScalarTy = VT->getElementType();
       unsigned ScalarBytes = DL.getTypeAllocSize(ScalarTy);
@@ -1155,10 +1044,9 @@ static bool retypeByteGlobals(Module &M) {
 
     Changed |= rewriteByteGEPs(GV, NewGV, OldAT, NewAT, ElemTy, ElemSize, Ctx);
 
-    // Dead constant-expression GEPs into the old byte global keep use_empty()
-    // false even though nothing reads through them; without pruning, the raw
-    // global survives next to its .typed twin and double-counts the 32KB
-    // threadgroup budget.
+    // Dead constexpr GEPs keep use_empty() false; without pruning the raw
+    // global survives next to its .typed twin and double-counts the 32KB TG
+    // budget.
     GV->removeDeadConstantUsers();
     if (GV->use_empty())
       GV->eraseFromParent();
@@ -1208,11 +1096,9 @@ static bool retypeByteGlobals(Module &M) {
     for (auto *U : GV->users()) {
       auto *GEP = dyn_cast<GetElementPtrInst>(U);
       if (!GEP) {
-        // Splitting is only sound when every access provably stays inside
-        // its constant-offset region. A non-GEP user (identity bitcast,
-        // direct access, intrinsic operand) hides an access chain that may
-        // span regions — treat like a dynamic offset and keep the global
-        // whole.
+        // A non-GEP user (bitcast, direct access, intrinsic operand) hides an
+        // access chain that may span regions; treat like a dynamic offset and
+        // keep the global whole.
         HasDynamic = true;
         break;
       }
@@ -1397,12 +1283,10 @@ static bool insertPreambleGEPs(Module &M) {
           if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
             if (i == 0 && GEP->getSourceElementType() == GV->getValueType())
               continue;
-          // Insert identity bitcast so the writer's PTM sees the typed-
-          // pointer transition explicitly (Metal v1 typed bitcode req;
-          // otherwise PSO load fails on bfloat scan2d kernels). Two
-          // shapes mirror the post-Prepare NormalizeAllocas re-run:
-          // bfloat/half-source GEP off any typed base (case-5b), and
-          // float-source GEP off a bfloat/half typed base (case-5a).
+          // Identity bitcast so the writer's PTM sees the typed-pointer
+          // transition explicitly (Metal v1 typed bitcode req; else PSO load
+          // fails on bfloat scan2d kernels). Two shapes: bfloat/half-source GEP
+          // off any typed base, or float-source GEP off a bfloat/half base.
           Value *NewOp = Pit->second;
           if (auto *GEP = dyn_cast<GetElementPtrInst>(&I); GEP && i == 0) {
             Type *SrcTy = GEP->getSourceElementType();
@@ -1418,15 +1302,12 @@ static bool insertPreambleGEPs(Module &M) {
               NewOp = BC;
             }
           } else if (auto *CI = dyn_cast<CallInst>(&I)) {
-            // The TG global (here its float-typed base) is fed straight into an
-            // MMA load/store intrinsic whose pointer pointee is half/bfloat
-            // (p3f16/p1f16/p3bf16/p1bf16). The writer's PointeeTypeMap would
-            // retag the shared base to that scalar to satisfy the MMA call,
-            // which then disagrees with the float GEPs/loads that reuse the
-            // same arena (load/store type != pointee type -> materializeAll
-            // failure). Insert an identity bitcast so the MMA argument is a
-            // distinct Value the PTM can retag in isolation, leaving the float
-            // base untouched.
+            // The float-typed TG base feeds an MMA intrinsic whose pointee is
+            // half/bfloat. The PTM would retag the shared base to that scalar,
+            // disagreeing with the float GEPs reusing the same arena
+            // (load/store type != pointee -> materializeAll failure). An
+            // identity bitcast gives the MMA arg a distinct Value the PTM can
+            // retag in isolation, leaving the float base untouched.
             Type *GVElem =
                 cast<ArrayType>(GV->getValueType())->getElementType();
             Function *Callee = CI->getCalledFunction();
@@ -1489,15 +1370,13 @@ static bool fixResidualI8GEPs(Module &M) {
       Type *AccessTy = nullptr;
       SmallVector<std::pair<Instruction *, Value *>, 2> MemUsers;
 
-      // When the producing GEP is the [N x i8] array base (element i8, size 1),
-      // the parent type carries no useful access width. Infer the real access
-      // type from this i8 GEP's own load/store users instead: the Metal GPU JIT
-      // rejects a dynamic-index i8-source TG GEP feeding a wider (e.g. <4 x
-      // i32>) access, so retype the GEP to match the memory op. Only safe when
-      // the byte index is provably a multiple of the access size.
+      // When the producing GEP is the [N x i8] base, the parent type has no
+      // access width; infer it from this GEP's own load/store users. The Metal
+      // GPU JIT rejects a dynamic-index i8-source TG GEP feeding a wider
+      // access, so retype to match the memory op (only when the byte index is
+      // provably a multiple of the access size).
       if (ElemSize <= 1) {
-        // Look through identity ptr→ptr bitcasts (inserted by 14d) to reach the
-        // real load/store (and its pointer alias) and learn its access width.
+        // Look through identity ptr->ptr bitcasts to reach the real load/store.
         std::function<void(Value *)> FindAccess = [&](Value *V) {
           for (auto *U : V->users()) {
             if (auto *LI = dyn_cast<LoadInst>(U)) {
@@ -1521,11 +1400,9 @@ static bool fixResidualI8GEPs(Module &M) {
         if (AccessSize <= 1)
           continue;
 
-        // All GEPs that share this threadgroup byte-global base must use one
-        // consistent scalar element type, else the Metal GPU JIT rejects the
-        // pipeline (mixed float/i32/<N> pointee types on a single TG global).
-        // Anchor on the dominant scalar element type already used by sibling
-        // GEPs on the same base; default to the access's scalar type.
+        // All GEPs sharing this TG base must use one scalar element type, else
+        // the Metal GPU JIT rejects the pipeline (mixed pointee types on one TG
+        // global). Anchor on the dominant sibling-GEP scalar type.
         Type *ScalarTy = AccessTy->getScalarType();
         DenseMap<Type *, unsigned> ScalarVotes;
         for (auto *U : SrcGEP->users())
@@ -1566,11 +1443,10 @@ static bool fixResidualI8GEPs(Module &M) {
       if (ElemSize == 0 || ElemSize == 1)
         continue;
 
-      // The byte offset must be provably a multiple of the element size;
-      // rescaling truncates otherwise (the optimizer emits sub-element
-      // offsets, e.g. half data staged in a float-typed TG scratch). Leave
-      // unaligned byte GEPs alone — the writer's identity-bitcast retype
-      // keeps their records consistent.
+      // The byte offset must be provably a multiple of the element size, else
+      // rescaling truncates (sub-element offsets, e.g. half data in float TG
+      // scratch). Leave unaligned byte GEPs to the writer's identity-bitcast
+      // retype.
       {
         Value *AlignIdx = stripIdentityIntOps(GEP->getOperand(1));
         bool Aligned = false;
@@ -1595,10 +1471,10 @@ static bool fixResidualI8GEPs(Module &M) {
       else
         ElemIdx = B.CreateUDiv(ByteIdx,
                                ConstantInt::get(ByteIdx->getType(), ElemSize));
-      // When the new element type does not match the producing GEP's own
-      // element type (access-driven anchor over an i8 base), retype the base
-      // through an identity bitcast so the writer's usage inference gives it
-      // the anchor type instead of the byte type.
+      // When ElemTy differs from the producing GEP's element type
+      // (access-driven anchor over an i8 base), retype the base through an
+      // identity bitcast so the writer's usage inference picks the anchor type,
+      // not the byte type.
       Value *Base = GEP->getPointerOperand();
       Type *ParentElem = SrcGEP->getSourceElementType();
       if (auto *PAT = dyn_cast<ArrayType>(ParentElem))
@@ -1608,10 +1484,9 @@ static bool fixResidualI8GEPs(Module &M) {
                                 GEP->getIterator());
       auto *NewGEP = B.CreateInBoundsGEP(ElemTy, Base, ElemIdx, GEP->getName());
 
-      // If the access type's scalar differs from the anchor element type (e.g.
-      // <4 x i32> vector access through a float-anchored TG global), rewrite
-      // the memory ops to load/store <N x ElemTy> and bitcast the value at the
-      // leaf so every pointer derived from the global stays one consistent
+      // If the access scalar differs from the anchor (e.g. <4 x i32> through a
+      // float-anchored global), rewrite the memory ops to load/store
+      // <N x ElemTy> and bitcast at the leaf so every derived pointer stays one
       // type.
       if (AccessTy && AccessTy->getScalarType() != ElemTy) {
         unsigned NumElems = 1;
@@ -1737,18 +1612,10 @@ static bool fixMismatchedTGGEPs(Module &M) {
   return Changed;
 }
 
-// 14g: Scalarize wide-vector stores to a threadgroup global that is also
-// accessed at a *different* vector width.
-//
-// Metal 4 / macOS 26 handles a `store <N x T>` to threadgroup memory fine when
-// every access to that global uses the same width (the audited vec4/vec2
-// fast-path). But when a wide-vector store (e.g. `store <4 x float>`) coexists
-// on the same global with a narrower dynamic-indexed load (e.g.
-// `load <1 x float>` / scalar `load float` through a `udiv`-derived index, as
-// emitted by tile/combo reductions like var_mean), the Metal shader compiler
-// fails `materializeAll` on the resulting metallib. Demoting only the wide
-// stores on such mixed-width globals to a sequence of element stores fixes the
-// materialization while leaving the audited same-width vec4/vec2 path intact.
+// 14g: Scalarize wide-vector stores to a TG global also accessed at a different
+// vector width. Metal handles `store <N x T>` to TG memory at uniform width,
+// but a wide store coexisting with a narrower dynamic-indexed load on the same
+// global fails materializeAll; demoting only the wide stores fixes it.
 static bool scalarizeMixedWidthTGVecStores(Module &M) {
   return false; // disabled for now
   bool Changed = false;
@@ -1816,8 +1683,6 @@ static bool scalarizeMixedWidthTGVecStores(Module &M) {
         Value *Ptr = i == 0 ? BasePtr
                             : B.CreateInBoundsGEP(ElemTy, BasePtr,
                                                   ConstantInt::get(I32, i));
-        // Element i sits at byte offset i*sizeof(ElemTy); preserve alignment
-        // only where it still holds (offset 0 keeps the vector alignment).
         Align EltAlign = i == 0 ? A : DL.getABITypeAlign(ElemTy);
         B.CreateAlignedStore(Elt, Ptr, EltAlign, SI->isVolatile());
       }
@@ -1848,23 +1713,12 @@ static bool rewriteTGGlobalGEPs(Module &M) {
   collectTGTypedGlobals(M, MMAGlobals);
 
   Changed |= splitMixedByteGlobals(M, ByteGlobals);
-
-  // Wide-vector store scalarisation on TG byte globals (formerly gated on
-  // MMAGlobals.size()==1) was a pre-Metal-4 workaround. The modern Apple
-  // toolchain (xcrun metal on Metal 4 / macOS 26) emits `store <N x T>` on
-  // threadgroup memory intact — vec4/vec2 float and vec4 int verified by
-  // the sub-track C audit oracle. Removing the call dropped 576 firings on
-  // the curated dot/reduce/scan/atomic suite; full Phase 1+2 of
-  // run_mps_tests.sh showed zero new failures vs. baseline.
-  // See PASS_GUARDS.md "Scalarisation audit (Sub-track C)".
-
   Changed |= mergeByteMMA(M, ByteGlobals, MMAGlobals);
   Changed |= retypeByteGlobals(M);
   Changed |= insertPreambleGEPs(M);
 
-  // 14e: iterate; scalarized i8 GEPs form chains that peel one level per pass.
-  // Bound is empirical (sub-track Q instrumentation): max observed depth is 1
-  // on the sentinel + extended suite. Bound is defensive padding.
+  // Scalarized i8 GEPs form chains peeling one level per pass; max observed
+  // depth is 1, so the bound is defensive padding.
   for (int Iter = 0; Iter < 8; Iter++) {
     if (!fixResidualI8GEPs(M))
       break;
@@ -1872,9 +1726,6 @@ static bool rewriteTGGlobalGEPs(Module &M) {
   }
 
   Changed |= fixMismatchedTGGEPs(M);
-  // After the global is fully retyped and GEPs are normalized, demote wide
-  // vector stores on any TG global that is also accessed at a narrower width
-  // (mixed-width aliasing crashes Metal's materializeAll; see helper comment).
   Changed |= scalarizeMixedWidthTGVecStores(M);
   return Changed;
 }
@@ -1887,12 +1738,9 @@ static bool normalizeI1Pointers(Module &M) {
   bool Changed = false;
   Type *I8 = Type::getInt8Ty(M.getContext());
 
-  // AIR has no 1-bit memory type; load/store i1 (e.g. mask values staged
-  // through threadgroup memory) fails Metal PSO creation. Legalize i1 in memory
-  // to i8: globals, GEP element types, and the load/store value types.
-
-  // Retype `[N x i1]`/`i1` globals to i8 (collect first; erasing while
-  // iterating M.globals() is invalid).
+  // AIR has no 1-bit memory type; load/store i1 fails Metal PSO creation.
+  // Legalize i1 in memory to i8: globals, GEP element types, and load/store
+  // value types.
   SmallVector<GlobalVariable *, 4> I1Globals;
   for (GlobalVariable &GV : M.globals()) {
     Type *VT = GV.getValueType();
@@ -1922,9 +1770,9 @@ static bool normalizeI1Pointers(Module &M) {
   for (Function &F : M)
     for (BasicBlock &BB : F)
       for (Instruction &I : llvm::make_early_inc_range(BB)) {
-        // GEP i1 element -> i8. Includes array-of-i1 source types (the
-        // `__base_` preamble GEP synthesized off a `[N x i1]` global), which
-        // otherwise reach the writer as an unmaterializable i1 array type.
+        // GEP i1 element -> i8, including array-of-i1 sources (the `__base_`
+        // preamble GEP off a `[N x i1]` global), else the writer sees an
+        // unmaterializable i1 array type.
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
           Type *SrcTy = GEP->getSourceElementType();
           if (SrcTy->isIntegerTy(1)) {
@@ -1972,20 +1820,15 @@ static bool normalizeI1Pointers(Module &M) {
 
 // ── Conditional constant folding ────────────────────────────────────────────
 //
-// Triton emits loop-carried integer recurrences (loop counters, modulo
-// double-buffer selectors) and the predicates/threadgroup-buffer indices
-// derived from them in a form that is range- or constant-determinable only by
-// sparse conditional constant propagation. Local simplification (InstSimplify,
-// EarlyCSE, GVN) leaves them as live SSA values. Metal's PSO compiler crashes
-// (XPC_ERROR_CONNECTION_INTERRUPTED) on some of those residual patterns. Run
-// SCCP's solver and replace every integer value it proves constant; this is
-// what InstCombine/SCCP/CorrelatedValuePropagation each independently do to
-// remove the crash. CFG is left untouched (no block/edge removal) so the rest
-// of the AIR pipeline sees the same control flow.
+// Triton emits loop-carried integer recurrences and the predicates/TG indices
+// derived from them in a form constant-determinable only by SCCP. Metal's PSO
+// compiler crashes (XPC_ERROR_CONNECTION_INTERRUPTED) on some residual
+// patterns; run SCCP's solver and replace every integer it proves constant.
+// CFG is left untouched so the rest of the AIR pipeline sees the same control
+// flow.
 
-// True if Val is used, directly or through integer arithmetic / casts / selects
-// / phis / GEP chains, as an index of a GEP into threadgroup (addrspace 3)
-// memory.
+// True if Val feeds, through integer arithmetic/casts/selects/phis/GEPs, a GEP
+// index into threadgroup (addrspace 3) memory.
 static bool feedsThreadgroupGEPIndex(Value *Val) {
   SmallVector<Value *, 16> Work{Val};
   SmallPtrSet<Value *, 16> Seen;
@@ -2009,22 +1852,12 @@ static bool feedsThreadgroupGEPIndex(Value *Val) {
   return false;
 }
 
-// SCCP's solver tracks a per-element lattice value for every aggregate it
-// visits. For an N-element struct built by a chain of N insertvalue
-// instructions (the pattern torch-inductor emits for wide reductions), each
-// insertvalue re-merges all N element states, so solve() is O(N^2). On the
-// conv1d_depthwise kernel (a 1024-element struct, 1024-long insertvalue chain)
-// that is ~45s of pure aggregate lattice churn inside a single llc invocation.
-//
-// foldConditionalConstants only ever consumes INTEGER constants (the loop
-// below skips any non-integer instruction), so none of that aggregate lattice
-// work is ever read back. Skip the solver entirely for any function whose
-// insertvalue aggregate work exceeds this bound. Such kernels are wide
-// reduction bodies, not the small thread/lane/pid index recurrences that need
-// the PSO-crash fold, so skipping the fold for them is safe: the byte-exact
-// scalar integer patterns Metal's PSO compiler crashes on do not appear in a
-// 1024-wide insertvalue aggregate. Small kernels stay below the bound and are
-// folded exactly as before.
+// SCCP's per-element aggregate lattice makes an N-insertvalue chain O(N^2)
+// (~45s on conv1d_depthwise's 1024-wide struct). foldConditionalConstants only
+// consumes INTEGER constants, so that aggregate work is never read back; skip
+// the solver for functions exceeding this bound. Those are wide reduction
+// bodies, not the index recurrences that need the PSO-crash fold, so it is
+// safe.
 static constexpr uint64_t kMaxAggregateFoldWork = 4096;
 
 static bool foldConditionalConstants(Module &M) {
@@ -2061,12 +1894,10 @@ static bool foldConditionalConstants(Module &M) {
       ResolvedUndefs = Solver.resolvedUndefsIn(F);
     }
 
-    // Values that transitively derive from a thread-varying system-value
-    // argument. MetalAIRSystemValues (run before this pass) lowers the thread/
-    // lane-position intrinsics to kernel arguments: tid* / tidtg* / simdlane
-    // are per-thread/per-lane, pid* / numprog* are threadgroup-uniform. SCCP
-    // can "prove" a per-warp/per-lane value constant; folding such a value when
-    // it indexes threadgroup memory is the bug below, so collect them here.
+    // Values deriving from a thread-varying system-value argument (tid* /
+    // simdlane are per-thread/per-lane; pid* / numprog* are TG-uniform). SCCP
+    // can "prove" a per-lane value constant; folding one that indexes TG memory
+    // is the bug guarded below.
     SmallPtrSet<Value *, 32> ThreadVarying;
     {
       SmallVector<Value *, 32> Work;
@@ -2094,16 +1925,11 @@ static bool foldConditionalConstants(Module &M) {
         Constant *C = Solver.getConstantOrNull(&I);
         if (!C)
           continue;
-        // Refuse to fold a thread-varying value that feeds a threadgroup GEP
-        // index. SCCP can prove a per-warp/per-lane index constant for a single
-        // thread, but it genuinely varies across the threadgroup. Replacing it
-        // collapses the threadgroup address (every warp reads/writes warp 0's
-        // slot), so a multi-warp cummax/cummin argmax scan stages its index
-        // through the wrong threadgroup location and returns wrong results -
-        // and the now-constant offset also makes the byte-global splitter
-        // fragment the one index buffer into distinct per-offset globals.
-        // Uniform folds (the ones that fix the fla chunk PSO crash) are not
-        // thread-varying and proceed.
+        // Refuse to fold a thread-varying value feeding a TG GEP index: SCCP
+        // proves it constant for one thread, but it varies across the
+        // threadgroup. Folding collapses the address (every warp hits warp 0's
+        // slot), so a multi-warp scan returns wrong results. Uniform folds (the
+        // fla chunk PSO-crash fix) are not thread-varying and proceed.
         if (ThreadVarying.count(&I) && feedsThreadgroupGEPIndex(&I))
           continue;
         I.replaceAllUsesWith(C);
@@ -2119,14 +1945,10 @@ static bool foldConditionalConstants(Module &M) {
 // ── Struct-phi decomposition ────────────────────────────────────────────────
 //
 // The Metal GPU JIT cannot materialize struct-typed phi nodes (Triton wraps
-// loop-carried values in singleton structs for runtime-bound loops, producing
-// `phi { ptr }` etc.). Split each struct phi into one scalar phi per element,
-// tracing the insertvalue chain for each incoming value and rewriting the
-// extractvalue users. Runs BEFORE ptrPhiToI64 so the exposed bare ptr phis get
-// the i64 treatment.
+// loop-carried values in singleton structs). Split each into one scalar phi per
+// element. Runs BEFORE ptrPhiToI64 so the exposed bare ptr phis get i64'd.
 
-/// Trace an insertvalue chain to find the scalar value for element `idx`.
-/// Returns nullptr if it cannot be resolved statically.
+/// Trace an insertvalue chain to the scalar for element `idx`, or null.
 static Value *traceInsertValueElement(Value *V, unsigned Idx) {
   while (auto *IV = dyn_cast<InsertValueInst>(V)) {
     if (IV->getNumIndices() == 1 && IV->getIndices()[0] == Idx)
@@ -2183,8 +2005,6 @@ static bool decomposeStructPhis(Module &M,
         for (unsigned i = 0; i < NumElems; i++) {
           Value *Elem = traceInsertValueElement(InVal, i);
           if (!Elem) {
-            // Fallback: materialize an extractvalue in the predecessor,
-            // before its terminator.
             IRBuilder<> PredB(InBB->getTerminator());
             Elem = PredB.CreateExtractValue(
                 InVal, i, InVal->getName() + "_ext" + Twine(i));
@@ -2284,10 +2104,9 @@ static bool ptrPhiToI64(Module &M,
   Type *I64 = Type::getInt64Ty(M.getContext());
 
   for (Function &F : M) {
-    // Functions whose struct phis were just decomposed expose loop-carried
-    // bare ptr phis. The Metal GPU JIT cannot materialize those either (they
-    // were previously hidden inside the struct wrapper), so force-convert
-    // every ptr phi in such functions to i64.
+    // Decomposed struct phis expose loop-carried bare ptr phis the Metal GPU
+    // JIT also can't materialize; force-convert every ptr phi in such
+    // functions.
     bool ForceAll = ForceConvert.contains(&F);
 
     bool FunctionHasUndefPtrPhi = false;
@@ -2320,13 +2139,10 @@ static bool ptrPhiToI64(Module &M,
 
 // ── Atomic intrinsic typed-pointer transition ───────────────────────────────
 //
-// The writer needs a fresh SSA pointer value before each `air.atomic.global.*`
-// call so its pointee type in the side table can differ from the upstream
-// GEP-result type (e.g. an i32 atomic on a float buffer needs an i32-typed
-// pointer at the call site even though the GEP is typed float). The
-// PointeeTypeMap built at write time picks up the inttoptr result via
-// `inferFromUsage` and tags it with the intrinsic's expected pointee type.
-
+// The writer needs a fresh SSA pointer before each `air.atomic.global.*` call
+// so its pointee type can differ from the GEP-result type (an i32 atomic on a
+// float buffer needs an i32-typed pointer at the call site). The PointeeTypeMap
+// picks up the inttoptr result via inferFromUsage.
 static bool atomicTypedPointerFixup(Module &M) {
   bool Changed = false;
   Type *I64 = Type::getInt64Ty(M.getContext());
@@ -2349,10 +2165,8 @@ static bool atomicTypedPointerFixup(Module &M) {
         unsigned AddrSpace = PtrArg->getType()->getPointerAddressSpace();
         if (AddrSpace != ASDevice && AddrSpace != ASThreadgroup)
           continue;
-        // Only insert a transition when the pointer source is a GEP — the
-        // typed-pointer mismatch this is fixing is exactly that case
-        // (otherwise inferFromUsage already sees the atomic call directly
-        // and would type the pointer to match).
+        // Only when the pointer source is a GEP: that is the typed-pointer
+        // mismatch case; otherwise inferFromUsage already types it to match.
         if (!isa<GetElementPtrInst>(PtrArg))
           continue;
         Fixups.push_back(CI);
@@ -2373,12 +2187,9 @@ static bool atomicTypedPointerFixup(Module &M) {
 
 static bool metalPrepare(Module &M) {
   bool Changed = false;
-  // Fold conditionally-constant integer recurrences FIRST: Metal's PSO compiler
-  // crashes on the unfolded loop-carried counters/selectors and the predicates
-  // and threadgroup-buffer indices derived from them.
-  // Then decompose struct-typed phi nodes: the Metal GPU JIT cannot materialize
-  // them, and decomposing exposes bare ptr phis that the later ptrPhiToI64 /
-  // i1 / TG-GEP stages must still normalize.
+  // Fold conditionally-constant integer recurrences FIRST (Metal's PSO compiler
+  // crashes on the unfolded ones), then decompose struct phis, which exposes
+  // bare ptr phis the later stages normalize.
   SmallPtrSet<Function *, 4> DecomposedFns;
   Changed |= foldConditionalConstants(M);
   Changed |= decomposeStructPhis(M, DecomposedFns);

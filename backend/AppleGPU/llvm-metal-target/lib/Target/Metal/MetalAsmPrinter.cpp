@@ -6,10 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Stub AsmPrinter for the Metal backend. Metal `.metallib` is just an opaque
-// byte blob produced by the MetalEmbedderPass; the AsmPrinter only needs to
-// emit the embedded global into its requested section so the MC
-// MetalLibObjectWriter can find and copy its bytes verbatim.
+// Stub AsmPrinter: emits the MetalEmbedderPass's opaque .metallib blob global
+// into its section so the MC MetalLibObjectWriter can copy its bytes verbatim.
 //
 //===----------------------------------------------------------------------===//
 

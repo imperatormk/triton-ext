@@ -7,11 +7,7 @@
 //
 // Reads textual LLVM IR (or `-` for stdin), runs the Metal codegen pipeline,
 // and emits a metallib byte stream. Designed to be byte-identical to the
-// in-tree `llc -mtriple=air -filetype=obj` output so compiler.py can switch
-// over by just flipping METAL_LLC_PATH.
-//
-// STAGE 1: this is a scaffold. It will not link until stage 2 resolves the
-// Triple::air / MetalLib registration gap (see STAGE_2_NOTES.md).
+// in-tree `llc -mtriple=air -filetype=obj` output.
 //===---------------------------------------------------------------------===//
 
 #include "llvm/ADT/StringRef.h"
@@ -139,11 +135,9 @@ int main(int argc, char **argv) {
 
   M->setDataLayout(TM->createDataLayout());
   // The -mtriple flag carries the target macOS version (e.g.
-  // air64_v26-apple-macosx14.0.0), which drives all per-OS AIR version fields
-  // (air.version, MSL language version, VERS, subarch). The module's own triple
-  // is typically a bare "air"/"" with NO OS component, so prefer the flag's
-  // OS-bearing triple. Only keep the module triple if IT already carries a
-  // macosx OS version and the flag does not.
+  // air64_v26-apple-macosx14.0.0) that drives all per-OS AIR version fields;
+  // the module triple is usually a bare "air" with no OS. Prefer the flag's
+  // OS-bearing triple unless only the module triple carries a macosx version.
   {
     StringRef ModTriple = M->getTargetTriple().str();
     bool ModHasOS = ModTriple.contains("macosx");

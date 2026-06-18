@@ -28,11 +28,8 @@ AnalysisKey PointeeTypeAnalysis::Key;
 
 static bool isIntegerDevicePointer(Value *Ptr);
 
-// ── Infer pointee type from usage ────────────────────────────────────────
-//
-// Recurses through load/store/GEP usage, then falls back to GEP source type
-// and atomic intrinsic name inference.
-
+// Infer pointee from usage: load/store/GEP, then GEP source type and atomic
+// intrinsic name inference.
 Type *PointeeTypeMap::inferFromUsage(Value *Ptr) {
   SmallPtrSet<Value *, 8> Visited;
   return inferFromUsage(Ptr, Visited);
@@ -42,13 +39,11 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
                                      SmallPtrSetImpl<Value *> &Visited) {
   if (!Visited.insert(Ptr).second)
     return nullptr;
-  // Prioritize load/store types over GEP source types.
-  // Recurse through GEP chains to find the ultimate store/load type.
-  // NOTE: Do NOT follow atomic intrinsic calls through GEP chains.
-  // When a float buffer pointer goes through a float GEP to a CAS call
-  // (which operates on i32), the GEP source type (float) must win.
-  // The atomic type mismatch is resolved separately by
-  // InferTypedPointersPass Phase 1b (ptrtoint+inttoptr insertion).
+  // Prioritize load/store over GEP source types; recurse through GEP chains.
+  // Do NOT follow atomic intrinsic calls through GEP chains: a float buffer
+  // through a float GEP into an i32 CAS must keep the GEP source type (float);
+  // the atomic mismatch is handled separately by InferTypedPointersPass Phase
+  // 1b.
   Type *GepType = nullptr;
   for (auto *U : Ptr->users()) {
     if (auto *LI = dyn_cast<LoadInst>(U))
@@ -57,16 +52,11 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
       if (SI->getPointerOperand() == Ptr)
         return SI->getValueOperand()->getType();
     }
-    // Follow identity pointer bitcasts on DEVICE (addrspace 1) pointers: a
-    // device output buffer's store often sits past a no-op ptr→ptr bitcast the
-    // mid-end leaves between a byte-form GEP and the typed store, so the base
-    // would otherwise infer the [N x i8] GEP source type instead of the stored
-    // element type (div7's i64 outputs). Restricted to addrspace(1):
-    // threadgroup (addrspace 3) smem uses array-typed globals (`[N x float]`)
-    // whose GEP chain must keep its array element type — following identity
-    // smem bitcasts there makes the base infer a scalar pointee that disagrees
-    // with the array GEP and the AIR writer rejects it ("Explicit gep type does
-    // not match pointee type").
+    // Follow identity ptr->ptr bitcasts only on DEVICE (addrspace 1) pointers,
+    // so a store past a no-op bitcast infers the stored element type, not the
+    // [N x i8] GEP source. NOT for addrspace(3): smem array globals
+    // (`[N x float]`) must keep their array GEP element type, else the writer
+    // rejects "Explicit gep type does not match pointee type".
     if (auto *BC = dyn_cast<BitCastInst>(U)) {
       if (BC->getType()->isPointerTy() &&
           BC->getType()->getPointerAddressSpace() == AS::Device)
@@ -89,17 +79,16 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
       if (!GepType)
         GepType = GEP->getSourceElementType();
     }
-    // Sub-track I: follow pointer-typed select users so both arms get a
-    // typed-pointer slot (writer cannot emit typed `select ptr` otherwise).
+    // Follow pointer-typed select users so both arms get a typed-pointer slot
+    // (writer cannot emit typed `select ptr` otherwise).
     if (auto *Sel = dyn_cast<SelectInst>(U)) {
       if (Sel->getType()->isPointerTy())
         if (Type *T = inferFromUsage(Sel, Visited))
           return T;
     }
-    // Follow pointer-typed phi users (loop-carried operand pointers): the
-    // loads often happen only through the phi, and the phi's own pointee is
-    // force-set elsewhere — without this the base infers the byte-GEP type
-    // and the phi record's operand types disagree. Visited guards cycles.
+    // Follow pointer-typed phi users (loop-carried pointers): loads often
+    // happen only through the phi, so without this the base infers the byte-GEP
+    // type and the phi record's operand types disagree. Visited guards cycles.
     if (auto *PN = dyn_cast<PHINode>(U)) {
       if (PN->getType()->isPointerTy())
         if (Type *T = inferFromUsage(PN, Visited))
@@ -109,9 +98,8 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
       if (auto *Callee = CI->getCalledFunction()) {
         StringRef Name = Callee->getName();
         // The simdgroup-matrix intrinsic's pointer suffix is definitive
-        // element-type evidence — byte-form GEP source types are mere
-        // addressing artifacts and must not outvote it (bf16 before f16:
-        // substring overlap).
+        // element-type evidence, outvoting byte-form GEP source types. Test
+        // bf16 before f16: substring overlap.
         if (Name.starts_with("air.simdgroup_matrix_8x8_")) {
           auto &Ctx = Ptr->getContext();
           if (Name.contains("p1bf16") || Name.contains("p3bf16"))
@@ -123,9 +111,9 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
           if (Name.contains("p1f32") || Name.contains("p3f32"))
             return Type::getFloatTy(Ctx);
         }
-        // Only use atomic type if the pointer is NOT a GEP result.
-        // GEP results must keep their source element type for consistency;
-        // the atomic type mismatch is handled by inserting ptrtoint+inttoptr.
+        // Only use atomic type when the pointer is NOT a GEP result; GEP
+        // results keep their source element type (atomic mismatch handled via
+        // ptrtoint+inttoptr).
         if (!isa<GetElementPtrInst>(Ptr) && Name.starts_with("air.atomic.")) {
           if (Name.ends_with(".i32"))
             return Type::getInt32Ty(Ptr->getContext());
@@ -138,16 +126,11 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
   return GepType;
 }
 
-// ── Collapse device pointers to float* ───────────────────────────────────
-//
-// When MMA intrinsics (simdgroup_multiply_accumulate) are present, the Metal
-// GPU JIT crashes on ANY non-float device pointer. This collapses all
-// addrspace(1) entries to float*.
-
+// With MMA intrinsics present, the Metal GPU JIT crashes on ANY non-float
+// device pointer; collapse all addrspace(1) entries to float*.
 void PointeeTypeMap::collapseDevicePointersToFloat(Module &M) {
   Type *F32 = Type::getFloatTy(M.getContext());
   for (auto &[Ptr, Ty] : map) {
-    // Check if this is a device pointer (addrspace 1)
     auto *PtrTy = Ptr->getType();
     if (auto *PT = dyn_cast<PointerType>(PtrTy)) {
       if (PT->getAddressSpace() == AS::Device && !isIntegerDevicePointer(Ptr))
@@ -156,11 +139,7 @@ void PointeeTypeMap::collapseDevicePointersToFloat(Module &M) {
   }
 }
 
-// ── Remap i1 → i8 ───────────────────────────────────────────────────────
-//
-// Metal has no i1 memory type. Pointers to i1 crash the GPU JIT.
-// Remap to i8 (booleans are i8 in Metal memory).
-
+// Metal has no i1 memory type (pointers to i1 crash the GPU JIT); remap to i8.
 void PointeeTypeMap::remapI1ToI8(Module &M) {
   Type *I8 = Type::getInt8Ty(M.getContext());
   for (auto &[Ptr, Ty] : map) {
@@ -169,15 +148,11 @@ void PointeeTypeMap::remapI1ToI8(Module &M) {
   }
 }
 
-// ── Initial analysis: scan all pointers and infer types ──────────────────
-//
-// This analysis MUST be self-contained - it may be re-run after pipeline
-// passes invalidate it. All Metal-specific overrides (MMA, async copy)
-// must be here, not only in InferTypedPointersPass.
+// This analysis MUST be self-contained - it may be re-run after pipeline passes
+// invalidate it, so all Metal-specific overrides (MMA, async copy) live here.
 
-// MMA intrinsic names are shared with InferTypedPointersPass via
-// PointeeTypeMap.h (namespace mma_intrinsics). See the "Two-stage design"
-// note in that header for why the override logic is duplicated.
+// MMA intrinsic names shared with InferTypedPointersPass via PointeeTypeMap.h
+// (namespace mma_intrinsics); the override logic is intentionally duplicated.
 static constexpr const char *kMMALoad = mma_intrinsics::kLoad;
 static constexpr const char *kMMAStore = mma_intrinsics::kStore;
 static constexpr const char *kMMALoadDev = mma_intrinsics::kLoadDev;
@@ -193,26 +168,14 @@ static bool functionUsesMMA(const Function &F) {
   return false;
 }
 
-// The MMA collapse forces every device pointer to float* because the Metal
-// GPU JIT rejects non-float device pointers fed to float (v64f32) simdgroup
-// matrix intrinsics. But an MMA kernel can still have a device buffer that is
-// genuinely a non-float scalar type:
-//   - the i32 output of an int8 dot (the f32 accumulator is fptosi'd to i32 and
-//     stored to an i32* result), or
-//   - a half / bfloat input matrix that is loaded scalar-wise (load half /
-//     getelementptr half) to stage it into a threadgroup convert buffer, or
-//     fed directly into a v64f16/v64bf16 MMA load. The fp16 linear/matmul
-//     max-autotune kernels hit exactly this: %arg is a half device buffer, but
-//     the blanket collapse retags it float*, so a `load half` off a
-//     `getelementptr half` on it ends up with a float pointee.
-// For such a buffer the GEPs / loads / stores keep a concrete non-float scalar
-// element type, so collapsing the pointer to float* makes the writer emit an
-// access whose explicit type disagrees with the pointer's pointee, which the
-// Metal reader rejects with "Explicit load/store type does not match pointee
-// type" / "Explicit gep type does not match pointee type" → materializeAll
-// failure. Preserve a device pointer whose inferred usage is a concrete
-// non-float scalar (integer, half, or bfloat); such a buffer is never fed to a
-// float (v64f32) MMA intrinsic, so float collapse would only corrupt it.
+// The MMA collapse forces device pointers to float*, but an MMA kernel can
+// still have a genuinely non-float scalar device buffer (i32 int8-dot output,
+// or a half/bfloat input matrix). Collapsing those to float* makes the writer
+// emit an access whose type disagrees with the pointer, rejected as "Explicit
+// load/store type does not match pointee type" → materializeAll failure.
+// Preserve any device pointer whose inferred usage is a concrete non-float
+// scalar (int/half/bfloat); such buffers are never fed to a float MMA
+// intrinsic.
 static bool isNonFloatScalarDevicePointer(Value *Ptr) {
   Type *Ty = PointeeTypeMap::inferFromUsage(Ptr);
   if (!Ty)
@@ -499,16 +462,11 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
         }
       }
 
-  // Phase 8b: Unify pointer-typed select arms.
-  //
-  // A `select i1, ptr, ptr` is emitted with no explicit result-type record; the
-  // Metal GPU JIT derives the result pointee from the two arm value type IDs
-  // and refuses to materialize when they disagree. This bites the indirect
-  // scatter/gather pattern where one arm is a concrete typed GEP (e.g. half*)
-  // and the other is `inttoptr i64 <tg-loaded ptr>` whose pointee was inferred
-  // independently (and may have collapsed to a different scalar, e.g. float*).
-  // Force both arms — and the select itself — to one pointee, preferring a
-  // concrete (non-inttoptr) arm's type so real typed accesses stay correct.
+  // Phase 8b: Unify pointer-typed select arms. A `select i1, ptr, ptr` carries
+  // no result-type record; the Metal GPU JIT derives the result pointee from
+  // the two arm type IDs and refuses to materialize when they disagree. Force
+  // both arms and the select to one pointee, preferring a concrete
+  // (non-inttoptr) arm's type so real typed accesses stay correct.
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB) {

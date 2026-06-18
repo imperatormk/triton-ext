@@ -31,15 +31,10 @@ LinearLayout appleMmaTile(MLIRContext *ctx) {
   auto dimRow = S("dim0");
   auto dimCol = S("dim1");
 
-  // Build layout as product of identity1D maps:
-  //   identity1D(N, inDim, outDim) contributes log2(N) bits:
-  //   the next log2(N) bits of inDim XOR-map to the next log2(N) bits of
-  //   outDim.
-
   LinearLayout layout =
       // lane bits [0:2] → col bits [0:2]  (8 columns)
       LinearLayout::identity1D(8, S("lane"), dimCol) *
-      // lane bits [3:4] → row bits [0:1]  (4 row groups: rows 0,1,2,3)
+      // lane bits [3:4] → row bits [0:1]  (4 row groups)
       LinearLayout::identity1D(4, S("lane"), dimRow) *
       // reg  bit  [0]   → row bit  [2]    (row halves: +4)
       LinearLayout::identity1D(2, S("register"), dimRow);

@@ -30,7 +30,6 @@ using namespace llvm;
 #define DEBUG_TYPE "metal-scalar-buffer-packing"
 
 namespace {
-// Metal address-space constants used throughout this pass.
 constexpr unsigned ASDevice = 1;
 constexpr unsigned ASConstant = 2;
 } // namespace
@@ -120,11 +119,8 @@ static bool scalarBufferPacking(Module &M) {
     };
     SmallVector<ScalarParam, 8> ScalarParams;
 
-    // Identify descriptor groups for type inference of dead params.
-    //
-    // ── Cross-component coupling (keep in sync with the Python driver) ──
-    // Pattern-matches the flat descriptor layout produced by upstream
-    // Triton's expand_signature. For a no-metadata descriptor this emits
+    // Type inference for dead descriptor params. Keep in sync with the Python
+    // driver: upstream Triton's expand_signature emits a flat descriptor
     // [i64×(2N), i1, i1, i32×N, i64×N] where N = ndim, group_size = 4*N + 2.
     SmallDenseMap<unsigned, Type *, 16> DescriptorTypeForParam;
     {
@@ -189,13 +185,10 @@ static bool scalarBufferPacking(Module &M) {
           if (LoadTy) {
             ScalarParams.push_back({i, LoadTy, true, false});
           } else {
-            // No load to infer the width from. The Apple lowering emits scalar
-            // arg loads as volatile precisely so this branch is not reached for
-            // ordinary scalar params: a mis-sized slot would shift every
-            // following scalar's byte offset and desync from the Python
-            // driver's _compute_scalar_layout. This path now only covers
-            // genuinely load-free descriptor groups, sized by
-            // DescriptorTypeForParam.
+            // No load to infer width from: a mis-sized slot shifts every later
+            // scalar's byte offset and desyncs from the Python driver's
+            // _compute_scalar_layout. Only load-free descriptor groups reach
+            // here, sized by DescriptorTypeForParam.
             Type *DeadTy = Type::getInt32Ty(M.getContext());
             auto It = DescriptorTypeForParam.find(i);
             if (It != DescriptorTypeForParam.end())
@@ -419,12 +412,9 @@ static bool scalarBufferPacking(Module &M) {
             Preamble.push_back(Cast);
             Loaded = Cast;
           } else if (SP.ScalarType->isDoubleTy()) {
-            // double is 8 bytes: assemble from two 4-byte float slots exactly
-            // like the i64 case (the buffer element type is float, so a single
-            // GEP loads only 4 bytes and loading a double straight off a float*
-            // GEP emits an explicit-gep-type mismatch that the Metal bitcode
-            // reader rejects). Combine lo|hi into an i64, then bitcast to
-            // double.
+            // Assemble from two 4-byte float slots like the i64 case: loading a
+            // double off a float* GEP emits an explicit-gep-type mismatch the
+            // Metal bitcode reader rejects. Combine lo|hi into i64, bitcast.
             auto *LoI64 = CastInst::Create(Instruction::ZExt, AsI32,
                                            Type::getInt64Ty(M.getContext()),
                                            Name + "_lo64");
@@ -458,9 +448,8 @@ static bool scalarBufferPacking(Module &M) {
             Preamble.push_back(Cast);
             Loaded = Cast;
           } else {
-            // Unknown wide scalar: fall back to a direct typed load. The buffer
-            // element type may differ, but keep the GEP/pointee consistent by
-            // loading the buffer element and bitcasting where sizes match.
+            // Unknown wide scalar: load the buffer element and bitcast to keep
+            // the GEP/pointee consistent.
             auto *Conv = CastInst::Create(Instruction::BitCast, AsI32,
                                           SP.ScalarType, Name);
             Preamble.push_back(Conv);

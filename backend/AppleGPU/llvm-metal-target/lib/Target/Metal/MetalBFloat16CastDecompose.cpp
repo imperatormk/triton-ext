@@ -36,16 +36,12 @@ static bool bfloat16CastDecompose(Module &M) {
     return Elem;
   };
 
-  // Phase 0: decompose fptrunc f32 -> bfloat (round-to-nearest-even) and
-  // fpext bfloat -> f32, both as integer bit manipulation — the native casts
-  // are miscompiled by the GPU JIT. Scalar and vector.
+  // Phase 0: decompose fptrunc f32->bf16 (RTNE) and fpext bf16->f32 as integer
+  // bit manipulation; the native casts are miscompiled by the GPU JIT.
   //
-  // NB: no NaN-quieting branch. A `fcmp uno` + `select` to force the QNaN bit
-  // is undefined under the module's `air.compile.fast_math_enable` (which
-  // implies `nnan`); the AGX JIT miscompiles the resulting select and its
-  // surrounding bitcast chain — most visibly inside the bf16 atomic-add CAS
-  // loop, which corrupts adjacent lanes into NaN. Plain RTNE truncation is
-  // the correct lowering for a no-NaN target.
+  // No NaN-quieting branch: under fast_math_enable (implies nnan) the AGX JIT
+  // miscompiles the `fcmp uno`+`select` bitcast chain (corrupts adjacent lanes
+  // to NaN in the bf16 atomic-add CAS loop). RTNE truncation is correct here.
   for (Function &F : M) {
     for (BasicBlock &BB : F) {
       for (auto It = BB.begin(); It != BB.end();) {
@@ -85,17 +81,11 @@ static bool bfloat16CastDecompose(Module &M) {
     }
   }
 
-  // Phase 0.5: sink a vector `bitcast <N x i16> -> <N x bfloat>` (the RNE
-  // decompose tail) through its extractelement users to scalars. When the i16
-  // vector traces back to a simdgroup_matrix accumulator, the AGX JIT
-  // miscompiles MULTI-LANE extraction of the narrow <N x i16> register to zero
-  // (a single-lane extract, and the integer RNE math itself, are fine — the
-  // bug is narrowing the wide simdgroup f32 register to i16 *as a vector* and
-  // then pulling several lanes out of it). If the i16 vector is a
-  // `trunc <N x i32> -> <N x i16>`, sink the trunc too so the extract reads the
-  // <N x i32> (full-width) register and the trunc+reinterpret run on scalars.
-  // Every vector op is preserved; only the free trunc/reinterpret moves to
-  // scalars — no extra work, no scalarized arithmetic. Same shape for half.
+  // Phase 0.5: sink a vector `bitcast <N x i16> -> <N x bfloat>` through its
+  // extractelement users to scalars. AGX JIT miscompiles multi-lane extraction
+  // of a narrow <N x i16> register (narrowed from a simdgroup_matrix f32 accum)
+  // to zero. If the i16 vector is a `trunc <N x i32>`, sink the trunc too so
+  // the extract reads the full-width register. Half-precision: same shape.
   for (Function &F : M) {
     SmallVector<Instruction *, 8> DeadBC;
     for (BasicBlock &BB : F) {
@@ -118,8 +108,7 @@ static bool bfloat16CastDecompose(Module &M) {
             AllExtract = false;
         if (!AllExtract)
           continue;
-        // Pull the extract off the widest available integer vector: if the i16
-        // came from a trunc of i32, extract the i32 and trunc per scalar.
+        // Extract off the widest integer vector available.
         Value *I16Vec = BC->getOperand(0);
         auto *Trn = dyn_cast<TruncInst>(I16Vec);
         Value *WideVec = (Trn && isa<FixedVectorType>(Trn->getSrcTy()))

@@ -36,11 +36,9 @@ static bool shuffleReadsVectorRegister(Function &F) {
     auto *CI = dyn_cast<CallInst>(&I);
     if (!CI || !isShuffleCall(CI))
       continue;
-    // The shuffle value operand is operand 0.
     Value *Op = CI->getArgOperand(0);
-    // Walk back through scalar FP ops / extracts; a shuffle whose operand is an
-    // extractelement (or reaches one without leaving scalar arithmetic) was fed
-    // from a vector register.
+    // A shuffle whose operand reaches an extractelement without leaving scalar
+    // arithmetic was fed from a vector register.
     SmallVector<Value *, 8> Work{Op};
     SmallPtrSet<Value *, 16> Seen;
     while (!Work.empty()) {
@@ -52,9 +50,9 @@ static bool shuffleReadsVectorRegister(Function &F) {
       auto *Inst = dyn_cast<Instruction>(V);
       if (!Inst)
         continue;
-      // Only chase through value-preserving scalar arithmetic / casts and other
-      // shuffles; do not cross loads, phis or vector builds (those break the
-      // "lives in a vector register at the shuffle" chain we care about).
+      // Chase only value-preserving scalar arithmetic/casts and other shuffles;
+      // loads, phis, vector builds break the "lives in a vector register"
+      // chain.
       if (isa<UnaryOperator>(Inst) || isa<BinaryOperator>(Inst) ||
           isa<CastInst>(Inst) || isa<SelectInst>(Inst) ||
           (isa<CallInst>(Inst) && isShuffleCall(cast<CallInst>(Inst))))
@@ -65,21 +63,17 @@ static bool shuffleReadsVectorRegister(Function &F) {
   return false;
 }
 
-// True when the function performs vector floating-point *arithmetic* (not just
-// vector memory load/store and the extract/insert glue around them). The SLP
-// vectorizer (LLVM O1+) produces this in cross-lane reduce/scan kernels, and
-// the resulting AIR is miscompiled by the AGX JIT the same way as the
-// vector-fed shuffle pattern (wrong per-lane results). GEMM kernels never
-// contain vector FP arithmetic — their only vectors are memory quads — so they
-// are skipped and stay byte-identical.
+// True when the function does vector FP *arithmetic* (not just vector memory
+// load/store glue). SLP (O1+) produces this in cross-lane reduce/scan kernels;
+// the AGX JIT miscompiles the result like the vector-fed shuffle pattern. GEMM
+// has no vector FP arithmetic (only memory quads), so it is skipped untouched.
 static bool hasVectorComputeShape(Function &F) {
   auto isVecFP = [](Type *T) {
     auto *VT = dyn_cast<FixedVectorType>(T);
     return VT && VT->getElementType()->isFloatingPointTy();
   };
   for (Instruction &I : instructions(F)) {
-    // Cross-lane vector lane permute (SLP repacks scan/segment data with these;
-    // the AGX JIT miscompiles wide `shufflevector`s). GEMM never emits one.
+    // AGX JIT miscompiles wide `shufflevector`s (SLP scan/segment repack).
     if (isa<ShuffleVectorInst>(I))
       return true;
     // Vector fadd/fsub/fmul/fdiv/frem/fneg.

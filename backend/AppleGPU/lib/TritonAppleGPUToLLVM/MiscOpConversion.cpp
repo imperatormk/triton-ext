@@ -55,8 +55,8 @@ struct WarpIdOpConversion
     auto i32Ty = IntegerType::get(ctx, 32);
     auto mod = op->getParentOfType<ModuleOp>();
 
-    // Use air.thread_position_in_threadgroup (returns [3 x i32]) + extractvalue
-    // 0. _add_air_metadata() rewrites this call+extractvalue to a function arg.
+    // air.thread_position_in_threadgroup returns [3 x i32]; _add_air_metadata()
+    // later rewrites this call+extractvalue into a function arg.
     auto arrI32x3Ty = LLVM::LLVMArrayType::get(i32Ty, 3);
     auto tidFnTy = LLVMFunctionType::get(arrI32x3Ty, {}, false);
     {
@@ -118,14 +118,10 @@ struct GetNumProgramsOpAppleConversion
 };
 
 // Lower triton::FuncOp → LLVM::LLVMFuncOp for Apple Metal kernels.
-//
-// Metal passes scalar kernel args (i32, i64, etc.) via setBytes — a pointer
-// to constant address space (addrspace 2). The LLVM IR must reflect this:
-// scalar args become `i32 addrspace(2)*` pointers, and we insert explicit
-// loads at function entry. This matches what `xcrun metal` emits for
-// `constant T&` parameters, and eliminates the Python regex workaround.
-//
-// Pointer args (addrspace 1 = device) are passed through unchanged.
+// Metal passes scalar kernel args via setBytes as constant-addrspace(2)
+// pointers, so scalar args become `i32 addrspace(2)*` with explicit entry
+// loads (matches `xcrun metal` for `constant T&`). Pointer args (addrspace 1 =
+// device) pass through unchanged.
 struct AppleFuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -177,10 +173,9 @@ struct AppleFuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
     auto llvmFuncTy = LLVM::LLVMFunctionType::get(retTy, newArgTypes);
     auto newFuncOp = LLVM::LLVMFuncOp::create(
         rewriter, loc, funcOp.getName(), llvmFuncTy, LLVM::Linkage::External);
-    // Mark the launchable entry: downstream consumers (entry-name detection,
-    // non-kernel inlining/pruning, !air.kernel emission) must not infer
-    // kernel identity from the call graph — the optimizer may inline a
-    // noinline helper's only call site, leaving two uncalled functions.
+    // Mark the launchable entry explicitly: downstream must not infer kernel
+    // identity from the call graph, since the optimizer may inline a helper's
+    // only call site, leaving two uncalled functions.
     if (isKernel)
       newFuncOp.setPassthroughAttr(
           rewriter.getArrayAttr({rewriter.getStringAttr("air-kernel")}));
@@ -198,15 +193,11 @@ struct AppleFuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
         oldArg.setType(newArgTypes[i]);
         auto origTy = getTypeConverter()->convertType(
             funcOp.getFunctionType().getInput(i));
-        // Mark the scalar-arg load volatile so it is never eliminated. Once the
-        // arg becomes an opaque addrspace(2) pointer, its original width is not
-        // recoverable from the type; the scalar-buffer-packing pass recovers it
-        // from this load's result type. If the load were dead (e.g. it feeds
-        // only a bounds-check assert that later gets elided), the pass would
-        // have to guess the width, mis-size the packed slot, and corrupt every
-        // following scalar's byte offset. Keeping the load alive guarantees an
-        // exact, signature-matching layout. A constant-buffer load is cheap and
-        // any genuinely unused result is dropped after packing rewrites it.
+        // Volatile so the load is never eliminated: the opaque addrspace(2)
+        // pointer loses the arg's original width, and scalar-buffer-packing
+        // recovers it from this load's result type. A dead load would force the
+        // pass to guess the width, mis-size the slot, and corrupt every
+        // following scalar's byte offset.
         Value loaded = LLVM::LoadOp::create(rewriter, loc, origTy, oldArg,
                                             /*alignment=*/0,
                                             /*isVolatile=*/true);
@@ -439,10 +430,9 @@ struct ExternElementwiseOpAppleConversion
                                    operands[0][1])};
     }
 
-    // Trig functions not in LLVM intrinsics — use math lib calls
-    // tan, asin, acos, atan, atan2, sinh, cosh, tanh, asinh, acosh, atanh
-    // For now, emit as external function calls; metal-llc's
-    // MetalLLVMToAIRIntrinsics pass maps them to air.* builtins.
+    // Trig fns without LLVM intrinsics (tan, asin, atan2, sinh, tanh, ...):
+    // emit as external calls; metal-llc's MetalLLVMToAIRIntrinsics maps them to
+    // air.* builtins.
     {
       auto funcTy = operands[0].size() == 1
                         ? LLVM::LLVMFunctionType::get(elemTy, {elemTy})

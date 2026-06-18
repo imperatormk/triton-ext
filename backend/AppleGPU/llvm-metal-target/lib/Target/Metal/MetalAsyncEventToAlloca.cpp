@@ -21,14 +21,9 @@ using namespace llvm;
 
 #define DEBUG_TYPE "metal-async-event-to-alloca"
 
-// Sub-track K (Task 2): Part 1 (rewrite `@__tg_async_events` TG global to
-// stack alloca in the kernel entry block) had zero firings across all
-// 3991 test_core.py kernel dumps and zero behavioural effect when ablated
-// on the full MPS suite — current Triton-MLIR lowering never emits the
-// `__tg_async_events` named TG global. Dropped. Only Part 2 (no-op
-// bitcast before async-copy / wait-event pointer args) remains; it is
-// load-bearing for 2 `test_dot3d[*float16-float16]` shapes vs Part 2
-// ablation (per Sub-track K bisect).
+// Only the no-op bitcast before async-copy / wait-event pointer args remains
+// (the `@__tg_async_events` TG-global-to-alloca rewrite never fired and was
+// dropped). Load-bearing for 2 `test_dot3d[*float16-float16]` shapes.
 
 static constexpr StringLiteral kAsyncCopyPrefix("air.simdgroup_async_copy_2d.");
 static constexpr StringLiteral

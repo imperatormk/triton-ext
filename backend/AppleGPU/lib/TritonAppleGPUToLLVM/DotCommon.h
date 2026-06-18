@@ -31,19 +31,11 @@ Value divByConst(OpBuilder &b, Location loc, Value v, int64_t c);
 // remByConst: v % c  ->  v & (c-1) when c is power-of-2, else RemUIOp.
 Value remByConst(OpBuilder &b, Location loc, Value v, int64_t c);
 
-// Bank conflict padding: add PAD elements per row in TG buffers.
-// Apple GPU has 32 banks of 4 bytes each (128-byte bank period).
-// For stride = N (e.g. 64), all threads in the same column hit the same bank.
-// Adding PAD elements (16 bytes) shifts successive rows by PAD banks,
-// eliminating most bank conflicts for 8-row strips.
-// Only applied when the padded buffer fits within 32KB TG limit.
-//
-// The pad amount must be 16 bytes regardless of element type:
-//   float32 (4B) -> 4 elements, float16/bf16 (2B) -> 8, int8 (1B) -> 16.
-// For integer types we skip padding entirely: int8 dots go through TG as f32
-// (scatter converts i8->f32), but async copy writes raw bytes with a stride
-// mismatch against the f32 MMA load.  Disabling padding avoids corrupting
-// the stride arithmetic for these types.
+// Bank-conflict padding: add 16 bytes per TG row (Apple GPU = 32 banks x 4B,
+// 128-byte period) so successive rows shift banks. Pad is always 16 bytes:
+// f32 -> 4 elems, f16/bf16 -> 8, int8 -> 16. Integer types skip padding: int8
+// dots stage TG as f32 but async copy writes raw bytes, and padding would
+// corrupt that stride mismatch. Only applied when the buffer fits 32KB.
 inline constexpr int64_t TG_PAD = 4;
 
 // Compute element-type-aware pad amount.  Returns 0 for integer element types

@@ -23,8 +23,7 @@ static bool inlineNonKernel(Module &M) {
   bool Changed = false;
   SmallPtrSet<Function *, 4> WasCallee;
 
-  // Strip noinline so InlineFunction succeeds even on frontend-marked
-  // functions.
+  // Strip noinline so InlineFunction succeeds on frontend-marked functions.
   for (Function &F : M)
     if (!F.isDeclaration() && F.hasFnAttribute(Attribute::NoInline))
       F.removeFnAttr(Attribute::NoInline);
@@ -55,11 +54,9 @@ static bool inlineNonKernel(Module &M) {
     }
   }
 
-  // Erase functions that were fully inlined and are now unused. When the
-  // frontend marked the launchable entry ("air-kernel" fn attribute), also
-  // erase any other unused defined function: the mid-end optimizer may
-  // inline a helper's only call site itself, leaving it uncalled here, and
-  // a stray second function corrupts the metallib container.
+  // Erase fully-inlined, now-unused functions. When an "air-kernel" entry is
+  // marked, also erase any other unused defined function: a stray second
+  // function corrupts the metallib container.
   bool HaveKernelAttr = llvm::any_of(M, [](const Function &F) {
     return !F.isDeclaration() && F.hasFnAttribute("air-kernel");
   });

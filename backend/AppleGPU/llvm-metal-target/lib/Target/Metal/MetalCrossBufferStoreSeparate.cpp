@@ -10,43 +10,21 @@
 //
 // The Apple AGX JIT coalesces device stores by *address*, ignoring source
 // order. When two stores to different buffer args land at the same per-thread
-// element offset and are program-adjacent (one straight-line block), the JIT
-// fuses them and drops warp 0's value on one of the pair. At -O0 the bug never
-// fires because each masked store sits in its OWN predicated basic block:
+// element offset in one straight-line block, the JIT fuses them and drops
+// warp 0's value. At -O0 the bug never fires because each masked store sits in
+// its own predicated basic block; -O1+ flattens those into one run.
 //
-//     br i1 %mask, label %store_bb, label %cont
-//   store_bb:  store v, ptr ; br label %cont
-//   cont:      ...
+// This pass restores the -O0 structure: it groups conflicting device stores by
+// their per-thread offset SSA and hoists each offset group into its own
+// predicated block guarded by THAT group's in-bounds mask (the dominating
+// `icmp slt offset, N`). The guard is always taken for in-bounds threads
+// (semantics-identical) but is a real conditional branch, so the JIT can no
+// longer address-coalesce the cross-buffer pair. Per-offset grouping keeps a
+// store under a different predicate from being pulled under the wrong guard.
 //
-// so the same-offset cross-buffer stores are separated by real control flow the
-// JIT does not speculate across. -O1+ flattens this into one straight-line run
-// and the bug fires.
-//
-// This pass restores the -O0 structure: it groups the conflicting device stores
-// BY their per-thread offset SSA, and hoists each offset group into its own
-// freshly-created predicated block guarded by THAT group's reaching in-bounds
-// mask (the `icmp slt offset, N` that already dominates the store at -O0). The
-// predicate is always taken for in-bounds threads (identical semantics) but is
-// a real conditional branch, so the JIT can no longer place the cross-buffer
-// pair in one straight-line run -> it cannot address-coalesce them. This is
-// precisely the transform that distinguishes the passing -O0 IR from the
-// failing -O1 IR.
-//
-// Grouping per offset (rather than one shared guard over the whole conflicting
-// run) means a store under a DIFFERENT predicate/offset is never pulled under
-// the wrong guard: only the stores that share one offset (hence one in-bounds
-// condition) move together, and non-conflicting stores stay unguarded in the
-// continuation exactly as before.
-//
-// Detection (reaching-arg + same-offset):
-//   * walk a store pointer back through GEP / bitcast / addrspacecast to the
-//     reaching addrspace(1) Argument and the SSA offset value;
-//   * an offset group is a TRIGGER when >=2 of its stores reach DIFFERENT
-//   buffer
-//     Args at that same SSA offset (the same per-thread slot in >=2 buffers).
-// A block is only rewritten when it contains such a cross-buffer offset group,
-// so single-output kernels (no two device-output buffers at the same offset)
-// are a guaranteed byte-identical no-op.
+// A block is rewritten only when it contains a cross-buffer offset group (>=2
+// stores reaching DIFFERENT addrspace(1) Args at the same SSA offset), so
+// single-output kernels are a byte-identical no-op.
 //
 //===----------------------------------------------------------------------===//
 
@@ -83,8 +61,7 @@ static Value *traceBaseAndOffset(Value *Ptr, Value *&OffsetOut) {
   Value *Cur = Ptr;
   while (Cur) {
     if (auto *GEP = dyn_cast<GetElementPtrInst>(Cur)) {
-      // Capture the last (innermost) non-constant index as the per-thread
-      // offset. Element-typed GEPs in this IR are single-index (i64/float/i8).
+      // Last non-constant index is the per-thread offset.
       for (Value *Idx : GEP->indices()) {
         if (!isa<ConstantInt>(Idx))
           OffsetOut = Idx;
@@ -101,7 +78,6 @@ static Value *traceBaseAndOffset(Value *Ptr, Value *&OffsetOut) {
       continue;
     }
     if (auto *GEPOp = dyn_cast<GEPOperator>(Cur)) {
-      // Constant-expression GEP (rare post-prepare); peel it too.
       for (Value *Idx : GEPOp->indices())
         if (!isa<ConstantInt>(Idx))
           OffsetOut = Idx;
@@ -124,15 +100,12 @@ static bool isDeviceArgStore(StoreInst *SI, Value *&Base, Value *&Offset) {
   return isa<Argument>(Base);
 }
 
-// Find the in-bounds mask (an i1) that dominates SI and selects this offset.
-// At -O0 each store is guarded by `icmp slt <offset>, N`; that icmp is still
-// present in the flattened IR (the assume operands). We look for an i1 user of
-// the offset that is an icmp comparing the offset against a bound. Returns null
-// if none is found — the caller then skips the group (a constant-true guard
-// would fold away and the AGX bug would return).
+// Find the in-bounds mask (an i1 `icmp slt/ult offset, N`) that dominates SI.
+// Returns null if none is found - the caller then skips the group, since a
+// constant-true guard would fold away and the AGX bug would return.
 static Value *findMaskForOffset(Value *Offset, Instruction *InsertPt) {
-  // Peel sext/zext: the GEP index is often `sext %i32off`, while the in-bounds
-  // icmp compares the i32 offset directly. Collect candidate offset values.
+  // Peel sext/zext: the GEP index is often `sext %i32off` while the icmp
+  // compares the i32 offset directly.
   SmallVector<Value *, 3> Cands;
   if (Offset) {
     Cands.push_back(Offset);
@@ -142,10 +115,8 @@ static Value *findMaskForOffset(Value *Offset, Instruction *InsertPt) {
         Cands.push_back(Ext->getOperand(0));
   }
   for (Value *Off : Cands) {
-    // The offset SSA is typically an `or disjoint`/`shl` chain; the in-bounds
-    // icmp compares exactly that value against the element count. Accept an
-    // slt/ult icmp user of the offset that is defined before the store (so the
-    // value dominates the new conditional branch we will emit at InsertPt).
+    // Accept an slt/ult icmp user defined before the store, so it dominates the
+    // conditional branch we emit at InsertPt.
     for (User *U : Off->users()) {
       auto *IC = dyn_cast<ICmpInst>(U);
       if (!IC || !IC->getType()->isIntegerTy(1))
@@ -153,8 +124,6 @@ static Value *findMaskForOffset(Value *Offset, Instruction *InsertPt) {
       if (IC->getPredicate() != ICmpInst::ICMP_SLT &&
           IC->getPredicate() != ICmpInst::ICMP_ULT)
         continue;
-      // Defined before the store (entry-block icmp dominates everything; an
-      // icmp in the same block must precede the store).
       if (IC->getParent() == &IC->getFunction()->getEntryBlock())
         return IC;
       if (IC->getParent() == InsertPt->getParent() && IC->comesBefore(InsertPt))
@@ -164,66 +133,43 @@ static Value *findMaskForOffset(Value *Offset, Instruction *InsertPt) {
   return nullptr;
 }
 
-// Hoist a set of conflicting stores (all sharing one per-thread offset, hence
-// one in-bounds predicate) into ONE shared predicated block guarded by `Guard`,
-// inserted right before `At`:
-//
-//   <pre>                      br i1 %guard, %store_bb, %cont
-//   store_bb: store0; store1; ... ; br %cont
-//   cont:     <rest>
-//
-// The conflicting stores (which may be non-adjacent in the original block) are
-// MOVED — in program order — into the new store block, along with the address
-// GEPs they depend on. Non-conflicting stores stay in `cont` (unguarded,
-// exactly as before), so a store with a DIFFERENT predicate/offset is never
-// pulled under this guard. A real conditional branch on the in-bounds predicate
-// is what makes the AGX JIT stop treating the warp-0 lane stores as
-// unconditionally executed, so it no longer address-coalesces the cross-buffer
-// pair. `Guard` is an i1 true for in-bounds threads; semantics are preserved
-// exactly (out-of-bounds threads never stored anyway). Returns the continuation
-// block for re-scanning.
+// Hoist a set of conflicting stores (sharing one per-thread offset) into one
+// predicated block guarded by `Guard`. The stores (possibly non-adjacent) are
+// moved in program order into the new block along with the address GEPs they
+// depend on; non-conflicting stores stay in the continuation, so a store under
+// a different offset is never pulled under this guard. The real conditional
+// branch stops the AGX JIT from treating warp-0 lane stores as unconditional,
+// so it no longer address-coalesces the cross-buffer pair. Returns the
+// continuation block for re-scanning.
 static BasicBlock *guardStoreGroup(ArrayRef<StoreInst *> Group, Value *Guard) {
   assert(!Group.empty() && "empty store group");
   BasicBlock *Pre = Group.front()->getParent();
-  // Anchor the hoist at the EARLIEST store in program order (the safety check
-  // in the caller guarantees every store's value is defined before this point).
+  // Anchor at the earliest store; the caller guarantees every store's value is
+  // defined before this point.
   Instruction *At = Group.front();
   for (StoreInst *SI : Group)
     if (SI->comesBefore(At))
       At = SI;
 
-  // Split before the first store of the group: [At .. end) -> Tail. Then peel a
-  // fresh empty StoreBB between Pre and Tail to hold exactly the group's
-  // stores.
+  // Split before At into Tail, then peel an empty StoreBB between Pre and Tail.
   BasicBlock *Tail = Pre->splitBasicBlock(At, Pre->getName() + ".cbssep.tail");
   BasicBlock *StoreBB = BasicBlock::Create(
       Pre->getContext(), Pre->getName() + ".cbssep.st", Pre->getParent(), Tail);
 
-  // Pre: replace the unconditional branch (to Tail) with a guarded branch.
+  // Replace Pre's unconditional branch to Tail with a guarded branch.
   Instruction *PreTerm = Pre->getTerminator();
   IRBuilder<> B(PreTerm);
   B.CreateCondBr(Guard, StoreBB, Tail);
   PreTerm->eraseFromParent();
 
-  // Move each conflicting store into StoreBB, preserving the group's relative
-  // order, together with the pure single-use instructions feeding its POINTER
-  // and VALUE operands that currently live in Tail. The address chain (GEP /
-  // bitcast) and value glue (e.g. `extractelement` from a vectorized result the
-  // mid-end sank next to its store) are side-effect-free and only used by this
-  // store, so relocating them is safe; their own operands are defined before
-  // FirstSI (the split point) and still dominate. Foreign stores and shared
-  // values are left in place. This keeps the move scoped to THIS offset group
-  // even when other groups' stores are interleaved between its members.
-  // Move shared instructions at most once across the whole group (a duplicated
-  // output's value glue feeds several of the group's stores).
+  // Move each store into StoreBB in order, together with the pure operand-chain
+  // instructions (address GEP/bitcast, value glue) that live in Tail and are
+  // used only by this group. `Moved` dedups glue shared across the group's
+  // stores (e.g. a duplicated output).
   SmallPtrSet<Instruction *, 16> Moved;
   IRBuilder<> SB(StoreBB);
   for (StoreInst *SI : Group) {
-    // Collect the pure operand chain (pointer + value) living in Tail by a
-    // small DFS, then move it in dependency order (operands before users).
-    // Multi-use instructions are pulled too — the caller guaranteed every such
-    // value's users are stores in this group, which all move into StoreBB, so
-    // the def still precedes every use. `Moved` dedups shared glue.
+    // DFS the pure operand chain in Tail, collected operands-before-users.
     SmallVector<Instruction *, 8> Ordered;
     SmallPtrSet<Instruction *, 8> Seen;
     std::function<void(Value *)> pull = [&](Value *V) {
@@ -231,10 +177,9 @@ static BasicBlock *guardStoreGroup(ArrayRef<StoreInst *> Group, Value *Guard) {
       if (!I || I->getParent() != Tail || I->mayHaveSideEffects() ||
           isa<StoreInst>(I) || Moved.count(I) || Seen.count(I))
         return;
-      // Only relocate a (possibly multi-use) instruction when EVERY user is
-      // also being hoisted: a store in this group, or another instruction
-      // already marked to move. Otherwise a user left behind in Tail would see
-      // its def sink into the predicated StoreBB and no longer dominate it.
+      // Relocate only when every user is also hoisted; otherwise a user left in
+      // Tail would lose dominance over its def sunk into the predicated
+      // StoreBB.
       for (User *U : I->users()) {
         auto *UI = dyn_cast<Instruction>(U);
         bool UserHoisted = (UI && (Moved.count(UI) || Seen.count(UI))) ||
@@ -290,14 +235,9 @@ static bool separateInFunction(Function &F) {
     if (Stores.size() < 2)
       continue;
 
-    // Group conflicting stores BY OFFSET SSA. Two device stores conflict when
-    // they share the same per-thread offset value but target DIFFERENT base
-    // args (the same per-thread slot in >=2 buffers — the AGX coalescing
-    // trigger). Each such offset group gets ITS OWN predicated block guarded by
-    // ITS OWN in-bounds mask, so a store under a different predicate is never
-    // forced under the wrong guard. Process one group per scan, then re-scan
-    // the continuation (which now holds the remaining stores) for the next
-    // group.
+    // Group conflicting stores by offset SSA: same per-thread offset but
+    // DIFFERENT base args (the AGX coalescing trigger). Process one group per
+    // scan, then re-scan the continuation for the next.
     DenseMap<Value *, SmallVector<StoreInst *, 4>> ByOffset;
     DenseMap<Value *, bool> CrossBuffer;
     DenseMap<Value *, Value *> AnyBaseForOffset;
@@ -313,14 +253,11 @@ static bool separateInFunction(Function &F) {
         CrossBuffer[R.Offset] = true;
     }
 
-    // Pick one offset group that is genuinely cross-buffer, has a real mask,
-    // and is safe to hoist. Hoisting moves the whole group to the position of
-    // its FIRST store; for the result to dominate-check, every store's stored
-    // VALUE (and pointer) must already be available there. A value computed
-    // AFTER the first store (e.g. a `fptrunc` the mid-end sank below the store
-    // run) would become a use-before-def -> the AIR writer emits an invalid
-    // forward record. Such a group is skipped (left un-separated) rather than
-    // miscompiled.
+    // Pick one offset group that is cross-buffer, has a real mask, and is safe
+    // to hoist. Hoisting moves the group to its first store, so every stored
+    // value/pointer must already be available there; a value sunk after the
+    // first store would forward-reference and make the AIR writer emit an
+    // invalid record, so such a group is skipped rather than miscompiled.
     SmallVector<Value *, 8> OffsetOrder;
     for (auto &R : Stores)
       if (R.Offset && ByOffset.count(R.Offset) &&
@@ -341,21 +278,11 @@ static bool separateInFunction(Function &F) {
       for (StoreInst *SI : Vec)
         if (SI->comesBefore(FirstSI))
           FirstSI = SI;
-      // guardStoreGroup relocates each store along with the pure single-use
-      // glue feeding its pointer and value (e.g. a vectorized result's
-      // `extractelement`). That keeps dominance EXCEPT when a store's value is
-      // defined after FirstSI AND cannot be moved with it — i.e. it is impure
-      // or shared (multi-use), so it must stay where it is and would then be
-      // used before its def. Detect that case and skip the group (leave it
-      // un-separated) rather than emit an invalid forward reference. A value
-      // defined before FirstSI, or a movable pure single-use def, is always
-      // safe. A store's value defined after FirstSI is fine as long as it is
-      // PURE and every one of its users is a store in THIS group — then it (and
-      // they) all move together into StoreBB and the def still precedes every
-      // use. A duplicated output (out1==out4) makes the shared `extractelement`
-      // multi-use, which is safe precisely because all those uses are hoisted.
-      // An impure value, or one consumed by something outside the group (a
-      // later non-store use, or a foreign store), cannot be relocated -> skip.
+      // A value defined after FirstSI is safe only if it is pure and every user
+      // is a store in THIS group - then it moves into StoreBB with them and
+      // still precedes every use. An impure value, or one with a user outside
+      // the group, cannot be relocated, so skip the group rather than emit an
+      // invalid forward reference.
       auto allUsersInGroup = [&](Instruction *V) {
         for (User *U : V->users()) {
           auto *SU = dyn_cast<StoreInst>(U);

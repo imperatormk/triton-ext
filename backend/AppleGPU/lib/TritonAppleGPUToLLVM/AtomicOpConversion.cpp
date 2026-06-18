@@ -41,20 +41,10 @@ namespace ttg = mlir::triton::gpu;
 
 namespace {
 
-// Lower triton::AtomicRMWOp → air.atomic.global.{op}.{type}
-//
-// Metal uses explicit AIR intrinsics for atomics:
-//   float @air.atomic.global.add.f32(float addrspace(1)*, float, i32 order, i32
-//   scope, i1 volatile) i32   @air.atomic.global.add.s.i32(i32 addrspace(1)*,
-//   i32, i32 order, i32 scope, i1 volatile) i32
-//   @air.atomic.global.max.s.i32(...) i32   @air.atomic.global.min.s.i32(...)
-//   i32   @air.atomic.global.xchg.s.i32(...)
-//
-// For unsupported native atomics (f32 max/min, f16/bf16 add), we emit a CAS
-// loop:
-//   air.atomic.global.cmpxchg.weak.i32(ptr, expected_ptr, desired, succ_order,
-//   fail_order, scope, vol) returns old i32. Expected is passed by pointer and
-//   updated on failure.
+// Lower triton::AtomicRMWOp → air.atomic.global.{op}.{type}. Natively
+// unsupported atomics (f32 max/min, f16/bf16 add) emit a CAS loop via
+// air.atomic.global.cmpxchg.weak.i32 (expected passed by pointer, updated on
+// failure).
 struct AtomicRMWOpAppleConversion
     : public ConvertOpToLLVMPattern<triton::AtomicRMWOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -84,21 +74,8 @@ struct AtomicRMWOpAppleConversion
     return {};
   }
 
-  // Emit CAS loop for f32 max/min:
-  //   alloca expected
-  //   load old from *ptr (via xchg 0 trick or just initial load)
-  //   loop:
-  //     store old → expected
-  //     new_f = max/min(old_f, val_f)
-  //     new_i = bitcast new_f → i32
-  //     old_i = bitcast old_f → i32
-  //     store old_i → expected
-  //     old_ret = cmpxchg(ptr_i32, &expected, new_i, ...)
-  //     expected_after = load expected
-  //     cmp = icmp eq old_ret, old_i (success if unchanged)
-  //     br cmp → done, loop
-  //   done:
-  //     result = bitcast old_ret → float
+  // CAS loop for f32 max/min: cmpxchg the i32 word until it matches, computing
+  // max/min in f32 each retry.
   Value emitF32CASLoop(ConversionPatternRewriter &rewriter, Location loc,
                        ModuleOp mod, Value ptr, Value val, RMWOp rmwOp) const {
     auto *ctx = rewriter.getContext();
@@ -180,13 +157,9 @@ struct AtomicRMWOpAppleConversion
     return afterBlock->getArgument(0);
   }
 
-  // Emit CAS loop for f16/bf16 atomic add. Metal has NO i16 cmpxchg, so we
-  // widen to i32: load the aligned i32 word, extract the target half, compute,
-  // pack back, cmpxchg i32. The f16/bf16 element may sit at an odd offset, so:
-  //   - aligned_ptr = ptr & ~3   (align down)
-  //   - byte_offset = ptr & 3    → 0 or 2
-  //   - shift       = byte_offset * 8  → 0 or 16
-  //   - mask        = 0xFFFF << shift
+  // CAS loop for f16/bf16 atomic add. Metal has NO i16 cmpxchg, so widen to
+  // i32: load the aligned word, extract the target half (shift = (ptr&3)*8),
+  // compute, pack back, cmpxchg.
   Value emitF16BF16CASLoop(ConversionPatternRewriter &rewriter, Location loc,
                            ModuleOp mod, Value ptr, Value val, Type elemTy,
                            RMWOp rmwOp) const {
@@ -534,9 +507,8 @@ struct AtomicRMWOpAppleConversion
       return success();
     }
 
-    // Tensor atomic: unpack → per-element atomic → pack
-    // Compute redundant thread predicate to mask out threads that
-    // don't own unique elements (e.g. 128 threads, 4 elements → 124 idle)
+    // Tensor atomic: unpack → per-element atomic → pack. The redundant thread
+    // predicate masks out threads that don't own unique elements.
     auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
     Value threadPred =
         emitAppleRedundantThreadPredicate(freeVarMasks, rewriter, loc, mod);
@@ -571,22 +543,14 @@ struct AtomicRMWOpAppleConversion
   }
 };
 
-// Lower triton::AtomicCASOp → air.atomic.global.cmpxchg.weak.{i32,i64}
-//
-// Metal CAS signature:
-//   i32 @air.atomic.global.cmpxchg.weak.i32(
-//       ptr addrspace(1) ptr, ptr addrspace(0) expected,
-//       i32 desired, i32 succ_order, i32 fail_order, i32 scope, i1 volatile)
-// expected is passed by pointer and updated on failure.
-// Returns old value.
+// Lower triton::AtomicCASOp → air.atomic.global.cmpxchg.weak.i32. `expected` is
+// passed by pointer (addrspace 0) and updated on failure; returns old value.
 struct AtomicCASOpAppleConversion
     : public ConvertOpToLLVMPattern<triton::AtomicCASOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
-  // Emit f16/bf16 CAS via i32 CAS on aligned word.
-  // Strategy: align ptr to i32 boundary, read i32 word, replace the target
-  // half with cmp/val, do i32 CAS. No loop needed — CAS semantics guarantee
-  // atomicity. If the CAS fails (other half changed), return the old f16 value.
+  // f16/bf16 CAS via i32 CAS on the aligned word: splice cmp/val into the
+  // target half, one i32 CAS (no loop). Returns the old f16/bf16 value.
   Value emitF16BF16CAS(ConversionPatternRewriter &rewriter, Location loc,
                        ModuleOp mod, Value ptr, Value cmp, Value val,
                        Type elemTy) const {

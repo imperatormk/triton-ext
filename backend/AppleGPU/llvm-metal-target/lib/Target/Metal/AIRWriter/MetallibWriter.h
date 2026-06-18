@@ -49,21 +49,10 @@ struct MetallibOptions {
   MetalVersion Version = MetalVersion::fromOSMajor(16);
 };
 
-// Write the module as a metallib to the output stream.
-//
-// The PointeeTypeMap is critical: LLVM's Module has opaque pointers,
-// but Metal's bitcode format requires typed POINTER records. The writer
-// uses the map to emit:
-// ptr addrspace(1) %buf → float addrspace(1)* %buf (in bitcode)
-//
-// Without the map, all pointers would be opaque and Metal would reject
-// the metallib.
-//
-// Pipeline:
-// Module + PointeeTypeMap
-// → custom bitcode (typed POINTER records, not LLVM's BitcodeWriter)
-// → bitcode wrapper (0x0B17C0DE magic)
-// → metallib container (MTLB header + 4 sections)
+// Write the module as a metallib to the output stream. The PointeeTypeMap is
+// required: Metal's bitcode needs typed POINTER records, which Module's opaque
+// pointers can't provide. Pipeline: custom bitcode (typed records) → bitcode
+// wrapper (0x0B17C0DE magic) → metallib container (MTLB header + 4 sections).
 bool writeMetallib(llvm::Module &M, PointeeTypeMap &PTM, llvm::raw_ostream &OS,
                    const MetallibOptions &Opts = {});
 

@@ -16,14 +16,9 @@
 namespace llvm {
 namespace metal {
 
-/// Emit LLVM Module as bitcode with Metal-compatible typed pointers.
-///
-/// LLVM 17+ only supports opaque pointers in-memory, but Metal's GPU JIT
-/// requires typed POINTER records (code 8) in bitcode. This emitter walks
-/// the Module and uses the PointeeTypeMap to emit typed pointer type records
-/// instead of opaque pointer records (code 25).
-///
-/// This replaces LLVM's WriteBitcodeToFile for Metal targets.
+/// Emit the Module as bitcode with Metal-compatible typed pointers, using the
+/// PointeeTypeMap to emit typed POINTER records (code 8) instead of opaque
+/// pointer records (code 25). Replaces LLVM's WriteBitcodeToFile.
 std::vector<uint8_t> emitMetalBitcode(llvm::Module &M, PointeeTypeMap &PTM);
 
 /// Lower ConstantExpr operands to real instructions. Must run BEFORE

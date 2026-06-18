@@ -22,11 +22,10 @@ using namespace llvm;
 static constexpr StringLiteral kBarrier("air.wg.barrier");
 static constexpr StringLiteral kBarrierOld("air.threadgroup.barrier");
 
-// Sub-track J: arg-rewrite portion dropped. Real-context bisect (post-rename
-// IR on dot3d-int8 / scan2d-bf16) showed the Metal 4 JIT accepts
-// air.wg.barrier with either (2,1) or legacy (1,4) args; only the function
-// name needs to be the modern one (call sites to air.threadgroup.barrier are
-// rejected as "unlowered function call"). See PASS_GUARDS.md sub-track J.
+// The Metal 4 JIT accepts air.wg.barrier with either (2,1) or legacy (1,4)
+// args, but rejects calls to air.threadgroup.barrier as "unlowered function
+// call" - only the function name must be modern. See PASS_GUARDS.md sub-track
+// J.
 static bool barrierRename(Module &M) {
   Function *OldBarrier = M.getFunction(kBarrierOld);
   if (!OldBarrier)
@@ -53,9 +52,9 @@ static bool barrierRename(Module &M) {
   return Changed;
 }
 
-// Adjacent identical barriers (same callee, same constant args, no
-// instruction between) rendezvous the same threads twice; the second is a
-// no-op. Only the exact-adjacent identical case is folded.
+// Two adjacent identical barriers (same callee/constant args, nothing between)
+// rendezvous the same threads twice; the second is a no-op. Only the
+// exact-adjacent case is folded.
 static bool dropAdjacentDuplicateBarriers(Module &M) {
   Function *Barrier = M.getFunction(kBarrier);
   if (!Barrier)

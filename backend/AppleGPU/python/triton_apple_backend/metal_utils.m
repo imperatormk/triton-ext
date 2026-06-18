@@ -1,19 +1,13 @@
-// metal_utils — Triton Apple backend Metal runtime
-//
-// JIT-compiled at first use. Links against user's installed libtorch
-// to access getMTLBufferStorage() for zero-copy MPS tensor dispatch.
-//
-// Works with any PyTorch version that has MPS support (2.0+).
-// No custom PyTorch wheel needed.
+// metal_utils - Triton Apple backend Metal runtime.
+// Links against the user's libtorch for getMTLBufferStorage() (zero-copy MPS
+// tensor dispatch). Works with any PyTorch 2.0+ MPS build.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-// From PyTorch: ATen/native/mps/OperationUtils.h
-// getMTLBufferStorage = __builtin_bit_cast(id<MTLBuffer>,
-// tensor.storage().data()) We link against libtorch to get THPVariable_Unpack.
+// getMTLBufferStorage mirrors PyTorch's ATen/native/mps/OperationUtils.h.
 #include <ATen/Tensor.h>
 #include <ATen/mps/MPSStream.h>
 #include <torch/csrc/autograd/python_variable.h>
@@ -22,12 +16,12 @@ static inline id<MTLBuffer> getMTLBufferStorage(const at::TensorBase &t) {
   return __builtin_bit_cast(id<MTLBuffer>, t.storage().data());
 }
 
-// Use PyTorch's MPS device — same device that owns the tensor buffers.
+// Use PyTorch's MPS device - same device that owns the tensor buffers.
 static id<MTLDevice> get_device(void) {
   return at::mps::getCurrentMPSStream()->device();
 }
 
-// ── MetalKernel — callable PSO wrapper ───────────────────────────────────
+// ── MetalKernel - callable PSO wrapper ───────────────────────────────────
 
 typedef struct {
   PyObject_HEAD id<MTLComputePipelineState> pso;
@@ -60,8 +54,8 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
 
   Py_ssize_t nargs = PyTuple_Size(args);
 
-  // Pre-extract tensor buffers and scalar values before entering the
-  // Metal dispatch block (Python API calls not safe inside dispatch_sync).
+  // Pre-extract before the dispatch block: Python API calls are not safe
+  // inside dispatch_sync.
   struct ArgInfo {
     enum Kind { TENSOR, INT, FLOAT } kind;
     id<MTLBuffer> buf;
@@ -74,9 +68,8 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
     PyObject *arg = PyTuple_GetItem(args, i);
     if (THPVariable_Check(arg)) {
       at::Tensor t = THPVariable_Unpack(arg);
-      // Guard before touching t.device(): a tensor with no storage/device
-      // (e.g. from an ABI-skewed libtorch build) makes t.device() abort with
-      // an uncatchable c10::Error. Report cleanly instead of crashing.
+      // Guard before t.device(): a storage-less tensor (ABI-skewed libtorch)
+      // makes t.device() abort with an uncatchable c10::Error.
       if (!t.defined() || !t.has_storage()) {
         PyErr_Format(PyExc_RuntimeError,
                      "Arg %zd: tensor is undefined or has no storage "
@@ -106,23 +99,10 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
     }
   }
 
-  // Use PyTorch's MPS stream directly — encode on the same command buffer
-  // so ordering with other MPS ops is guaranteed.
-  // CRITICAL: Must dispatch on stream->queue() (the serial queue) to
-  // synchronize with other MPS operations (MPSGraph, blit copies, etc.)
-  // that also use this queue. Without this, commandEncoder/endKernelCoalescing
-  // race with concurrent MPS graph executions causing nondeterministic results.
-  //
-  // PERF: We deliberately do NOT call endKernelCoalescing() here. PyTorch's
-  // MPSStream::commandEncoder() caches one compute encoder; reusing it across
-  // back-to-back Triton dispatches coalesces them into a single encoder (and a
-  // single command buffer), so Metal pipelines them instead of paying encoder
-  // setup/teardown per kernel. The encoder uses the default serial dispatch
-  // type, so RAW dependencies between consecutive kernels are still honored by
-  // the implicit barrier between serial dispatches. Whenever torch needs to
-  // interleave a blit copy or MPSGraph it calls endKernelCoalescing() itself
-  // (MPSStream::copy / executeMPSGraph), so our open encoder is always closed
-  // before any other queue work, preserving global ordering and correctness.
+  // Dispatch on stream->queue() (serial) to serialize with other MPS ops, else
+  // they race. Deliberately do NOT call endKernelCoalescing(): reusing torch's
+  // cached encoder coalesces back-to-back dispatches; RAW deps are still
+  // honored.
   @autoreleasepool {
     auto stream = at::mps::getCurrentMPSStream();
 
@@ -177,7 +157,7 @@ static PyTypeObject MetalKernelType = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
 };
 
-// ── MetalLibrary — metallib container ────────────────────────────────────
+// ── MetalLibrary - metallib container ────────────────────────────────────
 
 typedef struct {
   PyObject_HEAD id<MTLLibrary> library;
@@ -205,9 +185,8 @@ static PyObject *MetalLibrary_get_function(MetalLibraryObject *self,
   id<MTLComputePipelineState> pso =
       [get_device() newComputePipelineStateWithFunction:fn error:&error];
   if (!pso) {
-    // The Metal PSO compiler often hides the real diagnostic in the error's
-    // userInfo (and any underlying error) rather than localizedDescription.
-    // Surface the whole thing so codegen failures are actionable.
+    // The PSO compiler often hides the real diagnostic in userInfo / the
+    // underlying error rather than localizedDescription; surface all of it.
     NSMutableString *full = [NSMutableString string];
     [full appendFormat:@"%@", [error localizedDescription]];
     NSDictionary *info = [error userInfo];

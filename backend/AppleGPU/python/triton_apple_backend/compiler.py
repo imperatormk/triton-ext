@@ -16,14 +16,10 @@ from triton._C.libtriton import ir, passes, llvm
 
 
 def _host_macos_major() -> int:
-    """Target macOS major version for AIR emission.
+    """Target macOS major version for AIR emission (host == target since we JIT).
 
-    Triton JITs on the machine it runs on, so the host macOS version IS the
-    target. Apple changed the simdgroup-MMA intrinsic signature + several AIR
-    version fields across OS versions (verified via `xcrun metal
-    -mmacosx-version-min=N`): the discriminator is the macOS major. macOS 26
-    (the 2025 renumber) maps to the "16" era for AIR purposes.
-
+    Apple changed the simdgroup-MMA intrinsic signature + AIR version fields
+    across OS versions, keyed on the macOS major; macOS 26 maps to the "16" era.
     Override with TRITON_MPS_TARGET_OS_MAJOR (e.g. for cross-compiling).
     """
     env = os.environ.get("TRITON_MPS_TARGET_OS_MAJOR")
@@ -35,12 +31,10 @@ def _host_macos_major() -> int:
     try:
         import platform
         major = int(platform.mac_ver()[0].split(".")[0])
-        # Apple renumbered macOS 16 -> 26; both are the same AIR era ("16").
         major = 16 if major >= 16 else major
     except Exception:
         major = 16  # default: current shipping target
-    # Export so the C++ DotOp lowering pass (reads TRITON_MPS_TARGET_OS_MAJOR)
-    # selects the matching simdgroup intrinsic signature.
+    # Export so the C++ DotOp lowering pass selects the matching intrinsic.
     os.environ.setdefault("TRITON_MPS_TARGET_OS_MAJOR", str(major))
     return major
 
@@ -63,14 +57,8 @@ def _pmaybe_enable_debug(pm):
 
 
 def _find_llc():
-    """Locate the metal-llc binary shipped by the AppleGPU backend.
+    """Locate the metal-llc binary (nested or standalone build layout).
 
-    `metal-llc` is produced by `backend/AppleGPU/llvm-metal-target/`. Two
-    layouts are supported:
-      - Nested (default `make build`):
-          <triton-ext>/build/backend/AppleGPU/llvm-metal-target/bin/metal-llc
-      - Standalone (`cmake -S llvm-metal-target -B llvm-metal-target/build`):
-          <triton-ext>/backend/AppleGPU/llvm-metal-target/build/bin/metal-llc
     Override with METAL_LLC_PATH for ad-hoc dev.
     """
     if os.environ.get('METAL_LLC_PATH'):
@@ -89,8 +77,6 @@ def _find_llc():
     return None
 
 
-# Sized scalar types that may appear as the element type of an `addrspace(3)`
-# global. Vectors are handled by multiplying through.
 def _load_metalir():
     """Return a compile function backed by the out-of-tree `metal-llc`."""
     llc = _find_llc()
@@ -281,15 +267,10 @@ class MPSBackend(BaseBackend):
 
     # ── Stage 3: LLVM IR with simdgroup intrinsics ─────────────────────────
     def make_llir(self, mod, metadata, options):
-        # Resolve the target macOS major *before* running the lowering passes.
-        # The C++ DotOp→AIR pass reads TRITON_MPS_TARGET_OS_MAJOR via getenv to
-        # pick the simdgroup-matrix intrinsic signature (canonical for macOS<=15
-        # vs the 3-vector form for macOS>=16). `_host_macos_major()` exports the
-        # env var as a side effect; it must run here, since make_metallib (which
-        # also calls it, for the llc triple) runs only AFTER this pass — too late
-        # to influence the signature. Without this, macOS 14 was handed the
-        # macOS-16 3-vector MMA intrinsic and the driver crashed PSO creation
-        # ("Compiler encountered an internal error").
+        # Must run here: the C++ DotOp→AIR pass reads TRITON_MPS_TARGET_OS_MAJOR
+        # (exported as a side effect) to pick the simdgroup-matrix intrinsic
+        # signature, and the only other caller (make_metallib) runs too late.
+        # Wrong signature crashes PSO creation.
         _host_macos_major()
 
         pm = ir.pass_manager(mod.context)
@@ -315,9 +296,8 @@ class MPSBackend(BaseBackend):
         llvm.init_targets()
         context = llvm.context()
         llvm_mod = llvm.to_module(mod, context)
-        # Standard mid-end optimization, same call as the NVIDIA backend
-        # (DISABLE_LLVM_OPT=1 skips it). metal-llc only runs the codegen IR
-        # prologue (LSR), so without this the LLVM IR ships unoptimized.
+        # Mid-end optimization (metal-llc only runs the codegen prologue, so
+        # without this the IR ships unoptimized). Same call as the NVIDIA backend.
         _opt_level = {
             '0': None,
             '1': llvm.OPTIMIZE_O1,
@@ -325,9 +305,8 @@ class MPSBackend(BaseBackend):
             '3': llvm.OPTIMIZE_O3,
         }[os.environ.get('METAL_LLVM_OPT_LEVEL', '3')]
         if _opt_level is not None:
-            # Optional: capture the pre-O3 module for offline triage of an LLVM
-            # mid-end hang (enable with METAL_DUMP_PREOPT_DIR). A wide loop-carried
-            # literal-struct phi (large per-thread tile) makes IPSCCP non-terminate.
+            # METAL_DUMP_PREOPT_DIR captures the pre-O3 module for offline triage
+            # of a mid-end hang.
             _preopt_dir = os.environ.get('METAL_DUMP_PREOPT_DIR')
             _preopt_path = None
             if _preopt_dir:
@@ -357,11 +336,9 @@ class MPSBackend(BaseBackend):
         if os.environ.get('TRITON_MPS_DEBUG'):
             open('/tmp/raw_pre.ll', 'w').write(llvm_ir)
 
-        # Recompute shared memory: Triton's ttg.shared only counts the
-        # reduction scratchpad (global_smem). The Apple GPU convert_layout
-        # lowering adds __tg_cvt_* threadgroup globals whose sizes depend
-        # on the tile configuration. Compute the real total from the LLVM IR
-        # so the autotuner can reject configs that exceed the 32 KB limit.
+        # ttg.shared counts only the reduction scratchpad; the real total
+        # (incl. __tg_cvt_* convert globals) is recomputed downstream from the
+        # IR so the autotuner can reject configs over the 32 KB limit.
         metadata["_llvm_ir"] = llvm_ir
 
         return llvm_mod
@@ -388,9 +365,8 @@ class MPSBackend(BaseBackend):
         entry_names = [n for n in defined_names if n not in called]
         if len(entry_names) != 1:
             # The optimizer may inline a noinline helper's only call site,
-            # leaving the (dead) helper as a second uncalled define. The
-            # conversion stamps the launchable entry with the "air-kernel"
-            # function attribute; resolve through it.
+            # leaving a dead helper as a second uncalled define. Disambiguate
+            # via the "air-kernel" attribute that marks the launchable entry.
             attr_groups = {
                 m.group(1)
                 for m in re.finditer(
@@ -418,10 +394,9 @@ class MPSBackend(BaseBackend):
             kname = metadata["name"]
             open(f'/tmp/dot_kernel_{kname}.ll', 'w').write(llvm_ir)
 
-        # MetalIR C++ pipeline: LLVM IR → AIR transforms → v1 bitcode → metallib.
-        # One llc run also returns the post-coalesce threadgroup total; the
-        # backend convert/dot lowerings add __tg_* globals past ttg.shared, so
-        # the real footprint replaces the front-end estimate here.
+        # MetalIR C++ pipeline: LLVM IR → AIR → v1 bitcode → metallib. The same
+        # llc run returns the real threadgroup total (incl. __tg_* convert/dot
+        # globals past ttg.shared), replacing the front-end estimate.
         result, tg_bytes = _get_metalir_compile()(llvm_ir)
         metadata["shared"] = tg_bytes
         if debug:

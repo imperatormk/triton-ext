@@ -41,10 +41,8 @@ namespace ttg = mlir::triton::gpu;
 
 namespace {
 
-// ConvertLayoutOp for DotOperandEncoding or blocked→blocked:
-//
-// - DotOperandEncoding target: identity pass-through (elements same per thread)
-// - blocked→blocked: TG scatter/gather redistribution
+// ConvertLayoutOp: identity pass-through for DotOperandEncoding targets,
+// TG scatter/gather redistribution for blocked->blocked.
 struct ConvertLayoutOpAppleConversion
     : public mlir::ConvertOpToLLVMPattern<ttg::ConvertLayoutOp> {
   using mlir::ConvertOpToLLVMPattern<
@@ -71,24 +69,19 @@ struct ConvertLayoutOpAppleConversion
     auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
     auto dstTy = cast<RankedTensorType>(op.getResult().getType());
 
-    // DotOperandEncoding target — identity pass-through when source is
-    // blocked encoding.  Our dot lowering looks through convert_layout to
-    // get source blocked values and uses blocked encoding for scatter/gather.
-    // When the source is MMA encoding, the element count per thread differs
-    // from the DotOperandEncoding count, so we must NOT pass through
-    // (the shared LinearLayout-based convert_layout handles that case).
+    // DotOperandEncoding target: identity pass-through from blocked source (the
+    // dot lowering peels the cvt). NOT for an MMA source - its per-thread
+    // element count differs, so the shared LinearLayout cvt must handle it.
     if (isa<ttg::DotOperandEncodingAttr>(dstTy.getEncoding()) &&
         isa<ttg::BlockedEncodingAttr>(srcTy.getEncoding())) {
       rewriter.replaceOp(op, adaptor.getSrc());
       return success();
     }
 
-    // A/B operands of an AppleMma dot never need lowering: the dot pattern
-    // reads operand registers from the convert SOURCE (resolveOperand peels
-    // the cvt) or straight from SMEM/device, so the converted struct is dead
-    // in every dot path. Lowering it anyway burns a __tg_cvt strip plus
-    // stores+barriers DCE cannot strip, which pushes pipelined kernels at
-    // the 32KB staging cap over the TG budget.
+    // A/B operands of an AppleMma dot need no lowering: the dot pattern reads
+    // them from the cvt SOURCE, so the converted struct is dead. Lowering it
+    // anyway burns a __tg_cvt strip that pushes pipelined kernels over the
+    // 32KB TG cap.
     if (!op->use_empty() &&
         isa<ttg::BlockedEncodingAttr>(srcTy.getEncoding())) {
       bool onlyMmaABUses = true;
@@ -107,13 +100,10 @@ struct ConvertLayoutOpAppleConversion
       }
     }
 
-    // A 1-D convert between #ttg.slice encodings (the reduce-result restripe,
-    // e.g. slice<dim=1,#blocked[8,4]> -> slice<dim=1,#blocked[32,1]>) routes
-    // through the linear-layout-indexed TG scatter/gather. The upstream smem
-    // path miscompiles this restripe: it derives the store and gather smem
-    // slots from inconsistent warp/lane formulas (store collapses the reduce
-    // dim, gather does not), so half the rows read a stale slot and a -inf
-    // reduce-init leaks into the result.
+    // 1-D #ttg.slice -> #ttg.slice (reduce-result restripe) routes through the
+    // LL-indexed TG scatter/gather: the upstream smem path miscompiles it
+    // (store collapses the reduce dim, gather does not -> stale-slot reads,
+    // -inf reduce-init leaks into the result).
     if (srcTy.getShape().size() == 1 &&
         isa<ttg::SliceEncodingAttr>(srcTy.getEncoding()) &&
         isa<ttg::SliceEncodingAttr>(dstTy.getEncoding()) &&
@@ -136,23 +126,9 @@ struct ConvertLayoutOpAppleConversion
     if (!dstEnc || (!srcEnc && !srcMmaEnc))
       return failure();
 
-    // When the conversion is within a single simdgroup (or a pure register
-    // shuffle) it needs no shared memory: hand it to the shared upstream
-    // ConvertLayout pattern, which moves the values with simd_shuffle (Apple
-    // TargetInfo implements shuffleIdx/shuffleXor/permute). This is what turns
-    // the #mma -> #blocked C-output convert into a register+shuffle epilogue
-    // (no __tg_cvt buffer, no barriers) once StoreShuffleLayout has re-laid the
-    // store into the simdgroup-shuffle layout. The threadgroup scatter/gather
-    // below stays as the fallback for the cross-warp converts that genuinely
-    // need shared memory (the upstream smem path miscompiles some replicated
-    // fp16/bf16 cases, which is exactly why those route through here instead).
-    // Pointer-element tensors stay on the TG path: the upstream shuffle
-    // pattern cannot move !tt.ptr elements.
-    // #mma sources stay on the in-tree TG-scatter epilogue: the upstream
-    // simd-shuffle pattern builds a ColumnAction from the source LinearLayout
-    // and asserts on the fragment struct's element count (LinearLayout.cpp
-    // ColumnAction::apply). The TG-scatter path reads the fragment via the
-    // (fragIdx, vecIdx) slot map and is correct (just slower).
+    // Defer no-shared-memory converts to upstream simd_shuffle. Exceptions stay
+    // on the TG path: !tt.ptr elements (shuffle can't move them) and #mma
+    // sources (shuffle's ColumnAction asserts on the fragment element count).
     if (!srcMmaEnc && !isa<triton::PointerType>(srcTy.getElementType()) &&
         !cvtNeedsSharedMemory(srcTy, dstTy))
       return failure();
@@ -172,28 +148,17 @@ struct ConvertLayoutOpAppleConversion
                              dstTy, loc, ctx, mod);
     }
 
-    // #mma (fragment) -> W-blocked store epilogue: when StoreShuffleLayout has
-    // re-laid the store into the within-simdgroup "W" layout, the convert moves
-    // every C element to a lane in the SAME simdgroup it already occupies, so
-    // it needs no shared memory. Lower it as a register-only air.simd_shuffle
-    // restripe (oracle-validated in tools/fragment-oracle) instead of the TG
-    // scatter/gather below. On any unexpected shape we fall through to the
-    // (always-correct) TG path.
+    // #mma -> W-blocked store epilogue: lower as a register-only simd_shuffle
+    // restripe; unexpected shapes fall through to the TG path below.
     if (srcMmaEnc && !cvtNeedsSharedMemory(srcTy, dstTy)) {
       if (succeeded(convertMmaToWShuffle(op, adaptor, rewriter, srcMmaEnc,
                                          dstEnc, srcTy, dstTy, loc, ctx, mod)))
         return success();
     }
 
-    // ND blocked->blocked: handle rank>=2 by operating on the trailing two
-    // dimensions (rows, cols). For rank>2 we require every leading dim to be
-    // size 1 so the whole tensor is a single (rows x cols) tile; this is the
-    // case the upstream transferWithinBlockSwizzling miscompiles for fp16/bf16
-    // replicated layouts (it vectorizes the replicated registers into a
-    // <2 x half> store at a 2-byte stride but reads them back at a 4-byte
-    // stride, corrupting the row+16 slot). Our scatter/gather is fully scalar
-    // and addresses TG by (row,col) coordinate, so it is correct regardless of
-    // replication. Routing the convert here keeps the fix entirely in-tree.
+    // ND blocked->blocked on trailing two dims; rank>2 requires leading dims
+    // size 1. Upstream transferWithinBlockSwizzling miscompiles fp16/bf16
+    // replicated layouts here, so use a fully-scalar (row,col) scatter/gather.
     unsigned rank = shape.size();
     if (rank < 2)
       return failure();
@@ -265,10 +230,8 @@ struct ConvertLayoutOpAppleConversion
     Value c32 = arith::ConstantIntOp::create(rewriter, loc, 32, 32);
     Value warpId = arith::DivUIOp::create(rewriter, loc, tid32, c32);
 
-    // Strip height = largest multiple of 8 that fits in the 32KB TG budget
-    // (fewer strips = fewer barriers); floored to rows when the full tensor
-    // fits. Account for global_smem (from allocate-shared-memory pass) and
-    // MMA dot TG buffers (from tt.dot pre-scan) against the 32KB cap.
+    // Strip height = largest multiple of 8 fitting the 32KB TG budget (fewer
+    // strips = fewer barriers), minus live global_smem and MMA dot TG buffers.
     constexpr int64_t tgBudgetBytes = 32 * 1024;
     int64_t smemBytes = 0;
     bool smemLive = true;
@@ -291,14 +254,9 @@ struct ConvertLayoutOpAppleConversion
     int64_t stripRows = std::min(maxStripRows, rows);
     int64_t tgStripSize = stripRows * cols;
     int64_t tgSize = tgStripSize;
-    // Pool every 2D convert scatter/gather into ONE shared TG global per
-    // (element-type) key, sized to the running max, instead of a fresh
-    // counter-numbered buffer per conversion. Each convert round-trips
-    // through this buffer fully fenced (scatter, barrier, gather, barrier),
-    // so distinct conversions never have overlapping live TG ranges and can
-    // safely alias the same storage. Sharing one buffer keeps the addrspace(3)
-    // footprint at a single tile instead of N tiles, which is what kept the
-    // fused fp16 epilogue (3 separate 64x64 half buffers) under the 32KB cap.
+    // Pool all 2D convert scatter/gathers into ONE shared TG global per
+    // element-type key, sized to the running max. Each convert is fully fenced,
+    // so live ranges are disjoint and can alias one buffer.
     std::string tgName =
         ("__tg_cvt_" + llvm::Twine(getCvtPoolKey(tgElemTy))).str();
     {
@@ -399,17 +357,10 @@ struct ConvertLayoutOpAppleConversion
       return {bR, bC, pred};
     };
 
-    // Per-lane base (row,col) for an AppleMma source under the PHYSICAL
-    // toLinearLayout (AppleMmaLayoutConversions.cpp). emitOffsetForLayout fixes
-    // lane=0, warp=0 and enumerates only the register in-dim, so the lane+warp
-    // contribution to the absolute (row,col) must be added here. The physical
-    // per-lane storage is:
+    // Per-lane base (row,col) for an AppleMma source; adds the lane+warp
+    // contribution emitOffsetForLayout omits. Physical per-lane storage:
     //   phys_row = L1 | (L2<<1) | (L4<<2)
     //   phys_col = (L0<<1) | (L3<<2)        (register supplies col bit 0)
-    // with column-major warp tiling (warpRow = warpId/wN, warpCol = warpId%wN,
-    // warpOrder={1,0}), each warp owning an 8-row/8-col simdgroup tile step.
-    // The owned offsets enumerated by emitOffsetForLayout already cover exactly
-    // the in-bounds MxN tensor positions, so the predicate is always true.
     auto makeBaseMma =
         [&](AppleMmaEncodingAttr enc) -> std::tuple<Value, Value, Value> {
       auto wpc = enc.getWarpsPerCTA();
@@ -448,9 +399,7 @@ struct ConvertLayoutOpAppleConversion
       return {bR, bC, truePred};
     };
 
-    // Use LinearLayout-based offsets (matches upstream element ordering).
-    // The source may be blocked or AppleMma; both expose toLinearLayout, so
-    // emitOffsetForLayout enumerates this lane's owned per-register offsets.
+    // LinearLayout-based per-register offsets (blocked or AppleMma source).
     Attribute srcEncAttr = srcMmaEnc ? Attribute(srcMmaEnc) : Attribute(srcEnc);
     auto srcOffsets = emitOffsetForLayout(srcEncAttr, srcTy);
     auto dstOffsets = emitOffsetForLayout(dstEnc, dstTy);
@@ -467,15 +416,14 @@ struct ConvertLayoutOpAppleConversion
     bool srcFragment = srcMmaEnc && sStructTy && !sStructTy.getBody().empty() &&
                        isa<VectorType>(sStructTy.getBody()[0]);
     if (srcFragment) {
-      // #mma fragment struct → per-element scalars via the (fragIdx, vecIdx)
-      // slot map, so the downstream TG-scatter epilogue sees flat scalars.
+      // #mma fragment struct -> per-element scalars via the (fragIdx, vecIdx)
+      // slot map, so the TG-scatter epilogue sees flat scalars.
       auto info = applegpu::getAppleMmaFragmentInfo(srcTy, srcMmaEnc);
       auto fragElemTy =
           cast<VectorType>(sStructTy.getBody()[0]).getElementType();
-      // The fragment carries f32 even for an f16/bf16 #mma accumulator (the
-      // narrowing is deferred here). Narrow each EXTRACTED SCALAR to the dst
-      // element type — a scalar fptrunc the AGX JIT compiles correctly, unlike
-      // a vector bf16 round-trip on the simdgroup register.
+      // Fragment carries f32 even for an f16/bf16 accumulator; narrow each
+      // extracted SCALAR (scalar fptrunc compiles correctly on AGX, unlike a
+      // vector bf16 round-trip on the simdgroup register).
       Type dstElemTy = getTypeConverter()->convertType(dstTy.getElementType());
       bool narrowScalar = fragElemTy != dstElemTy &&
                           isa<FloatType>(fragElemTy) &&
@@ -543,15 +491,11 @@ struct ConvertLayoutOpAppleConversion
     SmallVector<Value> dstElems(dstCoords.size());
     Value zeroElem;
     if (isPointerElem) {
-      // The masked-out fallback for a pointer-typed lane must NOT be a null
-      // (address 0) device pointer. Metal's AIR materializer refuses to build a
-      // PSO for a kernel that can store through a constant-null device pointer
-      // ("Failed to materializeAll"), even when that store is predicated off.
-      // Reuse a real input pointer (srcElems[0]) as the neutral element: it is
-      // a valid pointer of the right type and address space, and is only ever
-      // selected into masked-out lanes whose stores are disabled, so it is
-      // never actually dereferenced. This keeps the materializer happy without
-      // changing observable behaviour.
+      // The masked-out fallback for a pointer lane must NOT be a null device
+      // pointer: the AIR materializer refuses to build a PSO that can store
+      // through a constant-null device ptr ("Failed to materializeAll") even
+      // when predicated off. Reuse a real input pointer (srcElems[0]) as the
+      // neutral element - valid, never dereferenced.
       if (!srcElems.empty()) {
         zeroElem = srcElems[0];
       } else {
@@ -573,12 +517,10 @@ struct ConvertLayoutOpAppleConversion
       int64_t rowStart = strip * stripRows;
       int64_t rowEnd = std::min(rowStart + stripRows, rows);
 
-      // Scatter source elements for this strip via a predicated store.
-      // pred = srcPred && inStrip(rOff); srcPred is a single
-      // shared in-bounds value and inStrip depends only on rOff, so all
-      // elements in a row share one predicate. Group by rOff and emit one
-      // conditional block per distinct row instead of per element, keeping the
-      // block count proportional to strip rows rather than the full tile.
+      // Scatter this strip via predicated stores. pred = srcPred &&
+      // inStrip(rOff) is shared per row, so group by rOff and emit one
+      // conditional block per distinct row (block count proportional to strip
+      // rows, not the full tile).
       std::map<int64_t, SmallVector<size_t>> srcByRow;
       SmallVector<int64_t> srcRowOrder;
       for (size_t i = 0; i < srcElems.size(); ++i) {
@@ -589,8 +531,7 @@ struct ConvertLayoutOpAppleConversion
       }
       bool singleStripSrc = (numStrips == 1);
       for (int64_t rOff : srcRowOrder) {
-        // Single strip => every row is in-strip, so pred collapses to srcPred
-        // and the row-range compare is dropped.
+        // Single strip => every row in-strip; pred collapses to srcPred.
         Value pred;
         if (singleStripSrc) {
           pred = srcPred;
@@ -634,13 +575,9 @@ struct ConvertLayoutOpAppleConversion
       LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                            ValueRange{fenceTG, execMod});
 
-      // Gather destination elements for this strip.
-      // Use wrapped dstBaseRow (already < rows) for strip check — do NOT
-      // gate by dstPred. When tileM > rows, multiple threads wrap to the
-      // same row; all need the correct TG value regardless of dstPred.
-      // inStrip depends only on rOff, so compute it once per distinct row and
-      // reuse it across that row's elements instead of recomputing the strip
-      // compare per element.
+      // Gather this strip. Use wrapped dstBaseRow for the strip check; do NOT
+      // gate by dstPred - when tileM > rows, multiple threads wrap to the same
+      // row and all need the correct TG value. inStrip is shared per row.
       std::map<int64_t, SmallVector<size_t>> dstByRow;
       SmallVector<int64_t> dstRowOrder;
       for (size_t i = 0; i < dstCoords.size(); ++i) {
@@ -649,14 +586,9 @@ struct ConvertLayoutOpAppleConversion
           dstRowOrder.push_back(rOff);
         dstByRow[rOff].push_back(i);
       }
-      // Single-strip fast path: the whole tile fits one TG pass, so every
-      // destination row is unconditionally in-strip (rowStart=0, rowEnd=rows,
-      // dstBaseRow already wrapped < rows). The per-element safeIdx select and
-      // the merge select then both reduce to the gathered value, so emit a
-      // plain GEP+load+assign and drop the two selects and the per-row strip
-      // compare. This is the dominant cost of the #mma->#blocked output convert
-      // (its select/icmp chain is ~99% of a 128x128x64 dot's LLVM IR), so the
-      // single-strip elision shrinks that IR by roughly half.
+      // Single-strip fast path: whole tile fits one TG pass, so every dst row
+      // is unconditionally in-strip; emit plain GEP+load and elide the
+      // select/icmp chain.
       bool singleStrip = (numStrips == 1);
       Value zeroIdx = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
       for (int64_t rOff : dstRowOrder) {
@@ -723,11 +655,10 @@ struct ConvertLayoutOpAppleConversion
     return success();
   }
 
-  // #mma fragment -> W-blocked register shuffle restripe (store epilogue).
-  // Each W destination element (row,col) is gathered from the #mma physical
-  // lane that owns tile-local (row%8, col%8) via air.simd_shuffle on the
-  // col-parity register. Pure registers, no shared memory, no barriers.
-  // Validated bit-exact in tools/fragment-oracle (store-restripe case).
+  // #mma -> W-blocked register-shuffle restripe (store epilogue). Each W dst
+  // (row,col) is gathered from the #mma lane owning tile-local (row%8, col%8)
+  // via air.simd_shuffle on the col-parity register. No shared memory, no
+  // barriers; bit-exact in tools/fragment-oracle.
   LogicalResult convertMmaToWShuffle(ttg::ConvertLayoutOp op, OpAdaptor adaptor,
                                      ConversionPatternRewriter &rewriter,
                                      AppleMmaEncodingAttr srcMmaEnc,
@@ -760,9 +691,7 @@ struct ConvertLayoutOpAppleConversion
 
     auto i16Ty = IntegerType::get(ctx, 16);
 
-    // Per-lane W base (row,col). The W layout is tile-aligned within each warp,
-    // so dstEnc's per-register offsets plus this lane's base give the absolute
-    // (row,col) every output element lands on.
+    // Per-lane W base (row,col); + dstEnc per-register offsets = absolute pos.
     Value laneId = emitLaneId(rewriter, loc, mod);
     auto tpw = dstEnc.getThreadsPerWarp();
     auto spt = dstEnc.getSizePerThread();
@@ -836,8 +765,8 @@ struct ConvertLayoutOpAppleConversion
                                shl(bit(tRow, 2), 4)));
       Value srcLane16 = arith::TruncIOp::create(rewriter, loc, i16Ty, srcLane);
 
-      // Which fragment register holds (absRow,absCol). fragIdx is constant per
-      // owned tile; for the W store one frag per 8x8 tile, vecIdx = col parity.
+      // Fragment register holding (absRow,absCol): one frag per 8x8 tile,
+      // vecIdx = col parity.
       int64_t fragIdx, vecIdx;
       applegpu::appleMmaFragmentSlot(rOff, cOff, srcInfo, fragIdx, vecIdx);
       if (fragIdx >= (int64_t)frags.size())
@@ -846,8 +775,8 @@ struct ConvertLayoutOpAppleConversion
       Value scalar =
           LLVM::ExtractElementOp::create(rewriter, loc, frags[fragIdx], vIdx);
       Value shuffled = emitFragShuffle(rewriter, loc, mod, scalar, srcLane16);
-      // f16/bf16 accumulator: the fragment is f32; narrow the shuffled scalar
-      // to the dst element type (a scalar fptrunc, off the simdgroup register).
+      // f16/bf16 accumulator: fragment is f32; narrow the shuffled scalar
+      // (scalar fptrunc, off the simdgroup register).
       Type outElemTy = outSt.getBody()[i];
       if (shuffled.getType() != outElemTy &&
           isa<FloatType>(shuffled.getType()) && isa<FloatType>(outElemTy) &&
@@ -934,9 +863,8 @@ struct ConvertLayoutOpAppleConversion
     Value c32 = arith::ConstantIntOp::create(rewriter, loc, 32, 32);
     Value warpId = arith::DivUIOp::create(rewriter, loc, tid32, c32);
 
-    // Create TG global (pooled per element type, sized to running max). The
-    // 1D scatter/gather is fully fenced like the 2D path, so distinct
-    // conversions of the same element type share one barrier-disjoint buffer.
+    // TG global pooled per element type (fully fenced like the 2D path, so
+    // same-type conversions share one barrier-disjoint buffer).
     std::string tgName =
         ("__tg_cvt_" + llvm::Twine(getCvtPoolKey(tgElemTy))).str();
     {
@@ -967,10 +895,9 @@ struct ConvertLayoutOpAppleConversion
       Value sptV = arith::ConstantIntOp::create(rewriter, loc, spt, 32);
       Value tpwV = arith::ConstantIntOp::create(rewriter, loc, tpw, 32);
       Value wpcV = arith::ConstantIntOp::create(rewriter, loc, wpc, 32);
-      // Clamp the physical warp/lane into this layout's logical extent: when
-      // warpsPerCTA[0] < the threadgroup's warp count (the dim-0 span is
-      // smaller than the physical grid), raw warpId would index past the buffer
-      // slot.
+      // Clamp physical warp/lane into the layout's logical extent: when
+      // warpsPerCTA[0] < the threadgroup warp count, raw warpId would index
+      // past the buffer slot.
       Value warpIdx = arith::RemUIOp::create(rewriter, loc, warpId, wpcV);
       Value laneIdx = arith::RemUIOp::create(rewriter, loc, laneId, tpwV);
       Value base = arith::AddIOp::create(
@@ -1050,10 +977,9 @@ struct ConvertLayoutOpAppleConversion
   }
 
   // 1D convert for arbitrary distributed encodings (e.g. #ttg.slice). The smem
-  // slot for each register is the element's actual tensor index (from
-  // emitIndices), so the scatter store and gather load address the same slot by
-  // construction — unlike the parametric warp/lane formula in computeBase1D,
-  // which only holds for the contiguous blocked layout.
+  // slot is each register's actual tensor index (emitIndices), so scatter and
+  // gather address the same slot by construction - unlike computeBase1D's
+  // warp/lane formula, which only holds for contiguous blocked layouts.
   LogicalResult convertLayout1DGeneric(ttg::ConvertLayoutOp op,
                                        OpAdaptor adaptor,
                                        ConversionPatternRewriter &rewriter,

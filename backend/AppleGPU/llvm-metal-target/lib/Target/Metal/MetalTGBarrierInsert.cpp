@@ -22,8 +22,6 @@ using namespace llvm;
 
 #define DEBUG_TYPE "metal-tg-barrier-insert"
 
-// Metal threadgroup address space.
-
 // AIR barrier intrinsic names (new and legacy).
 static constexpr StringLiteral kBarrier("air.wg.barrier");
 static constexpr StringLiteral kBarrierOld("air.threadgroup.barrier");
@@ -111,15 +109,8 @@ static bool tgBarrierInsert(Module &M) {
       }
     }
 
-    // A barrier may only be inserted where EVERY thread executes it; a
-    // divergent barrier desynchronizes the threadgroup. CondTargets catches
-    // direct conditional successors, but blocks reached through further
-    // unconditional edges (the optimizer's sink-split blocks) are still
-    // divergently executed. Compute divergent regions: forward-taint values
-    // from the per-thread index intrinsics, then mark every block between a
-    // taint-conditioned branch and its reconvergence point (immediate
-    // postdominator) as divergent. Insertion stays allowed everywhere else
-    // (loop bodies executed by all threads must keep their barriers).
+    // Barriers must be uniform: forward-taint per-thread index intrinsics, then
+    // mark blocks between a tainted branch and its postdominator as divergent.
     PostDominatorTree PDT;
     PDT.recalculate(F);
     SmallPtrSet<const Value *, 32> Tainted;
@@ -164,11 +155,8 @@ static bool tgBarrierInsert(Module &M) {
     };
 
     // Strategy 1: barrier before TG stores in non-conditional-target blocks.
-    // Within a block, only the first TG store in a "store burst" needs the
-    // barrier; subsequent consecutive stores by the same thread cannot race
-    // with the prior barrier-protected region. A new TG load resets the
-    // burst (the load might consume a value that needs fresh synchronisation
-    // before the next store).
+    // Only the first store in a burst needs it; a TG load resets the burst
+    // (it may consume a value needing fresh sync before the next store).
     for (BasicBlock &BB : F) {
       if (!TGStoreBlocks.count(&BB) || CondTargets.count(&BB) ||
           !uniformlyExecuted(&BB))
@@ -268,13 +256,9 @@ static bool tgBarrierInsert(Module &M) {
       }
     }
 
-    // Strategy 4: coalesce redundant consecutive barriers within a block.
-    // Two barrier calls separated only by instructions that touch neither
-    // threadgroup memory nor any call are equivalent to a single barrier: the
-    // first already synchronised the threadgroup and nothing observable to
-    // other threads happened in between, so the second is a no-op. Removing it
-    // is the dominant per-K-step saving in the MMA dot lowering, which emits a
-    // barrier at the end of one phase and the start of the next.
+    // Strategy 4: coalesce redundant consecutive barriers within a block. Two
+    // barriers separated only by instructions touching neither TG memory nor a
+    // call are equivalent to one; the second is a no-op.
     for (BasicBlock &BB : F) {
       Instruction *PrevBarrier = nullptr;
       SmallVector<Instruction *, 8> ToErase;

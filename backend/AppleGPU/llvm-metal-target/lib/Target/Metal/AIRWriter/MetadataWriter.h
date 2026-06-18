@@ -37,8 +37,8 @@ struct MetadataEnumerator {
   std::vector<const MDNode *> nodes;
   DenseMap<const MDNode *, unsigned> nodeMap;
 
-  // Sub-track E2a: also walks instruction-attached metadata across every
-  // function so alias.scope / noalias / tbaa MDNodes get IDs.
+  // Also walks instruction-attached metadata so alias.scope / noalias / tbaa
+  // MDNodes get IDs.
   void collect(Module &M, ValueEnumerator &E);
   void visitNode(const MDNode *N, ValueEnumerator &E);
   uint64_t operandID(const Metadata *Op) const;

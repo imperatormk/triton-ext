@@ -47,12 +47,9 @@ def _round_to_int(y):
 
 @triton.jit
 def _pow_mag(ax, y):
-    # |ax|**y computed with a compensated product to retain precision for
-    # large exponents (Metal has no f64, so a plain exp(y*log(ax)) in f32 is
-    # too lossy for e.g. x**1000). Work in base 2: ax**y = 2**(y*log2(ax)).
-    # Compute t = y*log2(ax) as a (hi, lo) double-single pair so the rounding
-    # error of the product is carried into the exponent, then evaluate
-    # 2**t = 2**ki * 2**frac, keeping the exp2 argument small.
+    # |ax|**y via a compensated product (Metal has no f64). Work in base 2:
+    # ax**y = 2**(y*log2(ax)), computing t = y*log2(ax) as a (hi, lo) pair so the
+    # product's rounding error is carried into the exponent.
     lg = tl.log2(ax)
     hi = y * lg
     e = tl.math.fma(y, lg, -hi)  # exact rounding error of the product
@@ -264,11 +261,9 @@ def _fast_gelu(x):
 
 @triton.jit
 def _cyl_bessel_i0(x):
-    # Modified Bessel function I0, Abramowitz & Stegun 9.8.1 / 9.8.2.
-    # I0 is even, so work in |x|. Split at 3.75: a polynomial in (x/3.75)^2
-    # for the small range, an asymptotic exp(ax)/sqrt(ax) * poly(3.75/ax) for
-    # the large range. Single-precision accurate (|err| < ~1.6e-7), which is
-    # all f32 (and Metal, which has no f64) can carry anyway.
+    # Modified Bessel function I0, Abramowitz & Stegun 9.8.1 / 9.8.2. Even, so
+    # work in |x|; split at 3.75 (polynomial in (x/3.75)^2 below, asymptotic
+    # exp(ax)/sqrt(ax)*poly(3.75/ax) above). f32-accurate (|err| < ~1.6e-7).
     ax = tl.abs(x)
     small = ax < 3.75
     # --- small branch: t = (x/3.75)^2 ---

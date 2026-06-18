@@ -39,29 +39,20 @@ using namespace mlir::LLVM;
 using namespace mlir::arith;
 namespace ttg = mlir::triton::gpu;
 
-// ── Fragment-ABI eligibility analysis ─────────────────────────────────────
-// A use of an AppleMma-encoded value is "dot-chain" if it keeps the value on
-// the simdgroup register path: as the dot accumulator (C), carried through the
-// scf.for loop, or unpacked to #blocked by a convert_layout. Any other consumer
-// (elementwise arith/math, broadcast/expand from a #mma slice, integer #mma)
-// needs the generic flat per-thread layout, so its type stays out of the
-// fragment ABI. The decision is per-type and conservative: a type is
-// fragment-eligible only if EVERY #mma value of that exact type in the module
-// is consumed solely by dot-chain ops.
+// Fragment-ABI eligibility: a use is "dot-chain" if it keeps the value on the
+// simdgroup register path (dot accumulator C, scf.for carry, or unpack to
+// #blocked). A type is eligible only if EVERY #mma value of that exact type is
+// consumed solely by dot-chain ops.
 static bool isAppleMmaTensor(Type t) {
   auto rt = dyn_cast<RankedTensorType>(t);
-  // The fragment ABI carries <64 x f32> simdgroup_matrix fragments, so only f32
-  // #mma accumulators qualify; bf16/i32 #mma tensors keep the flat layout.
+  // The fragment ABI carries <64 x f32> fragments; only f32 #mma qualifies.
   return rt && isa<AppleMmaEncodingAttr>(rt.getEncoding()) &&
          rt.getElementType().isF32();
 }
 
-// Fragment-ABI candidate predicate for the kkt elementwise/mask chain. SEPARATE
-// from isAppleMmaTensor (which is load-bearing on the f32 GATE-A/B dot path):
-// admits the f32 accumulator AND the rank-2 i32/i1 #mma temporaries that the
-// kkt op-web builds (cmpi index compares, andi/select masks) so they can ride
-// the same per-lane simdgroup slot map. bf16/i64 #mma and slice<#mma> stay
-// flat.
+// Fragment-ABI candidate for the kkt elementwise/mask chain: the f32
+// accumulator plus the rank-2 i32/i1 #mma temporaries (cmpi/andi/select) that
+// ride the same per-lane slot map. bf16/i64 #mma and slice<#mma> stay flat.
 static bool isFragmentCandidateTensor(Type t) {
   auto rt = dyn_cast<RankedTensorType>(t);
   if (!rt || !isa<AppleMmaEncodingAttr>(rt.getEncoding()) || rt.getRank() != 2)
@@ -70,15 +61,9 @@ static bool isFragmentCandidateTensor(Type t) {
   return elt.isF32() || elt.isInteger(32) || elt.isInteger(1);
 }
 
-// A rank-2 f16/bf16 #mma tensor. This is NOT a general fragment candidate (it
-// must NOT enter the kkt elementwise web, which would reintroduce the
-// bf16-#mma elementwise scalarization leak) — it is admitted to the fragment
-// ABI ONLY as the narrow dot-accumulator epilogue: the f16/bf16 GEMM
-// accumulates in <64 x f32>, then `arith.truncf : f32#mma -> f16/bf16#mma`
-// narrows the result before the convert_layout to #blocked. Carrying that
-// truncf result as a <64 x half/bf16> fragment (instead of poisoning the f32
-// accumulator's type, which scalarized the whole loop) is what puts f16/bf16
-// GEMM on the same fragment baseline as f32.
+// A rank-2 f16/bf16 #mma tensor. NOT a general fragment candidate (must not
+// enter the kkt elementwise web); admitted ONLY as the dot-accumulator
+// epilogue (truncf of an <64 x f32> accum before convert_layout to #blocked).
 static bool isHalfMmaTensor(Type t) {
   auto rt = dyn_cast<RankedTensorType>(t);
   if (!rt || !isa<AppleMmaEncodingAttr>(rt.getEncoding()) || rt.getRank() != 2)
@@ -87,19 +72,11 @@ static bool isHalfMmaTensor(Type t) {
   return elt.isF16() || elt.isBF16();
 }
 
-// True iff `op` is the f16/bf16 accumulator-epilogue truncf: a TruncFOp from an
-// f32 #mma fragment candidate to an f16/bf16 #mma, whose result feeds only a
-// convert_layout to a non-#mma layout (the store epilogue), AND whose f32 #mma
-// input is produced DIRECTLY by a dot (or a loop-carried dot accumulator).
-//
-// The direct-dot requirement is load-bearing: it admits the GEMM epilogue
-// (dot -> truncf -> store) but REJECTS solve_tril's merge kernel
-// (dot -> negf -> truncf -> store). With an intervening elementwise op the
-// mid-end sinks it through the truncf (negf(truncf) == truncf(negf)), leaving a
-// `fsub <64 x bfloat>` on the simdgroup bf16 fragment — which, combined with
-// the bf16 round-trip bitcast, crashes the AGX PSO materializer
-// (agx-crash-trunk/solve_tril_bf16_merge_pso_crash). The pure dot accumulator
-// has no such elementwise op on the fragment, so it stays safe.
+// True iff `op` is the f16/bf16 accumulator-epilogue truncf (f32 #mma ->
+// f16/bf16 #mma feeding only a convert_layout, f32 input produced directly by a
+// dot). LANDMINE: the direct-dot requirement is required to avoid a bf16 fsub
+// on the fragment (e.g. dot->negf->truncf) that crashes the AGX PSO
+// materializer.
 static bool isAccumTruncEpilogue(Operation *op) {
   auto tf = dyn_cast<arith::TruncFOp>(op);
   if (!tf)
@@ -107,13 +84,8 @@ static bool isAccumTruncEpilogue(Operation *op) {
   if (!isFragmentCandidateTensor(tf.getIn().getType()) ||
       !isHalfMmaTensor(tf.getType()))
     return false;
-  // The narrowed result must feed EXACTLY ONE convert_layout to a non-#mma
-  // layout — the single store epilogue of a GEMM. fla's chunk_delta_h
-  // recurrence truncates an intermediate h and fans it out to several
-  // convert_layouts (one of which re-feeds a dot), and the multiple distinct
-  // #blocked targets don't share one fragment slot map → a flat/fragment slot
-  // mismatch at pack time. Requiring a single blocked consumer keeps this on
-  // the pure GEMM store narrow.
+  // Must feed EXACTLY ONE convert_layout to a non-#mma layout; multiple
+  // consumers don't share a slot map → flat/fragment mismatch at pack time.
   ttg::ConvertLayoutOp theCvt;
   for (Operation *user : tf->getUsers()) {
     auto cvt = dyn_cast<ttg::ConvertLayoutOp>(user);
@@ -146,13 +118,10 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
   llvm::DenseSet<Type> eligible;
   llvm::DenseSet<Type> blocked;
 
-  // The accumulator reaches this pass after SCF→ControlFlow, so the loop carry
-  // is a cf.br/cf.cond_br block-argument forward, not an scf.yield. The kkt
-  // op-web additionally keeps the fragment on the register path through
-  // expand_dims (slice<#mma>→#mma), broadcast (col/row replicate), and the
-  // per-slot elementwise mask ops (cmpi/andi/select + the f32 binary/unary
-  // ops). Each of those has a fragment lowering, so recognizing them here is
-  // what flips the atomic gate that admits kkt's accumulator type.
+  // After SCF→ControlFlow the loop carry is a cf.br block-arg forward, not an
+  // scf.yield. The kkt op-web also keeps the fragment on the register path
+  // through expand_dims, broadcast, and the per-slot elementwise/mask ops, each
+  // of which has a fragment lowering.
   auto isDotChainUse = [](Operation *user, Value v) -> bool {
     if (isa<triton::DotOp>(user))
       return true; // dot consumes #mma only as accumulator C
@@ -167,14 +136,9 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
     // before the store convert. Keeps the f32 accumulator on the fragment path.
     if (isAccumTruncEpilogue(user))
       return true;
-    // Fragment elementwise / view consumers (kkt chain). A use is clean ONLY if
-    // the consumer is fully fragment-lowerable: its #mma result is a fragment
-    // candidate AND every ranked-tensor operand is itself a same-encoding
-    // fragment candidate (or, for expand_dims, a slice of the #mma parent).
-    // This rejects mixed-layout elementwise (e.g. chunk_delta_h's
-    // `load(#blocked) - dot(#mma)`) which has no per-slot fragment lowering and
-    // would otherwise be wrongly admitted, then fall back to a flat pack and
-    // crash. broadcast/expand_dims take a single operand.
+    // Fragment elementwise/view consumers (kkt chain): clean ONLY if the #mma
+    // result is a candidate AND every ranked-tensor operand is too. Rejects
+    // mixed-layout elementwise, which has no per-slot lowering.
     auto sameMmaFragmentOperands = [](Operation *u) {
       for (Value o : u->getOperands()) {
         auto rt = dyn_cast<RankedTensorType>(o.getType());
@@ -207,14 +171,10 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
     return false;
   };
 
-  // A fragment-candidate value can only live on the fragment path if its
-  // PRODUCER emits a fragment struct. The dot, the fragment elementwise/view
-  // patterns, a splat constant, and a loop-carried block argument all do. A
-  // convert_layout INTO #mma (e.g. chunk_delta_h materializes b_v as #blocked
-  // then converts to #mma for `load - dot`) has no fragment lowering and yields
-  // a flat struct, so any type that some value reaches via such a producer must
-  // stay flat — otherwise the flat producer's element count collides with the
-  // fragment struct slot count at pack time.
+  // A candidate can ride the fragment path only if its PRODUCER emits a
+  // fragment struct (dot, fragment elementwise/view, splat, loop-carried arg).
+  // convert_layout INTO #mma yields a flat struct, so types reached that way
+  // must stay flat.
   auto isFragmentProducer = [](Value v) -> bool {
     if (isa<BlockArgument>(v))
       return true; // loop carry / entry forward
@@ -235,9 +195,8 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
     return false;
   };
 
-  // The f16/bf16 truncf-epilogue result rides the fragment ABI alongside the
-  // f32 candidates, but is NOT an isFragmentCandidateTensor (so it can't be
-  // dragged into the kkt elementwise web). It is collected/poisoned separately.
+  // The f16/bf16 truncf-epilogue result rides the fragment ABI but is NOT an
+  // isFragmentCandidateTensor (kept out of the kkt web); collected separately.
   auto isCollectible = [](Value v) -> bool {
     if (isFragmentCandidateTensor(v.getType()))
       return true;
@@ -247,14 +206,9 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
     return def && isAccumTruncEpilogue(def);
   };
 
-  // Fixpoint over candidate VALUES, then collapse to TYPES. A fragment chain is
-  // admitted atomically: a value is "bad" if its producer can't emit a fragment
-  // struct or any consumer isn't a recognized fragment op; badness then
-  // propagates BOTH ways across the fragment elementwise/view web (a bad result
-  // poisons the op's #mma operands and vice-versa) so a chain is never half
-  // admitted (which previously left a flat producer feeding a fragment consumer
-  // and crashed at pack time). A type is eligible only if EVERY value of that
-  // type is good.
+  // Fixpoint over candidate VALUES, then collapse to TYPES. Badness propagates
+  // BOTH ways so a chain is never half-admitted. A type is eligible only if
+  // EVERY value of it is good.
   llvm::SmallVector<Value> candidates;
   llvm::DenseSet<Value> bad;
   auto collect = [&](Value v) {
@@ -286,12 +240,9 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
         break;
       }
   }
-  // Type→values index: the type converter decides the ABI per TYPE, so badness
-  // is a per-type property — if ANY value of a type is bad, EVERY value of it
-  // must be (otherwise a flat producer of that type would feed a fragment
-  // consumer, or vice-versa, and crash). So poison propagates three ways:
-  // through a fragment op's operands, through its results, and across all
-  // same-type siblings.
+  // The ABI is decided per TYPE, so badness is per-type: if ANY value of a type
+  // is bad, every value of it must be. Poison propagates three ways: through a
+  // fragment op's operands, its results, and all same-type siblings.
   llvm::DenseMap<Type, SmallVector<Value>> byType;
   for (Value v : candidates)
     byType[v.getType()].push_back(v);
@@ -424,9 +375,8 @@ Value emitFragShuffle(ConversionPatternRewriter &rewriter, Location loc,
         .getResult();
   }
   auto i32Ty = IntegerType::get(ctx, 32);
-  // f16/bf16 fragments shuffle through the i32 form by bitcasting to a 16-bit
-  // integer first (ZExt on a float is invalid IR); the integer round-trips the
-  // bit pattern exactly, then bitcast back to the float type.
+  // f16/bf16 shuffle through i32 via a 16-bit-integer bitcast (ZExt on a float
+  // is invalid IR), then bitcast back.
   bool isFloat16 = vt.isF16() || vt.isBF16();
   Value asI32 = val;
   bool isBool = vt.isInteger(1);
@@ -474,8 +424,7 @@ bool extractFirstElemConst(Value tensor, int64_t &out, bool peelModulo) {
     return false;
   if (isa<triton::ExpandDimsOp>(defOp))
     return extractFirstElemConst(defOp->getOperand(0), out, peelModulo);
-  // See extractFirstElemScalar: peel a proven-no-op boundary modulo so a
-  // constant row origin survives the wrap instead of folding to 0.
+  // Peel a proven-no-op boundary modulo so a constant origin survives the wrap.
   if (peelModulo && isa<arith::RemSIOp, arith::RemUIOp>(defOp))
     return extractFirstElemConst(defOp->getOperand(0), out, peelModulo);
   if (isa<triton::MakeRangeOp>(defOp)) {
@@ -517,12 +466,10 @@ Value extractFirstElemScalar(Value tensor, bool peelModulo) {
   if (isa<triton::ExpandDimsOp>(defOp))
     return extractFirstElemScalar(defOp->getOperand(0), peelModulo);
 
-  // Peel through a boundary-wrap modulo to its dividend. The caller sets
-  // peelModulo ONLY when the wrap was already proven block-aligned (a no-op
-  // over the tile), so the first element of (dividend % M) equals the first
-  // element of the dividend. Without this, a program-id-dependent row origin
-  // such as (pid_m*BLOCK_M + arange) % M_total is dropped to 0 and the async
-  // DMA reads every program's tile from row 0 (correct only for pid_m == 0).
+  // Peel through a boundary-wrap modulo to its dividend (peelModulo set ONLY
+  // when the wrap is proven block-aligned). Else a pid-dependent row origin
+  // like (pid_m*BLOCK_M + arange) % M drops to 0 and the DMA reads every tile
+  // from row 0 (correct only for pid_m == 0).
   if (peelModulo && isa<arith::RemSIOp, arith::RemUIOp>(defOp))
     return extractFirstElemScalar(defOp->getOperand(0), peelModulo);
 
@@ -547,12 +494,10 @@ Value extractFirstElemScalar(Value tensor, bool peelModulo) {
   return nullptr;
 }
 
-// Interior-tile fast path for masked stores. A GEMM C-store carries a
-// rectangular boundary mask `(om[:,None] < M) & (on[None,:] < N)`. For
-// provably-full interior tiles the guard `(rowFirst + BM) <= rowBound &&
-// (colFirst + BN) <= colBound` lets the caller branch to an unmasked store
-// instead of a 64-way predicated chain. CONSERVATIVE: any unrecognized leaf
-// makes this return null and the store keeps the exact existing masked path.
+// Interior-tile fast path for masked stores: from a GEMM C-store's rect mask
+// `(om<M)&(on<N)`, build a guard `(rowFirst+BM)<=rowBound && (colFirst+BN)<=
+// colBound` so the caller can branch to an unmasked store instead of a 64-way
+// predicated chain. Conservative: any unrecognized leaf returns null.
 Value computeRectStoreFullGuard(triton::StoreOp op,
                                 ConversionPatternRewriter &rewriter,
                                 Location loc) {

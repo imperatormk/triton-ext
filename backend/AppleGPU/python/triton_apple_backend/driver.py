@@ -27,24 +27,11 @@ def _materialize_offline_error(metallib_bytes, name=None):
     """Replay a metallib through the offline Metal toolchain to surface the real
     lowering error behind an opaque in-process PSO failure.
 
-    The Metal PSO compiler runs in the out-of-process MTLCompilerService, so the
-    genuine LLVM/AIR backend error never reaches the NSError we catch (we only
-    see "Failed to materializeAll" / "XPC_ERROR_CONNECTION_INTERRUPTED"). Feeding
-    the SAME metallib to the offline tools reproduces the failure with the real
-    diagnostic:
-      - `metal-objdump -d` runs the bitcode VERIFIER and prints the precise error
-        (e.g. "Explicit gep type does not match pointee type ..."). This is the
-        most actionable signal, so it runs first.
-      - `xcrun metallib` is the blunter cross-check ("Unexpected bitcode file").
-    Returns a combined diagnostic str (always including the saved metallib path
-    for manual inspection) or None if no tool is available. Best-effort: any
-    failure here is swallowed so it never masks the original error.
-
-    The failing metallib is saved to a STABLE, named location when
-    METAL_PSO_FAIL_DIR is set (the test harness points it at the persisted dump
-    base), so the exact failing config survives the run for offline triage even
-    when inductor's per-worker tempdir is reaped. The filename embeds the kernel
-    name; a `.txt` sidecar records the verifier error. Falls back to a tempfile.
+    metal-objdump -d runs the bitcode verifier (precise error) and runs first;
+    xcrun metallib is the blunter cross-check. Returns a combined diagnostic str
+    (incl. saved metallib path) or None. Best-effort: failures are swallowed.
+    With METAL_PSO_FAIL_DIR set, the failing metallib + a .txt sidecar persist to
+    a stable, named location so the config survives inductor's reaped tempdir.
     """
     import subprocess as _sp
     import tempfile as _tf
@@ -208,16 +195,10 @@ class MPSUtils:
         try:
             module = self._metal.load_metallib(bytes(metallib_bytes))
             function = module.get_function(name)
-            # Report the PSO's real maxTotalThreadsPerThreadgroup as n_max_threads.
-            # Triton (compiler.py) rejects configs where num_warps*warp_size
-            # exceeds this via OutOfResources, letting the autotuner drop them.
-            # This MUST be accurate: a kernel using cross-warp threadgroup memory
-            # (e.g. a multi-warp scan/reduction) is only correct when ALL its
-            # warps launch. If register pressure caps the PSO below the required
-            # thread count, silently launching fewer threads leaves some warps'
-            # threadgroup-memory slots unwritten -> uninitialized reads -> racy,
-            # nondeterministic results. Reporting the true max forces such a
-            # config to be discarded instead of producing wrong answers.
+            # Report the PSO's real maxTotalThreadsPerThreadgroup so triton drops
+            # configs needing more threads. Must be accurate: a cross-warp-smem
+            # kernel launched with fewer threads leaves smem slots unwritten ->
+            # uninitialized reads -> nondeterministic wrong answers.
             max_threads = getattr(function,
                                   'max_total_threads_per_threadgroup', 1024)
             return module, function, 0, 0, max_threads
@@ -233,13 +214,9 @@ class MPSUtils:
             # instead of hard-failing the compile. See test_large_block_sizes.
             if 'exceeds available stack space' in msg:
                 raise OutOfResources(0, 0, "Metal PSO stack space") from e
-            # Opaque PSO-compile errors: the real LLVM/AIR lowering diagnostic
-            # dies in the out-of-process MTLCompilerService and never reaches
-            # this NSError, leaving only blunt strings like "Failed to
-            # materializeAll" or "XPC_ERROR_CONNECTION_INTERRUPTED". Replay the
-            # exact metallib through the offline Metal toolchain (metal-objdump,
-            # which prints the precise verifier error, plus xcrun metallib),
-            # and rethrow with the real backend error inlined.
+            # Opaque PSO-compile errors lose the real LLVM/AIR diagnostic (it dies
+            # in MTLCompilerService). Replay the metallib offline to recover the
+            # precise error, then rethrow with it inlined.
             _opaque = ('materializeAll', 'XPC_ERROR_CONNECTION_INTERRUPTED',
                        'XPC_CONNECTION_INTERRUPTED', 'PSO creation failed',
                        'Unexpected bitcode')
@@ -285,10 +262,9 @@ class MPSLauncher:
         self.signature = dict(src.signature)
         self.constants = getattr(src, "constants", {})
 
-        # Constexpr args appear in Python *args but NOT in the compiled IR.
-        # We strip them before passing to _mps_MetalKernel so Metal buffer slots
-        # match IR arg positions exactly. self.constexpr_py_slots is the set of
-        # Python *args indices that are constexpr (to be stripped at launch).
+        # Constexpr args appear in Python *args but not the compiled IR; strip
+        # them so Metal buffer slots match IR arg positions. constexpr_py_slots =
+        # the *args indices to strip at launch.
         self.constexpr_py_slots = frozenset(
             i for i, (k, ty) in enumerate(self.signature.items())
             if ty == 'constexpr')
@@ -301,20 +277,11 @@ class MPSLauncher:
         ]
         expanded = expand_signature(non_constexpr_sig, None, None)
 
-        # Classify each expanded arg as pointer or scalar.
-        # All scalars are packed into ONE device buffer,
-        # so the IR param order is: [pointers..., packed_scalar_buf, system_values].
-        # We need to separate pointers from scalars at launch time.
-        #
-        # Python tuple kernel args are flattened recursively: an empty tuple
-        # contributes nothing; nested tuples expand to their leaf elements.
-        # Leaf entries with type 'constexpr' (inlined constants inside tuples)
-        # are skipped — they have no GPU arg slot.
-        #
-        # self._flat_arg_keep[i] says whether flat_arg[i] (after full tuple
-        # flattening in __call__) should be forwarded to the GPU.  We need this
-        # because constexpr values inside tuples ARE present in flat_args but
-        # must NOT be passed to the kernel.
+        # Classify each expanded arg as pointer or scalar. Scalars pack into one
+        # device buffer, so IR param order is [pointers, packed_scalar_buf,
+        # system_values]. Tuple args flatten recursively (constexpr leaves have no
+        # GPU slot); _flat_arg_keep[i] says whether flat_arg[i] is forwarded
+        # (constexpr-in-tuple values are in flat_args but must not reach the kernel).
         self.ptr_indices = []  # indices into the KEPT slice of flat_args
         self.scalar_indices = []  # indices into the KEPT slice of flat_args
         self.scalar_types = []  # type strings for scalars (for packing)
@@ -366,13 +333,9 @@ class MPSLauncher:
     def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata,
                  launch_metadata, launch_enter_hook, launch_exit_hook, *args):
 
-        # The kernel requires exactly num_warps*warp_size threads; with fewer,
-        # cross-warp threadgroup-memory cooperation breaks (unwritten smem slots
-        # -> uninitialized reads -> nondeterministic results). load_binary
-        # reports the PSO's real maxTotalThreadsPerThreadgroup so triton drops
-        # any config that needs more threads than the PSO supports. If we ever
-        # reach dispatch with a deficit, fail loudly instead of silently capping
-        # and returning wrong answers.
+        # Kernel needs exactly num_warps*warp_size threads; fewer breaks cross-warp
+        # smem cooperation -> nondeterministic results. load_binary already drops
+        # over-large configs, so a deficit here is a bug: fail loudly.
         max_threads = getattr(function, 'max_total_threads_per_threadgroup',
                               1024)
         if self._requested_threads > max_threads:
@@ -385,12 +348,9 @@ class MPSLauncher:
         if launch_enter_hook:
             launch_enter_hook(launch_metadata)
 
-        # Strip constexpr args and decompose TensorDescriptors.
-        # Python tuple args are flattened recursively so that the positional
-        # index structure matches _flat_arg_keep built in __init__.
-        # After full flattening, positions with keep=False (constexpr values
-        # inside tuples) are dropped before indexing with ptr_indices /
-        # scalar_indices.
+        # Strip constexpr args and decompose TensorDescriptors. Tuple args flatten
+        # recursively to match _flat_arg_keep from __init__; keep=False positions
+        # (constexpr-in-tuple) are dropped before indexing.
         from triton.runtime.jit import TensorWrapper
 
         def _flatten_arg(a, out):
@@ -398,11 +358,9 @@ class MPSLauncher:
             if isinstance(a, TensorWrapper):
                 out.append(a.base)
             elif isinstance(a, torch.Tensor):
-                # Pass tensors (including views) through unchanged. Do NOT unwrap
-                # to `a._base`: for a view like `base[4:20]`, `._base` is the
-                # offset-0 base tensor, which drops the storage_offset and makes
-                # the kernel read from the wrong location. The launcher applies
-                # storage_offset() itself via setBuffer:offset:.
+                # Pass tensors (incl. views) through unchanged. Do NOT unwrap to
+                # `a._base`: it drops storage_offset -> kernel reads wrong location.
+                # The launcher applies storage_offset() via setBuffer:offset:.
                 out.append(a)
             elif isinstance(a, TensorDescriptor):
                 out.extend(decompose_descriptor(a))
@@ -418,10 +376,9 @@ class MPSLauncher:
                 continue
             _flatten_arg(a, all_flat_args)
 
-        # Apply keep mask: drop constexpr-inside-tuple positions.
-        # The flattened runtime args must line up 1:1 with the keep mask built
-        # from the signature in __init__; a mismatch means zip() would silently
-        # truncate and pass the wrong buffers. Fail loudly instead.
+        # Apply keep mask: drop constexpr-in-tuple positions. Args must line up
+        # 1:1 with the mask from __init__; a mismatch would silently pass wrong
+        # buffers via zip() truncation, so fail loudly.
         if len(all_flat_args) != len(self._flat_arg_keep):
             raise RuntimeError(
                 f"flat arg count {len(all_flat_args)} does not match signature "

@@ -169,15 +169,9 @@ static bool airSystemValues(Module &M) {
             EV->replaceAllUsesWith(Components[std::min(Idx, 2u)]);
             EV->eraseFromParent();
           }
-          // Any remaining users (e.g. a `freeze [3 x i32]` inserted by the
-          // mid-end between the call and its extractvalue, or the call passed
-          // around as a whole aggregate) must see the REAL system value, not
-          // undef.  Reconstruct the [3 x i32] aggregate from Components and
-          // replace the call with it.  Building it right before the call keeps
-          // it dominating every use.  (Previously this RAUW'd undef, which
-          // poisoned a freeze-separated extractvalue -> garbage div/rem inputs
-          // for any kernel whose program-id / thread-position feeds integer
-          // math; the freeze appears at -O2/-O3.)
+          // Whole-aggregate users (e.g. a freeze the mid-end inserts at
+          // -O2/-O3) must see the real system value: rebuild the [3 x i32] from
+          // Components.
           if (!CI->use_empty()) {
             IRBuilder<> B(CI);
             Value *Agg = UndefValue::get(CI->getType());
@@ -213,11 +207,8 @@ static bool airSystemValues(Module &M) {
       if (F.isDeclaration())
         continue;
 
-      // A kernel that calls a noinline device function leaves that callee in
-      // the module as a second definition. Only the kernel is an entry point;
-      // the callee is reached through a call and must not get !air.kernel
-      // metadata (it would be mis-emitted as a second kernel). The kernel is
-      // the definition with no callers.
+      // Skip called functions: a noinline device callee must not get
+      // !air.kernel metadata (it would be mis-emitted as a second kernel).
       bool IsCalled = false;
       for (User *U : F.users()) {
         if (auto *CB = dyn_cast<CallBase>(U)) {
@@ -235,9 +226,8 @@ static bool airSystemValues(Module &M) {
       unsigned TGIdx = 0;  // threadgroup buffers have their own index space
       auto *FTy = F.getFunctionType();
 
-      // Buffer params: device AS=1, constant AS=2, threadgroup AS=3. Apple
-      // tags all three as "air.buffer" but threadgroup args carry
-      // air.address_space=3 and live in a separate location_index counter.
+      // Buffer params: device AS=1, constant AS=2, threadgroup AS=3. All tagged
+      // "air.buffer", but threadgroup args use a separate location_index space.
       for (unsigned I = 0; I < FTy->getNumParams(); ++I) {
         Type *ParamTy = FTy->getParamType(I);
         if (!ParamTy->isPointerTy())
@@ -311,10 +301,8 @@ static bool airSystemValues(Module &M) {
     Changed = true;
   }
 
-  // Version metadata: air.version = (2, AIRMinor, 0). The minor is driven by
-  // the target macOS major (OSmajor-8), derived from the module triple and
-  // falling back to macOS 16 when absent. Empirically verified against Apple's
-  // `xcrun metal -mmacosx-version-min=N`.
+  // air.version = (2, AIRMinor, 0); minor driven by target macOS major
+  // (OSmajor-8 from the triple, defaulting to macOS 16).
   auto AIRVer = metal::MetalVersion::fromTriple(M.getTargetTriple().str());
   auto *VerMD = M.getOrInsertNamedMetadata(kNMDVersion);
   if (VerMD->getNumOperands() == 0) {
@@ -326,11 +314,9 @@ static bool airSystemValues(Module &M) {
     Changed = true;
   }
 
-  // Language version metadata = ("Metal", MSLMajor, MSLMinor, 0). The MSL
-  // version the target macOS supports: 13->3.0, 14->3.1, 15->3.2, 16->4.0.
-  // An OS rejects a metallib stamped with a newer MSL than it supports, so
-  // this MUST track the target macOS major. Empirically verified against
-  // Apple's `xcrun metal -mmacosx-version-min=N`.
+  // air.language_version = ("Metal", MSLMajor, MSLMinor, 0): 13->3.0, 14->3.1,
+  // 15->3.2, 16->4.0. An OS rejects a metallib stamped with a newer MSL than it
+  // supports, so this MUST track the target macOS major.
   if (!M.getNamedMetadata(kNMDLanguageVersion)) {
     auto *LangMD = M.getOrInsertNamedMetadata(kNMDLanguageVersion);
     LangMD->addOperand(MDNode::get(
@@ -341,10 +327,9 @@ static bool airSystemValues(Module &M) {
     Changed = true;
   }
 
-  // air.compile_options — Apple's `xcrun metal` always emits these three
-  // top-level options. The stricter macOS 13/14/15 Metal driver rejects AIR
-  // that lacks them ("Compiler encountered an internal error"); macOS 26 is
-  // lenient. Empirically required for the older-OS path.
+  // air.compile_options - the stricter macOS 13/14/15 Metal driver rejects AIR
+  // that lacks these three ("Compiler encountered an internal error"); macOS 26
+  // is lenient.
   if (!M.getNamedMetadata("air.compile_options")) {
     auto *OptsMD = M.getOrInsertNamedMetadata("air.compile_options");
     OptsMD->addOperand(

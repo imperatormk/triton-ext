@@ -22,11 +22,9 @@ inline bool isAirTriple(const Triple &T) {
   return A == "air" || A == "air64" || A.starts_with("air64_v");
 }
 
-/// In-tree the target is registered via `RegisterTarget<Triple::air, ...>`.
-/// Out-of-tree we hijack `Triple::UnknownArch`: the prebuilt's Triple parser
-/// returns `UnknownArch` for any unrecognized arch string (including "air"),
-/// so `lookupTarget("air", ...)` will dispatch to whatever target registered
-/// itself for `UnknownArch`. We are the only target in this dylib that does.
+/// Hijack `Triple::UnknownArch`: the prebuilt parser returns it for any
+/// unrecognized arch (including "air"), and we are the only target in this
+/// dylib registered for it, so `lookupTarget("air", ...)` dispatches here.
 inline constexpr Triple::ArchType kAirArchHijack = Triple::UnknownArch;
 
 /// The AIR data layout string. Copied verbatim from the in-tree

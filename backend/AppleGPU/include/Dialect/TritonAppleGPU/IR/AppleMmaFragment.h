@@ -38,26 +38,15 @@ inline AppleMmaFragmentInfo getAppleMmaFragmentInfo(RankedTensorType ty,
   return info;
 }
 
-// The fragment LLVM ABI type for a pure dot-chain AppleMma tensor:
-//   !llvm.struct<(vector<64xELT> x numFrags)>
-// ELT is the per-element LLVM scalar (f32 accumulators, i32 index masks, i1
-// boolean masks) — the kkt fragment chain carries f32/i32/i1 fragments that all
-// share the same per-lane simdgroup slot map.
+// The fragment LLVM ABI type: !llvm.struct<(vector<64xELT> x numFrags)>, where
+// ELT is the per-element LLVM scalar (f32/i32/i1).
 inline Type getAppleMmaFragmentElemType(MLIRContext *ctx, RankedTensorType ty) {
   Type elt = ty.getElementType();
   if (elt.isF32() || elt.isInteger(32) || elt.isInteger(1))
     return elt;
-  // f16/bf16 #mma dot-accumulator tensors (the GEMM truncf epilogue) ride the
-  // SAME <64 x f32> hardware accumulator fragment as f32 — the per-element
-  // narrowing to f16/bf16 happens on the extracted scalar in the store convert,
-  // NOT on the <64 x f32> simdgroup register. This keeps the accumulator
-  // vectorized AND keeps every f16/bf16 #mma value on an f32 fragment, so a
-  // bf16/f16 #mma that the mid-end has folded an elementwise op onto (e.g.
-  // solve_tril's negf-before-truncf, chunk_delta_h) never materializes a
-  // `<64 x bf16>` simdgroup fragment — the AGX PSO materializer crashes on that
-  // (agx-crash-trunk/solve_tril_bf16_merge_pso_crash), and a vector bf16
-  // round-trip on a simdgroup register miscompiles to zero
-  // (bf16_sgmatrix_fptrunc_miscompile).
+  // f16/bf16 #mma accumulators ride the SAME <64 x f32> fragment as f32
+  // (narrowing happens on the extracted scalar in the store convert); a vector
+  // f16/bf16 simdgroup fragment crashes the AGX PSO materializer.
   return Float32Type::get(ctx);
 }
 

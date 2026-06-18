@@ -41,17 +41,9 @@ namespace ttg = mlir::triton::gpu;
 
 namespace {
 
-// Safe tt.store lowering: use conditional branch instead of read-modify-write.
-//
-// The LoadStoreToLLVM.cpp StoreOpConversion uses a read-modify-write pattern
-// for masked stores: load(ptr); select(mask, val, loaded); store(ptr).
-// This is broken when masked-out pointers alias with other threads' valid
-// addresses (e.g., when M < RBLOCK and row strides cause overlap), creating
-// race conditions and data corruption.
-//
-// This pattern uses a conditional branch: if (mask) store(val, ptr), which
-// is safe regardless of the pointer value when the mask is false.
-// Interior-tile fast path for masked stores.
+// Masked store via conditional branch (if (mask) store), not read-modify-write:
+// masked-out pointers can alias other threads' valid addresses (M < RBLOCK,
+// overlapping row strides), so the RMW select form races and corrupts data.
 struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -85,14 +77,9 @@ struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
     auto masks = maskOperand ? unpackElems(maskOperand, rewriter, loc)
                              : SmallVector<Value>{};
 
-    // When the stored tensor is replicated across lanes/warps (the threadgroup
-    // has more threads than the tensor has elements — e.g. a 64-thread group
-    // writing a 1-element reduction result), every redundant thread computes
-    // the same destination pointer. Without predication they all race-store to
-    // that address, and a thread holding a stale/zeroed replica can win, so the
-    // result is corrupted (observed as ~all-but-one programs storing 0). Emit a
-    // redundant-thread predicate so only the canonical owner of each element
-    // stores, and skip redundant register-replicated copies entirely.
+    // Replicated tensors (more threads than elements) make redundant threads
+    // race on the same destination pointer; predicate so only the canonical
+    // owner stores, and skip register-replicated copies.
     Value threadPred;
     uint32_t regMask = 0;
     if (isa<RankedTensorType>(op.getPtr().getType())) {
@@ -103,10 +90,9 @@ struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
       regMask = freeVarMasks[StringAttr::get(rewriter.getContext(), "reg")];
     }
 
-    // Emit the per-element store sequence. When dropElemMask is set the
-    // boundary store mask is dropped (the tile is provably full); the
-    // redundant-thread predicate still applies since it guards replicated
-    // writers, not bounds.
+    // dropElemMask drops the boundary mask (tile provably full); the
+    // redundant-thread predicate still applies (it guards replicas, not
+    // bounds).
     auto emitStores = [&](bool dropElemMask) {
       for (size_t i = 0; i < ptrs.size(); ++i) {
         if (!isCanonicalIndex(i, regMask))
@@ -133,9 +119,8 @@ struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
       }
     };
 
-    // Interior-tile fast path: if the boundary mask is a full rectangular mask
-    // and the tile is provably (at runtime, simdgroup-uniformly) fully in
-    // bounds, branch to a maskless store and skip the per-element predication.
+    // Interior-tile fast path: when a full rectangular tile is provably
+    // (runtime, simdgroup-uniform) in bounds, branch to a maskless store.
     Value fullGuard =
         !masks.empty() ? computeRectStoreFullGuard(op, rewriter, loc) : nullptr;
     if (fullGuard) {
@@ -164,12 +149,7 @@ struct SafeStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
   }
 };
 
-// Safe tt.load lowering: use conditional branch for masked loads.
-//
-// Similar to SafeStoreOpConversion, the LoadStoreToLLVM.cpp LoadOpConversion
-// unconditionally loads from the pointer (even when masked out), then selects
-// the result. Loading from out-of-bounds pointers is undefined behavior on
-// Metal. This pattern uses a conditional branch to avoid the invalid load.
+// Masked tt.load lowering.
 struct SafeLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -215,8 +195,7 @@ struct SafeLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
         Value other = otherOperand
                           ? otherOperand
                           : LLVM::ZeroOp::create(rewriter, loc, resultTy);
-        // Load unconditionally, select result.
-        // For scalar loads the pointer is always valid.
+        // Scalar pointer is always valid: load unconditionally, select result.
         Value val = LLVM::LoadOp::create(rewriter, loc, resultTy, ptr);
         val = LLVM::SelectOp::create(rewriter, loc, maskOperand, val, other);
         rewriter.replaceOp(op, val);
@@ -263,8 +242,6 @@ struct SafeLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
     return success();
   }
 };
-
-// Lower ttg::WarpIdOp → air.dispatch_thread_id[0] / threadsPerWarp.
 
 } // anonymous namespace
 

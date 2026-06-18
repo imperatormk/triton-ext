@@ -6,18 +6,15 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The vector-condition SELECT form (VSELECT) is rejected by the AGX JIT (see
-// the SelectInst emission in FunctionWriter). The mid-end vectorizers produce
-// vector-condition selects on `where`/`clamp`. Rather than scalarize into a
-// per-lane extract/select/insert chain (which doubles register pressure and
-// relies on the JIT re-fusing the lanes), lower each into a branchless bitmask
-// blend that stays fully vectorized:
+// The AGX JIT rejects vector-condition selects (VSELECT). Rather than scalarize
+// (doubles register pressure, relies on the JIT re-fusing lanes), lower each
+// into a branchless bitmask blend that stays vectorized:
 //
 //   mask = sext <N x i1> cond to <N x iW>      ; all-ones / all-zeros per lane
 //   res  = (a_bits & mask) | (b_bits & ~mask)  ; bit-reinterpreted operands
 //
-// where iW is the element bit width. Float operands are bitcast to an integer
-// vector of matching width and the result bitcast back.
+// Float operands are bitcast to an integer vector of matching width, result
+// bitcast back.
 //
 //===----------------------------------------------------------------------===//
 

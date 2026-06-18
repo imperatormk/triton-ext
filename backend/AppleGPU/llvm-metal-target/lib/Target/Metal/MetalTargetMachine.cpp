@@ -52,10 +52,8 @@ using namespace llvm;
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMetalTarget() {
   RegisterTargetMachine<MetalTargetMachine> X(getTheMetalTarget());
   auto *PR = PassRegistry::getPassRegistry();
-  // TargetPassConfig::addIRPasses() schedules these through the legacy PM.
-  // They must be registered in THIS image's PassRegistry: the target lib is
-  // a dylib with its own statically-linked LLVM copy, so registrations done
-  // in the driver binary land in a different registry singleton.
+  // Must register in THIS dylib's PassRegistry singleton: the target lib has
+  // its own statically-linked LLVM copy, distinct from the driver binary's.
   initializeCore(*PR);
   initializeCodeGen(*PR);
   initializeScalarOpts(*PR);
@@ -89,10 +87,8 @@ public:
 
   MCSection *getExplicitSectionGlobal(const GlobalObject *GO, SectionKind Kind,
                                       const TargetMachine &TM) const override {
-    // Out-of-tree: the stock MCContext has no `getMetalLibSection` and the
-    // .metallib payload is emitted directly via MetalWriterPass in
-    // addPassesToEmitFile -- AsmPrinter never runs, so this hook is never
-    // hit in practice. Return null to make the unreachable explicit.
+    // Out-of-tree: metallib is emitted directly via MetalWriterPass;
+    // AsmPrinter never runs, so this hook is unreachable.
     (void)GO;
     (void)Kind;
     (void)TM;
@@ -167,23 +163,19 @@ bool MetalTargetMachine::addPassesToEmitFile(
     CodeGenFileType FileType, bool DisableVerify,
     MachineModuleInfoWrapperPass *MMIWP) {
   TargetPassConfig *PassConfig = createPassConfig(PM);
-  // Standard llc IR prologue (verifier, LSR + codegen-prep IR passes) at
-  // -O1+, same as every upstream backend; -O0 / -disable-lsr opt out.
   PassConfig->addIRPasses();
   PassConfig->addCodeGenPrepare();
 
   switch (FileType) {
   case CodeGenFileType::AssemblyFile:
-    // Phase 1: emit the transformed LLVM IR. The .metallib writer lands in
-    // Phase 2 (MC ObjectWriter + embedder pass).
+    // Emit the transformed LLVM IR.
     PM.add(createPrintModulePass(Out, "", true));
     break;
   case CodeGenFileType::ObjectFile:
-    // Out-of-tree: always use the direct MetalWriterPass path. The in-tree
-    // build also wires an AsmPrinter + MC ObjectWriter route, but that
-    // requires MCSectionMetalLib + MetalLibObjectWriter additions to core MC
-    // which we cannot land into Triton's pinned LLVM. MetalWriterPass writes
-    // the .metallib bytes directly to `Out`, producing byte-identical output.
+    // Out-of-tree: write the .metallib bytes directly via MetalWriterPass. The
+    // in-tree AsmPrinter/MC route needs MCSectionMetalLib +
+    // MetalLibObjectWriter core-MC additions we can't land into Triton's pinned
+    // LLVM.
     PM.add(createMetalWriterPass(Out));
     break;
   case CodeGenFileType::Null:

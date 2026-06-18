@@ -22,9 +22,6 @@ using namespace llvm;
 
 #define DEBUG_TYPE "metal-scalar-store-guard"
 
-// Metal device address space. Inlined here since this pass only needs the
-// one constant.
-
 // AIR per-thread index intrinsics and the `!air.kernel` named-metadata key.
 static constexpr StringLiteral kCallTid("air.thread_position_in_grid");
 static constexpr StringLiteral kCallTidTG("air.thread_position_in_threadgroup");

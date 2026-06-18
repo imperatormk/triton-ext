@@ -77,8 +77,7 @@ void emitTypeBlock(BitstreamWriter &W, ValueEnumerator &E) {
       W.EmitRecord(bitc::TYPE_CODE_FUNCTION, V);
     } else if (auto *ST = dyn_cast<StructType>(T)) {
       if (ST->isOpaque()) {
-        // Opaque struct (e.g., %event_t = type opaque).
-        // Metal/LLVM v1 bitcode: STRUCT_NAME + TYPE_CODE_OPAQUE [isPacked=0]
+        // Opaque struct: Metal v1 bitcode = STRUCT_NAME + TYPE_CODE_OPAQUE
         if (ST->hasName()) {
           SmallVector<uint64_t, 32> NV;
           for (char C : ST->getName())

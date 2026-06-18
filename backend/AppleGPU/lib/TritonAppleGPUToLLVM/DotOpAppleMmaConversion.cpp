@@ -1,4 +1,5 @@
 // DotOpAppleMmaConversion: lower tt.dot with AppleMmaEncoding on C (rank-2).
+#include "ConvertCommon.h"
 #include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "DotCommon.h"
@@ -26,6 +27,12 @@ using namespace mlir::triton::applegpu;
 using namespace mlir::triton::applegpu::dotcommon;
 
 namespace {
+
+struct OperandRouting {
+  bool useDevice = false;
+  bool useSmem = false;
+  bool fast() const { return useDevice || useSmem; }
+};
 
 // DotOpAppleMmaConversion: AppleMmaEncoding on C, rank-2 only. Device-pointer
 // A/B load MMA tiles directly via p1f32 intrinsics (skipping the TG
@@ -350,6 +357,56 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       return unpack(mappedPtrs);
     };
 
+    // Operand's tt.load pointer tensor; bails on masked loads (must not feed
+    // the device-direct path).
+    auto resolveLoadPtrTensor = [&](Value tritonVal) -> Value {
+      Value src = tritonVal;
+      if (auto cvt = tritonVal.getDefiningOp<ttg::ConvertLayoutOp>())
+        src = cvt.getSrc();
+      auto loadOp = src.getDefiningOp<tt::LoadOp>();
+      if (!loadOp || loadOp.getMask())
+        return Value();
+      return loadOp.getPtr();
+    };
+
+    auto remapStride = [&](Value stride, int64_t strideConst) -> Value {
+      if (strideConst != INT64_MIN)
+        return arith::ConstantIntOp::create(rewriter, loc, strideConst, 64);
+      if (!stride)
+        return Value();
+      Value s = rewriter.getRemappedValue(stride);
+      if (!s)
+        return Value();
+      if (auto it = dyn_cast<IntegerType>(s.getType())) {
+        if (it.getWidth() < 64)
+          s = arith::ExtSIOp::create(rewriter, loc, i64Ty, s);
+        else if (it.getWidth() > 64)
+          s = arith::TruncIOp::create(rewriter, loc, i64Ty, s);
+      } else {
+        return Value();
+      }
+      return s;
+    };
+
+    // (rowStride, colStride) from a proven 2D affine view; false -> caller
+    // falls back to pointer-diff reconstruction.
+    auto resolveAffinePtrInfo = [&](Value tritonVal, Value &rowStride,
+                                    Value &colStride) -> bool {
+      Value ptrTensor = resolveLoadPtrTensor(tritonVal);
+      if (!ptrTensor)
+        return false;
+      AffineMmaPtrInfo info;
+      if (!extractAffineMmaPtrInfo(ptrTensor, info))
+        return false;
+      Value rs = remapStride(info.rowStride, info.rowStrideConst);
+      Value cs = remapStride(info.colStride, info.colStrideConst);
+      if (!rs || !cs)
+        return false;
+      rowStride = rs;
+      colStride = cs;
+      return true;
+    };
+
     // Pipelined-SMEM operands (num_stages>1): the operand comes from a
     // local_load of the staging buffer. Only a plain row-major strip
     // (maxPhase==1, order=[1,0], shape==operand shape) can be SG-loaded at
@@ -412,8 +469,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // Try to get device pointers for A and B
     auto aPtrs = resolveDevicePointers(op.getA());
     auto bPtrs = resolveDevicePointers(op.getB());
-    bool useDeviceA = (aPtrs.size() == elemsA.size() && !aPtrs.empty());
-    bool useDeviceB = (bPtrs.size() == elemsB.size() && !bPtrs.empty());
+    OperandRouting aRoute, bRoute;
+    aRoute.useDevice = (aPtrs.size() == elemsA.size() && !aPtrs.empty());
+    bRoute.useDevice = (bPtrs.size() == elemsB.size() && !bPtrs.empty());
 
     // Row stride (leading dim) in elements for device MMA loads. Strategy 1:
     // two THIS-thread elements with same col, different row. Strategy 2 (all
@@ -607,24 +665,22 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     };
 
     Value aRowStride, bRowStride, aColStride, bColStride;
-    if (useDeviceA) {
-      aRowStride =
-          computeRowStride(aPtrs, aOffsets, aType.getElementType(), aSrcEnc);
-      aColStride =
-          computeColStride(aPtrs, aOffsets, aType.getElementType(), aSrcEnc);
+    if (aRoute.useDevice) {
+      if (!resolveAffinePtrInfo(op.getA(), aRowStride, aColStride)) {
+        aRowStride =
+            computeRowStride(aPtrs, aOffsets, aType.getElementType(), aSrcEnc);
+        aColStride =
+            computeColStride(aPtrs, aOffsets, aType.getElementType(), aSrcEnc);
+      }
     }
-    if (useDeviceB) {
-      bRowStride =
-          computeRowStride(bPtrs, bOffsets, bType.getElementType(), bSrcEnc);
-      bColStride =
-          computeColStride(bPtrs, bOffsets, bType.getElementType(), bSrcEnc);
+    if (bRoute.useDevice) {
+      if (!resolveAffinePtrInfo(op.getB(), bRowStride, bColStride)) {
+        bRowStride =
+            computeRowStride(bPtrs, bOffsets, bType.getElementType(), bSrcEnc);
+        bColStride =
+            computeColStride(bPtrs, bOffsets, bType.getElementType(), bSrcEnc);
+      }
     }
-
-    // If stride computation failed, fall back to TG path
-    if (useDeviceA && (!aRowStride || !aColStride))
-      useDeviceA = false;
-    if (useDeviceB && (!bRowStride || !bColStride))
-      useDeviceB = false;
 
     // SMEM fallback for operands without device pointers: SG-load directly from
     // the staging buffer, keeping the dot register-resident (no operand
@@ -632,16 +688,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     Value aSmemBase, bSmemBase;
     int64_t aSmemPitch = 0, bSmemPitch = 0;
     {
-      if (!useDeviceA)
+      if (!aRoute.useDevice)
         std::tie(aSmemBase, aSmemPitch) = resolveSmemOperand(op.getA(), aType);
-      if (!useDeviceB)
+      if (!bRoute.useDevice)
         std::tie(bSmemBase, bSmemPitch) = resolveSmemOperand(op.getB(), bType);
     }
-    bool useSmemA = !useDeviceA && static_cast<bool>(aSmemBase);
-    bool useSmemB = !useDeviceB && static_cast<bool>(bSmemBase);
-    bool fastA = useDeviceA || useSmemA;
-    bool fastB = useDeviceB || useSmemB;
-    bool fastPath = fastA && fastB;
+    aRoute.useSmem = !aRoute.useDevice && static_cast<bool>(aSmemBase);
+    bRoute.useSmem = !bRoute.useDevice && static_cast<bool>(bSmemBase);
+    bool fastPath = aRoute.fast() && bRoute.fast();
 
     // Device base pointer for an 8x8 MMA tile. Subtracts this thread's own
     // element offset from ptrs[0] so every thread computes the SAME tile
@@ -1193,11 +1247,11 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // tiles, the device origin adding the runtime warp offset on top of the
       // compile-time step. A tiles for tk+1 prefetched before MMA of tk.
       Value aDevStride, bDevStride, aDevTranspose, bDevTranspose;
-      if (useDeviceA) {
+      if (aRoute.useDevice) {
         aDevStride = makeDevMmaStride(aColStride, aRowStride);
         aDevTranspose = makeDevMmaTranspose(aColStride, aRowStride);
       }
-      if (useDeviceB) {
+      if (bRoute.useDevice) {
         bDevStride = makeDevMmaStride(bColStride, bRowStride);
         bDevTranspose = makeDevMmaTranspose(bColStride, bRowStride);
       }
@@ -1222,7 +1276,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // use CONSTANT tile offsets (a runtime SG offset mis-lowers). A's is a
       // row offset (warpRow*8 rows of pitch aSmemPitch); B's a pure column.
       Value ptrSmemAWarp, ptrSmemBWarp;
-      if (useSmemA) {
+      if (aRoute.useSmem) {
         Value pitchA =
             arith::ConstantIntOp::create(rewriter, loc, aSmemPitch, 32);
         Value flat = arith::ExtUIOp::create(
@@ -1232,7 +1286,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy,
                                 aSmemBase, ArrayRef<LLVM::GEPArg>{flat});
       }
-      if (useSmemB) {
+      if (bRoute.useSmem) {
         Value flat = arith::ExtUIOp::create(rewriter, loc, i64Ty, warpColElem);
         ptrSmemBWarp =
             LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy,
@@ -1243,7 +1297,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // simdgroup intrinsic at constant pitch, device operands via the
       // device-direct load; both yield the same v64 matrix type for one MMA fn.
       auto loadATile = [&](int64_t k, int64_t tk) -> Value {
-        if (useSmemA) {
+        if (aRoute.useSmem) {
           Value aOff = makeI64Vec2(rewriter, loc, tk * 8, k * warpsM * 8);
           return emitSGLoad(abTgLoadFn, ptrSmemAWarp, aSmemPitch, aSmemPitch,
                             aOff);
@@ -1256,7 +1310,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                           aDevStride, zeroOff, aDevTranspose);
       };
       auto loadBTile = [&](int64_t tk, int64_t j) -> Value {
-        if (useSmemB) {
+        if (bRoute.useSmem) {
           Value bOff = makeI64Vec2(rewriter, loc, j * warpsN * 8, tk * 8);
           return emitSGLoad(abTgLoadFn, ptrSmemBWarp, bSmemPitch, bSmemPitch,
                             bOff);
@@ -1269,7 +1323,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                           bDevStride, zeroOff, bDevTranspose);
       };
 
-      if (useSmemA || useSmemB) {
+      if (aRoute.useSmem || bRoute.useSmem) {
         // SMEM-resident operands: SG-load every owned strip tile upfront, ONE
         // barrier, then the all-register MMA loop. The barrier is required: the
         // pipeliner prefetches num_stages-1 ahead, so without the fence the

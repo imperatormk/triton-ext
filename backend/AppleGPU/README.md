@@ -32,13 +32,9 @@ git clone https://github.com/triton-lang/triton.git
 cd triton
 
 # Create venv
-python3.12 -m venv pytorch25-venv
-source pytorch25-venv/bin/activate
+python3.12 -m venv .venv
+source .venv/bin/activate
 pip install pybind11 numpy pytest
-
-# macOS patches needed before building:
-# - third_party/nvidia/CMakeLists.txt: skip GSan CUDA on Apple (stub gsan.ll)
-# - CMakeLists.txt: skip examples/plugins on Apple (visibility link errors)
 
 # Build LLVM (first time only, ~40 min)
 cd llvm-project
@@ -65,18 +61,8 @@ git checkout apple-gpu
 
 ### 3. Build the plugin
 
-```bash
-make build
-```
-
-This configures (if needed) and builds `libapplegpu_backend.dylib` (or `.so`)
-under `build/lib/` and the `metal-llc` binary under `build/bin/`. `make build`
-auto-discovers the Triton + LLVM artifacts via `ci/pick-local-artifact.py`; if
-they are not present it errors with `Missing artifact directories`.
-
-**Building against a source build of Triton + LLVM** (no CI artifacts): invoke
-cmake directly, pointing at your trees, then build only this extension's
-targets:
+Configure with cmake, pointing at your Triton + LLVM trees, then build this
+extension's targets:
 
 ```bash
 cmake -S . -B build -G Ninja \
@@ -89,9 +75,10 @@ cmake -S . -B build -G Ninja \
 ninja -C build metal-llc libapplegpu_backend.dylib
 ```
 
-`cmake` always *configures* every extension
-(`dialect pass backend language extensions`); naming the targets keeps the
-*build* to AppleGPU only.
+This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/` and the
+`metal-llc` binary under `build/bin/`. cmake configures every extension
+(`dialect pass backend language extensions`); naming the ninja targets keeps the
+build to AppleGPU only.
 
 ### 4. Run
 
@@ -106,7 +93,7 @@ export TRITON_PASS_PLUGIN_PATH=$TRITON_PLUGIN_PATHS
 export PYTHONPATH=$PWD/backend/AppleGPU/python
 ```
 
-Then save this as `vecadd.py` and run `python vecadd.py`:
+Then run:
 
 ```python
 import torch, triton, triton.language as tl

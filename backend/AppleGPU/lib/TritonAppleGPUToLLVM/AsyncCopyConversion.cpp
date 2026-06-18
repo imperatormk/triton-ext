@@ -1749,6 +1749,126 @@ bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info,
   return true;
 }
 
+bool extractAffineMmaPtrInfo(Value ptrTensor, AffineMmaPtrInfo &info) {
+  auto *addptrOp = ptrTensor.getDefiningOp();
+  if (!addptrOp || !isa<triton::AddPtrOp>(addptrOp))
+    return false;
+
+  // Collect additive index terms across the flat and nested-addptr shapes.
+  SmallVector<Value> terms, work;
+  work.push_back(addptrOp->getOperand(1));
+  work.push_back(addptrOp->getOperand(0));
+  unsigned budget = 256;
+  while (!work.empty() && budget--) {
+    Value v = work.pop_back_val();
+    if (auto *d = v.getDefiningOp()) {
+      if (isa<triton::BroadcastOp>(d) || isa<triton::SplatOp>(d)) {
+        work.push_back(d->getOperand(0));
+        continue;
+      }
+      if (auto add = dyn_cast<arith::AddIOp>(d)) {
+        work.push_back(add.getLhs());
+        work.push_back(add.getRhs());
+        continue;
+      }
+      if (auto inAddptr = dyn_cast<triton::AddPtrOp>(d)) {
+        work.push_back(inAddptr->getOperand(0));
+        work.push_back(inAddptr->getOperand(1));
+        continue;
+      }
+    }
+    terms.push_back(v);
+  }
+  if (budget == 0)
+    return false;
+
+  auto peelBroadcast = [](Value v) -> Value {
+    while (auto *bc = v.getDefiningOp()) {
+      if (isa<triton::BroadcastOp>(bc)) {
+        v = bc->getOperand(0);
+        continue;
+      }
+      break;
+    }
+    return v;
+  };
+
+  // expand_dims axis 1 varies row (dim 0), axis 0 varies col; bare = unit
+  // stride, muli(expand_dims, s) = stride s.
+  Value strideVal[2];
+  int64_t strideConst[2] = {INT64_MIN, INT64_MIN};
+  bool sawUnit[2] = {false, false};
+  auto record = [&](int dim, Value s, int64_t sc) {
+    if (s)
+      strideVal[dim] = s;
+    if (sc != INT64_MIN)
+      strideConst[dim] = sc;
+    if (!s && sc == INT64_MIN)
+      sawUnit[dim] = true;
+  };
+
+  for (Value t : terms) {
+    if (defChainContainsModulo(t))
+      return false;
+    Value inner = peelBroadcast(t);
+    if (auto muli = inner.getDefiningOp<arith::MulIOp>()) {
+      triton::ExpandDimsOp exp;
+      Value strideSSA;
+      int64_t strideC = INT64_MIN;
+      for (unsigned i = 0; i < 2; i++) {
+        Value opnd = muli->getOperand(i);
+        Value p = peelBroadcast(opnd);
+        if (auto e = p.getDefiningOp<triton::ExpandDimsOp>())
+          exp = e;
+        else if (auto sp = opnd.getDefiningOp<triton::SplatOp>())
+          strideSSA = sp->getOperand(0);
+        else if (auto cst = p.getDefiningOp<arith::ConstantOp>()) {
+          if (auto dense = dyn_cast<DenseIntElementsAttr>(cst.getValue()))
+            if (dense.isSplat())
+              strideC = dense.getSplatValue<APInt>().getSExtValue();
+        }
+      }
+      if (!exp || (!strideSSA && strideC == INT64_MIN))
+        return false;
+      int dim = exp.getAxis() == 1 ? 0 : 1;
+      record(dim, strideSSA, strideC);
+      continue;
+    }
+    if (auto exp = inner.getDefiningOp<triton::ExpandDimsOp>()) {
+      int dim = exp.getAxis() == 1 ? 0 : 1;
+      record(dim, Value(), INT64_MIN);
+      continue;
+    }
+  }
+
+  auto haveDim = [&](int dim) {
+    return strideVal[dim] || strideConst[dim] != INT64_MIN || sawUnit[dim];
+  };
+  if (!haveDim(0) || !haveDim(1))
+    return false;
+
+  auto setStride = [&](int dim, Value &outV, int64_t &outC) {
+    if (strideVal[dim]) {
+      outV = strideVal[dim];
+      outC = INT64_MIN;
+    } else if (strideConst[dim] != INT64_MIN) {
+      outC = strideConst[dim];
+    } else {
+      outC = 1;
+    }
+  };
+  setStride(0, info.rowStride, info.rowStrideConst);
+  setStride(1, info.colStride, info.colStrideConst);
+  bool rowUnit = !info.rowStride && info.rowStrideConst == 1;
+  bool colUnit = !info.colStride && info.colStrideConst == 1;
+  // Exactly one dim must be unit-stride for the SG tile load; transpose = the
+  // inner (col) dim carries the leading stride.
+  if (rowUnit == colUnit)
+    return false;
+  info.transposed = rowUnit;
+  return true;
+}
+
 void populateAsyncCopyPatterns(LLVMTypeConverter &typeConverter,
                                RewritePatternSet &patterns,
                                ModuleAxisInfoAnalysis &axisInfoAnalysis) {

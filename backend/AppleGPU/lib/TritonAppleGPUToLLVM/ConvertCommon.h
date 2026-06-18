@@ -66,6 +66,19 @@ struct AsyncCopyPtrInfo {
 bool extractAsyncCopyPtrInfo(Value ptrTensor, AsyncCopyPtrInfo &info,
                              bool allowModulo);
 
+// Per-dim strides of a 2D affine source pointer for the MMA device-direct load
+// (transposed = inner dim carries the leading stride). INT64_MIN *Const = use
+// the SSA Value.
+struct AffineMmaPtrInfo {
+  Value rowStride;
+  Value colStride;
+  int64_t rowStrideConst = INT64_MIN;
+  int64_t colStrideConst = INT64_MIN;
+  bool transposed = false;
+};
+
+bool extractAffineMmaPtrInfo(Value ptrTensor, AffineMmaPtrInfo &info);
+
 // Per-group pattern registration. The pass driver owns the centralized
 // RewritePatternSet and calls each of these; the benefits live with the
 // registration so the driver's relative-priority view stays in one place.

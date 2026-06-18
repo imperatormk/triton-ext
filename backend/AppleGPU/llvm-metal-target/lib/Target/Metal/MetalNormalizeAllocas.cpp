@@ -24,10 +24,7 @@ using namespace llvm;
 
 #define DEBUG_TYPE "metal-normalize-allocas"
 
-// Metal address spaces.
-
-/// Walks users of V and returns true if any load (or store value) is float.
-/// Recurses through GEP users.
+/// True if any load/stored value reaching V (through GEP users) is float.
 static bool hasFloatUse(Value *V) {
   for (User *U : V->users()) {
     if (auto *LI = dyn_cast<LoadInst>(U))

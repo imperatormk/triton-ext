@@ -54,19 +54,11 @@ static void writeENDT(raw_ostream &OS) { OS.write("ENDT", 4); }
 
 // ── Bitcode ──────────────────────────────────────────────────────────────
 
-// generateBitcode is now in BitcodeEmitter.cpp (emitMetalBitcode)
-// It emits typed pointers using the PointeeTypeMap.
-
 static std::vector<uint8_t> wrapBitcode(const std::vector<uint8_t> &BC) {
-  // The wrapped section is [20-byte wrapper header][bitcode][8 zero bytes].
   // The wrapper's size field is the TRUE bitcode length: metal-objdump reads
-  // exactly that many bytes as the bitstream, so it must equal a complete,
-  // word-aligned bitstream (see emitMetalBitcode, which now flushes its final
-  // 32-bit word). A short or misaligned size makes the reader over-read and
-  // report "truncated module". Apple's `xcrun metallib` reports the unpadded
-  // bitcode size here too. Every derived size (section size, MDSZ, total file
-  // size, hash) flows from WrappedBC.size(), so reporting it here keeps them
-  // all self-consistent.
+  // exactly that many bytes as the bitstream, so it must be a complete,
+  // word-aligned bitstream or the reader over-reads and reports "truncated
+  // module". Every derived size flows from WrappedBC.size().
   uint32_t Size = BC.size();
   std::string Buf;
   raw_string_ostream RSO(Buf);
@@ -76,13 +68,11 @@ static std::vector<uint8_t> wrapBitcode(const std::vector<uint8_t> &BC) {
   writeU32(RSO, Size);       // bitcode size (true, word-aligned length)
   writeU32(RSO, 0xFFFFFFFF); // CPU type
   RSO.write(reinterpret_cast<const char *>(BC.data()), BC.size());
-  // Append trailing zero bytes so the whole wrapped section spans a multiple
-  // of 16. metal-objdump's bitcode reader needs read-ahead slack past the
-  // declared bitstream end and reports "truncated module" unless the section
-  // (20-byte wrapper + bitcode + trailing) is 16-aligned; verified by sweeping
-  // many sizes against `xcrun metal-objdump`. The slack is trailing zeros, not
-  // counted in the wrapper size field, so the embedded module is unchanged. Use
-  // a full 16-byte block when already aligned so there is always nonzero slack.
+  // Pad to 16-align the whole wrapped section: metal-objdump's reader needs
+  // read-ahead slack past the declared bitstream end, else "truncated module".
+  // Slack is trailing zeros, not counted in the wrapper size, so the embedded
+  // module is unchanged. Force a full block when already aligned for nonzero
+  // slack.
   size_t SectionSoFar = 20u + BC.size();
   size_t Pad = (16u - (SectionSoFar % 16u)) % 16u;
   if (Pad == 0)
@@ -124,9 +114,8 @@ static std::string buildEntryTags(StringRef Name, ArrayRef<uint8_t> Hash,
   writeU64(OS, 0);
   writeU64(OS, 0);
 
-  // VERS (air_major, air_minor, metal_major, metal_minor)
-  // air_major is always 2; air_minor is derived from the target macOS major
-  // (OSmajor-8), empirically verified via `xcrun metal -mmacosx-version-min`.
+  // VERS (air_major, air_minor, metal_major, metal_minor). air_major is always
+  // 2; air_minor is derived from the target macOS major (OSmajor-8).
   writeTag(OS, "VERS", 8);
   writeU16(OS, MetalVersion::AIRMajor);
   writeU16(OS, Opts.Version.AIRMinor);
@@ -141,13 +130,12 @@ static std::string buildEntryTags(StringRef Name, ArrayRef<uint8_t> Hash,
 
 bool writeMetallib(Module &M, PointeeTypeMap &PTM, raw_ostream &OS,
                    const MetallibOptions &OptsIn) {
-  // The target triple is the single source of truth for the AIR version.
-  // Derive it here (falling back to macOS 16 when absent) so the VERS tag's
-  // air_minor tracks the target macOS major.
+  // The target triple is the source of truth for the AIR version (fall back to
+  // macOS 16 when absent) so VERS air_minor tracks the target macOS major.
   MetallibOptions Opts = OptsIn;
   Opts.Version = MetalVersion::fromTriple(M.getTargetTriple().str());
 
-  // Emit bitcode with typed pointers (the whole point of this project)
+  // Emit bitcode with typed pointers.
   auto Bitcode = emitMetalBitcode(M, PTM);
   auto WrappedBC = wrapBitcode(Bitcode);
   auto Hash = SHA256::hash(ArrayRef<uint8_t>(WrappedBC));
@@ -177,10 +165,8 @@ bool writeMetallib(Module &M, PointeeTypeMap &PTM, raw_ostream &OS,
   }
 
   // ── Build section 0: entry headers ─────────────────────────────────────
-  // Format: u32(entry_count) + per entry: u32(entry_size) + tags
-  // entry_size = tags.size() + 4(ENDT) + 4(ENDT)
-  // The 2 ENDTs are written AFTER section 0 (in a gap, not counted in sec0
-  // size)
+  // u32(entry_count) + per entry: u32(entry_size) + tags. entry_size counts the
+  // 2 ENDTs, but they are written AFTER section 0 (in a gap, not in sec0 size).
 
   std::string Sec0;
   {
@@ -240,11 +226,9 @@ bool writeMetallib(Module &M, PointeeTypeMap &PTM, raw_ostream &OS,
 
   OS.write("MTLB", 4);
 
-  // MTLB header bytes 4-15. Byte 4 (Platform[4]) is the container-format
-  // version and byte 8 (Platform[8]) is the OS major — both vary by target
-  // macOS and are derived from the version (verified vs `xcrun metal`:
-  // 13->07/13, 14->07/14, 15->08/15, 16->09/26). The OS byte uses the renumber
-  // (16 -> 26).
+  // MTLB header: byte 4 is the container-format version, byte 8 the OS major;
+  // both derived from the version (13->07/13, 14->07/14, 15->08/15, 16->09/26).
+  // The OS byte uses the renumber (16 -> 26).
   uint8_t Platform[12] = {0x01, 0x80, 0x02, 0x00, 0x09, 0x00,
                           0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
   Platform[4] = Opts.Version.ContainerByte & 0xFF;

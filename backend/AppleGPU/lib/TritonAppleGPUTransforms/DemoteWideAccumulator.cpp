@@ -1,42 +1,14 @@
-// Demote a wide loop-carried literal-struct accumulator (an LLVM-dialect block
-// argument of type !llvm.struct<(T x N)> for large N) to scalarized per-element
-// allocas that the loop load/modify/stores in place.
+// Demote a wide loop-carried literal-struct accumulator (LLVM block argument of
+// type !llvm.struct<(T x N)> for large N) to N per-element allocas the loop
+// load/modify/stores in place.
 //
-// WHY THIS EXISTS
-// ---------------
-// A rolled `scf.for` whose iter_arg is a large per-thread tensor slice (e.g.
-// the depthwise-conv1d accumulator, a tensor<16x64x64xf32> that lowers to a
-// 1024-element per-thread struct) becomes, after scf->cf + TritonGPU->LLVM
-// lowering, a loop with a single literal-struct block argument:
-//
-//   ^bb1(%iv: i32, %acc: !llvm.struct<(f32 x1024)>):     ; the phi
-//     ... %e = llvm.extractvalue %acc[i] ...             ; 1024 reads
-//     ... %acc.next = llvm.insertvalue ..., i ...        ; 1024 writes (undef
-//     base) llvm.br ^bb1(%iv.next, %acc.next)
-//
-// LLVM's interprocedural SCCP (part of optimize_module(O3), the same call the
-// NVIDIA backend makes) NON-TERMINATES on this shape: getStructValueState /
-// visitInsertValueInst spin on the 1024-field aggregate lattice. Confirmed:
-// `opt -O3` on the pre-opt module hangs at 100% CPU forever.
-//
-// THE FIX (robust by construction)
-// --------------------------------
-// We replace the wide struct phi with N scalar allocas in the entry block:
-//   * the preheader edge stores the init value's N fields into the slots,
-//   * every `extractvalue %acc[i]` becomes `load slot_i`,
-//   * the latch edge stores the next value's N fields into the slots, with the
-//     field value pulled directly out of the producing insertvalue chain so no
-//     wide aggregate value is ever materialized, and
-//   * the struct is dropped from the block-argument and branch-operand lists.
-//
-// After this there is no struct-typed SSA value crossing the loop at all: only
-// scalar allocas with scalar load/stores, which mem2reg/SROA handle trivially
-// and which present IPSCCP with N independent scalar lattices instead of one
-// N-field aggregate lattice. The wide-aggregate phi cannot be reintroduced
-// because the carried value's type is now plain scalars in memory.
-//
-// The pass only fires above kMinStructFields, so small loop-carried tensors
-// (the common case) are left byte-for-byte unchanged.
+// WHY: LLVM's IPSCCP (run as part of optimize_module(O3)) NON-TERMINATES on a
+// wide-aggregate phi - getStructValueState / visitInsertValueInst spin on the
+// N-field lattice (`opt -O3` hangs at 100% CPU forever). Scalarizing to N
+// allocas presents IPSCCP with N independent scalar lattices instead, and no
+// struct-typed SSA value crosses the loop, so the wide phi can't be
+// reintroduced. Fires only above kMinStructFields; smaller loops are left
+// unchanged.
 
 #include "TritonAppleGPUTransforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -124,9 +96,8 @@ struct DemoteWideAccumulator
     }
     if (targets.empty())
       return;
-    // demote() erases a block argument (and its matching branch operand),
-    // shifting every higher index down. Process each block's targets
-    // highest-index-first so the remaining (lower) indices stay valid.
+    // demote() erases an argument, shifting higher indices down; process each
+    // block's targets highest-index-first so the lower indices stay valid.
     llvm::stable_sort(targets, [](const auto &a, const auto &b) {
       if (a.first != b.first)
         return a.first < b.first;
@@ -135,18 +106,11 @@ struct DemoteWideAccumulator
     for (auto [blk, argIdx] : targets)
       demote(func, blk, argIdx);
 
-    // After demotion the latch's wide-struct construction (the insertvalue
-    // chain that fed the old phi, plus its undef/zero base) is dead — its only
-    // consumer was the branch operand we dropped. It must be ERASED, not just
-    // left dead: IPSCCP still walks the lattice of a 1024-field aggregate even
-    // when the result is unused, which is exactly the non-termination we are
-    // eliminating.
-    //
-    // Collect every wide-aggregate op once, then erase in REVERSE program order
-    // (uses before defs): an insertvalue chain is built defs-then-uses, so the
-    // chain head (last built, the dead root) comes last and is erased first,
-    // dropping the use on the next link, and so on — a single linear sweep, no
-    // re-walk. A use-less op stays use-less, so this can't erase a live value.
+    // The now-dead latch insertvalue chain must be ERASED, not just left dead:
+    // IPSCCP walks a wide-aggregate's lattice even when its result is unused,
+    // which is the non-termination we're eliminating. Erase in REVERSE program
+    // order (uses before defs) so the chain falls in one sweep; use_empty()
+    // guards against erasing anything live.
     SmallVector<Operation *> wideOps;
     func.walk([&](Operation *op) {
       if (!isa<LLVM::InsertValueOp, LLVM::ExtractValueOp, LLVM::UndefOp,
@@ -172,7 +136,7 @@ struct DemoteWideAccumulator
     auto [elemTy, n] = *wideScalarStruct(arg.getType());
 
     // Every predecessor must reach `blk` via an unconditional llvm.br (the
-    // canonical loop shape this targets). Bail otherwise — correctness over
+    // canonical loop shape this targets). Bail otherwise - correctness over
     // coverage; the only consumer is the rolled-accumulator loop.
     SmallVector<LLVM::BrOp> preds;
     for (Block *pred : blk->getPredecessors()) {
@@ -195,7 +159,6 @@ struct DemoteWideAccumulator
     auto ptrTy = LLVM::LLVMPointerType::get(func.getContext());
     SmallVector<Value> slots;
     slots.reserve(n);
-    // build(res, arraySize, alignment(IntegerAttr, optional), elem_type)
     for (int64_t i = 0; i < n; ++i)
       slots.push_back(LLVM::AllocaOp::create(b, loc, ptrTy, /*arraySize=*/one,
                                              /*alignment=*/IntegerAttr(),

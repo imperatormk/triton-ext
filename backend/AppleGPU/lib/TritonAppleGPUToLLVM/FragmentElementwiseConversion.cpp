@@ -41,12 +41,10 @@ namespace ttg = mlir::triton::gpu;
 
 namespace {
 
-// Fragment ABI elementwise: when an f32 #mma value carries the fragment struct,
-// apply the op per fragment vector (<64 x f32>). The struct layout is identical
-// across operands of the same #mma type, so a binary op is a lane-wise vector
-// op on matching slots and a unary op maps over the slots. Fires only when the
-// converted operand/result types are the fragment struct; otherwise defers to
-// the generic flat elementwise lowering.
+// Fragment ABI elementwise: apply the op per fragment vector (<64 x f32>).
+// Identical struct layout across same-#mma operands means a binary op is
+// lane-wise per matching slot, a unary op maps over slots. Fires only when the
+// operand/result types are the fragment struct; else defers to flat lowering.
 template <typename SrcOp, typename LLVMOp>
 struct AppleMmaFragmentBinaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
   using ConvertOpToLLVMPattern<SrcOp>::ConvertOpToLLVMPattern;
@@ -115,14 +113,11 @@ struct AppleMmaFragmentUnaryConversion : public ConvertOpToLLVMPattern<SrcOp> {
   }
 };
 
-// f16/bf16 accumulator-epilogue truncf on a fragment struct: a FORWARD. The
-// f16/bf16 #mma result rides the same <64 x f32> accumulator fragment as the
-// f32 input (getAppleMmaFragmentElemType keeps it f32), so this truncf is a
-// no-op at the fragment level — the actual f32 -> f16/bf16 narrowing is emitted
-// per-element on the EXTRACTED SCALAR in the #mma->#blocked store convert
-// (ConvertLayoutOpAppleConversion), keeping the accumulator vectorized and the
-// narrowing off the simdgroup register. Matches only when in/out are the same
-// f32 fragment struct; defers otherwise so the generic flat truncf still runs.
+// f16/bf16 epilogue truncf on a fragment struct: a FORWARD (no-op). The
+// f16/bf16 #mma result rides the same <64 x f32> accumulator fragment as f32,
+// so the actual narrowing is emitted per-element on the extracted scalar in the
+// #mma->#blocked store convert (ConvertLayoutOpAppleConversion), keeping the
+// accumulator off the simdgroup register. Matches only same f32 in/out struct.
 struct AppleMmaFragmentTruncFConversion
     : public ConvertOpToLLVMPattern<arith::TruncFOp> {
   using ConvertOpToLLVMPattern<arith::TruncFOp>::ConvertOpToLLVMPattern;
@@ -149,13 +144,10 @@ struct AppleMmaFragmentTruncFConversion
   }
 };
 
-// ── Fragment-ABI integer/mask + view lowerings (kkt op-web) ──────────────
-//
-// These keep the i32/i1/f32 kkt temporaries on the simdgroup register path so
-// the f32 accumulator never leaves the <64 x ELT> fragment struct. expand_dims
-// is a pure local reg-pack (slice flat scalar → its (row,col) fragment slot);
-// broadcast is the validated scalar simd_shuffle replicate (oracle-proven);
-// cmpi/andi/select are per-slot lane-wise vector ops.
+// Fragment-ABI integer/mask + view lowerings: keep i32/i1/f32 temporaries on
+// the simdgroup register path so the accumulator stays in the <64 x ELT>
+// fragment struct. expand_dims = local reg-pack; broadcast = scalar
+// simd_shuffle replicate; cmpi/andi/select = per-slot lane-wise vector ops.
 
 static LLVMStructType fragStructOf(Type t) {
   auto s = dyn_cast_or_null<LLVMStructType>(t);
@@ -164,8 +156,7 @@ static LLVMStructType fragStructOf(Type t) {
   return nullptr;
 }
 // expand_dims: slice<#mma> (flat per-thread scalars) → #mma fragment struct.
-// Layout-preserving: the slice flat element k corresponds to result offset
-// (row_k,col_k); pack it into that lane's fragment slot. No cross-lane move.
+// Layout-preserving: pack flat element k into its (row_k,col_k) fragment slot.
 struct AppleMmaExpandDimsConversion
     : public ConvertOpToLLVMPattern<triton::ExpandDimsOp> {
   using ConvertOpToLLVMPattern<triton::ExpandDimsOp>::ConvertOpToLLVMPattern;
@@ -194,10 +185,9 @@ struct AppleMmaExpandDimsConversion
     else
       srcElems.push_back(src);
 
-    // expand_dims is layout-preserving: enumerate the SLICE source's per-thread
-    // offsets (1D, kept dim) — these match the flat source struct element count
-    // exactly — and insert the expand axis to recover each element's (row,col)
-    // home in the result #mma fragment. (The result's own emitOffsetForLayout
+    // Enumerate the SLICE source's per-thread offsets (1D, kept dim) - these
+    // match the flat source element count - and insert the expand axis to find
+    // each element's (row,col) home. (The result's own emitOffsetForLayout
     // counts register-broadcast copies and would over-count vs the flat slice.)
     auto sliceTy = cast<RankedTensorType>(op.getSrc().getType());
     auto sliceOffsets = emitOffsetForLayout(sliceTy.getEncoding(), sliceTy);

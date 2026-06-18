@@ -6,17 +6,14 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Rewrite every f64 (`double`) value to f32 (`float`). Apple GPU / Metal has
-// no double type, so any kernel containing one crashes the Metal shader
-// compiler. The f64 chains Triton emits (sitofp i64 -> double, transcendental
-// f64 intrinsics, fmul, then fptrunc back to float) are shape-derived scalars
-// that already truncate to float at the end, so f32 is accuracy-safe.
+// Rewrite every f64 value to f32. Apple GPU / Metal has no double type, so any
+// kernel containing one crashes the Metal shader compiler. The f64 chains
+// Triton emits are shape-derived scalars that truncate to float at the end, so
+// f32 is accuracy-safe.
 //
-// Strategy: a single forward worklist pass per function. For each f64
-// instruction we build a float replacement (mapping its operands through the
-// value map), RAUW, and erase the dead f64 op. Identity casts (fptrunc/fpext
-// float->float) are dropped by forwarding to the operand. f64 constants are
-// rounded to float. Double intrinsics are remapped to their .f32 overload.
+// Forward worklist pass per function: build a float replacement for each f64
+// instruction, RAUW, erase. Identity float->float casts forward to the operand;
+// f64 constants round to float; double intrinsics remap to their .f32 overload.
 //
 //===----------------------------------------------------------------------===//
 
@@ -95,13 +92,9 @@ public:
       Map[V] = R;
       return R;
     }
-    // An f64 value we have not produced yet (e.g. an argument, or processed
-    // out of order). Materialize a placeholder fptrunc that we patch later is
-    // overkill here -- forward iteration over the function guarantees defs
-    // precede uses except for phis, which we handle specially. If we still hit
-    // an unmapped f64 value, fall back to an fpext-free bitcast is impossible;
-    // instead leave it and rely on a second pass. As a safety net, return V
-    // (will be fixed once its def is processed).
+    // Unmapped f64 value (argument, or phi back-edge). Forward iteration maps
+    // defs before uses except across phis, which are patched in a fix-up loop;
+    // return V here and let that loop resolve it.
     return V;
   }
 
@@ -143,8 +136,7 @@ public:
         Elts.push_back(demoteConstant(CA->getOperand(i)));
       return ConstantArray::get(cast<ArrayType>(DT), Elts);
     }
-    // Fallback: cannot demote (e.g. ConstantExpr). Should not appear in these
-    // scalar shape chains; bail loudly in debug builds.
+    // Cannot demote (e.g. ConstantExpr); not expected in these scalar chains.
     LLVM_DEBUG(dbgs() << "metal-demote-f64: unhandled f64 constant: " << *C
                       << "\n");
     return C;
@@ -155,16 +147,14 @@ public:
     Type *FloatTy = Type::getFloatTy(Ctx);
     (void)FloatTy;
 
-    // Forward iteration. Defs precede uses except across phi back-edges; we
-    // patch phi incoming values in a fix-up loop afterwards.
+    // Defs precede uses except across phi back-edges (patched below).
     for (Instruction &I : instructions(F)) {
       if (!instrTouchesF64(&I))
         continue;
       processInstruction(&I);
     }
 
-    // Fix-up: phis may have referenced f64 values not yet mapped at creation
-    // time. Re-resolve every new phi's incoming values.
+    // Re-resolve each new phi's incoming values now that all defs are mapped.
     for (auto &KV : Map) {
       if (auto *NewPhi = dyn_cast_or_null<PHINode>(KV.second)) {
         auto *OldPhi = cast<PHINode>(KV.first);
@@ -175,14 +165,10 @@ public:
       }
     }
 
-    // RAUW: every old f64 instruction's float users have been rebuilt to use
-    // the new values directly, but external (non-demoted) users may remain if
-    // an f64 value feeds something we did not rewrite (it shouldn't, post
-    // demotion). Erase dead instructions in reverse program order.
+    // Erase dead f64 instructions in reverse program order, RAUW'ing any
+    // surviving use to its float replacement.
     for (Instruction *I : reverse(Dead)) {
       if (!I->use_empty()) {
-        // Any surviving use must be replaced with the float value (this also
-        // covers identity-cast forwarding consumers we missed).
         if (Value *R = Map.lookup(I))
           I->replaceAllUsesWith(R);
       }
@@ -216,13 +202,10 @@ private:
       Value *Src = get(FPT->getOperand(0));
       Type *DstTy = demoteTy(FPT->getType());
       if (Src->getType() == DstTy) {
-        // fptrunc float->float : identity, forward operand.
-        record(FPT, Src);
+        record(FPT, Src); // float->float identity
       } else if (DstTy->getScalarType()->isHalfTy()) {
-        // fptrunc double->half  =>  fptrunc float->half.
         record(FPT, B.CreateFPTrunc(Src, DstTy, FPT->getName()));
       } else {
-        // float -> something narrower than float that isn't half: keep trunc.
         record(FPT, B.CreateFPTrunc(Src, DstTy, FPT->getName()));
       }
       return;
@@ -231,10 +214,8 @@ private:
       Value *Src = get(FPE->getOperand(0));
       Type *DstTy = demoteTy(FPE->getType());
       if (Src->getType() == DstTy) {
-        // fpext float->float (was float->double): identity.
-        record(FPE, Src);
+        record(FPE, Src); // float->float identity
       } else if (Src->getType()->getScalarType()->isHalfTy()) {
-        // fpext half->double => fpext half->float.
         record(FPE, B.CreateFPExt(Src, DstTy, FPE->getName()));
       } else {
         record(FPE, B.CreateFPExt(Src, DstTy, FPE->getName()));
@@ -262,9 +243,6 @@ private:
       return;
     }
     if (auto *BC = dyn_cast<BitCastInst>(I)) {
-      // bitcast i64 -> double => bitcast i32... no: bit width changes. A
-      // bitcast to/from double has no valid f32 analogue (different size), so
-      // route through the value: if source is f64 mapped to f32, re-bitcast.
       Value *Src = get(BC->getOperand(0));
       Type *DstTy = demoteTy(BC->getType());
       if (Src->getType() == DstTy) {
@@ -286,7 +264,6 @@ private:
       return;
     }
     if (auto *UO = dyn_cast<UnaryOperator>(I)) {
-      // fneg double
       Value *Op = get(UO->getOperand(0));
       Value *NV = B.CreateUnOp(UO->getOpcode(), Op, UO->getName());
       if (auto *NI = dyn_cast<Instruction>(NV))
@@ -353,22 +330,16 @@ private:
     // ---- return ------------------------------------------------------------
     if (auto *Ret = dyn_cast<ReturnInst>(I)) {
       if (Ret->getReturnValue() && hasF64(Ret->getReturnValue()->getType())) {
-        // The function return type itself would need rewriting; these kernels
-        // are void, so this is not expected. Leave as-is but warn.
+        // Would need to rewrite the return type; these kernels are void.
         LLVM_DEBUG(dbgs() << "metal-demote-f64: f64 return in " << F.getName()
                           << "\n");
       }
       return;
     }
 
-    // ---- loads / stores through f64 -- not expected for scalar chains, but
-    // handle to keep the IR consistent if they appear.
+    // ---- loads / stores through f64 (not expected for scalar chains) -------
     if (auto *LD = dyn_cast<LoadInst>(I)) {
       if (LD->getType()->isDoubleTy()) {
-        // Load the bits as float -- requires the pointee was f64 in memory.
-        // We do NOT rewrite memory layout here; instead load as f64 then
-        // fptrunc. But since f64 is illegal, load as i32-pair is overkill.
-        // For safety, load and immediately fptrunc to float.
         LLVM_DEBUG(dbgs() << "metal-demote-f64: f64 load in " << F.getName()
                           << "\n");
       }
@@ -390,23 +361,17 @@ private:
 
     if (Callee && Callee->isIntrinsic()) {
       Intrinsic::ID ID = Callee->getIntrinsicID();
-      // Remap the overloaded float type from double to float. Most of these
-      // are simple single-type-arg intrinsics (sqrt/sin/cos/exp/log/fabs/
-      // floor/ceil/trunc/rint/...) or multi-arg same-type (pow/fma/copysign/
-      // minnum/maxnum/...). Build with all f64 operands demoted to f32.
+      // Remap the overload type from double to float and demote all operands.
       SmallVector<Value *, 4> Args;
       SmallVector<Type *, 2> OverloadTys;
       for (Value *A : CB->args())
         Args.push_back(get(A));
-      // The overload type set: for these FP intrinsics the mangling type is
-      // the (now float) result/operand type.
       Type *NewTy = demoteTy(CB->getType());
       OverloadTys.push_back(NewTy);
 
       Module *M = F.getParent();
       Function *NewFn = nullptr;
       switch (ID) {
-      // Intrinsics overloaded on a single FP type (result == operand type).
       case Intrinsic::sqrt:
       case Intrinsic::sin:
       case Intrinsic::cos:
@@ -437,7 +402,6 @@ private:
         break;
       }
       default: {
-        // Generic attempt: re-declare with the demoted overload type.
         NewFn = Intrinsic::getOrInsertDeclaration(M, ID, OverloadTys);
         break;
       }
@@ -454,9 +418,8 @@ private:
       return;
     }
 
-    // Non-intrinsic call with f64 args/ret: demote args, and if the callee
-    // signature has f64 we cannot safely change it here (would need to rewrite
-    // the callee). For these scalar chains, such calls are not expected.
+    // Non-intrinsic f64 call: cannot rewrite the callee signature here; not
+    // expected in these scalar chains.
     if (ArgF64 || RetF64) {
       LLVM_DEBUG(dbgs() << "metal-demote-f64: f64 user call: " << *CB << "\n");
     }
@@ -493,7 +456,6 @@ static bool demoteF64(Module &M) {
   SmallVector<Function *, 8> DeadDecls;
   for (Function &Fn : M) {
     if (Fn.isDeclaration() && Fn.isIntrinsic() && Fn.use_empty()) {
-      // Check the declaration mentions double in its type.
       if (hasF64(Fn.getReturnType()))
         DeadDecls.push_back(&Fn);
       else {

@@ -61,10 +61,8 @@ using namespace llvm;
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMetalTarget() {
   RegisterTargetMachine<MetalTargetMachine> X(getTheMetalTarget());
   auto *PR = PassRegistry::getPassRegistry();
-  // TargetPassConfig::addIRPasses() schedules these through the legacy PM.
-  // They must be registered in THIS image's PassRegistry: the target lib is
-  // a dylib with its own statically-linked LLVM copy, so registrations done
-  // in the driver binary land in a different registry singleton.
+  // Must register in THIS dylib's PassRegistry singleton: the target lib has
+  // its own statically-linked LLVM copy, distinct from the driver binary's.
   initializeCore(*PR);
   initializeCodeGen(*PR);
   initializeScalarOpts(*PR);
@@ -108,10 +106,8 @@ public:
 
   MCSection *getExplicitSectionGlobal(const GlobalObject *GO, SectionKind Kind,
                                       const TargetMachine &TM) const override {
-    // Out-of-tree: the stock MCContext has no `getMetalLibSection` and the
-    // .metallib payload is emitted directly via MetalWriterPass in
-    // addPassesToEmitFile -- AsmPrinter never runs, so this hook is never
-    // hit in practice. Return null to make the unreachable explicit.
+    // Out-of-tree: metallib is emitted directly via MetalWriterPass;
+    // AsmPrinter never runs, so this hook is unreachable.
     (void)GO;
     (void)Kind;
     (void)TM;
@@ -141,28 +137,15 @@ public:
     // Metal IR pipeline passes (LLVM IR -> AIR-conformant IR), in order.
     // AIR bitcode has no switch encoding; lower to branch chains first.
     addPass(createLowerSwitchPass());
-    // AGX-1 (cross-buffer same-offset device-store warp-0 miscompile).
-    // Run EARLY, while the in-bounds predicate icmp (and its assume) are still
-    // intact, so the separation guard can use the REAL mask. Sinks the run of
-    // conflicting cross-buffer stores behind one shared in-bounds branch; a
-    // no-op on single-output kernels (needs >=2 device-output buffers writing
-    // the same per-thread offset). See MetalCrossBufferStoreSeparate.cpp.
+    // AGX-1 (cross-buffer same-offset device-store warp-0 miscompile). Run
+    // EARLY, while the in-bounds predicate icmp/assume are intact, so the
+    // separation guard uses the REAL mask. No-op on single-output kernels.
     addPass(createMetalCrossBufferStoreSeparateLegacyPass());
-    // The Apple AGX GPU JIT miscompiles cross-lane `air.simd_shuffle*` when the
-    // shuffle's scalar operand is sourced via `extractelement` from a vector
-    // SSA value (a vector register): the permute reads the wrong physical lane
-    // for some SIMD threads, corrupting cross-lane reductions. Apple's own
-    // `metal` frontend never feeds vector-extracted values into shuffles. The
-    // SLP vectorizer (O1+) creates exactly this pattern in reduce/scan kernels,
-    // so scalarize the vector chains entangled with shuffle operands back to
-    // scalars before AIR emission. GEMM's pure load/store vectors are
-    // untouched.
     // addPass(createMetalScalarizeShuffleOperandsLegacyPass()); // disabled for
     // now
     addPass(createMetalInlineNonKernelLegacyPass());
-    // Apple GPU has no double type; demote all f64 to f32 before anything
-    // else touches the IR (and before serialization, which would crash the
-    // Metal shader compiler on any surviving double).
+    // Apple GPU has no double type; demote f64 to f32 before serialization
+    // (any surviving double crashes the Metal shader compiler).
     addPass(createMetalDemoteF64LegacyPass());
     addPass(createMetalLowerFNegLegacyPass());
     addPass(createMetalNaNMinMaxLegacyPass());
@@ -184,13 +167,7 @@ public:
     // Emit Apple-style alias-scope MD + "air-buffer-no-alias" param attrs
     // after the IR shape is final but before final normalisations.
     addPass(createMetalAliasAnnotateLegacyPass());
-    // Final pre-serialization normalizations.
     addPass(createMetalPrepareLegacyPass());
-    // (AGX-1 cross-buffer store separation now runs early, after LowerSwitch.)
-    // MetalPrepare's mergeByteGlobals now emits the identity bitcast
-    // inline on bfloat/half/float-through-bfloat typed-base GEPs, so the
-    // post-Prepare NormalizeAllocas re-run is no longer needed.
-    // See test_scan2d[cum{sum,prod}-bfloat16-*].
   }
 };
 } // namespace
@@ -220,23 +197,19 @@ bool MetalTargetMachine::addPassesToEmitFile(
     CodeGenFileType FileType, bool DisableVerify,
     MachineModuleInfoWrapperPass *MMIWP) {
   TargetPassConfig *PassConfig = createPassConfig(PM);
-  // Standard llc IR prologue (verifier, LSR + codegen-prep IR passes) at
-  // -O1+, same as every upstream backend; -O0 / -disable-lsr opt out.
   PassConfig->addIRPasses();
   PassConfig->addCodeGenPrepare();
 
   switch (FileType) {
   case CodeGenFileType::AssemblyFile:
-    // Phase 1: emit the transformed LLVM IR. The .metallib writer lands in
-    // Phase 2 (MC ObjectWriter + embedder pass).
+    // Emit the transformed LLVM IR.
     PM.add(createPrintModulePass(Out, "", true));
     break;
   case CodeGenFileType::ObjectFile:
-    // Out-of-tree: always use the direct MetalWriterPass path. The in-tree
-    // build also wires an AsmPrinter + MC ObjectWriter route, but that
-    // requires MCSectionMetalLib + MetalLibObjectWriter additions to core MC
-    // which we cannot land into Triton's pinned LLVM. MetalWriterPass writes
-    // the .metallib bytes directly to `Out`, producing byte-identical output.
+    // Out-of-tree: write the .metallib bytes directly via MetalWriterPass. The
+    // in-tree AsmPrinter/MC route needs MCSectionMetalLib +
+    // MetalLibObjectWriter core-MC additions we can't land into Triton's pinned
+    // LLVM.
     PM.add(createMetalWriterPass(Out));
     break;
   case CodeGenFileType::Null:

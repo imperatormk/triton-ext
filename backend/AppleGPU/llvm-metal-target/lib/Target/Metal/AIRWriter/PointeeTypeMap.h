@@ -19,67 +19,21 @@
 namespace llvm {
 namespace metal {
 
-// ── Pointee Type Map ─────────────────────────────────────────────────────
+// Side table mapping each opaque pointer to its reconstructed pointee type.
+// Metal GPU JIT requires typed POINTER records in bitcode but LLVM 19+ only
+// has opaque pointers; the custom bitcode writer consumes this map to emit
+// typed records while the in-memory Module stays valid with opaque pointers.
 //
-// Metal GPU JIT requires typed pointers in bitcode (POINTER records with
-// pointee type), but LLVM 19+ only has opaque pointers (ptr addrspace(N)).
+// Metal GPU JIT rules encoded here: device (AS1) and TG (AS3) ptrs must be
+// typed; when MMA intrinsics are present ALL device ptrs become float*; i1*
+// crashes the JIT so remap to i8*.
 //
-// This side table tracks what each pointer "actually points to" as the IR
-// passes transform it. Passes that need typed pointer info read/write this
-// map. The custom bitcode writer consumes it to emit typed POINTER records.
-//
-// Example flow:
-//
-// LLVM Module (opaque ptrs):
-// %p = getelementptr float, ptr addrspace(1) %buf, i32 %idx
-// %v = load float, ptr addrspace(1) %p
-//
-// PointeeTypeMap after InferTypedPointersPass:
-// %buf → float (inferred from GEP source type)
-// %p → float (inferred from load type)
-//
-// Custom bitcode writer:
-// %buf emitted as float addrspace(1)* (POINTER record with pointee=float)
-// %p emitted as float addrspace(1)*
-//
-// Keeping the type info in a side table (rather than a bespoke typed-pointer
-// IR) lets the LLVM Module stay valid with opaque pointers throughout the
-// pipeline; only the bitcode writer needs the resolved pointee types.
-//
-// ── Key rules from Metal GPU JIT ─────────────────────────────────────────
-//
-// 1. ALL device pointers (addrspace 1) must be typed in bitcode
-// 2. When MMA intrinsics are present, ALL device ptrs must be float*
-// (narrow loads now stay narrow; the per-load alias contract emitted by
-// MetalAliasAnnotate carries the disambiguation the JIT needs)
-// 3. TG pointers (addrspace 3) must be typed (usually float*)
-// 4. i1* crashes GPU JIT - remap to i8*
-// 5. Constant buffer ptrs (addrspace 2) follow scalar packing rules
-//
-// ── Two-stage design: Analysis vs Pass (READ THIS BEFORE EDITING) ─────────
-//
-// The pointee-type logic deliberately lives in TWO places, and they overlap.
-// This is intentional, but fragile - keep them in sync.
-//
-// * PointeeTypeAnalysis::run (PointeeTypeMap.cpp) is a cached LLVM Analysis.
-// It builds the map from scratch and MUST be fully self-contained: the pass
-// manager may invalidate and recompute it at any point, so every
-// Metal-specific override (MMA collapse, async-copy event_t, i1->i8) has to
-// be reproducible here with no outside state.
-//
-// * InferTypedPointersPass::run (InferTypedPointers.cpp) is a Transform Pass.
-// It calls getResult<PointeeTypeAnalysis>() to get the map, then REFINES it
-// after doing IR mutations the analysis can't do (e.g. the Phase 1b
-// ptrtoint+inttoptr atomic fixup). Because those mutations create new SSA
-// values, the MMA/async overrides must be re-applied here too.
-//
-// Net effect: the MMA + async-copy override blocks are near-duplicated across
-// the two files. If you change one (e.g. add a new MMA intrinsic variant),
-// change BOTH. The shared intrinsic-name constants below exist so at least
-// those can't silently diverge.
-
-// Shared MMA intrinsic names, used by both PointeeTypeAnalysis and
-// InferTypedPointersPass. Keep additions here, not copy-pasted per file.
+// The pointee-type logic lives in TWO overlapping places that must stay in
+// sync: PointeeTypeAnalysis::run (cached LLVM Analysis, must be fully
+// self-contained as the PM may recompute it) and InferTypedPointersPass::run
+// (Transform Pass that refines the map after IR mutations). The MMA + async
+// override blocks are near-duplicated; change BOTH. Shared intrinsic-name
+// constants below prevent at least those from diverging.
 namespace mma_intrinsics {
 inline constexpr const char *kLoad =
     "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
@@ -133,15 +87,9 @@ private:
   llvm::DenseMap<llvm::Value *, llvm::Type *> map;
 };
 
-// Compute the pointee-type side table for a module. This is a pure function of
-// the module (no analysis-manager state), so callers that aren't running under
-// the new-PM analysis machinery -- e.g. the legacy metallib writer pass -- can
-// call it directly.
+// Pure function of the module (no analysis-manager state), so callers outside
+// the new-PM machinery (e.g. the legacy metallib writer pass) can call it.
 PointeeTypeMap buildPointeeTypeMap(llvm::Module &M);
-
-// ── LLVM Analysis wrapper ────────────────────────────────────────────────
-// Shared across passes via the AnalysisManager; delegates to
-// buildPointeeTypeMap.
 
 struct PointeeTypeAnalysis : llvm::AnalysisInfoMixin<PointeeTypeAnalysis> {
   using Result = PointeeTypeMap;

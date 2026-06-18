@@ -7,11 +7,10 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// Header-only helpers that map LLVM IR enums to the small integer codes the
-/// AIR bitstream expects in INST_BINOP, INST_CAST and MODULE_GLOBAL records.
-/// Kept inline because every helper is hot in the FunctionWriter inner loop
-/// and the mapping is fixed by the Apple bitcode reader rather than by LLVM
-/// (so the values cannot share LLVM's own `Bitcode/LLVMBitCodes.h` constants).
+/// Header-only helpers mapping LLVM IR enums to the integer codes the AIR
+/// bitstream expects in INST_BINOP, INST_CAST and MODULE_GLOBAL records. The
+/// mapping is fixed by the Apple bitcode reader, NOT LLVM, so these values
+/// cannot share LLVM's own `Bitcode/LLVMBitCodes.h` constants.
 ///
 //===----------------------------------------------------------------------===//
 

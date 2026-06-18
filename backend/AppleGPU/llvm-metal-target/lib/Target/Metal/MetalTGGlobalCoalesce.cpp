@@ -96,6 +96,123 @@ static std::optional<int64_t> constInt(Value *V) {
 // size rather than clip live staging.
 static constexpr StringLiteral kAsyncCopy2D("air.simdgroup_async_copy_2d");
 
+// Conservative compile-time upper bound on the unsigned value of an integer SSA
+// value, for statically bounding a dynamic threadgroup GEP index. Returns
+// nullopt when no finite bound is provable. The vector-staged GEMM staging path
+// (no async copy) addresses `@global_smem` with a thread-derived index of the
+// form zext(shl(or(and(tid,C1), and(tid,C2)), S)): `and X, C` is bounded by C,
+// `or` by the bitwise-or of the bounds, `shl`/`mul`-by-const scale the bound,
+// and `zext` preserves it. Bounding that index proves the staged region's
+// high-water mark so the dead reservation tail can be trimmed even without an
+// async copy to anchor the region.
+static std::optional<uint64_t> staticMaxUnsigned(Value *V, unsigned Depth = 0) {
+  if (auto *CI = dyn_cast<ConstantInt>(V))
+    return CI->getZExtValue();
+  if (Depth > 16)
+    return std::nullopt;
+  Type *Ty = V->getType();
+  if (!Ty->isIntegerTy())
+    return std::nullopt;
+  unsigned BitW = Ty->getIntegerBitWidth();
+  uint64_t TypeMax = BitW >= 64 ? ~0ULL : ((1ULL << BitW) - 1);
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    Value *A = BO->getOperand(0), *B = BO->getOperand(1);
+    switch (BO->getOpcode()) {
+    case Instruction::And: {
+      // and X, C is bounded by C; and X, Y by min(maxX, maxY).
+      auto MA = staticMaxUnsigned(A, Depth + 1);
+      auto MB = staticMaxUnsigned(B, Depth + 1);
+      if (MA && MB)
+        return std::min(*MA, *MB);
+      if (MA)
+        return *MA;
+      if (MB)
+        return *MB;
+      return std::nullopt;
+    }
+    case Instruction::Or:
+    case Instruction::Xor:
+    case Instruction::Add: {
+      auto MA = staticMaxUnsigned(A, Depth + 1);
+      auto MB = staticMaxUnsigned(B, Depth + 1);
+      if (!MA || !MB)
+        return std::nullopt;
+      // or/xor of two values is <= the bitwise-or of their bounds rounded up to
+      // a mask; add is the sum. Use the safe over-approximation (sum) for all
+      // three (or/xor never exceed the sum), clamped to the type width.
+      uint64_t Sum = *MA + *MB;
+      return std::min(Sum, TypeMax);
+    }
+    case Instruction::Shl: {
+      auto MA = staticMaxUnsigned(A, Depth + 1);
+      auto *C = dyn_cast<ConstantInt>(B);
+      if (!MA || !C)
+        return std::nullopt;
+      return std::min(*MA << C->getZExtValue(), TypeMax);
+    }
+    case Instruction::Mul: {
+      auto MA = staticMaxUnsigned(A, Depth + 1);
+      auto MB = staticMaxUnsigned(B, Depth + 1);
+      if (!MA || !MB)
+        return std::nullopt;
+      return std::min(*MA * *MB, TypeMax);
+    }
+    default:
+      return std::nullopt;
+    }
+  }
+  if (auto *ZE = dyn_cast<ZExtInst>(V))
+    return staticMaxUnsigned(ZE->getOperand(0), Depth + 1);
+  if (auto *TR = dyn_cast<TruncInst>(V)) {
+    if (auto M = staticMaxUnsigned(TR->getOperand(0), Depth + 1))
+      return std::min(*M, TypeMax);
+    return std::nullopt;
+  }
+  if (auto *Sel = dyn_cast<SelectInst>(V)) {
+    auto MT = staticMaxUnsigned(Sel->getTrueValue(), Depth + 1);
+    auto MF = staticMaxUnsigned(Sel->getFalseValue(), Depth + 1);
+    if (MT && MF)
+      return std::max(*MT, *MF);
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+// True when every transitive consumer of a (dynamic) threadgroup GEP is an
+// air.simdgroup_matrix_8x8_load READ (possibly through further constant GEPs /
+// bitcasts). Such a GEP only reads staged bytes the operand stores already
+// wrote, so it cannot extend the buffer's live region past the write high-water
+// and is safe to skip when its tid-derived index is not statically boundable.
+// Returns false on any store, async copy, non-MMA call, or unrecognized user
+// (those must be accounted for explicitly).
+static bool gepFeedsOnlyMMAReads(Value *V) {
+  SmallVector<Value *, 16> Work{V};
+  SmallPtrSet<Value *, 16> Seen;
+  bool SawMMARead = false;
+  while (!Work.empty()) {
+    Value *Cur = Work.pop_back_val();
+    if (!Seen.insert(Cur).second)
+      continue;
+    for (User *U : Cur->users()) {
+      if (isa<GEPOperator>(U) || isa<BitCastOperator>(U) ||
+          isa<AddrSpaceCastOperator>(U)) {
+        Work.push_back(U);
+        continue;
+      }
+      if (auto *CB = dyn_cast<CallBase>(U)) {
+        Function *Callee = CB->getCalledFunction();
+        if (Callee &&
+            Callee->getName().starts_with("air.simdgroup_matrix_8x8_load")) {
+          SawMMARead = true;
+          continue;
+        }
+      }
+      return false;
+    }
+  }
+  return SawMMARead;
+}
+
 static bool shrinkOverAllocatedThreadgroupGlobals(Module &M) {
   const DataLayout &DL = M.getDataLayout();
 
@@ -113,6 +230,7 @@ static bool shrinkOverAllocatedThreadgroupGlobals(Module &M) {
     int64_t HighWater = 0;
     bool Bail = false;
     bool SawDynamicGEP = false;
+    bool SawUnboundedDynGEP = false;
     bool SawAsyncCopy = false;
 
     SmallVector<std::pair<User *, int64_t>, 16> Work;
@@ -127,6 +245,42 @@ static bool shrinkOverAllocatedThreadgroupGlobals(Module &M) {
         APInt Off(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
         if (!GEP->accumulateConstantOffset(DL, Off)) {
           SawDynamicGEP = true;
+          // The vector-staged GEMM path indexes the byte arena with a single
+          // thread-derived dynamic index. Two distinct dynamic GEP shapes reach
+          // the staging global:
+          //   (a) the operand-store GEPs (`getelementptr i8, base, i64 %idx`)
+          //       whose %idx is a boundable and/or/shl of tid -> bound them and
+          //       fold the reach into the high-water;
+          //   (b) the MMA-load address GEPs (`getelementptr [4 x i8], base, i64
+          //       %idx`) feeding only air.simdgroup_matrix_8x8_load. Those are
+          //       READS of bytes the stores already wrote; their tid index is
+          //       not boundable here (tid.x has no IR bound
+          //       pre-AIRSystemValues) but they cannot extend the live region
+          //       past the write high- water, so they are safe to skip.
+          if (gepFeedsOnlyMMAReads(GEP))
+            continue;
+          int64_t DynMaxByte = 0;
+          bool Bounded = false;
+          if (GEP->getNumOperands() == 2) {
+            if (auto M = staticMaxUnsigned(GEP->getOperand(1))) {
+              uint64_t ElemBytes =
+                  DL.getTypeAllocSize(GEP->getSourceElementType());
+              DynMaxByte = static_cast<int64_t>(*M * ElemBytes);
+              Bounded = true;
+            }
+          }
+          if (!Bounded) {
+            SawUnboundedDynGEP = true;
+            continue;
+          }
+          int64_t DynBase = Base + DynMaxByte;
+          if (DynBase < 0 || DynBase >= CurBytes) {
+            Bail = true;
+            break;
+          }
+          HighWater = std::max(HighWater, DynBase);
+          for (User *UU : GEP->users())
+            Work.push_back({UU, DynBase});
           continue;
         }
         for (User *UU : GEP->users())
@@ -161,20 +315,27 @@ static bool shrinkOverAllocatedThreadgroupGlobals(Module &M) {
         }
       }
       // Any other concrete consumer (load/store/non-copy call) at a known base
-      // contributes at least one element; if it sits past what the copies
-      // cover we cannot prove the tail dead, so bail.
+      // contributes its access width; if it sits past what the copies cover we
+      // cannot prove the tail dead, so bail.
       if (Base < 0 || Base >= CurBytes) {
         Bail = true;
         break;
       }
-      HighWater = std::max(HighWater, Base + 1);
+      int64_t AccessBytes = 1;
+      if (auto *SI = dyn_cast<StoreInst>(U))
+        AccessBytes = DL.getTypeStoreSize(SI->getValueOperand()->getType());
+      else if (auto *LI = dyn_cast<LoadInst>(U))
+        AccessBytes = DL.getTypeStoreSize(LI->getType());
+      HighWater = std::max(HighWater, Base + AccessBytes);
     }
 
-    // A dynamic GEP is only bounded if an async copy established its region;
-    // with no copy on the global, its touched bytes are unprovable -> keep
-    // size.
-    if (SawDynamicGEP && !SawAsyncCopy)
+    // A dynamic GEP whose index could not be statically bounded leaves its
+    // touched bytes unprovable unless an async copy established the region.
+    // A bounded dynamic GEP (vector-staged GEMM thread index) already folded
+    // its reach into HighWater above, so it does not force a bail.
+    if (SawUnboundedDynGEP && !SawAsyncCopy)
       Bail = true;
+    (void)SawDynamicGEP;
 
     if (Bail || HighWater <= 0)
       continue;

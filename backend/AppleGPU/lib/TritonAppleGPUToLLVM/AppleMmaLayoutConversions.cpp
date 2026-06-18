@@ -34,31 +34,13 @@ AppleMmaEncodingAttr::toLinearLayout(llvm::ArrayRef<int64_t> shape) const {
   auto dimCol = dimNames[1]; // "dim1"
 
   // ── Single 8×8 simdgroup tile ─────────────────────────────────────────
-  //
-  // Hardware mapping: lane[0:2]→col, lane[3:4]→row, reg[0]→row+4
-  //
-  // Convention: "register" must be the first in-dim (asserted by
-  // ensureLayoutNotSmallerThan). We construct via explicit bases:
-  //
-  //   register bit 0 → row bit 2  (rows 0-3 vs 4-7)
-  //   lane bit 0     → col bit 0
-  //   lane bit 1     → col bit 1
-  //   lane bit 2     → col bit 2
-  //   lane bit 3     → row bit 0
-  //   lane bit 4     → row bit 1
-  // PHYSICAL layout (TRITON_C_LIVE_KLOOP): match the simdgroup_matrix hardware
-  // per-lane storage so the #mma<->simdgroup_matrix bridge is lane-local
-  // (insertelement/extractelement at indices 0,1), eliminating the per-K-step
-  // TG round-trip for the C accumulator. Derived from the Phase-4 device-path
-  // doc:
+  // PHYSICAL layout matches the simdgroup_matrix per-lane storage so the
+  // #mma<->simdgroup_matrix bridge is lane-local (extract/insert at 0,1):
   //   phys_row = L[1] | (L[2]<<1) | (L[4]<<2)
   //   phys_col = (L[0]<<1) | (L[3]<<2) | R
-  // LOGICAL layout (historical): row = (T>>3)+R*4, col = T&7.
-  // The physical layout is now UNCONDITIONAL: every C-accumulator bridge site
-  // (device, batchStrips, per-strip) is lane-local against this layout, so the
-  // old TRITON_C_LIVE_KLOOP opt-out is gone (forcing logical here would
-  // miscompile those bridges). The logical bases below are kept only for
-  // reference.
+  // It is UNCONDITIONAL: every C-accumulator bridge site is lane-local against
+  // it, so forcing the logical layout (row = (T>>3)+R*4, col = T&7) here would
+  // miscompile those bridges. Logical bases kept for reference only.
   bool physLayout = true;
   std::vector<std::vector<int32_t>> registerBases =
       physLayout ? std::vector<std::vector<int32_t>>{{0, 1}}
@@ -95,7 +77,6 @@ AppleMmaEncodingAttr::toLinearLayout(llvm::ArrayRef<int64_t> shape) const {
                    .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
 
   // ── Broadcast to full tensor shape ────────────────────────────────────
-  // Handles shapes larger than one CTA tile by repeating the pattern.
   // Apple has no CGA — use trivial 1-CTA layout.
   return combineCtaCgaWithShape(ctaLayout, getCGALayout(), shape);
 }

@@ -25,10 +25,9 @@ void MetadataEnumerator::collect(Module &M, ValueEnumerator &E) {
   for (auto &NMD : M.named_metadata())
     for (unsigned I = 0; I < NMD.getNumOperands(); I++)
       visitNode(NMD.getOperand(I), E);
-  // E2a: pick up MDNodes attached to instructions (alias.scope, noalias,
-  // tbaa, etc.). Apple's writer threads these through ValueEnumerator;
-  // ours did not. Without this pass METADATA_BLOCK has no IDs for the
-  // FUNC_CODE_INST_ATTACHMENT records to reference.
+  // Pick up MDNodes attached to instructions (alias.scope, noalias, tbaa).
+  // Without this, METADATA_BLOCK has no IDs for FUNC_CODE_INST_ATTACHMENT
+  // records to reference.
   for (auto &F : M) {
     if (F.isDeclaration())
       continue;
@@ -46,9 +45,8 @@ void MetadataEnumerator::collect(Module &M, ValueEnumerator &E) {
 void MetadataEnumerator::visitNode(const MDNode *N, ValueEnumerator &E) {
   if (!N || nodeMap.count(N))
     return;
-  // For distinct, self-referential nodes (alias-scope domains:
-  // `!d = distinct !{!d, ...}`) we MUST reserve the slot before recursing,
-  // otherwise we infinite-loop. Non-distinct nodes can keep the original
+  // Self-referential distinct nodes (`!d = distinct !{!d, ...}`) MUST reserve
+  // their slot before recursing or we infinite-loop. Non-distinct nodes keep
   // post-order semantics so named-metadata references don't shift.
   if (N->isDistinct()) {
     unsigned MyID = nodes.size();

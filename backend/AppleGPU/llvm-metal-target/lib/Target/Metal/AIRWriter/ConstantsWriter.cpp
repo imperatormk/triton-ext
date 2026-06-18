@@ -32,12 +32,10 @@ void emitConstantsBlock(BitstreamWriter &W, ValueEnumerator &E,
       W.EmitRecord(bitc::CST_CODE_SETTYPE, V);
       V.clear();
     }
-    // In current LLVM, ConstantInt/ConstantFP can be *vector*-typed: a
-    // `<N x T> splat (T val)` is a single scalar ConstantInt/ConstantFP whose
-    // getType() is the vector type (the textual `splat (...)` form). The
-    // scalar INTEGER/FLOAT records below would emit one element against a
-    // vector SETTYPE, which the AIR reader decodes as undef. Emit these as a
-    // replicated CST_CODE_DATA so the splat survives the round-trip.
+    // A `<N x T> splat (T val)` is a scalar ConstantInt/ConstantFP whose
+    // getType() is the vector type. The scalar INTEGER/FLOAT records would emit
+    // one element against a vector SETTYPE, which the AIR reader decodes as
+    // undef. Emit a replicated CST_CODE_DATA so the splat survives round-trip.
     if ((isa<ConstantInt>(C) || isa<ConstantFP>(C)) &&
         isa<FixedVectorType>(C->getType())) {
       auto *VT = cast<FixedVectorType>(C->getType());
@@ -53,15 +51,11 @@ void emitConstantsBlock(BitstreamWriter &W, ValueEnumerator &E,
     } else if (isa<UndefValue>(C)) {
       W.EmitRecord(bitc::CST_CODE_UNDEF, V);
     } else if (auto *CI = dyn_cast<ConstantInt>(C)) {
-      // Always use INTEGER for ints (even zero) - Metal doesn't
-      // accept NULL for integer types in some contexts.
-      // The bitcode reader decodes CST_CODE_INTEGER via
-      // decodeSignRotatedValue and then builds
-      // ConstantInt::get(Ty, V, /*isSigned=*/true), so the emitted value
-      // must be the *signed* representation of the constant. For i1 this
-      // means `true` is -1 (not +1): an i1 cannot hold signed +1, and
-      // emitting +1 trips APInt's isIntN assertion in the reader. Use
-      // getSExtValue() for all widths so true -> -1 sign-rotates correctly.
+      // Always use INTEGER for ints (Metal rejects NULL for integers in some
+      // contexts). The reader builds ConstantInt::get(Ty, V, isSigned=true), so
+      // the value must be the *signed* representation: for i1, `true` is -1
+      // (not +1, which trips APInt's isIntN assertion in the reader). Use
+      // getSExtValue() so true -> -1 sign-rotates correctly.
       int64_t Val = CI->getSExtValue();
       V.push_back(Val >= 0 ? uint64_t(Val) << 1 : (uint64_t(-Val) << 1) | 1);
       W.EmitRecord(bitc::CST_CODE_INTEGER, V);

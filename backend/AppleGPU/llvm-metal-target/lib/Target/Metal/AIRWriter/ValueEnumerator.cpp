@@ -45,20 +45,15 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
                 PointeeTypeMap::inferFromUsage(const_cast<Argument *>(&Arg)))
           inferredPointee[Arg.getType()] = Ty;
 
-  // PTM overrides - but skip global variables (they get separate TypeEntry
-  // via globalPtrTypeIdx, not the shared inferredPointee).
-  // Skip event_t-typed entries for AS3 - these should NOT set the AS3
-  // default because MMA TG pointers need float*3 as default. Event pointers
-  // use per-value PTM entries via ptrTypeIdxForValue/funcTypeParamIndices.
+  // PTM overrides. Skip globals (separate TypeEntry via globalPtrTypeIdx) and
+  // AS3 event_t (MMA TG pointers need float*3 default; events use per-value
+  // PTM).
   //
-  // DETERMINISM: walk the module's values in program order and look each up in
-  // PTM, rather than iterating the DenseMap<Value*,Type*> directly.  DenseMap
-  // pointer-key iteration order varies run-to-run, and when several values
-  // share a pointer Type but map to different pointees the last write to
-  // inferredPointee[Type] wins -- iterating in map order made the emitted type
-  // table (and thus the whole .metallib bitstream) nondeterministic, which the
-  // AGX PSO compiler intermittently rejected with "Failed to materializeAll".
-  // See triton-main/repro_materializeall/.
+  // DETERMINISM: walk values in program order, not DenseMap<Value*,Type*>
+  // order. Map iteration order varies run-to-run; when several values share a
+  // pointer Type but map to different pointees, last-write-wins made the type
+  // table (and whole .metallib) nondeterministic -> intermittent "Failed to
+  // materializeAll".
   auto applyPTMOverride = [&](Value *V) {
     Type *T = PTM.get(V);
     if (!T)
@@ -88,43 +83,34 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
   addType(Type::getVoidTy(Ctx));
   addType(Type::getFloatTy(Ctx));
 
-  // Pre-create event_t type BEFORE function type processing.
-  // Async copy intrinsics return event_t addrspace(3)* and
-  // wait_simdgroup_events takes a pointer-to-event-pointer. The event_t type
-  // must exist before function types reference it, to avoid forward references
-  // in the type table (which crash Metal's LLVM 14-based reader).
+  // Pre-create event_t BEFORE function type processing: forward references in
+  // the type table crash Metal's LLVM 14-based reader.
   //
-  // CRITICAL: Set inferredPointee[PtrAs3] = EventTy so that any bare
-  // typeIdx(PtrAs3) call during emission resolves to event_t*3 (not i8*3
-  // or float*3). This is needed for wait_simdgroup_events param 1, whose
-  // pointee is PtrAs3 - the emission calls typeIdx(PtrAs3) which uses
-  // inferredPointee to determine the inner pointer's pointee type.
-  // The i8*3 entries for async copy buffer params are handled separately
-  // through per-param funcTypeParamIndices, not this TYPE-LEVEL default.
+  // CRITICAL: inferredPointee[PtrAs3] = EventTy so a bare typeIdx(PtrAs3)
+  // resolves to event_t*3 (not i8*3/float*3); needed for wait_simdgroup_events
+  // param 1. Async-copy i8*3 buffer params go via per-param
+  // funcTypeParamIndices, not this type-level default.
   {
     StructType *EventTy = StructType::getTypeByName(Ctx, "event_t");
     if (EventTy) {
       addType(EventTy);
       auto *PtrAs3 = PointerType::get(Ctx, 3);
       inferredPointee[PtrAs3] = EventTy;
-      // Also pre-create the event_t*3 pointer entry so it exists before
-      // function type processing (avoids forward references).
       ptrTypeIdx(PtrAs3, EventTy);
     }
   }
 
-  // Enumerate function types - definitions first, then declarations.
-  // Must process definitions first so their per-param pointee inference
-  // populates funcTypeParamIndices before any recursive addType call
-  // from declaration processing caches the function type with wrong params.
+  // Definitions first so their per-param pointee inference populates
+  // funcTypeParamIndices before any recursive addType from declaration
+  // processing caches the function type with wrong params.
   for (auto &F : M)
     if (!F.isDeclaration())
       addFunctionType(F.getFunctionType(), &F);
   for (auto &F : M)
     if (F.isDeclaration())
       addFunctionType(F.getFunctionType(), &F);
-  // Create function pointer types for definitions (kernels) only.
-  // Declarations (intrinsics) don't need function pointers in Metal v1.
+  // Function pointer types for definitions (kernels) only; intrinsic
+  // declarations don't need them in Metal v1.
   for (auto &F : M)
     if (!F.isDeclaration())
       ptrTypeIdx(PtrAs0, F.getFunctionType());
@@ -138,9 +124,8 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
     globalPtrTypeIdx(&GV); // creates ptr(valueType, addrspace) entry
   }
 
-  // Instruction result + operand types - enumerate ALL types used by
-  // instructions so the type table is complete before emission.
-  // For GEPs into arrays, the result pointer needs a separate typed entry.
+  // Enumerate ALL types used by instructions so the type table is complete
+  // before emission.
   for (auto &F : M) {
     for (auto &BB : F) {
       for (auto &I : BB) {
@@ -152,21 +137,16 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
         // The shuffle mask constant is not an in-memory operand.
         if (auto *SV = dyn_cast<ShuffleVectorInst>(&I))
           addType(SV->getShuffleMaskForBitcode()->getType());
-        // Alloca: enumerate the allocated type AND the result's typed-pointer.
-        // The alloca result is pointer_to(allocatedType, addrspace=0).
-        // Both the allocated type and the result pointer type must exist
-        // in the type table for the bitcode reader to materialize correctly.
+        // Alloca: both allocated type and result ptr(allocatedType,0) must be
+        // in the table for the reader to materialize.
         if (auto *AI = dyn_cast<AllocaInst>(&I)) {
           addType(AI->getAllocatedType());
-          // Create result type entry: ptr(allocatedType, 0)
           ptrTypeIdx(PointerType::get(M.getContext(), 0),
                      AI->getAllocatedType());
         }
-        // GEP result: create ptr(elementType, addrspace) entry
-        // Use PTM override for device (AS 1) pointers (e.g., store float
-        // through i8* GEP should produce float*, not i8*).
-        // For TG (AS 3) byte globals, keep GEP's own result element type -
-        // the byte global stays as [N x i8] and GEP results must be i8*.
+        // GEP result ptr(elementType, addrspace). PTM override for device (AS1)
+        // pointers; keep GEP's own element type for AS3 byte globals (stay
+        // i8*).
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
           if (GEP->getType()->isPointerTy()) {
             Type *ResultPointee = GEP->getResultElementType();
@@ -179,8 +159,8 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
                        ResultPointee);
           }
         }
-        // Pointer PHIs (e.g. LSR loop-carried operand pointers) need their
-        // typed pointer entry in the table before emission.
+        // Pointer PHIs (e.g. LSR loop-carried pointers) need their typed
+        // pointer entry in the table before emission.
         if (auto *PN = dyn_cast<PHINode>(&I)) {
           if (PN->getType()->isPointerTy()) {
             unsigned AddrSpace = PN->getType()->getPointerAddressSpace();
@@ -190,8 +170,8 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
             ptrTypeIdx(PointerType::get(M.getContext(), AddrSpace), Pointee);
           }
         }
-        // Bitcast ptr→ptr: in Metal v1 these change typed pointer.
-        // Create a separate typed pointer entry from PTM.
+        // Bitcast ptr→ptr changes the typed pointer in Metal v1; create a
+        // separate typed pointer entry from PTM.
         if (auto *BC = dyn_cast<BitCastInst>(&I)) {
           if (BC->getType()->isPointerTy() &&
               BC->getSrcTy() == BC->getDestTy()) {
@@ -211,7 +191,7 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
     globalValueMap[&GV] = globalValues.size();
     globalValues.push_back(&GV);
   }
-  // Definitions first, then declarations (the order Metal's loader expects)
+  // Definitions first, then declarations (order Metal's loader expects).
   for (auto &F : M) {
     if (F.isDeclaration())
       continue;
@@ -235,11 +215,9 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
     if (GV.hasInitializer())
       addModuleConstant(GV.getInitializer());
 
-  // Also collect sub-constants of function-level aggregate constants.
-  // ConstantsWriter emits ConstantArray/ConstantStruct/ConstantVector via
-  // AGGREGATE records that reference sub-constants by moduleConstIdx.
-  // If a function-level constant is a non-data aggregate, its sub-constants
-  // must be in the module constant table.
+  // Aggregate constants are emitted as AGGREGATE records that reference
+  // sub-constants by moduleConstIdx, so the sub-constants must be in the
+  // module constant table.
   auto addSubConstants = [&](const Value *Op) {
     auto *C = dyn_cast<Constant>(Op);
     if (!C || isa<GlobalValue>(C))
@@ -359,15 +337,12 @@ unsigned ValueEnumerator::addType(Type *T) {
   if (isa<PointerType>(T))
     return ptrTypeIdx(T, pointeeType(T));
 
-  // FunctionTypes are handled by addFunctionType for proper per-param
-  // pointee tracking. If we get here via a generic path, use the
-  // stored indices or fall through to simple entry creation.
+  // FunctionTypes go through addFunctionType for per-param pointee tracking.
   if (auto *FT = dyn_cast<FunctionType>(T)) {
     TypeEntry E{T, nullptr};
     auto It = typeMap.find(E);
     if (It != typeMap.end())
       return It->second;
-    // Not yet enumerated - add with default pointees (no Function context)
     return addFunctionType(FT, nullptr);
   }
 
@@ -407,9 +382,8 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
   // Add return type - for pointer returns, infer pointee from call results
   if (FT->getReturnType()->isPointerTy()) {
     Type *RetPointee = nullptr;
-    // Async copy intrinsics return event_t addrspace(3)*.
-    // Must check function name because async_copy may be declared but never
-    // called (no users to infer from via PTM).
+    // Async copy intrinsics return event_t addrspace(3)*. Check by name:
+    // async_copy may be declared but never called (no users for PTM).
     if (F && F->isDeclaration() &&
         F->getName().starts_with("air.simdgroup_async_copy")) {
       auto &Ctx = F->getContext();
@@ -445,38 +419,34 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
     // Infer pointee for this specific param
     Type *Pointee = nullptr;
 
-    // For atomic intrinsics, the device pointer param must match the
-    // atomic type (i32 or f32) - NOT the kernel buffer's default pointee.
-    // E.g., air.atomic.global.cmpxchg.weak.i32 needs i32*, not float*.
+    // Atomic intrinsic device pointer must match the atomic type (i32/f32),
+    // NOT the kernel buffer's default pointee (e.g. air.atomic...i32 needs
+    // i32*).
     if (F && F->isDeclaration()) {
       StringRef Name = F->getName();
       if (Name.starts_with("air.atomic.")) {
         unsigned AddrSpace = cast<PointerType>(PT)->getAddressSpace();
         if (AddrSpace == 1 || AddrSpace == 3) {
-          // Determine pointee from intrinsic name suffix
           if (Name.ends_with(".i32"))
             Pointee = Type::getInt32Ty(F->getContext());
           else if (Name.ends_with(".f32"))
             Pointee = Type::getFloatTy(F->getContext());
         }
       }
-      // Async copy intrinsics use i8* for buffer pointer params.
-      // The intrinsic name suffix (e.g., .p3i8.p1i8) indicates byte pointers.
-      // Use i8* for both AS3 (destination) and AS1 (source) pointer params.
+      // Async copy buffer params are i8* for both AS3 (dest) and AS1 (src).
       if (Name.starts_with("air.simdgroup_async_copy")) {
         unsigned AddrSpace = cast<PointerType>(PT)->getAddressSpace();
         if (AddrSpace == 1 || AddrSpace == 3)
           Pointee = Type::getInt8Ty(F->getContext());
       }
       // wait_simdgroup_events param 1: pointer to event_t*3 storage.
-      // inferredPointee[PtrAs3] = event_t is set permanently in the
-      // constructor when event_t exists, so typeIdx(PtrAs3) at emission
-      // time resolves to event_t*3. Just set Pointee = PtrAs3.
+      // inferredPointee[PtrAs3]=event_t (set in ctor) makes typeIdx(PtrAs3)
+      // resolve to event_t*3, so Pointee = PtrAs3.
       if (Name == "air.wait_simdgroup_events" && I == 1) {
         auto *PtrAs3 = PointerType::get(F->getContext(), 3);
         Pointee = PtrAs3;
         ParamIndices.push_back(ptrTypeIdx(PT, Pointee));
-        continue; // Skip the normal param processing below
+        continue;
       }
     }
 
@@ -513,9 +483,8 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
 void ValueEnumerator::addModuleConstant(const Constant *C) {
   if (moduleConstMap.count(C) || globalValueMap.count(C))
     return;
-  // ConstantDataArray/Vector have packed data with no sub-constant operands.
-  // Extract elements as individual constants so they can be referenced by
-  // AGGREGATE records (Metal v1 doesn't support DATA for array globals).
+  // Extract packed ConstantData elements as individual constants for AGGREGATE
+  // records (Metal v1 doesn't support DATA for array globals).
   if (auto *CDA = dyn_cast<ConstantDataSequential>(C)) {
     for (unsigned I = 0; I < CDA->getNumElements(); I++)
       addModuleConstant(CDA->getElementAsConstant(I));

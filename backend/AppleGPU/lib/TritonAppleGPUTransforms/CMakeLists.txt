@@ -4,7 +4,6 @@ add_triton_library(TritonAppleGPUTransforms
   SimplifyGatherLayout.cpp
   StoreShuffleLayout.cpp
   WidenPipelinedStaging.cpp
-  DemoteWideAccumulator.cpp
 
   DEPENDS
   TritonAppleGPUDialectIncGen

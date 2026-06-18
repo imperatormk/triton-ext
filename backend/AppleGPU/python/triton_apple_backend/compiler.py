@@ -318,11 +318,6 @@ class MPSBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
 
-        # Scalarize a wide loop-carried literal-struct accumulator phi to
-        # per-element allocas, else O3's IPSCCP non-terminates on the wide
-        # aggregate. Must run after the canonicalizer; O3 folds it back to SSA.
-        _plugin.add_demote_wide_accumulator(pm)
-
         pm.run(mod, 'make_llir')
 
         # Convert MLIR LLVM dialect → LLVM module

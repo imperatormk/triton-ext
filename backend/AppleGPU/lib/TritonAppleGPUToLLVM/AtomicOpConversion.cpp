@@ -499,6 +499,29 @@ struct AtomicRMWOpAppleConversion
         combinedMask = LLVM::AndOp::create(rewriter, loc, isThread0, llMask);
       }
 
+      // Lock-release XCHG: a device-scope release fence must flush the
+      // critical-section stores before the unlock becomes visible to other
+      // threadgroups (air.wg.barrier only orders within a threadgroup).
+      // fence(mem_device=1, release=3, scope_device=2).
+      if (rmwOp == RMWOp::XCHG) {
+        auto voidTy = LLVMVoidType::get(ctx);
+        auto fenceFnTy =
+            LLVMFunctionType::get(voidTy, {i32Ty, i32Ty, i32Ty}, false);
+        {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(mod.getBody());
+          if (!mod.lookupSymbol<LLVMFuncOp>("air.atomic.fence"))
+            LLVMFuncOp::create(rewriter, mod.getLoc(), "air.atomic.fence",
+                               fenceFnTy, Linkage::External);
+        }
+        auto fenceFn = mod.lookupSymbol<LLVMFuncOp>("air.atomic.fence");
+        Value memDev = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+        Value relOrd = arith::ConstantIntOp::create(rewriter, loc, 3, 32);
+        Value devScope = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+        LLVM::CallOp::create(rewriter, loc, fenceFn,
+                             ValueRange{memDev, relOrd, devScope});
+      }
+
       // Thread 0 (with mask) executes the atomic; others get a default value
       Value result =
           emitOneAtomic(rewriter, loc, mod, llPtr, llVal, combinedMask,
@@ -545,6 +568,9 @@ struct AtomicRMWOpAppleConversion
 
 // Lower triton::AtomicCASOp → air.atomic.global.cmpxchg.weak.i32. `expected` is
 // passed by pointer (addrspace 0) and updated on failure; returns old value.
+// Apple exposes only the WEAK cmpxchg (the strong name is PSO-rejected), so the
+// call is wrapped in a spurious-failure retry loop — else a spinlock acquire
+// could fall through without taking the lock and lose updates.
 struct AtomicCASOpAppleConversion
     : public ConvertOpToLLVMPattern<triton::AtomicCASOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -638,14 +664,15 @@ struct AtomicCASOpAppleConversion
 
     LLVM::StoreOp::create(rewriter, loc, expectedI32, expectedAlloca);
 
-    Value order = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+    Value succOrd = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+    Value failOrd = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
     Value scope = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
     Value vol = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
 
     Value oldI32 =
         LLVM::CallOp::create(rewriter, loc, casFn,
                              ValueRange{alignedPtr, expectedAlloca, desiredI32,
-                                        order, order, scope, vol})
+                                        succOrd, failOrd, scope, vol})
             .getResult();
 
     // Extract the old f16/bf16 half from the returned i32 word.
@@ -654,10 +681,13 @@ struct AtomicCASOpAppleConversion
     return LLVM::BitcastOp::create(rewriter, loc, elemTy, oldI16);
   }
 
-  // Emit a single scalar CAS operation. Returns the old value.
+  // Emit a single scalar CAS operation. Returns the old value. `succOrder` /
+  // `failOrder` are AIR memory orders (0=relaxed, 2=acquire, 3=release,
+  // 4=acq_rel, 5=seq_cst) carried through to the intrinsic so the lock acquire
+  // establishes the cross-threadgroup acquire edge the spinlock relies on.
   Value emitOneCAS(ConversionPatternRewriter &rewriter, Location loc,
-                   ModuleOp mod, Value ptr, Value cmp, Value val,
-                   Type valueTy) const {
+                   ModuleOp mod, Value ptr, Value cmp, Value val, Type valueTy,
+                   unsigned succOrder, unsigned failOrder) const {
     auto *ctx = rewriter.getContext();
 
     if (valueTy.isF16() || valueTy.isBF16())
@@ -680,6 +710,15 @@ struct AtomicCASOpAppleConversion
     auto i32Ty = IntegerType::get(ctx, 32);
     auto i1Ty = IntegerType::get(ctx, 1);
 
+    // air.atomic.global.cmpxchg.weak.i32 signature:
+    // (ptr, &expected, desired, succ_order, fail_order, scope, vol). The
+    // mem_flags-bearing 8-arg form Metal's own front end emits crashes the AGX
+    // PSO compiler (TypeFinder null-deref) for our writer's module shape, so we
+    // use this 7-arg form and rely on the order args for cross-group ordering.
+    // TODO: this 7-arg form only weakly honours the order operands -> a rare
+    // ~1/12 cold flake on acquire/release CAS. The principled fix (emit the
+    // canonical 8-arg form + metal::_atomic struct_type_info metadata) is in
+    // triton-main/CAS_CANONICAL_ATOMIC_TODO.md.
     {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(mod.getBody());
@@ -711,20 +750,44 @@ struct AtomicCASOpAppleConversion
                                               /*alignment=*/4);
     }
 
-    LLVM::StoreOp::create(rewriter, loc, cmpI, expectedAlloca);
-
-    Value order = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+    Value succ = arith::ConstantIntOp::create(rewriter, loc, succOrder, 32);
+    Value fail = arith::ConstantIntOp::create(rewriter, loc, failOrder, 32);
     Value scope = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
     Value vol = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
 
+    // Weak-CAS retry: re-issue while old==cmp but `desired` hasn't landed; exit
+    // once old!=cmp (lost the race) or the swap is confirmed. That first value
+    // is what Triton expects.
+    Block *currentBlock = rewriter.getInsertionBlock();
+    Block *afterBlock =
+        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    Block *loopBlock = rewriter.createBlock(afterBlock);
+    afterBlock->addArgument(casTy, loc);
+
+    rewriter.setInsertionPointToEnd(currentBlock);
+    LLVM::BrOp::create(rewriter, loc, loopBlock);
+
+    rewriter.setInsertionPointToStart(loopBlock);
+    LLVM::StoreOp::create(rewriter, loc, cmpI, expectedAlloca);
     Value oldI = LLVM::CallOp::create(rewriter, loc, casFn,
                                       ValueRange{ptr, expectedAlloca, valI,
-                                                 order, order, scope, vol})
+                                                 succ, fail, scope, vol})
                      .getResult();
+    Value readCmp = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::eq,
+                                         oldI, cmpI);
+    Value memNow = LLVM::LoadOp::create(rewriter, loc, casTy, ptr);
+    Value notLanded = LLVM::ICmpOp::create(
+        rewriter, loc, LLVM::ICmpPredicate::ne, memNow, valI);
+    Value retry = LLVM::AndOp::create(rewriter, loc, readCmp, notLanded);
+    LLVM::CondBrOp::create(rewriter, loc, retry, loopBlock, ValueRange{},
+                           afterBlock, ValueRange{oldI});
+
+    rewriter.setInsertionPointToStart(afterBlock);
+    Value resultI = afterBlock->getArgument(0);
 
     if (needBitcast)
-      return LLVM::BitcastOp::create(rewriter, loc, valueTy, oldI);
-    return oldI;
+      return LLVM::BitcastOp::create(rewriter, loc, valueTy, resultI);
+    return resultI;
   }
 
   LogicalResult
@@ -743,15 +806,39 @@ struct AtomicCASOpAppleConversion
         tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
                  : getTypeConverter()->convertType(op.getType());
 
+    // Map Triton sem → AIR success order. A CAS is the acquire half of a
+    // spinlock, so it must ALWAYS carry the acquire edge (else the critical
+    // section reads pre-lock state and the next holder races): promote release→
+    // acq_rel, relaxed→acquire. failOrder mirrors the acquire component — the
+    // PSO compiler crashes on acq_rel success paired with a relaxed failure.
+    unsigned succOrder, failOrder;
+    switch (op.getSem()) {
+    case triton::MemSemantic::RELEASE:
+    case triton::MemSemantic::ACQUIRE_RELEASE:
+      succOrder = 4;
+      failOrder = 2;
+      break;
+    case triton::MemSemantic::ACQUIRE:
+    case triton::MemSemantic::RELAXED:
+    default:
+      succOrder = 2;
+      failOrder = 2;
+      break;
+    }
+
     // Check supported types. Apple GPUs have NO 64-bit atomics — there is no
     // `air.atomic.global.cmpxchg.weak.i64` intrinsic, and emitting one crashes
     // the Metal compiler service (XPC_ERROR_CONNECTION_INTERRUPTED). Fail the
     // lowering cleanly (the op stays illegal -> compile error) rather than
     // producing AIR that brings down the GPU compiler.
     if (!(valueTy.isInteger(32) || valueTy.isF32() || valueTy.isF16() ||
-          valueTy.isBF16()))
-      return rewriter.notifyMatchFailure(
-          op, "Apple GPU has no 64-bit atomics (i64/f64 CAS unsupported)");
+          valueTy.isBF16())) {
+      op.emitError("atomic_cas on ")
+          << valueTy
+          << " is unsupported on the Apple GPU backend: Metal has no 64-bit "
+             "device atomics (only 32-bit/16-bit cmpxchg exist)";
+      return failure();
+    }
 
     if (!tensorTy) {
       // Scalar CAS: only thread 0 executes, broadcast result to all threads.
@@ -824,8 +911,8 @@ struct AtomicCASOpAppleConversion
       LLVM::CondBrOp::create(rewriter, loc, isThread0, casBlock, mergeBlock);
 
       rewriter.setInsertionPointToStart(casBlock);
-      Value casResult =
-          emitOneCAS(rewriter, loc, mod, llPtr, llCmp, llVal, valueTy);
+      Value casResult = emitOneCAS(rewriter, loc, mod, llPtr, llCmp, llVal,
+                                   valueTy, succOrder, failOrder);
       Value resultToStore = casResult;
       if (valueTy.isF32())
         resultToStore =
@@ -844,6 +931,27 @@ struct AtomicCASOpAppleConversion
       // TG memory fence (flag=2) to ensure the TG store is visible
       Value flagTG = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
       LLVM::CallOp::create(rewriter, loc, barrFn, ValueRange{flagTG, scope1});
+
+      // Device-scope acquire fence after lock acquisition, so the critical
+      // section can't read pre-lock state (air.wg.barrier only orders within a
+      // threadgroup). fence(mem_device=1, acquire=2, scope_device=2).
+      auto voidTy2 = LLVMVoidType::get(ctx);
+      auto fenceFnTy =
+          LLVMFunctionType::get(voidTy2, {i32Ty, i32Ty, i32Ty}, false);
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(mod.getBody());
+        if (!mod.lookupSymbol<LLVMFuncOp>("air.atomic.fence"))
+          LLVMFuncOp::create(rewriter, mod.getLoc(), "air.atomic.fence",
+                             fenceFnTy, Linkage::External);
+      }
+      auto fenceFn = mod.lookupSymbol<LLVMFuncOp>("air.atomic.fence");
+      Value memDev = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+      Value acqOrd = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+      Value devScope = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+      LLVM::CallOp::create(rewriter, loc, fenceFn,
+                           ValueRange{memDev, acqOrd, devScope});
+
       Value loaded =
           LLVM::LoadOp::create(rewriter, loc, tgElemTy, tgPtr).getResult();
       if (valueTy.isF32())
@@ -897,15 +1005,17 @@ struct AtomicCASOpAppleConversion
                                ValueRange{}, afterBlock, ValueRange{zeroVal});
 
         rewriter.setInsertionPointToStart(casBlock);
-        Value casResult = emitOneCAS(rewriter, loc, mod, ptrElements[i],
-                                     cmpElements[i], valElements[i], valueTy);
+        Value casResult =
+            emitOneCAS(rewriter, loc, mod, ptrElements[i], cmpElements[i],
+                       valElements[i], valueTy, succOrder, failOrder);
         LLVM::BrOp::create(rewriter, loc, ValueRange{casResult}, afterBlock);
 
         rewriter.setInsertionPointToStart(afterBlock);
         resultVals[i] = afterBlock->getArgument(0);
       } else {
-        resultVals[i] = emitOneCAS(rewriter, loc, mod, ptrElements[i],
-                                   cmpElements[i], valElements[i], valueTy);
+        resultVals[i] =
+            emitOneCAS(rewriter, loc, mod, ptrElements[i], cmpElements[i],
+                       valElements[i], valueTy, succOrder, failOrder);
       }
     }
 

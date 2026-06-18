@@ -27,10 +27,6 @@ static void addWidenStaging(mlir::PassManager *pm,
                             const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createWidenPipelinedStagingPass());
 }
-static void addDemoteWideAccumulator(mlir::PassManager *pm,
-                                     const std::vector<std::string> &) {
-  pm->addPass(mlir::triton::applegpu::createDemoteWideAccumulatorPass());
-}
 static void addToLLVMIR(mlir::PassManager *pm,
                         const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createConvertTritonAppleGPUToLLVMPass());
@@ -66,11 +62,6 @@ static void registerStoreShuffleLayout() {
 static void registerWidenStaging() {
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return mlir::triton::applegpu::createWidenPipelinedStagingPass();
-  });
-}
-static void registerDemoteWideAccumulator() {
-  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
-    return mlir::triton::applegpu::createDemoteWideAccumulatorPass();
   });
 }
 static void registerToLLVMIR() {
@@ -112,8 +103,6 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       {"add_store_shuffle_layout", "0.1.0", addStoreShuffleLayout,
        registerStoreShuffleLayout},
       {"add_widen_staging", "0.1.0", addWidenStaging, registerWidenStaging},
-      {"add_demote_wide_accumulator", "0.1.0", addDemoteWideAccumulator,
-       registerDemoteWideAccumulator},
       {"add_to_llvmir", "0.1.0", addToLLVMIR, registerToLLVMIR},
       {"add_lower_gpu_to_air", "0.1.0", addLowerGPUToAIR,
        registerLowerGPUToAIR},

@@ -61,11 +61,9 @@ struct MetalVersion {
     return {OS, OS - 8, OS + 12, TripleOS, MSLMaj, MSLMin, CByte};
   }
 
-  /// Parse the macOS major from a triple string such as
-  /// "air64_v28-apple-macosx26.0.0". The number after "macosx" maps back:
-  /// 26 -> 16 (Apple renumber), otherwise NN -> NN (13/14/15). Defaults to
-  /// OSMajor=16 when no "macosx" component is found, preserving current
-  /// shipping behavior (macOS 16 / 26-era).
+  /// Parse the macOS major from a triple like "air64_v28-apple-macosx26.0.0".
+  /// 26 -> 16 (Apple renumber), otherwise NN -> NN; defaults to OSMajor=16 when
+  /// no "macosx" component is found.
   static MetalVersion fromTriple(llvm::StringRef Triple) {
     constexpr llvm::StringRef Marker = "macosx";
     size_t Pos = Triple.find(Marker);

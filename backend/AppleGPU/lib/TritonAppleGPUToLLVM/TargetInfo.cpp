@@ -101,11 +101,8 @@ void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter,
 
 void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
   // Apple simdgroups do NOT auto-order threadgroup memory across lanes (unlike
-  // NVIDIA lockstep warps): a lane reading a TG slot written by another lane in
-  // the same simdgroup can see stale data without a fence. The membar pass
-  // emits warpSync (not barrier) for single-warp conversions, so emit a real
-  // TG-scoped fence here - otherwise single-warp MMA tiles (e.g. 16x16) give
-  // wrong, nondeterministic results.
+  // NVIDIA lockstep warps), so emit a real TG-scoped fence; without it
+  // single-warp MMA tiles read stale TG slots nondeterministically.
   barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
 }
 
@@ -241,11 +238,9 @@ Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
 }
 Value TargetInfo::permute(RewriterBase &rewriter, Location loc, Value a,
                           Value b, Value selector) const {
-  // Byte permute, matching NVIDIA prmt index mode (the only mode the
-  // warp-shuffle ConvertLayout fast path emits: nibbles in [0,7], no
-  // sign-replicate). Source bytes are concat {b,a}: 0..3 = a low..high,
-  // 4..7 = b; result byte k picks source byte (nibble_k & 7). AIR has no prmt
-  // intrinsic, so synthesize with portable 32-bit bit ops.
+  // Byte permute matching NVIDIA prmt index mode. Source bytes concat {b,a}:
+  // 0..3 = a low..high, 4..7 = b; result byte k picks source byte (nibble_k &
+  // 7). AIR has no prmt intrinsic, so synthesize with portable 32-bit bit ops.
   auto i32Ty = IntegerType::get(rewriter.getContext(), 32);
   auto i64Ty = IntegerType::get(rewriter.getContext(), 64);
   auto cst32 = [&](int v) {

@@ -1,18 +1,10 @@
-// StoreShuffleLayout: re-lay an MMA epilogue store into the simdgroup-shuffle
-// blocked layout so the #mma -> #blocked C-output convert becomes a
-// within-simdgroup register+shuffle move instead of a threadgroup round-trip
-// (the mma and coalesced store layouts use different warp tilings, so the
-// convert is otherwise cross-warp and spills through TG memory + barriers).
-//
-// The one blocked layout that keeps every C element in the SAME simdgroup as
-// the #mma result: warpsPerCTA = mma.warpsPerCTA, threadsPerWarp = [8, 4],
-// sizePerThread = [1, 2], order = [1, 0] (the register dim carries col bit 0,
-// matching the hardware per-lane storage). The convert is then within-warp.
-//
-// Runs after the final remove_layout_conversions, so it must re-lay the store's
-// pointer/mask address math into the shuffle layout itself (else a later pass
-// reverts it). Only an allowlist of layout-parametric ops is handled; any other
-// op aborts the rewrite for that store, keeping the coalesced+TG path.
+// StoreShuffleLayout: re-lay an MMA epilogue store into a simdgroup-shuffle
+// blocked layout (threadsPerWarp=[8,4], sizePerThread=[1,2], order=[1,0]) that
+// keeps every C element in the same simdgroup as the #mma result, so the #mma
+// -> #blocked convert becomes a within-warp shuffle instead of a TG round-trip.
+// Runs after the final remove_layout_conversions, so it re-lays the store's
+// pointer/mask address math too; only an allowlist of layout-parametric ops is
+// handled, any other op aborts the rewrite for that store.
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUTransforms/Passes.h"
@@ -49,11 +41,9 @@ static bool isRelayable(Operation *op) {
 class StoreShuffleLayoutPass
     : public impl::StoreShuffleLayoutBase<StoreShuffleLayoutPass> {
 
-  // Recursively rebuild `v` so its tensor result carries encoding `wantEnc`
-  // (a 2D blocked or its rank-reduced slice). Returns the rebuilt value or
-  // nullptr on failure (unhandled op / non-tensor / shape mismatch). Rebuilt
-  // values are memoized per (value, encoding) so shared subexpressions are
-  // cloned once.
+  // Recursively rebuild `v` so its tensor result carries encoding `wantEnc`.
+  // Returns nullptr on failure (unhandled op / non-tensor / shape mismatch).
+  // Memoized per (value, encoding) so shared subexpressions are cloned once.
   Value relay(Value v, Attribute wantEnc, OpBuilder &b,
               DenseMap<std::pair<Value, Attribute>, Value> &memo) {
     auto tt2 = dyn_cast<RankedTensorType>(v.getType());

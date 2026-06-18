@@ -59,16 +59,12 @@ static LLVMFuncOp getOrCreateFn(ModuleOp mod, RewriterBase &rewriter,
                             Linkage::External);
 }
 
-// Create a FRESH single-event alloca in the function entry block, one per async
-// copy. Each copy owns its own scalar event slot, threaded out as the op's
-// !ttg.async.token so the matching async_wait waits on exactly this copy.
-// LANDMINE: air.wait_simdgroup_events wants a thread-local (addrspace 0)
-// pointer; a TG (addrspace 3) global crashes the GPU compiler. Slots stay
-// scalar - Metal v1 bitcode mishandles arrays of typed pointers. A shared slot
-// would wait on only the LAST copy; a wait-on-every-slot set waited on the
-// wrong (loop-rotated) buffer and on not-yet-stored slots (UB). The slot is
-// zero-initialized so a token reaching a wait with no preceding store
-// (masked-skip, sync fallback, iter-0 hoist) holds a complete event → no-op.
+// Fresh single-event alloca in the function entry block, one per async copy,
+// threaded out as the op's !ttg.async.token so async_wait waits on exactly this
+// copy. LANDMINE: air.wait_simdgroup_events wants a thread-local (addrspace 0)
+// pointer; a TG (as3) global crashes the GPU compiler. Slots stay scalar (Metal
+// v1 bitcode mishandles arrays of typed pointers). Zero-initialized so a token
+// reaching a wait with no preceding store holds a complete event (no-op).
 static Value createEventAlloca(Operation *op, RewriterBase &rewriter) {
   auto *ctx = op->getContext();
   auto ptrTy3 = LLVMPointerType::get(ctx, 3);
@@ -93,13 +89,11 @@ static Value createCompletedEventSlot(Operation *op, RewriterBase &rewriter) {
   return createEventAlloca(op, rewriter);
 }
 
-// air.simdgroup_async_copy_2d is a SIMDGROUP-cooperative DMA. When
-// warpsPerCTA[outerDim] > 1 the staged buffer is consumed by every warp; each
-// warp must both ISSUE and WAIT its OWN per-simdgroup event before reading.
-// LANDMINE: a warp-0-only form (siblings wait empty slots) races - the
-// post-wait threadgroup barrier fences regular TG stores, not the DMA engine,
-// so a sibling can read before warp 0's copy lands (nondeterministic
-// corruption, seen on slice_scatter bmm and matmul_layer_norm 32x64x16 nw4).
+// air.simdgroup_async_copy_2d is a simdgroup-cooperative DMA. When
+// warpsPerCTA[outerDim] > 1 every warp consumes the staged buffer and must
+// issue and wait its OWN event. LANDMINE: a warp-0-only form races - the
+// post-wait TG barrier fences regular TG stores, not the DMA engine, so a
+// sibling can read before warp 0's copy lands (nondeterministic corruption).
 static bool asyncCopyOuterDimCrossWarp(ttg::AsyncCopyGlobalToLocalOp op) {
   auto srcTy = op.getSrc().getType();
   auto enc = srcTy.getEncoding();
@@ -217,12 +211,11 @@ static int64_t denseSplatAttr(Operation *op, StringRef name) {
   return attr.getSplatValue<APInt>().getSExtValue();
 }
 
-// IR-based proof (AxisInfo returns null pre-conversion here) that every
-// boundary-wrap modulo (rm%M / rn%N) is a NO-OP over this tile, so the affine
-// DMA form is exact. Inductor annotates each remsi/remui with tt.contiguity =
-// dense<C>; C >= tile extent means no element wraps inside the tile. Unaligned
-// shapes get C < extent (gcd-based) and we refuse. Returns true only if there
-// is >=1 modulo AND all are block-aligned to the tile.
+// IR-based proof (AxisInfo is null pre-conversion) that every boundary-wrap
+// modulo is a no-op over this tile, so the affine DMA form is exact. Inductor
+// annotates each rem with tt.contiguity = dense<C>; C >= tile extent means no
+// element wraps inside the tile. Returns true only if >=1 modulo AND all
+// block-aligned.
 static bool allModuloBlockAligned(Value v, ArrayRef<int64_t> tileShape,
                                   unsigned budget = 128) {
   (void)tileShape;
@@ -256,11 +249,9 @@ static bool allModuloBlockAligned(Value v, ArrayRef<int64_t> tileShape,
 }
 
 // Function-level safety gate for the boundary-wrap async path. The pipeliner
-// hoists the modulo into the PROLOGUE (the in-loop source is just an iter-arg
-// pointer), so a per-op def-chain walk can't see an UNALIGNED live wrap. At
-// FUNCTION scope: any remsi/remui not proven block-aligned (tt.contiguity >=
-// its own extent) means a live wrap, so async is unsafe for EVERY copy in the
-// kernel. Returns true when safe.
+// hoists the modulo into the prologue, so a per-op walk can't see an unaligned
+// live wrap. At function scope any rem not proven block-aligned means a live
+// wrap, so async is unsafe for EVERY copy in the kernel. Returns true if safe.
 static bool functionModuloIsSafe(Operation *op) {
   auto func = op->getParentOfType<FunctionOpInterface>();
   if (!func)
@@ -285,11 +276,9 @@ static bool functionModuloIsSafe(Operation *op) {
   return safe;
 }
 
-// Extract base/stride/origin from the FLATTENED-index pattern (inductor /
-// gemm_bench): addptr(splat(base), addi(rowTerm, colTerm)), where the strided
-// row term and unit-stride col term are summed before a single addptr. (The
-// nested addptr(broadcast(addptr(splat,muli)),col) shape is handled in
-// extractAsyncCopyPtrInfo.)
+// Extract base/stride/origin from the flattened-index pattern:
+// addptr(splat(base), addi(rowTerm, colTerm)). The nested-addptr shape is
+// handled in extractAsyncCopyPtrInfo.
 static bool extractFlatAsyncCopyPtrInfo(triton::AddPtrOp addptrOp,
                                         AsyncCopyPtrInfo &info,
                                         bool allowModulo) {
@@ -313,10 +302,10 @@ static bool extractFlatAsyncCopyPtrInfo(triton::AddPtrOp addptrOp,
         return bc->getOperand(0);
     return v;
   };
-  // Which logical dim an index term varies along (0 = outer/row, 1 = inner/col,
-  // -1 = unknown). The row-major DMA is valid only when the strided term
-  // indexes the OUTER dim and the unit term the INNER; a TRANSPOSED operand
-  // swaps these and the DMA reads the tile transposed -> silent miscompile.
+  // Which logical dim an index term varies along (0=row, 1=col, -1=unknown).
+  // The row-major DMA is valid only when the strided term indexes the outer dim
+  // and the unit term the inner; a transposed operand swaps these and the DMA
+  // reads the tile transposed -> silent miscompile.
   auto termVaryingDim = [&](Value term) -> int {
     Value inner = peelBroadcast(term);
     if (auto *muli = inner.getDefiningOp())
@@ -396,13 +385,10 @@ static bool extractFlatAsyncCopyPtrInfo(triton::AddPtrOp addptrOp,
   return true;
 }
 
-// Conservative proof that the INNER (dim-1) index of a 2D source pointer is
-// unit-stride (contiguous columns). The DMA copies each row as contiguous
-// elements, so a non-unit inner stride (transposed/strided-view operand) reads
-// the tile transposed -> silent miscompile. Returns true ONLY on a positive
-// proof; any unrecognized shape returns false (forces the sync copy). The inner
-// dim is the term whose expand_dims axis == 0; if it is multiplied by a
-// non-unit stride, columns are not contiguous.
+// Conservative proof that the inner (dim-1) index of a 2D source pointer is
+// unit-stride (contiguous columns). A non-unit inner stride (transposed/
+// strided-view operand) reads the tile transposed -> silent miscompile.
+// Returns true only on a positive proof; any unrecognized shape -> sync copy.
 static bool innerDimIsUnitStride(Value ptrTensor) {
   auto *addptrOp = ptrTensor.getDefiningOp();
   if (!addptrOp || !isa<triton::AddPtrOp>(addptrOp))
@@ -554,11 +540,10 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     return scalar;
   }
 
-  // Rectangular boundary mask: every leaf of the and-tree is either a uniform
-  // splat(i1) or a row/col bound `cmp slt idx, splat(extent)`. The async DMA
-  // honors such a mask exactly by clamping the source tile to
-  // (extent - firstIdx) remaining rows/cols and zero-filling the rest
-  // (clamp mode 0), so other=0 masked loads can stay on the DMA path.
+  // Rectangular boundary mask: every and-tree leaf is a uniform splat(i1) or a
+  // row/col bound `cmp slt idx, splat(extent)`. The DMA honors it exactly by
+  // clamping the source tile to the remaining rows/cols and zero-filling the
+  // rest (clamp mode 0), keeping other=0 masked loads on the DMA path.
   struct RectMaskInfo {
     SmallVector<Value, 2> uniforms; // scalar i1 leaves, all must be true
     Value rowBound, rowFirst;       // rows valid while row < rowBound
@@ -754,10 +739,9 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
   }
 
   // Interior-tile fullness guard: a uniform i1 true exactly when every bounded
-  // axis is fully in range (per axis `first + extent <= bound`, plus uniform
-  // leaves), so the clamp + residual zero are no-ops and the maskless full-tile
-  // DMA can fire. The K axis is bounded too, so a ragged-K last tile correctly
-  // keeps the clamped path. Returns null if any scalar can't be remapped.
+  // axis is fully in range (`first + extent <= bound`, plus uniform leaves), so
+  // the clamp + residual zero are no-ops and the maskless full-tile DMA can
+  // fire. Returns null if any scalar can't be remapped.
   static Value emitRectFullGuard(ConversionPatternRewriter &rewriter,
                                  Location loc, const RectMaskInfo &rectMask,
                                  int64_t tileRows, int64_t tileCols) {
@@ -813,14 +797,12 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
   }
 
   // Runtime tile-origin + row-stride fallback when the syntactic IR walk fails.
-  // Derives the two scalars the 2D intrinsic needs (uniform tile-origin
-  // pointer, uniform src row-stride bytes) from the MATERIALIZED per-element
-  // pointers; exact for ANY affine access.
+  // Derives the uniform tile-origin pointer and src row-stride from the
+  // materialized per-element pointers; exact for ANY affine access.
   //   origin = ptrtoint(srcElems[k]) - (row_k*rowStrideBytes + col_k*elemBytes)
-  // is uniform by construction (the per-lane part cancels, all lanes land on
-  // base). rowStrideBytes = (ptr(k1)-ptr(k0))/rowGap for a row-adjacent
-  // register pair of THIS thread. If no such pair exists (each thread owns one
-  // row) we bail to the sync copy.
+  // is uniform (per-lane part cancels). rowStrideBytes =
+  // (ptr(k1)-ptr(k0))/rowGap for a row-adjacent register pair; no such pair ->
+  // sync copy.
   LogicalResult lowerAsyncFromRuntimePtrs(
       ttg::AsyncCopyGlobalToLocalOp op, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter, bool useRectClamp = false,
@@ -931,7 +913,7 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     Value dstStrideBytes = LLVM::ConstantOp::create(
         rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(tileWidthBytes));
 
-    // Cross-warp: PARTITION the row dim across warps so each DMAs an exclusive
+    // Cross-warp: partition the row dim across warps so each DMAs an exclusive
     // band and waits its OWN event (the warp-0-only form races). Rect-clamped
     // edge tiles keep the full-tile copy (residual-zero assumes the whole
     // tile).
@@ -1146,9 +1128,8 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     // every warp: identical whole-tile copies write-write race. Handled below.
     bool outerCrossWarp = asyncCopyOuterDimCrossWarp(op);
 
-    // A non-uniform per-element mask zeros out-of-range rows/cols of a PARTIAL
-    // tile. The async copy reads the full tile, so dropping the mask is safe
-    // ONLY when the tile is proven fully in-bounds. Also gates the modulo
+    // The async copy reads the full tile, so dropping a non-uniform mask is
+    // safe only when the tile is proven fully in-bounds. Also gates the modulo
     // below.
     bool tileFullyInBounds =
         allModuloBlockAligned(op.getSrc(), shape) && functionModuloIsSafe(op);
@@ -1181,9 +1162,8 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
         if (!elemTy.isF32())
           otherIsZero = false;
         // LANDMINE: the DMA engine mis-copies when the source row stride is not
-        // 64B-aligned (measured: K=72/1000 corrupt, 80/96/1024 exact). The
-        // proof is stamped pre-conversion; without it refuse rect and use sync
-        // copy.
+        // 64B-aligned (K=72/1000 corrupt, 80/96/1024 exact). The proof is
+        // stamped pre-conversion; without it refuse rect and use sync copy.
         if (otherIsZero && !rectStrideIs64B(op))
           otherIsZero = false;
         if (otherIsZero && matchRectMask(op.getMask(), probe) &&
@@ -1232,8 +1212,7 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
       allowModulo = true;
 
     // Function-level live-wrap guard: the pipeliner hides the modulo in the
-    // prologue, so a per-op check can't see an UNALIGNED in-loop wrap. Any
-    // non-block-aligned wrap in the kernel forces every copy onto sync.
+    // prologue, so any non-block-aligned wrap in the kernel forces sync.
     bool funcModuloSafe = functionModuloIsSafe(op);
     if (!funcModuloSafe)
       allowModulo = false;
@@ -1286,12 +1265,9 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     if (!canAsyncDMA) {
       // Affine-from-IR reconstruction failed. Try the runtime tile-origin /
       // row-stride extraction from the materialized pointers (covers ANY affine
-      // access). Gated on a 2D tile and funcModuloSafe: a LIVE boundary wrap
-      // folds the per-element pointers back at the tile edge, breaking
-      // affinity. The full-tile read with no mask is correct only when proven
-      // in-bounds; a live boundary or unaligned shape would read past the
-      // matrix. A rect-matched mask is honored exactly, so it is not a live
-      // boundary.
+      // access). Gated on a 2D tile + funcModuloSafe: a live boundary wrap
+      // breaks affinity, and the maskless full-tile read is correct only when
+      // proven in-bounds (a rect-matched mask counts, it is honored exactly).
       bool noLiveBoundary =
           !llMask || mlirMaskScalar || tileFullyInBounds || useRectClamp;
       // The runtime DMA assumes contiguous columns; a transposed/strided-view
@@ -1374,15 +1350,12 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     Value llDst = adaptor.getResult();
     auto smemObj =
         LLVM::getSharedMemoryObjectFromStruct(loc, llDst, elemTy, rewriter);
-    // The dst memdesc slice's slot offset lives in smemObj's offsets, which the
-    // matching local_load applies; the DMA must write the SAME affine base or
-    // it stages every slot to slot 0, desyncing the rotating buffer
-    // (num_stages>=2).
+    // The DMA must write the SAME affine base the matching local_load reads, or
+    // it stages every slot to slot 0, desyncing the rotating buffer.
     Value dstBase = smemObj.getShmemAffineBase(loc, rewriter, dstTy);
 
-    // Cross-warp: PARTITION the row dim across warps so each DMAs an EXCLUSIVE
-    // band and waits its OWN event (the warp-0-only form races - siblings wait
-    // empty slots and the TG barrier doesn't fence the DMA engine). Only on an
+    // Cross-warp: partition the row dim across warps so each DMAs an exclusive
+    // band and waits its OWN event (the warp-0-only form races). Only on an
     // even row split; otherwise fall back to warp-0-only firing.
     int64_t nWarps = outerCrossWarp ? totalWarps(op) : 1;
     bool partition =
@@ -1607,14 +1580,11 @@ struct AsyncWaitOpAppleConversion
     auto voidTy = LLVMVoidType::get(ctx);
     auto ptrTy0 = LLVMPointerType::get(ctx, 0);
 
-    // Wait on EXACTLY the copies whose tokens this wait consumes. Each token is
-    // a copy's event slot; as a scf.for iter_arg it selects the correct
-    // alternating buffer each iteration (num_stages>=3 correctness fix). One
+    // Wait on exactly the copies whose tokens this wait consumes. One
     // wait_simdgroup_events(1, slot) per token keeps the slot scalar (Metal v1
-    // bitcode mishandles arrays of typed pointers). Zero-init slots make a
-    // sync/skip token a no-op. Waits are UNCONDITIONAL: gating on the DMA
-    // declaration being present is conversion-order dependent, and dropping a
-    // wait while any DMA is live reads in-flight slots.
+    // bitcode mishandles arrays of typed pointers); zero-init slots make a
+    // sync/skip token a no-op. Waits are unconditional: gating on the DMA decl
+    // is conversion-order dependent, and a dropped wait reads in-flight slots.
     auto waitFn = getOrCreateFn(mod, rewriter, "air.wait_simdgroup_events",
                                 voidTy, {i32Ty, ptrTy0});
     Value oneI32 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
@@ -1622,12 +1592,10 @@ struct AsyncWaitOpAppleConversion
     for (Value evSlot : adaptor.getAsyncToken())
       LLVM::CallOp::create(rewriter, loc, waitFn, ValueRange{oneI32, evSlot});
 
-    // TG barrier for shared-memory visibility (both sync and async paths).
-    // LANDMINE: flag 2 (TG fence) suffices ONLY because async copies reaching a
-    // consumer are single-simdgroup or per-warp-EXCLUSIVE. A
-    // CROSS-warp-consumed band would need flag 3, but those are routed to sync
-    // copy (see runtimeSafe) since even flag 3 leaves a ~7% residual visibility
-    // race.
+    // TG barrier for shared-memory visibility (sync and async paths). LANDMINE:
+    // flag 2 (TG fence) suffices ONLY because async copies reaching a consumer
+    // are single-simdgroup or per-warp-exclusive. A cross-warp-consumed band
+    // would need flag 3, but those are routed to sync copy (see runtimeSafe).
     auto barrFn =
         getOrCreateFn(mod, rewriter, "air.wg.barrier", voidTy, {i32Ty, i32Ty});
     Value barrFlag = LLVM::ConstantOp::create(rewriter, loc, i32Ty,

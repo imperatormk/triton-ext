@@ -1,15 +1,6 @@
 // Apple simdgroup_multiply_accumulate LinearLayout basis vectors.
-//
-// Empirically verified on M1 (verify_simdgroup.metal):
-//   lane T, reg R → row = (T >> 3) + R*4,  col = T & 7
-//
-// XOR basis vectors:
-//   lane  bit 0 → col bit 0
-//   lane  bit 1 → col bit 1
-//   lane  bit 2 → col bit 2  (8 cols)
-//   lane  bit 3 → row bit 0
-//   lane  bit 4 → row bit 1  (4 row groups)
-//   reg   bit 0 → row bit 2  (row halves: 0-3 vs 4-7)
+// Empirically verified on M1: lane T, reg R → row = (T >> 3) + R*4, col = T
+// & 7.
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "mlir/IR/MLIRContext.h"

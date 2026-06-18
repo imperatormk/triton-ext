@@ -21,12 +21,10 @@ using namespace llvm;
 
 #define DEBUG_TYPE "metal-nan-min-max"
 
-// AIR's native vector fmin/fmax tops out at width 4 (Apple's own frontend emits
-// air.fast_fmax.v4f32 and nothing wider; verified against an emit-llvm probe).
-// The .td rename table covers v2/v3/v4 only, so a wider min/max intrinsic from
-// the SLP mid-end (e.g. llvm.maximum.v8f32) would otherwise reach the writer
-// unrenamed and surface as an undefined symbol at PSO link. Split any min/max
-// wider than 4 into <=4-wide chunks so the native vector path still applies.
+// AIR's native vector fmin/fmax tops out at width 4 (.td renames cover v2/v3/v4
+// only); a wider min/max would reach the writer unrenamed and become an
+// undefined symbol at PSO link. Split min/max wider than 4 into <=4-wide
+// chunks.
 static bool splitWideVectorMinMax(Module &M) {
   bool Changed = false;
   Intrinsic::ID Ids[] = {Intrinsic::minimum, Intrinsic::maximum,
@@ -79,12 +77,9 @@ static bool splitWideVectorMinMax(Module &M) {
   return Changed;
 }
 
-// AIR has no llvm.vector.reduce.* counterpart (Apple's frontend lowers a
-// horizontal reduction to a scalar tree). Expand each reduce intrinsic into a
-// sequential element fold so the resulting scalar ops go through the normal
-// rename/NaN-guard machinery. Covers the float (fmaximum/fminimum/fmax/fmin/
-// fadd/fmul) and integer (add/mul/and/or/xor/umax/umin/smax/smin) forms the
-// SLP mid-end produces.
+// AIR has no llvm.vector.reduce.* counterpart. Expand each reduce intrinsic
+// into a sequential element fold so the scalar ops go through the normal
+// rename/NaN-guard machinery (covers the float and integer reduce forms).
 static Value *foldReduce(IRBuilder<> &B, Intrinsic::ID ID, Value *Vec,
                          Value *Start) {
   auto *VTy = cast<FixedVectorType>(Vec->getType());

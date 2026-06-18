@@ -39,12 +39,10 @@ using namespace mlir::LLVM;
 using namespace mlir::arith;
 namespace ttg = mlir::triton::gpu;
 
-// ── Fragment-ABI eligibility analysis ─────────────────────────────────────
-// A use of an AppleMma-encoded value is "dot-chain" if it keeps the value on
-// the simdgroup register path (dot accumulator C, scf.for carry, or unpack to
-// #blocked via convert_layout). Any other consumer needs the flat per-thread
-// layout. Per-type and conservative: a type is eligible only if EVERY #mma
-// value of that exact type is consumed solely by dot-chain ops.
+// Fragment-ABI eligibility: a use is "dot-chain" if it keeps the value on the
+// simdgroup register path (dot accumulator C, scf.for carry, or unpack to
+// #blocked). A type is eligible only if EVERY #mma value of that exact type is
+// consumed solely by dot-chain ops.
 static bool isAppleMmaTensor(Type t) {
   auto rt = dyn_cast<RankedTensorType>(t);
   // The fragment ABI carries <64 x f32> fragments; only f32 #mma qualifies.
@@ -63,11 +61,9 @@ static bool isFragmentCandidateTensor(Type t) {
   return elt.isF32() || elt.isInteger(32) || elt.isInteger(1);
 }
 
-// A rank-2 f16/bf16 #mma tensor. NOT a general fragment candidate (it must NOT
-// enter the kkt elementwise web, which would reintroduce the bf16-#mma
-// scalarization leak) - admitted ONLY as the dot-accumulator epilogue: f16/bf16
-// GEMM accumulates in <64 x f32>, then truncf narrows to a <64 x half/bf16>
-// fragment before the convert_layout to #blocked.
+// A rank-2 f16/bf16 #mma tensor. NOT a general fragment candidate (must not
+// enter the kkt elementwise web); admitted ONLY as the dot-accumulator
+// epilogue (truncf of an <64 x f32> accum before convert_layout to #blocked).
 static bool isHalfMmaTensor(Type t) {
   auto rt = dyn_cast<RankedTensorType>(t);
   if (!rt || !isa<AppleMmaEncodingAttr>(rt.getEncoding()) || rt.getRank() != 2)
@@ -76,13 +72,11 @@ static bool isHalfMmaTensor(Type t) {
   return elt.isF16() || elt.isBF16();
 }
 
-// True iff `op` is the f16/bf16 accumulator-epilogue truncf: f32 #mma candidate
-// -> f16/bf16 #mma, result feeds only a convert_layout to a non-#mma layout,
-// and the f32 input is produced DIRECTLY by a dot (or loop-carried dot accum).
-// LANDMINE: the direct-dot requirement rejects solve_tril's merge kernel
-// (dot -> negf -> truncf -> store); the mid-end sinks negf through the truncf,
-// leaving a bf16 fsub on the fragment that crashes the AGX PSO materializer
-// (agx-crash-trunk/solve_tril_bf16_merge_pso_crash).
+// True iff `op` is the f16/bf16 accumulator-epilogue truncf (f32 #mma ->
+// f16/bf16 #mma feeding only a convert_layout, f32 input produced directly by a
+// dot). LANDMINE: the direct-dot requirement is required to avoid a bf16 fsub
+// on the fragment (e.g. dot->negf->truncf) that crashes the AGX PSO
+// materializer.
 static bool isAccumTruncEpilogue(Operation *op) {
   auto tf = dyn_cast<arith::TruncFOp>(op);
   if (!tf)
@@ -90,10 +84,8 @@ static bool isAccumTruncEpilogue(Operation *op) {
   if (!isFragmentCandidateTensor(tf.getIn().getType()) ||
       !isHalfMmaTensor(tf.getType()))
     return false;
-  // Must feed EXACTLY ONE convert_layout to a non-#mma layout (the GEMM store
-  // epilogue). fla's chunk_delta_h fans a truncated h out to several
-  // convert_layouts that don't share a slot map → flat/fragment mismatch at
-  // pack time, so require a single blocked consumer.
+  // Must feed EXACTLY ONE convert_layout to a non-#mma layout; multiple
+  // consumers don't share a slot map → flat/fragment mismatch at pack time.
   ttg::ConvertLayoutOp theCvt;
   for (Operation *user : tf->getUsers()) {
     auto cvt = dyn_cast<ttg::ConvertLayoutOp>(user);
@@ -145,10 +137,8 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
     if (isAccumTruncEpilogue(user))
       return true;
     // Fragment elementwise/view consumers (kkt chain): clean ONLY if the #mma
-    // result is a candidate AND every ranked-tensor operand is too. This
-    // rejects mixed-layout elementwise (chunk_delta_h's `load(#blocked) -
-    // dot(#mma)`), which has no per-slot lowering and would crash at flat-pack
-    // time.
+    // result is a candidate AND every ranked-tensor operand is too. Rejects
+    // mixed-layout elementwise, which has no per-slot lowering.
     auto sameMmaFragmentOperands = [](Operation *u) {
       for (Value o : u->getOperands()) {
         auto rt = dyn_cast<RankedTensorType>(o.getType());
@@ -182,10 +172,9 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
   };
 
   // A candidate can ride the fragment path only if its PRODUCER emits a
-  // fragment struct (dot, fragment elementwise/view, splat constant,
-  // loop-carried arg). A convert_layout INTO #mma yields a flat struct, so any
-  // type reached via such a producer must stay flat (else the element count
-  // collides with the fragment slot count at pack time).
+  // fragment struct (dot, fragment elementwise/view, splat, loop-carried arg).
+  // convert_layout INTO #mma yields a flat struct, so types reached that way
+  // must stay flat.
   auto isFragmentProducer = [](Value v) -> bool {
     if (isa<BlockArgument>(v))
       return true; // loop carry / entry forward
@@ -217,12 +206,9 @@ llvm::DenseSet<Type> computeFragmentEligibleTypes(ModuleOp mod) {
     return def && isAccumTruncEpilogue(def);
   };
 
-  // Fixpoint over candidate VALUES, then collapse to TYPES. A chain is admitted
-  // atomically: a value is "bad" if its producer can't emit a fragment struct
-  // or any consumer isn't a recognized fragment op; badness propagates BOTH
-  // ways across the web so a chain is never half-admitted (a flat producer
-  // feeding a fragment consumer crashes at pack time). A type is eligible only
-  // if EVERY value of it is good.
+  // Fixpoint over candidate VALUES, then collapse to TYPES. Badness propagates
+  // BOTH ways so a chain is never half-admitted. A type is eligible only if
+  // EVERY value of it is good.
   llvm::SmallVector<Value> candidates;
   llvm::DenseSet<Value> bad;
   auto collect = [&](Value v) {

@@ -61,10 +61,9 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
   if (!Visited.insert(Ptr).second)
     return nullptr;
   // Prioritize load/store over GEP source types; recurse through GEP chains.
-  // Do NOT follow atomic intrinsic calls through GEP chains: a float buffer
-  // through a float GEP into an i32 CAS must keep the GEP source type (float);
-  // the atomic mismatch is handled separately by InferTypedPointersPass Phase
-  // 1b.
+  // Do NOT follow atomic intrinsics through GEP chains: a float buffer through
+  // a float GEP into an i32 CAS must keep the GEP source type (float); the
+  // atomic mismatch is handled by InferTypedPointersPass Phase 1b.
   Type *GepType = nullptr;
   for (auto *U : Ptr->users()) {
     if (auto *LI = dyn_cast<LoadInst>(U))
@@ -73,11 +72,10 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
       if (SI->getPointerOperand() == Ptr)
         return SI->getValueOperand()->getType();
     }
-    // Follow identity ptr->ptr bitcasts only on DEVICE (addrspace 1) pointers,
-    // so a store past a no-op bitcast infers the stored element type, not the
-    // [N x i8] GEP source. NOT for addrspace(3): smem array globals
-    // (`[N x float]`) must keep their array GEP element type, else the writer
-    // rejects "Explicit gep type does not match pointee type".
+    // Follow identity ptr->ptr bitcasts only on DEVICE (addrspace 1) pointers.
+    // NOT for addrspace(3): smem array globals must keep their array GEP
+    // element type, else the writer rejects "gep type does not match pointee
+    // type".
     if (auto *BC = dyn_cast<BitCastInst>(U)) {
       if (BC->getType()->isPointerTy() &&
           BC->getType()->getPointerAddressSpace() == AS::Device)
@@ -189,14 +187,11 @@ static bool functionUsesMMA(const Function &F) {
   return false;
 }
 
-// The MMA collapse forces device pointers to float*, but an MMA kernel can
-// still have a genuinely non-float scalar device buffer (i32 int8-dot output,
-// or a half/bfloat input matrix). Collapsing those to float* makes the writer
-// emit an access whose type disagrees with the pointer, rejected as "Explicit
-// load/store type does not match pointee type" → materializeAll failure.
-// Preserve any device pointer whose inferred usage is a concrete non-float
-// scalar (int/half/bfloat); such buffers are never fed to a float MMA
-// intrinsic.
+// MMA collapse forces device pointers to float*, but an MMA kernel can have a
+// genuine non-float scalar device buffer (i32 int8-dot output, half/bfloat
+// input). Collapsing those to float* makes the writer reject "load/store type
+// does not match pointee type". Preserve any device pointer whose inferred
+// usage is a concrete non-float scalar (int/half/bfloat).
 static bool isNonFloatScalarDevicePointer(Value *Ptr) {
   Type *Ty = PointeeTypeMap::inferFromUsage(Ptr);
   if (!Ty)
@@ -458,10 +453,8 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
         }
   }
 
-  // Phase 8: Fix up ptr-to-ptr bitcasts for typed pointer transitions.
-  // Some upstream passes leave identity bitcasts (ptr→ptr) before non-float
-  // device loads from phi pointers; MMA collapse clobbers their PTM to float*.
-  // Re-infer from load/store usage.
+  // Phase 8: Re-infer identity ptr->ptr bitcasts before non-float device
+  // loads/stores; MMA collapse clobbers their PTM to float*.
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB) {
@@ -489,11 +482,10 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
         }
       }
 
-  // Phase 8b: Unify pointer-typed select arms. A `select i1, ptr, ptr` carries
-  // no result-type record; the Metal GPU JIT derives the result pointee from
-  // the two arm type IDs and refuses to materialize when they disagree. Force
+  // Phase 8b: Unify pointer-typed select arms. The Metal GPU JIT refuses to
+  // materialize a `select i1, ptr, ptr` whose arm pointee types disagree. Force
   // both arms and the select to one pointee, preferring a concrete
-  // (non-inttoptr) arm's type so real typed accesses stay correct.
+  // (non-inttoptr) arm.
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB) {

@@ -44,11 +44,9 @@ inline Type getAppleMmaFragmentElemType(MLIRContext *ctx, RankedTensorType ty) {
   Type elt = ty.getElementType();
   if (elt.isF32() || elt.isInteger(32) || elt.isInteger(1))
     return elt;
-  // f16/bf16 #mma accumulators ride the SAME <64 x f32> fragment as f32;
-  // narrowing happens on the extracted scalar in the store convert. A vector
-  // <64 x bf16>/<64 x f16> simdgroup fragment crashes the AGX PSO materializer
-  // and a vector bf16 round-trip miscompiles to zero (agx-crash-trunk:
-  // solve_tril_bf16_merge_pso_crash, bf16_sgmatrix_fptrunc_miscompile).
+  // f16/bf16 #mma accumulators ride the SAME <64 x f32> fragment as f32
+  // (narrowing happens on the extracted scalar in the store convert); a vector
+  // f16/bf16 simdgroup fragment crashes the AGX PSO materializer.
   return Float32Type::get(ctx);
 }
 

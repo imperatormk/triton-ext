@@ -117,12 +117,9 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     if (K % 8 != 0)
       return failure();
 
-    // MMA encoding on the result only; A/B stay blocked. DotOpToLLVM scatters
-    // the blocked inputs through TG, so only one result->blocked
-    // ConvertLayoutOp is needed downstream (vs 4 if all operands were
-    // converted). Non-square wpc and large K are correct here (fixed in
-    // transferSwizzlingLocalMemImpl); oversized tiles fail cleanly via the
-    // shared-memory budget.
+    // MMA encoding on the result only; A/B stay blocked (DotOpToLLVM scatters
+    // them through TG), so only one result->blocked ConvertLayoutOp is needed
+    // downstream. Oversized tiles fail cleanly via the shared-memory budget.
     auto wpc = warpsPerTileApple(M, N, numWarps);
     auto mmaEnc = AppleMmaEncodingAttr::get(ctx, wpc);
 

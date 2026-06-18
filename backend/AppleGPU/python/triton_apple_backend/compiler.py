@@ -16,11 +16,10 @@ from triton._C.libtriton import ir, passes, llvm
 
 
 def _host_macos_major() -> int:
-    """Target macOS major version for AIR emission (host == target since we JIT).
+    """Target macOS major for AIR emission (host == target since we JIT).
 
-    Apple changed the simdgroup-MMA intrinsic signature + AIR version fields
-    across OS versions, keyed on the macOS major; macOS 26 maps to the "16" era.
-    Override with TRITON_MPS_TARGET_OS_MAJOR (e.g. for cross-compiling).
+    The simdgroup-MMA intrinsic signature is keyed on this; macOS 26 maps to
+    the "16" era. Override with TRITON_MPS_TARGET_OS_MAJOR.
     """
     env = os.environ.get("TRITON_MPS_TARGET_OS_MAJOR")
     if env:
@@ -295,10 +294,9 @@ class MPSBackend(BaseBackend):
 
     # ── Stage 3: LLVM IR with simdgroup intrinsics ─────────────────────────
     def make_llir(self, mod, metadata, options):
-        # Must run here: the C++ DotOp→AIR pass reads TRITON_MPS_TARGET_OS_MAJOR
-        # (exported as a side effect) to pick the simdgroup-matrix intrinsic
-        # signature, and the only other caller (make_metallib) runs too late.
-        # Wrong signature crashes PSO creation.
+        # Exports TRITON_MPS_TARGET_OS_MAJOR, which the C++ DotOp->AIR pass reads
+        # to pick the simdgroup-matrix intrinsic signature. Must run here;
+        # make_metallib is too late and the wrong signature crashes PSO creation.
         _host_macos_major()
 
         pm = ir.pass_manager(mod.context)
@@ -324,8 +322,7 @@ class MPSBackend(BaseBackend):
         llvm.init_targets()
         context = llvm.context()
         llvm_mod = llvm.to_module(mod, context)
-        # Mid-end optimization (metal-llc only runs the codegen prologue, so
-        # without this the IR ships unoptimized). Same call as the NVIDIA backend.
+        # Mid-end optimization; metal-llc only runs the codegen prologue.
         _opt_level = {
             '0': None,
             '1': llvm.OPTIMIZE_O1,
@@ -375,10 +372,8 @@ class MPSBackend(BaseBackend):
     def make_metallib(self, llvm_mod, metadata, options):
         llvm_ir = metadata.pop("_llvm_ir", None) or str(llvm_mod)
 
-        # Extract the kernel name. A module usually has exactly one
-        # `define void @<kernel>`, but a kernel that calls a `noinline` device
-        # function has two: the kernel entry and the callee. The kernel is the
-        # entry -- the one no `call` targets -- so pick the uncalled define.
+        # Extract the kernel name: the `define void @` that no `call` targets
+        # (a noinline device callee adds a second, called, define).
         defined_names = [
             line[len('define void @'):].split('(')[0]
             for line in llvm_ir.splitlines()
@@ -392,9 +387,8 @@ class MPSBackend(BaseBackend):
         }
         entry_names = [n for n in defined_names if n not in called]
         if len(entry_names) != 1:
-            # The optimizer may inline a noinline helper's only call site,
-            # leaving a dead helper as a second uncalled define. Disambiguate
-            # via the "air-kernel" attribute that marks the launchable entry.
+            # Inlining a noinline helper's only call site can leave a dead
+            # uncalled define; disambiguate via the "air-kernel" attribute.
             attr_groups = {
                 m.group(1)
                 for m in re.finditer(
@@ -422,9 +416,9 @@ class MPSBackend(BaseBackend):
             kname = metadata["name"]
             open(f'/tmp/dot_kernel_{kname}.ll', 'w').write(llvm_ir)
 
-        # MetalIR C++ pipeline: LLVM IR → AIR → v1 bitcode → metallib. The same
-        # llc run returns the real threadgroup total (incl. __tg_* convert/dot
-        # globals past ttg.shared), replacing the front-end estimate.
+        # MetalIR C++ pipeline: LLVM IR -> AIR -> v1 bitcode -> metallib. The
+        # llc run also returns the real threadgroup total, replacing the
+        # front-end estimate.
         result, tg_bytes = _get_metalir_compile()(llvm_ir)
         metadata["shared"] = tg_bytes
         if debug:

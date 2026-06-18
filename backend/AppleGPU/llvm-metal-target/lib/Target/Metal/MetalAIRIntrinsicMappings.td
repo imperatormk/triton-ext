@@ -45,12 +45,8 @@ def : IntrinsicRename<"llvm.maximum.v4f16", "air.fmax.v4f16">;
 def : IntrinsicRename<"llvm.minimum.v2f16", "air.fmin.v2f16">;
 def : IntrinsicRename<"llvm.minimum.v4f16", "air.fmin.v4f16">;
 
-// sin/cos use the *precise* AIR variants. tan is implemented in the libdevice
-// stub as sin(x)/cos(x); near the poles (x ~ pi/2, tan ~ 1e3) the low-precision
-// fast_sin/fast_cos plus the division amplify the relative error past test
-// tolerances (abs err 0.027 vs eager precise::tan err 2e-4). Precise sin/cos is
-// only marginally slower and strictly more accurate, so no other kernel
-// regresses (same rationale as exp2/log2/pow below).
+// Precise (not fast_) sin/cos: tan = sin/cos near the poles exceeds test
+// tolerances with the low-precision variants.
 def : IntrinsicRename<"llvm.sin.f32", "air.sin.f32">;
 def : IntrinsicRename<"llvm.cos.f32", "air.cos.f32">;
 def : IntrinsicRename<"llvm.sin.f16", "air.sin.f16">;
@@ -87,11 +83,9 @@ def : IntrinsicRename<"llvm.fma.f16", "air.fma.f16">;
 def : IntrinsicRename<"llvm.rint.f32", "air.fast_rint.f32">;
 def : IntrinsicRename<"llvm.rint.f16", "air.fast_rint.f16">;
 
-// SLP-vectorized f32 transcendentals. The AGX backend has no lowering for the
-// generic llvm.*.vNf32 vector intrinsics and aborts the metallib JIT, so map
-// them to Apple's native AIR vector intrinsics (the exact names xcrun metal
-// emits for floatN). Note vector fabs/fmax/fmin use the fast_ prefix unlike
-// their scalar forms.
+// SLP-vectorized f32 transcendentals: AGX has no lowering for generic
+// llvm.*.vNf32, so map to native AIR vector intrinsics. Note vector
+// fabs/fmax/fmin use the fast_ prefix unlike their scalar forms.
 def : IntrinsicRename<"llvm.maxnum.v2f32", "air.fast_fmax.v2f32">;
 def : IntrinsicRename<"llvm.maxnum.v3f32", "air.fast_fmax.v3f32">;
 def : IntrinsicRename<"llvm.maxnum.v4f32", "air.fast_fmax.v4f32">;

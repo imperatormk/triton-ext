@@ -109,11 +109,8 @@ static bool tgBarrierInsert(Module &M) {
       }
     }
 
-    // A barrier may only be inserted where EVERY thread executes it; a
-    // divergent barrier desynchronizes the threadgroup. Forward-taint the
-    // per-thread index intrinsics, then mark every block between a
-    // taint-conditioned branch and its reconvergence point (immediate
-    // postdominator) as divergent. (Uniform loop bodies keep their barriers.)
+    // Barriers must be uniform: forward-taint per-thread index intrinsics, then
+    // mark blocks between a tainted branch and its postdominator as divergent.
     PostDominatorTree PDT;
     PDT.recalculate(F);
     SmallPtrSet<const Value *, 32> Tainted;

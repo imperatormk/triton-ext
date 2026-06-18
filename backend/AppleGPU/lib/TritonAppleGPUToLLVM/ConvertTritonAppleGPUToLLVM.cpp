@@ -66,21 +66,18 @@ struct ConvertTritonAppleGPUToLLVMPass
     TargetInfo targetInfo;
     TritonGPUToLLVMTypeConverter typeConverter(ctx, targetInfo);
 
-    // Map !ttg.async.token to the event-slot pointer (ptr addrspace(0), the
-    // thread-local alloca holding the simdgroup event handle) instead of i32 0,
-    // so air.wait_simdgroup_events waits on exactly the copy the token names
-    // (the pipeliner's loop-carried iter_arg selects the alternating buffer).
-    // Registered last to override the upstream i32 mapping (newest-first).
+    // Map !ttg.async.token to the event-slot pointer (not i32 0) so the wait
+    // targets the exact copy the token names. Registered last to override the
+    // upstream i32 mapping (newest-first).
     typeConverter.addConversion(
         [ctx](triton::gpu::AsyncTokenType type) -> std::optional<Type> {
           return LLVM::LLVMPointerType::get(ctx, 0);
         });
 
-    // Fragment ABI: pure dot-chain #mma tensors carry their simdgroup_matrix
-    // fragments as !llvm.struct<(vector<64xf32> x F)> so O3 keeps the
-    // accumulator vectorized (no SROA-to-scalar → no occupancy collapse).
-    // Gated by consumer analysis: #mma tensors fed to elementwise/broadcast/
-    // slice (fla) fall through to the generic flat per-thread struct.
+    // Fragment ABI: pure dot-chain #mma tensors carry fragments as a vectorized
+    // struct so O3 keeps the accumulator vectorized (no SROA-to-scalar ->
+    // occupancy collapse). Gated by consumer analysis; non-dot consumers fall
+    // through to the generic flat per-thread struct.
     auto fragmentEligible = computeFragmentEligibleTypes(mod);
     typeConverter.addConversion(
         [ctx, fragmentEligible](RankedTensorType type) -> std::optional<Type> {
@@ -118,10 +115,10 @@ struct ConvertTritonAppleGPUToLLVMPass
       }
     }
 
-    // Pre-compute MMA threadgroup usage (max over all dots, since the pipeline
-    // coalesces __tg_dot_ab globals into one) and record it as a module attr,
-    // so ConvertLayoutOp can subtract it from the 32KB TG budget. Must account
-    // for bank-conflict padding (TG_PAD).
+    // Pre-compute MMA threadgroup usage (max over all dots; the pipeline
+    // coalesces __tg_dot_ab globals into one) as a module attr so
+    // ConvertLayoutOp can subtract it from the 32KB TG budget. Accounts for
+    // bank-conflict padding (TG_PAD).
     {
       int64_t maxMmaBytes = 0;
       mod.walk([&](mlir::triton::DotOp dot) {
@@ -148,12 +145,10 @@ struct ConvertTritonAppleGPUToLLVMPass
                      IntegerAttr::get(IntegerType::get(ctx, 64), maxMmaBytes));
     }
 
-    // global_smem is only live if the kernel has a standard shared-path
-    // consumer (reduce/scan/gather/histogram, or a dot staging through it).
-    // When dead, llc strips it, so it must NOT be subtracted from the convert's
-    // TG budget (else the convert is forced into many tiny strips). Detect
-    // consumers now -     // checking after the sibling lowerings run would
-    // race.
+    // global_smem is only live with a shared-path consumer (reduce/scan/gather/
+    // histogram, or a dot staging through it). When dead, llc strips it, so it
+    // must NOT be subtracted from the convert's TG budget. Detect now; checking
+    // after sibling lowerings run would race.
     {
       bool smemLive = false;
       mod.walk([&](Operation *o) {
@@ -161,14 +156,11 @@ struct ConvertTritonAppleGPUToLLVMPass
                 mlir::triton::GatherOp, mlir::triton::HistogramOp>(o))
           smemLive = true;
         // A pipelined float dot stages A/B through a ttg.local_alloc backed by
-        // global_smem, keeping the reservation live (e.g. 128x64x16 fp32:
-        // 16KB global_smem + 28KB convert = 45KB overflow if not subtracted).
+        // global_smem, keeping the reservation live.
         if (isa<ttg::LocalAllocOp>(o))
           smemLive = true;
         // An int8 dot aliases its A/B scatter buffer into global_smem
-        // (getOrGrowSharedArena), keeping the reservation live (e.g.
-        // 64x128x128 int8: 16KB global_smem + 24KB i32 convert = 40KB
-        // overflow).
+        // (getOrGrowSharedArena), keeping the reservation live.
         if (auto dot = dyn_cast<mlir::triton::DotOp>(o)) {
           auto aTy = cast<RankedTensorType>(dot.getA().getType());
           if (isa<IntegerType>(aTy.getElementType()))
@@ -198,10 +190,9 @@ struct ConvertTritonAppleGPUToLLVMPass
     RewritePatternSet patterns(ctx);
     ModuleAxisInfoAnalysis axisInfoAnalysis(mod);
 
-    // Apple func/call/return (addrspace(2)* kernel args, no SMEM stack ptr),
-    // warp-id/print/assert/num-programs, and the libdevice ExternElementwise
-    // mapping. Func/call/return outrank the NVIDIA-specific shared FuncOp
-    // patterns (benefit +20).
+    // Apple func/call/return (addrspace(2)* kernel args), warp-id/print/assert/
+    // num-programs, and libdevice ExternElementwise. Func/call/return outrank
+    // the shared FuncOp patterns (benefit +20).
     populateMiscOpPatterns(typeConverter, patterns, axisInfoAnalysis);
 
     // Shared Triton → LLVM patterns (handles device functions, non-kernel)
@@ -298,10 +289,9 @@ struct ConvertTritonAppleGPUToLLVMPass
     if (failed(applyPartialConversion(mod, target, std::move(patterns))))
       signalPassFailure();
 
-    // Async-wait cleanup: AsyncWaitOp emits a wait_simdgroup_events per token
-    // unconditionally (it can't know at pattern time if any copy took the DMA
-    // path). With no DMA call at all the waits guard nothing and the AIR JIT
-    // refuses to materialize them, so strip the waits and dead decl here.
+    // Async-wait cleanup: AsyncWaitOp emits waits unconditionally. With no DMA
+    // call the waits guard nothing and the AIR JIT refuses to materialize them,
+    // so strip the waits and dead decl here.
     bool hasDMACall = false;
     mod.walk([&](LLVM::CallOp call) {
       if (call.getCallee() == "air.simdgroup_async_copy_2d.p3i8.p1i8")
@@ -322,10 +312,9 @@ struct ConvertTritonAppleGPUToLLVMPass
             decl.erase();
     }
 
-    // Move loop_annotation from the discardable "llvm.loop_annotation" attr
-    // (how ControlFlowToLLVM copies it from cf.br) to the LLVM BrOp's inherent
-    // "loop_annotation" property; otherwise getLoopAnnotationAttr() is null and
-    // translateModuleToLLVMIR drops the !llvm.loop metadata.
+    // Move loop_annotation from the discardable "llvm.loop_annotation" attr to
+    // the BrOp's inherent "loop_annotation" property; otherwise
+    // getLoopAnnotationAttr() is null and the !llvm.loop metadata is dropped.
     mod.walk([](LLVM::BrOp brOp) {
       if (auto attr = brOp->getAttrOfType<LLVM::LoopAnnotationAttr>(
               "llvm.loop_annotation")) {
@@ -341,10 +330,9 @@ struct ConvertTritonAppleGPUToLLVMPass
       }
     });
 
-    // Cooperative air.* declarations must reach the LLVM mid-end marked
-    // `convergent` (barriers and event waits also `noduplicate`), or its
-    // CFG transforms may sink/duplicate them into divergent control flow
-    // and desynchronize the threadgroup.
+    // Cooperative air.* decls must be marked `convergent` (barriers/event waits
+    // also `noduplicate`), or LLVM CFG transforms may sink/duplicate them into
+    // divergent control flow and desynchronize the threadgroup.
     mod.walk([](LLVMFuncOp fn) {
       if (!fn.isExternal())
         return;
@@ -391,9 +379,9 @@ struct LowerGPUToAirPass
     auto *ctx = &getContext();
     auto i32Ty = IntegerType::get(ctx, 32);
 
-    // Declare air.thread_position_in_threadgroup once at module start.
-    // Returns [3 x i32]; we extractvalue index 0 for the flat thread ID.
-    // _add_air_metadata() rewrites this call+extractvalue pattern to an arg.
+    // Declare air.thread_position_in_threadgroup once; returns [3 x i32], we
+    // extractvalue index 0 for the flat thread ID. _add_air_metadata() rewrites
+    // this call+extractvalue pattern to an arg.
     auto arrI32x3Ty = LLVM::LLVMArrayType::get(i32Ty, 3);
     auto tidFnName = StringRef("air.thread_position_in_threadgroup");
     auto tidFnTy = LLVMFunctionType::get(arrI32x3Ty, {}, false);

@@ -19,21 +19,14 @@
 namespace llvm {
 namespace metal {
 
-// Side table mapping each opaque pointer to its reconstructed pointee type.
-// Metal GPU JIT requires typed POINTER records in bitcode but LLVM 19+ only
-// has opaque pointers; the custom bitcode writer consumes this map to emit
-// typed records while the in-memory Module stays valid with opaque pointers.
+// Side table mapping each opaque pointer to its reconstructed pointee type, so
+// the custom bitcode writer can emit the typed POINTER records the Metal GPU
+// JIT requires while the in-memory Module keeps opaque pointers. Rules: device
+// (AS1)/TG (AS3) ptrs must be typed; with MMA intrinsics all device ptrs become
+// float*; i1* crashes the JIT so remap to i8*.
 //
-// Metal GPU JIT rules encoded here: device (AS1) and TG (AS3) ptrs must be
-// typed; when MMA intrinsics are present ALL device ptrs become float*; i1*
-// crashes the JIT so remap to i8*.
-//
-// The pointee-type logic lives in TWO overlapping places that must stay in
-// sync: PointeeTypeAnalysis::run (cached LLVM Analysis, must be fully
-// self-contained as the PM may recompute it) and InferTypedPointersPass::run
-// (Transform Pass that refines the map after IR mutations). The MMA + async
-// override blocks are near-duplicated; change BOTH. Shared intrinsic-name
-// constants below prevent at least those from diverging.
+// The override logic is near-duplicated in PointeeTypeAnalysis::run and
+// InferTypedPointersPass::run and must stay in sync; change BOTH.
 namespace mma_intrinsics {
 inline constexpr const char *kLoad =
     "air.simdgroup_matrix_8x8_load.v64f32.p3f32";

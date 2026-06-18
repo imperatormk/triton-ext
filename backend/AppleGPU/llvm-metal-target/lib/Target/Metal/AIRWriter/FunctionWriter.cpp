@@ -39,12 +39,9 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
                        ValueEnumerator &E, const MetadataEnumerator &MD) {
   W.EnterSubblock(bitc::FUNCTION_BLOCK_ID, 5);
 
-  // Reverse-post-order so every def precedes its uses. The relative value-ID
-  // encoding (GetID = CurInstID - absID) can't represent a forward reference:
-  // an operand defined in a later-emitted block underflows the unsigned
-  // subtraction and corrupts the bitstream ("Invalid record"). Textual order is
-  // unsafe (def may follow a dominated use); RPO guarantees def-before-use.
-  // Unreachable blocks are appended so they're still emitted.
+  // Reverse-post-order so every def precedes its uses: the relative value-ID
+  // encoding can't represent a forward reference (underflows and corrupts the
+  // bitstream). Unreachable blocks are appended so they're still emitted.
   SmallVector<const BasicBlock *, 8> BBOrder;
   {
     SmallPtrSet<const BasicBlock *, 8> Seen;
@@ -177,9 +174,7 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         V.push_back(GEP->isInBounds() ? 1 : 0);
         // Metal GPU JIT requires GEP source type to match the pointer's
         // pointee. For AS1 pointers collapsed to float*, remap i32 GEP source
-        // to float (same 4-byte stride), but ONLY if all terminal (non-GEP)
-        // users consume float; if any is a non-float load/store/atomic, keep
-        // i32.
+        // to float (same stride), but ONLY if all terminal users consume float.
         Type *GepSrcTy = GEP->getSourceElementType();
         if (GEP->getPointerAddressSpace() == metal::AS::Device &&
             GepSrcTy->isIntegerTy(32)) {

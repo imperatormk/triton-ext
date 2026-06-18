@@ -1,18 +1,8 @@
-// Widen num_stages=2 pipelined-dot SMEM staging from 1 slot to 2 rotating slots
-// so the DotOp fast path can elide the per-dot post-load barrier.
-//
-// At num_stages=2 the pipeliner allocates one staging slot, so each K-step's
-// async copy overwrites the strip the in-flight dot is still reading, forcing a
-// TG barrier after the SG loads. With 2 rotating slots the copy targets the
-// other slot and the barrier is redundant (same shape as num_stages=3, where
-// the lowering already drops it). The pipeliner's rotation counters already
-// wrap at bound 1 and fold to 0, so widening is: alloc shape[0] 1 -> 2 and the
-// wrap bound 1 -> 2.
-//
-// Widening both operands doubles the footprint; on big tiles (128x128) that
-// caps the core at one resident threadgroup, too few simds to hide load
-// latency. Above kAsymPreferBytes only one operand is widened (see
-// widenAsymmetric); above that again the loop stays single-slot.
+// WidenPipelinedStaging: widen num_stages=2 pipelined-dot SMEM staging from 1
+// to 2 rotating slots so the DotOp fast path can elide the per-dot post-load
+// barrier (the copy targets the other slot instead of the in-flight dot's).
+// Widening both operands can overflow the TG budget; above kAsymPreferBytes
+// only one operand is widened, above that the loop stays single-slot.
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUTransforms/Passes.h"
@@ -42,11 +32,8 @@ static std::optional<int64_t> constValue(Value v) {
   return std::nullopt;
 }
 
-// Match the pipeliner rotation idiom
-//   %n = arith.addi %cnt, %c1
-//   %w = arith.cmpi sge, %n, %bound
-//   %i = arith.select %w, %c0, %n
-// and return the cmp whose bound must be bumped to the new slot count.
+// Match the pipeliner rotation idiom select(sge(addi(cnt,1),bound),0,addi) and
+// return the cmp whose bound must be bumped to the new slot count.
 static arith::CmpIOp matchRotation(Value idx) {
   auto sel = idx.getDefiningOp<arith::SelectOp>();
   if (!sel)
@@ -252,10 +239,9 @@ struct WidenPipelinedStaging
         copy->setAttr("applegpu.rect_dma", UnitAttr::get(copy.getContext()));
   }
 
-  // The pipeliner's prologue prefill: async copies emitted before the loop in
-  // the same block whose commit token feeds a loop init arg. They clamp the
-  // same boundary as the matching in-loop copy, so they are rect-eligible on
-  // exactly the same conditions; the body-only walk above never sees them.
+  // The pipeliner's prologue prefill copies (emitted before the loop, commit
+  // token feeding a loop init arg). They clamp the same boundary as the in-loop
+  // copy, so they are rect-eligible identically; the body walk never sees them.
   static SmallVector<ttg::AsyncCopyGlobalToLocalOp>
   prologueCopies(scf::ForOp loop) {
     SmallVector<ttg::AsyncCopyGlobalToLocalOp> out;
@@ -309,10 +295,8 @@ struct WidenPipelinedStaging
   }
 
   // Mirror DotOpToLLVM's SMEM fast-path gates: widening only pays when the dot
-  // SG-loads operands straight from staging. If the padded resident grid fits
-  // the TG budget the lowering prefers the batched TG strip path, where 2-slot
-  // staging only eats the strip budget. Operand must be SG-loadable from
-  // staging.
+  // SG-loads operands straight from staging (else the lowering prefers the
+  // batched TG strip path). Operand must be SG-loadable from staging.
   static bool smemResolvable(Value operand) {
     Value src = operand;
     if (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
@@ -516,14 +500,11 @@ struct WidenPipelinedStaging
 
   enum class AsymResult { Applied, KeepSingleSlot, Fallback };
 
-  // Widen only one operand to 2 slots; the other keeps 1. The rotation counters
-  // are shared, so the widened operand gets private slot indices from the
-  // induction variable (i = (iv - lb) / step): extract reads i & 1, insert
-  // writes (i & 1) ^ 1, matching the counters' phase (prologue fills slot 0).
-  // The shared counters keep wrap-at-1 and fold to 0 for the single-slot
-  // operand, whose post-load barrier the lowering keeps. The smaller slot is
-  // widened (A on a tie) to stay under kAsymPreferBytes; above that, leave the
-  // loop single-slot.
+  // Widen only the smaller operand (A on a tie) to 2 slots; the other keeps 1.
+  // Shared counters can't index it, so it derives private slot indices from the
+  // induction var i=(iv-lb)/step: extract reads i&1, insert writes (i&1)^1,
+  // matching the counters' phase (prologue fills slot 0). Above
+  // kAsymPreferBytes leave the loop single-slot.
   AsymResult widenAsymmetric(scf::ForOp loop, SmallVector<StagedAlloc> &staged,
                              int64_t otherBytes) {
     auto aAlloc = dotAStagingAlloc(loop);

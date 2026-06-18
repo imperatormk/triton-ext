@@ -46,14 +46,9 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
           inferredPointee[Arg.getType()] = Ty;
 
   // PTM overrides. Skip globals (separate TypeEntry via globalPtrTypeIdx) and
-  // AS3 event_t (MMA TG pointers need float*3 default; events use per-value
-  // PTM).
-  //
-  // DETERMINISM: walk values in program order, not DenseMap<Value*,Type*>
-  // order. Map iteration order varies run-to-run; when several values share a
-  // pointer Type but map to different pointees, last-write-wins made the type
-  // table (and whole .metallib) nondeterministic -> intermittent "Failed to
-  // materializeAll".
+  // AS3 event_t. Walk values in program order, not DenseMap order, for
+  // determinism: last-write-wins over varying map order made the type table
+  // (and .metallib) nondeterministic.
   auto applyPTMOverride = [&](Value *V) {
     Type *T = PTM.get(V);
     if (!T)
@@ -84,12 +79,9 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
   addType(Type::getFloatTy(Ctx));
 
   // Pre-create event_t BEFORE function type processing: forward references in
-  // the type table crash Metal's LLVM 14-based reader.
-  //
-  // CRITICAL: inferredPointee[PtrAs3] = EventTy so a bare typeIdx(PtrAs3)
-  // resolves to event_t*3 (not i8*3/float*3); needed for wait_simdgroup_events
-  // param 1. Async-copy i8*3 buffer params go via per-param
-  // funcTypeParamIndices, not this type-level default.
+  // the type table crash Metal's LLVM 14-based reader. Set
+  // inferredPointee[PtrAs3] = EventTy so a bare typeIdx(PtrAs3) resolves to
+  // event_t*3 (needed for wait_simdgroup_events param 1).
   {
     StructType *EventTy = StructType::getTypeByName(Ctx, "event_t");
     if (EventTy) {

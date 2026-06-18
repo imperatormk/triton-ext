@@ -63,10 +63,8 @@ static bool shuffleReadsVectorRegister(Function &F) {
   return false;
 }
 
-// True when the function does vector FP *arithmetic* (not just vector memory
-// load/store glue). SLP (O1+) produces this in cross-lane reduce/scan kernels;
-// the AGX JIT miscompiles the result like the vector-fed shuffle pattern. GEMM
-// has no vector FP arithmetic (only memory quads), so it is skipped untouched.
+// True when the function does vector FP *arithmetic* (not just memory glue),
+// which the AGX JIT miscompiles like the vector-fed shuffle pattern.
 static bool hasVectorComputeShape(Function &F) {
   auto isVecFP = [](Type *T) {
     auto *VT = dyn_cast<FixedVectorType>(T);

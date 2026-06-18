@@ -99,12 +99,10 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
     }
   }
 
-  // CRITICAL: dispatch on stream->queue() (the serial queue) to serialize with
-  // other MPS ops (MPSGraph, blit copies); otherwise they race -> nondet.
-  // PERF: deliberately do NOT call endKernelCoalescing() - reusing torch's
-  // cached compute encoder coalesces back-to-back dispatches into one encoder.
-  // Serial-dispatch RAW deps are still honored, and torch closes the encoder
-  // itself (MPSStream::copy / executeMPSGraph) before any other queue work.
+  // Dispatch on stream->queue() (serial) to serialize with other MPS ops, else
+  // they race. Deliberately do NOT call endKernelCoalescing(): reusing torch's
+  // cached encoder coalesces back-to-back dispatches; RAW deps are still
+  // honored.
   @autoreleasepool {
     auto stream = at::mps::getCurrentMPSStream();
 

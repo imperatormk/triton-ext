@@ -27,10 +27,9 @@ using namespace mlir::triton::applegpu::dotcommon;
 
 namespace {
 
-// DotOpAppleMmaConversion: AppleMmaEncoding on C, rank-2 only.
-// When A/B come from tt.load (device memory), loads MMA tiles directly via
-// p1f32 intrinsics, skipping the TG scatter/gather and its ~12 barriers per
-// iteration; falls back to the TG scatter path when device pointers are absent.
+// DotOpAppleMmaConversion: AppleMmaEncoding on C, rank-2 only. Device-pointer
+// A/B load MMA tiles directly via p1f32 intrinsics (skipping the TG
+// scatter/gather barriers); otherwise falls back to the TG scatter path.
 struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -161,11 +160,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     bool isF16Input = aElemTy.isF16();
     bool isBF16Input = aElemTy.isBF16();
 
-    // int8 inputs have no f32-typed simdgroup load:
-    // air.simdgroup_matrix_8x8_load reads f32 and would misread 1-byte-packed
-    // integers (4x stride mismatch). The device path byte-loads each owned i8,
-    // widens to f32, and builds the <64 x f32> matrix by hand
-    // (emitDevSGLoadInt8), then feeds the f32 MMA.
+    // int8 has no f32-typed simdgroup load (the f32 load would misread
+    // byte-packed ints), so the device path byte-loads, widens to f32, and
+    // builds the matrix by hand (emitDevSGLoadInt8) before the f32 MMA.
     bool isIntInput = isa<IntegerType>(aElemTy);
     Type intGepElemTy = aElemTy;
 
@@ -210,14 +207,12 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     Value laneId =
         LLVM::CallOp::create(rewriter, loc, laneIdFn, ValueRange{}).getResult();
 
-    // Manual device-load + widen for int8 A/B tiles: each lane byte-loads the
-    // two i8 elements it owns under the PHYSICAL AppleMma per-lane layout
-    // (AppleMmaLayoutConversions.cpp), widens to f32, and inserts at vector
-    // indices {0,1}. Physical per-lane mapping for lane T, register R in {0,1}:
+    // Manual device-load + widen for int8 A/B tiles: each lane byte-loads its
+    // two owned i8 elements under the physical AppleMma per-lane layout, widens
+    // to f32, inserts at vector indices {0,1}. Per-lane mapping (lane T, reg
+    // R):
     //   row = ((T>>1)&1) | (((T>>2)&1)<<1) | (((T>>4)&1)<<2)
     //   col = R | (((T>>0)&1)<<1) | (((T>>3)&1)<<2)
-    // tilePtr is the i8 tile origin; rowStride/colStride are runtime i64
-    // element strides.
     auto emitDevSGLoadInt8 = [&](Value tilePtr, Value rowStride,
                                  Value colStride) -> Value {
       auto matIntTy = getSimdgroupMatrixType(ctx); // <64 x f32>
@@ -343,11 +338,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       auto loadOp = src.getDefiningOp<tt::LoadOp>();
       if (!loadOp)
         return {};
-      // A masked load fills OOB lanes in registers; the device-direct
-      // simdgroup_matrix_8x8_load.p1 reads raw memory and cannot see the mask,
-      // so it would feed the MMA unmasked bytes at masked-out positions (100%
-      // mismatch on masked tl.dot, e.g. depthwise/grouped conv2d_backward).
-      // Decline the device path so the TG scatter preserves the register fill.
+      // The device-direct SG load reads raw memory and can't see a load mask,
+      // feeding the MMA unmasked bytes at masked-out positions; decline the
+      // device path so the TG scatter preserves the register fill.
       if (loadOp.getMask())
         return {};
       Value ptrTensor = loadOp.getPtr();
@@ -357,12 +350,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       return unpack(mappedPtrs);
     };
 
-    // Pipelined-SMEM operands: with num_stages>1 the operand comes from
-    // ttg.local_load of the pipeline staging buffer (resolveDevicePointers
-    // fails: the tt.load is gone, copies are masked). Only when the buffer is a
-    // plain row-major strip (maxPhase==1, order=[1,0], shape==operand shape)
-    // can simdgroup_matrix_8x8_load read it at constant pitch. Returns {base
-    // ptr (addrspace 3), row pitch elems}; null base -> registers fallback.
+    // Pipelined-SMEM operands (num_stages>1): the operand comes from a
+    // local_load of the staging buffer. Only a plain row-major strip
+    // (maxPhase==1, order=[1,0], shape==operand shape) can be SG-loaded at
+    // constant pitch. Returns {base ptr (as3), row pitch}; null -> registers.
     auto resolveSmemOperand =
         [&](Value tritonVal,
             RankedTensorType opTy) -> std::pair<Value, int64_t> {
@@ -406,9 +397,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     if (!aSrcEnc || !bSrcEnc)
       return failure();
 
-    // Fragment ABI: C arrived as struct<(<64xf32> x F)> (the dot-chain
-    // accumulator). The F fragment vectors seed matC_tiles directly and pack
-    // back into the same struct, no scalar bridge on register-resident paths.
+    // Fragment ABI: C arrived as struct<(<64xf32> x F)>; the fragment vectors
+    // seed matC_tiles and pack back directly, no scalar bridge.
     bool fragC = !elemsC.empty() && isa<VectorType>(elemsC.front().getType());
     SmallVector<Value> fragCIn;
     if (fragC)
@@ -425,14 +415,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     bool useDeviceA = (aPtrs.size() == elemsA.size() && !aPtrs.empty());
     bool useDeviceB = (bPtrs.size() == elemsB.size() && !bPtrs.empty());
 
-    // int8 operands also take the device path (byte-load + widen via
-    // emitDevSGLoadInt8), dropping the large f32 TG operand buffer that
-    // overflowed the 32KB budget for larger K (e.g. K=128).
-
     // Row stride (leading dim) in elements for device MMA loads. Strategy 1:
-    // find two THIS-thread elements with same col, different row. Strategy 2
-    // (common, all elements same row): simd_shuffle the same-column pointer
-    // from the row-adjacent lane (offset tpw[colDim]).
+    // two THIS-thread elements with same col, different row. Strategy 2 (all
+    // elements same row): simd_shuffle the same-column pointer from the
+    // row-adjacent lane.
     auto computeRowStride = [&](SmallVector<Value> &ptrs,
                                 SmallVector<SmallVector<unsigned>> &offsets,
                                 Type elemTy,
@@ -640,11 +626,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     if (useDeviceB && (!bRowStride || !bColStride))
       useDeviceB = false;
 
-    // Pipelined-SMEM fallback for operands without device pointers: SG-load
-    // directly from the staging buffer the local_load reads, keeping the dot
-    // register-resident (no operand scatter, no per-strip barriers). Resolved
-    // unconditionally: a tile sweep shows the SMEM-resident SG-load is faster
-    // or equal vs the batched TG strip path for every grid-fitting fp32 shape.
+    // SMEM fallback for operands without device pointers: SG-load directly from
+    // the staging buffer, keeping the dot register-resident (no operand
+    // scatter, no per-strip barriers).
     Value aSmemBase, bSmemBase;
     int64_t aSmemPitch = 0, bSmemPitch = 0;
     {
@@ -659,14 +643,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     bool fastB = useDeviceB || useSmemB;
     bool fastPath = fastA && fastB;
 
-    // Device base pointer for an 8x8 MMA tile. ptrs[0] points to this thread's
-    // own element at (baseRow+offsets[0][0], baseCol+offsets[0][1]); subtract
-    // that to reach the tile origin, so every thread computes the SAME base:
-    //   tile_ptr = ptrs[0] + (tileRow - baseRow - offsets[0][0]) * rowStride
-    //                      + (tileCol - baseCol - offsets[0][1])
-    // extraRow/extraCol are optional runtime element addends folded in; the
-    // device-MMA path uses them for the per-warp tile origin (warpRow*8 /
-    // warpCol*8) so each warp loads only the operand tiles it owns.
+    // Device base pointer for an 8x8 MMA tile. Subtracts this thread's own
+    // element offset from ptrs[0] so every thread computes the SAME tile
+    // origin. extraRow/extraCol are optional runtime addends for the per-warp
+    // origin (warpRow*8/warpCol*8) so each warp loads only its owned tiles.
     auto computeTileDevPtr =
         [&](SmallVector<Value> &ptrs,
             SmallVector<SmallVector<unsigned>> &offsets, Value rowStride,
@@ -713,13 +693,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       return tilePtr;
     };
 
-    // MMA stride for device loads. The 3-vector form is <colStride, rowStride>
-    // addressing (i,j) as base + i*rowStride + j*colStride. The canonical
-    // (macOS<=15) form takes a single elements_per_row pitch plus a transpose
-    // bool: (i,j) -> base + i*pitch + j (transpose=false) or base + i + j*pitch
-    // (transpose=true). For an MMA tile exactly one stride is unit, so pick the
-    // non-unit stride as the pitch (row-major -> rowStride/false, col-major ->
-    // colStride/true); transpose is derived at the call site.
+    // MMA stride for device loads. 3-vector form is <colStride, rowStride>; the
+    // canonical (macOS<=15) form takes a single elements_per_row pitch + a
+    // transpose bool. Exactly one stride is unit per MMA tile, so pick the
+    // non-unit one as the pitch; transpose is derived at the call site.
     auto makeDevMmaStride = [&](Value colStride, Value rowStride) -> Value {
       if (canonSG) {
         Value rowBig = arith::CmpIOp::create(
@@ -745,17 +722,12 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                    rowStride, colStride);
     };
 
-    // Canonical warp -> tile mapping (SINGLE source of truth). The A/B scatter
-    // (makeBase col-fastest), the C accumulator (makeBaseMma), and the per-warp
-    // owned-tile loops MUST all agree on which warp owns which 8x8 tile or
-    // operand rows feed the wrong MMA (commit a72c17e: makeBase used Morton
-    // while makeBaseMma used linear, swapping warps 1<->2 for square pow2
-    // warpsPerCTA, miscompiling nw=4). All callers use linear column-major
-    // order
+    // Canonical warp -> tile mapping (single source of truth). makeBase,
+    // makeBaseMma, and the per-warp owned-tile loops MUST agree on tile
+    // ownership or operand rows feed the wrong MMA. Linear column-major
     //   (warpRow, warpCol) = (w / wN, w % wN)
-    // matching toLinearLayout() and emitOffsetForLayout. (makeBase's non-col-
-    // fastest branch keeps the operand-local transposed order; it does not feed
-    // tile ownership.)
+    // matching toLinearLayout() and emitOffsetForLayout; a Morton remap here
+    // swaps warps for square pow2 warpsPerCTA and miscompiles.
     auto warpRowCol = [&](unsigned wN) -> std::pair<Value, Value> {
       Value warpRow = divByConst(rewriter, loc, warpId, wN);
       Value warpCol = remByConst(rewriter, loc, warpId, wN);
@@ -787,12 +759,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       Value tNsN = arith::ConstantIntOp::create(rewriter, loc, tN * sN, 32);
       Value sN_val = arith::ConstantIntOp::create(rewriter, loc, sN, 32);
 
-      // Warp decomposition: linear div/mod, matching emitOffsetForLayout. The
-      // A/B scatter and SG load round-trip through ABSOLUTE threadgroup
-      // positions, so each element must land where emitOffsetForLayout assigns
-      // it: row/col-major warp order, NOT Morton. A Morton remap here disagrees
-      // with the absolute gather for square pow2 warpsPerCTA (e.g. [2,2]):
-      // warps 1 and 2 swap tiles and the whole result is wrong.
+      // Warp decomposition: linear div/mod matching emitOffsetForLayout. The
+      // A/B scatter round-trips through absolute threadgroup positions, so warp
+      // order must be row/col-major (NOT Morton, which mis-maps square pow2
+      // warpsPerCTA).
       Value wR, wC;
       if (colFastest) {
         std::tie(wR, wC) = warpRowCol(wN);
@@ -825,9 +795,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     };
 
     // MMA base: lane->(row,col) within 8x8 tile, warp->tile position. Must use
-    // column-major warp ordering to match toLinearLayout(), which the upstream
-    // convert_layout relies on for shared-memory addressing. Do NOT use Morton
-    // here (safe only for self-consistent internal TG scatter/gather).
+    // column-major warp ordering to match toLinearLayout(); do NOT use Morton.
     auto makeBaseMma = [&](AppleMmaEncodingAttr enc, int64_t rows,
                            int64_t cols) -> std::pair<Value, Value> {
       auto wpc = enc.getWarpsPerCTA();
@@ -839,8 +807,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       Value laneRow = arith::ShRUIOp::create(rewriter, loc, laneId, c3);
 
       Value c8 = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
-      // Shared with makeBase via warpRowCol so the operand scatter and this C
-      // mapping can never diverge again (commit a72c17e).
+      // Shared with makeBase via warpRowCol so the two mappings can't diverge.
       auto [warpRow, warpCol] = warpRowCol(wN);
 
       Value baseRow = arith::AddIOp::create(
@@ -869,22 +836,17 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     int64_t tgABStripSize = 8 * std::max(Kpad, Npad);
     int64_t tgStripSize = (fastPath) ? tgCStripSize : tgABStripSize;
     // Multi-strip batching: give each 8-row strip its own TG block so all
-    // strips scatter and read back under one barrier pair instead of one per
-    // strip (trades TG memory for fewer barriers). The compiler.py gatekeeper
-    // validates the real post-coalesce footprint against Metal's 32KB cap, so
-    // this only needs a sane upper bound to stop one dot hogging the buffer.
-    // The batchStrips path keeps the whole C grid resident, which the per-warp
-    // owned-tile store-back (TASK #57) needs; the per-strip path can't (single
-    // strip, no resident grid) and computes the full grid.
+    // strips scatter and read back under one barrier pair (trades TG memory for
+    // fewer barriers). The batchStrips path keeps the whole C grid resident for
+    // the per-warp owned-tile store-back; the per-strip path computes the full
+    // grid. The compiler.py gatekeeper validates the real footprint vs 32KB.
     bool tgPath = !fastPath;
     int64_t maxStripsAB = std::max(M / 8, K / 8);
     int64_t batchedABSize = maxStripsAB * tgABStripSize;
     int64_t batchedCSize = (M / 8) * tgCStripSize;
-    // Gate the resident-grid path on its REAL combined footprint vs Metal's
-    // 32KB cap. A sub-f32 dot also keeps two half-typed convert_layout buffers
-    // (__tg_cvt_*, the #mma<->#blocked round trip) resident, each ~the C grid
-    // in operand bytes, which the gatekeeper sums; the dot grid is f32
-    // (4B/elem).
+    // Gate the resident-grid path on combined footprint vs 32KB. A sub-f32 dot
+    // also keeps two half-typed convert_layout buffers resident (each ~the C
+    // grid in operand bytes); the dot grid itself is f32 (4B/elem).
     int64_t residentGridBytes = std::max(batchedABSize, batchedCSize) * 4;
     unsigned aElemBytes = aElemTy.getIntOrFloatBitWidth() / 8;
     int64_t cvtBytes =
@@ -971,19 +933,17 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     Value garbageIdx =
         arith::ConstantIntOp::create(rewriter, loc, tgSize - 1, 64);
 
-    // Per-warp C-tile ownership (TASK #57): warp (warpRow, warpCol) owns the
-    // absolute C tiles (warpRow + k*warpsM, warpCol + j*warpsN), k in [0,ownM),
-    // j in [0,ownN), so each warp does only ownM*ownN MMAs instead of the full
-    // grid in every warp. The TG store-back writes each owned tile to its
-    // ABSOLUTE position (one writer per tile, no race) via a warp-origin GEP.
+    // Per-warp C-tile ownership: warp (warpRow,warpCol) owns the absolute tiles
+    // (warpRow + k*warpsM, warpCol + j*warpsN), so each warp does only
+    // ownM*ownN MMAs and the store-back writes each owned tile to its absolute
+    // position (one writer per tile, no race).
     int64_t cWarpsM = cMmaEnc.getWarpsPerCTA()[0];
     int64_t cWarpsN = cMmaEnc.getWarpsPerCTA()[1];
     int64_t ownM = std::max<int64_t>(1, tilesM / cWarpsM);
     int64_t ownN = std::max<int64_t>(1, tilesN / cWarpsN);
-    // Runtime warp origin in elements (warpRow*8, warpCol*8) and a base pointer
-    // pre-offset to this warp's (0,0) owned tile, for the owned SG load/store
-    // (CONSTANT tile offsets only; a runtime SG offset mis-lowers). Owned
-    // indexing degenerates to the full grid when warpsM*warpsN == 1.
+    // Warp origin in elements + a base pre-offset to this warp's (0,0) owned
+    // tile, for owned SG load/store (CONSTANT tile offsets only; a runtime SG
+    // offset mis-lowers). Degenerates to the full grid when warpsM*warpsN == 1.
     auto [cWarpRowT, cWarpColT] = warpRowCol((unsigned)cWarpsN);
     Value c8own = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
     Value cWarpRowElem = arith::MulIOp::create(rewriter, loc, cWarpRowT, c8own);
@@ -1000,10 +960,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                            ArrayRef<LLVM::GEPArg>{cWarpFlat64});
     // Owned A/B base pointers fold the warp origin into the TG base so each
     // warp SG-loads owned tiles at CONSTANT offsets (runtime SG offset
-    // mis-lowers). A [strip=tile-row, Kpad]: pre-offset warpRow*8 rows (flat
-    // warpRow*8 * Kpad). B [strip=tk, Npad]: pure column offset (flat
-    // warpCol*8). GEP element type is the A/B scatter type so the flat index
-    // scales in scatter elements.
+    // mis-lowers). A pre-offsets warpRow*8 rows; B a pure warpCol*8 column.
     Value KpadOwn = arith::ConstantIntOp::create(rewriter, loc, Kpad, 32);
     Value aWarpFlat64 = arith::ExtUIOp::create(
         rewriter, loc, i64Ty,
@@ -1018,10 +975,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                             ArrayRef<LLVM::GEPArg>{bWarpFlat64});
 
     // Direct scatter: store every operand element to its absolute TG offset
-    // (baseRow+rowOff)*stride + (baseCol+colOff), the closed-form
-    // distributed->shared mapping for the row-major strip. No predicate, no
-    // garbage sink; the matching SG-load reads each 8x8 tile from the same
-    // coordinates.
+    // (baseRow+rowOff)*stride + (baseCol+colOff). No predicate, no garbage
+    // sink; the matching SG-load reads each 8x8 tile from the same coordinates.
     auto directScatter = [&](Value ptr, Value baseRow, Value baseCol,
                              SmallVector<Value> &elems,
                              SmallVector<SmallVector<unsigned>> &offsets,
@@ -1122,12 +1077,11 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     for (int64_t tm = 0; tm < tilesM; ++tm)
       matC_tiles[tm].resize(tilesN);
 
-    // LANE-LOCAL C bridge (physical AppleMma layout), shared by every MMA path.
-    // Under the physical toLinearLayout each lane's #mma C scalars sit at the
-    // simdgroup_matrix per-lane storage (vector indices 0,1), so C-in is an
-    // insertelement and C-out the inverse extractelement at vecIdx = colOff%2
-    // (register bit = col bit0). No TG round-trip, no cross-lane shuffle.
-    // owM/owN are the per-warp owned tile counts; wM/wN the warp grid.
+    // Lane-local C bridge (physical AppleMma layout): each lane's #mma C
+    // scalars sit at the simdgroup_matrix per-lane storage (vector indices
+    // 0,1), so C-in is an insertelement and C-out the inverse extractelement at
+    // vecIdx = colOff%2. No TG round-trip. owM/owN owned tile counts; wM/wN
+    // warp grid.
     auto laneLocalCIn = [&](int64_t wM, int64_t wN, int64_t owM, int64_t owN) {
       auto matTyL = getSimdgroupMatrixType(ctx);
       if (fragC) {
@@ -1188,9 +1142,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     };
 
     // C accumulator-in must land in the SAME warp-owned slots the MMA and the
-    // Phase-4 extract use, not the full absolute grid, or a nonzero accumulator
-    // (e.g. add-matrix's #blocked->#mma into tt.dot's C operand) lands in the
-    // wrong tile (invisible when C-in is zero).
+    // Phase-4 extract use, not the full grid, or a nonzero accumulator lands in
+    // the wrong tile (invisible when C-in is zero).
     if (fastPath) {
       laneLocalCIn(cWarpsM, cWarpsN, ownM, ownN);
     } else if (batchStrips) {
@@ -1232,10 +1185,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // ── Phase 2: A/B loads + MMA ──────────────────────────────────
     if (fastPath) {
       // DEVICE PATH: direct MMA loads from device memory (no A/B scatter or
-      // barriers). Per-warp tiling: warp (warpRow,warpCol) loads and
-      // accumulates ONLY its owned tiles matC_tiles[k][j] = absolute tile
-      // (warpRow + k*warpsM, warpCol + j*warpsN). The tile's device origin adds
-      // the runtime warp offset (cWarpRow*8 / cWarpCol*8) on top of the
+      // barriers). Per-warp tiling: each warp loads/accumulates only its owned
+      // tiles, the device origin adding the runtime warp offset on top of the
       // compile-time step. A tiles for tk+1 prefetched before MMA of tk.
       Value aDevStride, bDevStride, aDevTranspose, bDevTranspose;
       if (useDeviceA) {
@@ -1264,9 +1215,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       Value warpColElem = arith::MulIOp::create(rewriter, loc, dWarpCol, c8i);
 
       // SMEM warp-base pointers: fold the warp origin into the base so SG loads
-      // use CONSTANT tile offsets (a runtime SG offset mis-lowers). A's origin
-      // is a row offset (warpRow*8 rows of pitch aSmemPitch); B's a pure column
-      // offset (warpCol*8).
+      // use CONSTANT tile offsets (a runtime SG offset mis-lowers). A's is a
+      // row offset (warpRow*8 rows of pitch aSmemPitch); B's a pure column.
       Value ptrSmemAWarp, ptrSmemBWarp;
       if (useSmemA) {
         Value pitchA =
@@ -1316,14 +1266,11 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       };
 
       if (useSmemA || useSmemB) {
-        // SMEM-resident operands: SG-load EVERY owned strip tile upfront, then
-        // ONE barrier, then the all-register MMA loop. The barrier is required:
-        // the reads happen after the membar-fenced local_load, and the
-        // pipeliner prefetches num_stages-1 ahead, so the copy that overwrites
-        // THIS slot is emitted right after these reads with no async_wait
-        // between them; without the fence it can clobber the strip mid-read
-        // (silent, K-count-dependent corruption). Loading first keeps the MMA
-        // off the barrier's critical path so the copies overlap the math.
+        // SMEM-resident operands: SG-load every owned strip tile upfront, ONE
+        // barrier, then the all-register MMA loop. The barrier is required: the
+        // pipeliner prefetches num_stages-1 ahead, so without the fence the
+        // next copy can clobber this slot mid-read (silent, K-count-dependent
+        // corruption). Loading first keeps the MMA off the barrier's crit path.
         SmallVector<SmallVector<Value>> matA(ownM);
         for (int64_t k = 0; k < ownM; ++k) {
           matA[k].resize(tilesK);
@@ -1347,15 +1294,12 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                       ValueRange{matA[k][tk], matB[tk][j], matC_tiles[k][j]})
                       .getResult();
       } else {
-        // ROLLED K-LOOP (task #86): emit the K accumulation as a REAL
-        // LLVM-dialect loop with the owned accumulators carried as phi-style
-        // block args, not a full straight-line unroll. The fully-unrolled form
-        // gave O3 N identical <64 x float> tiles to scalarize/revectorize,
-        // inflating register pressure so the AGX driver capped
-        // maxThreadsPerThreadgroup (~384 vs ~896). A bounded unroll factor U
-        // (METAL_MMA_KUNROLL, default 2) keeps latency hiding without the
-        // explosion. Rolled only when tilesK % U == 0 and trip count >= 2;
-        // otherwise (small/odd K) fall back to straight-line unroll.
+        // Rolled K-loop: emit the K accumulation as a real LLVM-dialect loop
+        // (accumulators carried as block args). A full unroll inflates register
+        // pressure enough that the AGX driver caps maxThreadsPerThreadgroup
+        // (~384 vs ~896); the bounded unroll factor (METAL_MMA_KUNROLL, default
+        // 2) keeps latency hiding. Rolled only when tilesK % U == 0 and trip >=
+        // 2; small/odd K falls back to straight-line unroll.
         int64_t kUnroll = 2;
         if (const char *e = ::getenv("METAL_MMA_KUNROLL")) {
           int64_t v = atoll(e);
@@ -1369,10 +1313,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
         bool doRoll = (tilesK > kUnroll) && (tripCount >= 2);
 
         // Runtime-K tile loaders: the K offset rides a loop-carried A/B
-        // reference pointer (aKRef/bKRef) advanced by kUnroll*8 K-elements per
-        // trip, so the per-trip address is a ptr += const recurrence, not a
-        // fresh mul(tk,stride)+gep. tkElemOff is a fallback for callers with no
-        // carried base (none on the rolled path).
+        // reference pointer (aKRef/bKRef) advanced kUnroll*8 K-elements per
+        // trip (ptr += const recurrence). tkElemOff is a fallback for callers
+        // with no carried base.
         auto loadATileRT = [&](int64_t k, Value tkElemOff,
                                Value aKRef = nullptr) -> Value {
           Value aTilePtr = computeTileDevPtr(
@@ -1582,9 +1525,8 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                            ValueRange{fenceTG, execMod});
 
-      // PER-WARP (TASK #57): every warp scattered the full A grid above (all
-      // strips resident), but loads only its owned tile-rows matA[k] = absolute
-      // (warpRow + k*warpsM) via the warp-base pointer at constant offset.
+      // Per-warp: every warp scattered the full A grid above, but loads only
+      // its owned tile-rows via the warp-base pointer at constant offset.
       SmallVector<SmallVector<Value>> matA(ownM);
       for (int64_t k = 0; k < ownM; ++k) {
         matA[k].resize(tilesK);
@@ -1617,10 +1559,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       LLVM::CallOp::create(rewriter, loc, tgBarrFn,
                            ValueRange{fenceTG, execMod});
     } else {
-      // TG PATH (per-strip): scatter/load through threadgroup memory. A's
-      // scatter stays CTA-uniform over every absolute row strip (a row's source
-      // lanes may live in another C warp row); each warp retains only its owned
-      // A rows and MMAs only its owned C tiles.
+      // TG PATH (per-strip): A's scatter stays CTA-uniform over every absolute
+      // row strip (a row's source lanes may live in another C warp row); each
+      // warp retains only its owned A rows and MMAs only its owned C tiles.
       int64_t aMaxBase = maxBaseRow(aSrcEnc);
       int64_t bMaxBase = maxBaseRow(bSrcEnc);
       auto aBuckets = bucketElements(aOffsets, aMaxBase, tilesM, 0);
@@ -1707,9 +1648,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       resultElems[i] = arith::ConstantOp::create(
           rewriter, loc, rewriter.getZeroAttr(outElemTy));
 
-    // Under the physical toLinearLayout the #mma C scalars sit at the
-    // simdgroup_matrix per-lane storage (vector indices 0,1), so C-out is a
-    // lane-local extractelement (inverse of laneLocalCIn) for every
+    // C-out is a lane-local extractelement (inverse of laneLocalCIn) for every
     // register-resident path; cOffsets are physical coords.
     if (fastPath) {
       laneLocalCOut(cWarpsM, cWarpsN, ownM, ownN, outElemTy, resultElems);

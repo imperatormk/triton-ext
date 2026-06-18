@@ -6,25 +6,11 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// AGX-1 root-fix. See MetalCrossBufferStoreSeparate.h and AGX_BUGS.md.
-//
-// The Apple AGX JIT coalesces device stores by *address*, ignoring source
-// order. When two stores to different buffer args land at the same per-thread
-// element offset in one straight-line block, the JIT fuses them and drops
-// warp 0's value. At -O0 the bug never fires because each masked store sits in
-// its own predicated basic block; -O1+ flattens those into one run.
-//
-// This pass restores the -O0 structure: it groups conflicting device stores by
-// their per-thread offset SSA and hoists each offset group into its own
-// predicated block guarded by THAT group's in-bounds mask (the dominating
-// `icmp slt offset, N`). The guard is always taken for in-bounds threads
-// (semantics-identical) but is a real conditional branch, so the JIT can no
-// longer address-coalesce the cross-buffer pair. Per-offset grouping keeps a
-// store under a different predicate from being pulled under the wrong guard.
-//
-// A block is rewritten only when it contains a cross-buffer offset group (>=2
-// stores reaching DIFFERENT addrspace(1) Args at the same SSA offset), so
-// single-output kernels are a byte-identical no-op.
+// The AGX JIT coalesces device stores by address; at -O1+ two stores to
+// different buffer args at the same per-thread offset in one block get fused,
+// dropping warp 0's value. This pass hoists each cross-buffer offset group into
+// its own predicated block guarded by its in-bounds mask, so the JIT can no
+// longer address-coalesce the pair. Single-output kernels are a no-op.
 //
 //===----------------------------------------------------------------------===//
 
@@ -134,13 +120,8 @@ static Value *findMaskForOffset(Value *Offset, Instruction *InsertPt) {
 }
 
 // Hoist a set of conflicting stores (sharing one per-thread offset) into one
-// predicated block guarded by `Guard`. The stores (possibly non-adjacent) are
-// moved in program order into the new block along with the address GEPs they
-// depend on; non-conflicting stores stay in the continuation, so a store under
-// a different offset is never pulled under this guard. The real conditional
-// branch stops the AGX JIT from treating warp-0 lane stores as unconditional,
-// so it no longer address-coalesces the cross-buffer pair. Returns the
-// continuation block for re-scanning.
+// predicated block guarded by `Guard`, moving them in program order with the
+// address GEPs they depend on. Returns the continuation block for re-scanning.
 static BasicBlock *guardStoreGroup(ArrayRef<StoreInst *> Group, Value *Guard) {
   assert(!Group.empty() && "empty store group");
   BasicBlock *Pre = Group.front()->getParent();
@@ -254,10 +235,8 @@ static bool separateInFunction(Function &F) {
     }
 
     // Pick one offset group that is cross-buffer, has a real mask, and is safe
-    // to hoist. Hoisting moves the group to its first store, so every stored
-    // value/pointer must already be available there; a value sunk after the
-    // first store would forward-reference and make the AIR writer emit an
-    // invalid record, so such a group is skipped rather than miscompiled.
+    // to hoist: a stored value defined after the hoist point would
+    // forward-reference and make the AIR writer emit an invalid record.
     SmallVector<Value *, 8> OffsetOrder;
     for (auto &R : Stores)
       if (R.Offset && ByOffset.count(R.Offset) &&

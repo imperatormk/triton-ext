@@ -31,6 +31,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include <cstdlib>
 
 namespace mlir::triton::applegpu {
 
@@ -40,6 +41,18 @@ using namespace mlir::arith;
 namespace ttg = mlir::triton::gpu;
 
 namespace {
+
+// Target macOS major (TRITON_MPS_TARGET_OS_MAJOR, default 16).
+// Cross-threadgroup device-atomic ordering arrived in Metal 3.2 = macOS 15; a
+// CAS spinlock cannot be made correct below that.
+static unsigned getTargetOSMajor() {
+  if (const char *e = std::getenv("TRITON_MPS_TARGET_OS_MAJOR")) {
+    unsigned v = std::atoi(e);
+    if (v)
+      return v;
+  }
+  return 16;
+}
 
 // Lower triton::AtomicRMWOp → air.atomic.global.{op}.{type}. Natively
 // unsupported atomics (f32 max/min, f16/bf16 add) emit a CAS loop via
@@ -710,16 +723,16 @@ struct AtomicCASOpAppleConversion
     auto i32Ty = IntegerType::get(ctx, 32);
     auto i1Ty = IntegerType::get(ctx, 1);
 
-    // 7-arg form (ptr, &expected, desired, succ_order, fail_order, scope, vol):
-    // the canonical 8-arg mem_flags form crashes the AGX PSO compiler
-    // (TypeFinder null-deref). The 7-arg form only weakly honours the order
-    // operands -> rare cold flake on acquire/release CAS.
+    // Canonical 8-arg form (ptr, &expected, desired, succ_order, fail_order,
+    // scope, mem_flags, vol). The writer types the lock arg as metal::_atomic
+    // so the Metal driver honours device ordering strongly.
     {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(mod.getBody());
       if (!mod.lookupSymbol<LLVMFuncOp>(airName)) {
         auto fnTy = LLVMFunctionType::get(
-            casTy, {ptrTy, ptrTy0, casTy, i32Ty, i32Ty, i32Ty, i1Ty}, false);
+            casTy, {ptrTy, ptrTy0, casTy, i32Ty, i32Ty, i32Ty, i32Ty, i1Ty},
+            false);
         LLVMFuncOp::create(rewriter, mod.getLoc(), airName, fnTy,
                            Linkage::External);
       }
@@ -748,7 +761,8 @@ struct AtomicCASOpAppleConversion
     Value succ = arith::ConstantIntOp::create(rewriter, loc, succOrder, 32);
     Value fail = arith::ConstantIntOp::create(rewriter, loc, failOrder, 32);
     Value scope = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
-    Value vol = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+    Value memFlags = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+    Value vol = arith::ConstantIntOp::create(rewriter, loc, 0, 1);
 
     // Weak-CAS retry: re-issue while old==cmp but `desired` hasn't landed; exit
     // once old!=cmp (lost the race) or the swap is confirmed. That first value
@@ -764,10 +778,11 @@ struct AtomicCASOpAppleConversion
 
     rewriter.setInsertionPointToStart(loopBlock);
     LLVM::StoreOp::create(rewriter, loc, cmpI, expectedAlloca);
-    Value oldI = LLVM::CallOp::create(rewriter, loc, casFn,
-                                      ValueRange{ptr, expectedAlloca, valI,
-                                                 succ, fail, scope, vol})
-                     .getResult();
+    Value oldI =
+        LLVM::CallOp::create(rewriter, loc, casFn,
+                             ValueRange{ptr, expectedAlloca, valI, succ, fail,
+                                        scope, memFlags, vol})
+            .getResult();
     Value readCmp = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::eq,
                                          oldI, cmpI);
     Value memNow = LLVM::LoadOp::create(rewriter, loc, casTy, ptr);
@@ -832,6 +847,17 @@ struct AtomicCASOpAppleConversion
           << valueTy
           << " is unsupported on the Apple GPU backend: Metal has no 64-bit "
              "device atomics (only 32-bit/16-bit cmpxchg exist)";
+      return failure();
+    }
+
+    if (!tensorTy && getTargetOSMajor() < 16) {
+      // A scalar CAS is a cross-threadgroup spinlock; its canonical 8-arg
+      // device-atomic form is only honoured at air.version >= (2,9,0) / MSL 4.1
+      // (macOS 26). Below that, reject cleanly rather than miscompile.
+      op.emitError(
+          "scalar atomic_cas (spinlock) is unsupported below macOS 26: "
+          "the canonical device-atomic form requires air.version 2.9 / "
+          "Metal 4.1 (coherent(device) cross-threadgroup ordering)");
       return failure();
     }
 

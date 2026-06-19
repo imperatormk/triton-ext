@@ -289,6 +289,55 @@ struct ConvertTritonAppleGPUToLLVMPass
     if (failed(applyPartialConversion(mod, target, std::move(patterns))))
       signalPassFailure();
 
+    // All smem consumers share one arena via AddressOfOp(@global_smem);
+    // rebasing every such ref onto a single trailing param preserves that
+    // offset model.
+    if (auto smemGlobal = mod.lookupSymbol<LLVM::GlobalOp>("global_smem")) {
+      int64_t arenaBytes = 0;
+      if (auto arrTy = dyn_cast<LLVMArrayType>(smemGlobal.getGlobalType()))
+        arenaBytes = (int64_t)arrTy.getNumElements() *
+                     (arrTy.getElementType().getIntOrFloatBitWidth() / 8);
+
+      auto tgPtrTy = LLVM::LLVMPointerType::get(ctx, 3);
+      bool anyRebased = false;
+      for (auto fn : llvm::to_vector(mod.getOps<LLVMFuncOp>())) {
+        if (fn.isExternal())
+          continue;
+        SmallVector<LLVM::AddressOfOp> refs;
+        fn.walk([&](LLVM::AddressOfOp ao) {
+          if (ao.getGlobalName() == "global_smem")
+            refs.push_back(ao);
+        });
+        if (refs.empty())
+          continue;
+
+        auto oldTy = fn.getFunctionType();
+        SmallVector<Type> argTys(oldTy.getParams().begin(),
+                                 oldTy.getParams().end());
+        argTys.push_back(tgPtrTy);
+        fn.setType(LLVM::LLVMFunctionType::get(oldTy.getReturnType(), argTys,
+                                               oldTy.isVarArg()));
+        Block &entry = fn.getBody().front();
+        BlockArgument tgArg = entry.addArgument(tgPtrTy, fn.getLoc());
+        for (auto ao : refs) {
+          ao.getResult().replaceAllUsesWith(tgArg);
+          ao.erase();
+        }
+        SmallVector<Attribute> passthrough;
+        if (auto existing = fn.getPassthroughAttr())
+          passthrough.append(existing.begin(), existing.end());
+        passthrough.push_back(StringAttr::get(ctx, "air.thread_group_bound"));
+        fn.setPassthroughAttr(ArrayAttr::get(ctx, passthrough));
+        anyRebased = true;
+      }
+
+      if (anyRebased && smemGlobal.use_empty())
+        smemGlobal.erase();
+      if (anyRebased)
+        mod->setAttr("applegpu.dynamic_smem_bytes",
+                     IntegerAttr::get(IntegerType::get(ctx, 64), arenaBytes));
+    }
+
     // Async-wait cleanup: AsyncWaitOp emits waits unconditionally. With no DMA
     // call the waits guard nothing and the AIR JIT refuses to materialize them,
     // so strip the waits and dead decl here.

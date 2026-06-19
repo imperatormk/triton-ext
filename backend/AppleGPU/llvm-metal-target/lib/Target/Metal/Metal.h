@@ -78,16 +78,8 @@ ModulePass *createMetalDeviceLoadsVolatileLegacyPass();
 /// Initializer for the Metal scalar-store-guard pass.
 void initializeMetalScalarStoreGuardLegacyPass(PassRegistry &);
 
-/// Initializer for the Metal scalarize-shuffle-operands pass.
-void initializeMetalScalarizeShuffleOperandsLegacyPass(PassRegistry &);
-
 /// Pass to guard scalar device stores with a `tid.x == 0` check.
 ModulePass *createMetalScalarStoreGuardLegacyPass();
-
-/// Pass to scalarize vector data-flow feeding `air.simd_shuffle*` operands,
-/// working around an AGX JIT miscompile of cross-lane shuffles whose operand
-/// lives in a vector register.
-ModulePass *createMetalScalarizeShuffleOperandsLegacyPass();
 
 /// Initializer for the Metal threadgroup-global coalesce pass.
 void initializeMetalTGGlobalCoalesceLegacyPass(PassRegistry &);

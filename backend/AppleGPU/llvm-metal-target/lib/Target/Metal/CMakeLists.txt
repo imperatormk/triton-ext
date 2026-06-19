@@ -46,7 +46,6 @@ set(METAL_CODEGEN_SOURCES
   MetalNormalizeAllocas.cpp
   MetalPrepare.cpp
   MetalScalarBufferPacking.cpp
-  MetalScalarizeShuffleOperands.cpp
   MetalScalarStoreGuard.cpp
   MetalSplitI64Shuffle.cpp
   MetalTGBarrierInsert.cpp

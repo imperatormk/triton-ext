@@ -2076,7 +2076,7 @@ static bool ptrPhiToI64(Module &M,
 }
 
 // Atomic intrinsic typed-pointer transition: insert a fresh SSA pointer before
-// each air.atomic.global.* call so its pointee type can differ from the
+// each air.atomic.* call so its pointee type can differ from the
 // GEP-result type (e.g. an i32 atomic on a float buffer).
 static bool atomicTypedPointerFixup(Module &M) {
   bool Changed = false;
@@ -2090,7 +2090,7 @@ static bool atomicTypedPointerFixup(Module &M) {
         if (!CI || !CI->getCalledFunction())
           continue;
         StringRef Name = CI->getCalledFunction()->getName();
-        if (!Name.starts_with("air.atomic.global."))
+        if (!Name.starts_with("air.atomic."))
           continue;
         if (!Name.ends_with(".i32") && !Name.ends_with(".f32"))
           continue;
@@ -2100,9 +2100,8 @@ static bool atomicTypedPointerFixup(Module &M) {
         unsigned AddrSpace = PtrArg->getType()->getPointerAddressSpace();
         if (AddrSpace != ASDevice && AddrSpace != ASThreadgroup)
           continue;
-        // Only when the pointer source is a GEP: that is the typed-pointer
-        // mismatch case; otherwise inferFromUsage already types it to match.
-        if (!isa<GetElementPtrInst>(PtrArg))
+        if (!isa<GetElementPtrInst>(PtrArg) &&
+            !isa<ConstantPointerNull>(PtrArg))
           continue;
         Fixups.push_back(CI);
       }
@@ -2110,10 +2109,17 @@ static bool atomicTypedPointerFixup(Module &M) {
   for (CallInst *CI : Fixups) {
     Value *PtrArg = CI->getArgOperand(0);
     unsigned AddrSpace = PtrArg->getType()->getPointerAddressSpace();
+    Type *PtrTy = PointerType::get(M.getContext(), AddrSpace);
+    if (isa<ConstantPointerNull>(PtrArg)) {
+      auto *NewPtr = new IntToPtrInst(ConstantInt::get(I64, 0), PtrTy, "",
+                                      CI->getIterator());
+      CI->setArgOperand(0, NewPtr);
+      Changed = true;
+      continue;
+    }
     IRBuilder<> B(CI);
     Value *AsInt = B.CreatePtrToInt(PtrArg, I64);
-    Value *NewPtr =
-        B.CreateIntToPtr(AsInt, PointerType::get(M.getContext(), AddrSpace));
+    Value *NewPtr = B.CreateIntToPtr(AsInt, PtrTy);
     CI->setArgOperand(0, NewPtr);
     Changed = true;
   }

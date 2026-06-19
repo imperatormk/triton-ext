@@ -23,26 +23,15 @@ def _load_metal_utils():
     return metal_utils
 
 
-# Native MPS dispatch (torch.mps.load_metallib) times kernels on torch's own
-# command stream, fixing inductor autotuner's "End event N was not recorded".
-# TRITON_MPS_NATIVE_DISPATCH=0 falls back to the bundled metal_utils.m launcher.
-_USE_NATIVE_DISPATCH = _os.environ.get("TRITON_MPS_NATIVE_DISPATCH",
-                                       "0") == "1"
-
-
-def _native_load_metallib_available():
-    return hasattr(torch, "mps") and hasattr(torch.mps, "load_metallib")
-
-
 def _materialize_offline_error(metallib_bytes, name=None):
     """Replay a metallib through the offline Metal toolchain to surface the real
     lowering error behind an opaque in-process PSO failure.
 
-    The PSO compiler runs out-of-process, so the real LLVM/AIR error never
-    reaches our NSError. metal-objdump -d (bitcode verifier) runs first, then
-    xcrun metallib as a cross-check. Returns a combined diagnostic str (incl.
-    saved metallib path) or None; best-effort. METAL_PSO_FAIL_DIR persists the
-    failing metallib + .txt sidecar past inductor's reaped tempdir.
+    metal-objdump -d runs the bitcode verifier (precise error) and runs first;
+    xcrun metallib is the blunter cross-check. Returns a combined diagnostic str
+    (incl. saved metallib path) or None. Best-effort: failures are swallowed.
+    With METAL_PSO_FAIL_DIR set, the failing metallib + a .txt sidecar persist to
+    a stable, named location so the config survives inductor's reaped tempdir.
     """
     import subprocess as _sp
     import tempfile as _tf
@@ -79,10 +68,12 @@ def _materialize_offline_error(metallib_bytes, name=None):
 
     parts = [f"(metallib saved for inspection: {mlib})"]
 
+    # metal-objdump: precise verifier diagnostic.
     rc, txt = _run(['xcrun', '-sdk', 'macosx', 'metal-objdump', '-d', mlib])
     if txt:
         parts.append(f"metal-objdump -d:\n{txt}")
 
+    # xcrun metallib: blunt cross-check.
     rc2, txt2 = _run(
         ['xcrun', '-sdk', 'macosx', 'metallib', mlib, '-o', mlib + '.out'])
     try:
@@ -95,6 +86,7 @@ def _materialize_offline_error(metallib_bytes, name=None):
     if rc is None and rc2 is None:
         return None  # no offline toolchain available
     diagnostic = "\n".join(parts)
+    # Persist a sidecar so the failing config is greppable after the run.
     if fail_dir and mlib and mlib.startswith(fail_dir):
         try:
             with open(mlib + '.txt', 'w') as f:
@@ -102,21 +94,6 @@ def _materialize_offline_error(metallib_bytes, name=None):
         except OSError:
             pass
     return diagnostic
-
-
-class _NativeKernel:
-    """Adapts a native _mps_MetalKernel to expose
-    `max_total_threads_per_threadgroup` (native exposes
-    `max_threads_per_threadgroup`); the call signature is identical.
-    """
-
-    def __init__(self, fn):
-        self._fn = fn
-        self.max_total_threads_per_threadgroup = getattr(
-            fn, "max_threads_per_threadgroup", 1024)
-
-    def __call__(self, *args, **kwargs):
-        return self._fn(*args, **kwargs)
 
 
 def ty_to_cpp(ty):
@@ -151,8 +128,9 @@ _SCALAR_PACK_INFO = {
     "u32": ("I", 4, 4),
     "u64": ("Q", 8, 8),
     "fp16": ("e", 2, 2),
-    # bf16 is 2 bytes but NOT IEEE fp16: _pack_scalars truncates the f32 bit
-    # pattern itself. The pack char is used only for size/alignment, never pack.
+    # bf16 is 2 bytes but is NOT IEEE fp16: _pack_scalars handles it explicitly
+    # (truncate the f32 bit pattern to the high 16 bits). The pack char below is
+    # only used for its size/alignment (2), never for struct.pack of bf16.
     "bf16": ("e", 2, 2),
     "fp32": ("f", 4, 4),
     "fp64": ("d", 8, 8),
@@ -208,25 +186,19 @@ class MPSUtils:
     """
 
     def __init__(self):
-        self._native = _USE_NATIVE_DISPATCH and _native_load_metallib_available(
-        )
-        self._metal = None if self._native else _load_metal_utils()
+        self._metal = _load_metal_utils()
 
     def load_binary(self, name, metallib_bytes, shared_mem, device):
         """
         Returns (module, function, n_regs, n_spills, n_max_threads).
         """
         try:
-            if self._native:
-                module = torch.mps.load_metallib(bytes(metallib_bytes))
-                function = _NativeKernel(getattr(module, name))
-            else:
-                module = self._metal.load_metallib(bytes(metallib_bytes))
-                function = module.get_function(name)
-            # n_max_threads MUST be the PSO's real
-            # maxTotalThreadsPerThreadgroup so triton drops over-thread configs:
-            # a cross-warp smem kernel is only correct when ALL warps launch;
-            # capping threads leaves smem slots unwritten -> nondeterministic.
+            module = self._metal.load_metallib(bytes(metallib_bytes))
+            function = module.get_function(name)
+            # Report the PSO's real maxTotalThreadsPerThreadgroup so triton drops
+            # configs needing more threads. Must be accurate: a cross-warp-smem
+            # kernel launched with fewer threads leaves smem slots unwritten ->
+            # uninitialized reads -> nondeterministic wrong answers.
             max_threads = getattr(function,
                                   'max_total_threads_per_threadgroup', 1024)
             return module, function, 0, 0, max_threads
@@ -238,12 +210,13 @@ class MPSUtils:
             if m:
                 raise OutOfResources(int(m.group(1)), int(m.group(2)),
                                      "Metal PSO") from e
-            # Over-budget stack footprint: skip the config like an OOM rather
-            # than hard-failing the compile. See test_large_block_sizes.
+            # Over-budget register/stack footprint: skip the config (like an OOM)
+            # instead of hard-failing the compile. See test_large_block_sizes.
             if 'exceeds available stack space' in msg:
                 raise OutOfResources(0, 0, "Metal PSO stack space") from e
-            # Opaque PSO errors: the real LLVM/AIR diagnostic dies out-of-process
-            # and leaves only blunt strings. Replay offline to recover it.
+            # Opaque PSO-compile errors lose the real LLVM/AIR diagnostic (it dies
+            # in MTLCompilerService). Replay the metallib offline to recover the
+            # precise error, then rethrow with it inlined.
             _opaque = ('materializeAll', 'XPC_ERROR_CONNECTION_INTERRUPTED',
                        'XPC_CONNECTION_INTERRUPTED', 'PSO creation failed',
                        'Unexpected bitcode')
@@ -289,22 +262,26 @@ class MPSLauncher:
         self.signature = dict(src.signature)
         self.constants = getattr(src, "constants", {})
 
-        # Constexpr args appear in Python *args but NOT in the compiled IR; strip
-        # them at launch so Metal buffer slots match IR arg positions exactly.
+        # Constexpr args appear in Python *args but not the compiled IR; strip
+        # them so Metal buffer slots match IR arg positions. constexpr_py_slots =
+        # the *args indices to strip at launch.
         self.constexpr_py_slots = frozenset(
             i for i, (k, ty) in enumerate(self.signature.items())
             if ty == 'constexpr')
 
-        # MPS has no hardware TMA, so tensordesc_meta is always None: descriptors
-        # decompose to (ptr, *shape, *strides, padding, tf32, *shape, *strides).
+        # Expand tensor descriptor types into flat scalar types.
+        # MPS has no hardware TMA, so tensordesc_meta is always None —
+        # descriptors are decomposed to (ptr, *shape, *strides, padding, tf32, *shape, *strides).
         non_constexpr_sig = [
             ty for ty in self.signature.values() if ty != 'constexpr'
         ]
         expanded = expand_signature(non_constexpr_sig, None, None)
 
-        # Classify each expanded arg as pointer or scalar. All scalars pack into
-        # ONE device buffer; IR param order is [pointers..., packed_scalar_buf].
-        # Tuples flatten to leaves; _flat_arg_keep masks out constexpr leaves.
+        # Classify each expanded arg as pointer or scalar. Scalars pack into one
+        # device buffer, so IR param order is [pointers, packed_scalar_buf,
+        # system_values]. Tuple args flatten recursively (constexpr leaves have no
+        # GPU slot); _flat_arg_keep[i] says whether flat_arg[i] is forwarded
+        # (constexpr-in-tuple values are in flat_args but must not reach the kernel).
         self.ptr_indices = []  # indices into the KEPT slice of flat_args
         self.scalar_indices = []  # indices into the KEPT slice of flat_args
         self.scalar_types = []  # type strings for scalars (for packing)
@@ -350,15 +327,16 @@ class MPSLauncher:
 
         warp_size = 32
         self._requested_threads = getattr(metadata, "num_warps", 4) * warp_size
+        self._smem_bytes = int(getattr(metadata, "shared", 0) or 0)
         self.ly = 1
         self.lz = 1
 
     def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata,
                  launch_metadata, launch_enter_hook, launch_exit_hook, *args):
 
-        # The kernel needs exactly num_warps*warp_size threads; fewer breaks
-        # cross-warp smem cooperation (unwritten slots -> nondeterministic). Fail
-        # loud rather than cap (load_binary should already have dropped this).
+        # Kernel needs exactly num_warps*warp_size threads; fewer breaks cross-warp
+        # smem cooperation -> nondeterministic results. load_binary already drops
+        # over-large configs, so a deficit here is a bug: fail loudly.
         max_threads = getattr(function, 'max_total_threads_per_threadgroup',
                               1024)
         if self._requested_threads > max_threads:
@@ -371,8 +349,9 @@ class MPSLauncher:
         if launch_enter_hook:
             launch_enter_hook(launch_metadata)
 
-        # Strip constexpr args and decompose TensorDescriptors. Tuple args
-        # flatten recursively to match _flat_arg_keep built in __init__.
+        # Strip constexpr args and decompose TensorDescriptors. Tuple args flatten
+        # recursively to match _flat_arg_keep from __init__; keep=False positions
+        # (constexpr-in-tuple) are dropped before indexing.
         from triton.runtime.jit import TensorWrapper
 
         def _flatten_arg(a, out):
@@ -380,9 +359,9 @@ class MPSLauncher:
             if isinstance(a, TensorWrapper):
                 out.append(a.base)
             elif isinstance(a, torch.Tensor):
-                # Pass views through unchanged; do NOT unwrap to `a._base`, which
-                # drops storage_offset and reads the wrong location. The launcher
-                # applies storage_offset() itself via setBuffer:offset:.
+                # Pass tensors (incl. views) through unchanged. Do NOT unwrap to
+                # `a._base`: it drops storage_offset -> kernel reads wrong location.
+                # The launcher applies storage_offset() via setBuffer:offset:.
                 out.append(a)
             elif isinstance(a, TensorDescriptor):
                 out.extend(decompose_descriptor(a))
@@ -398,8 +377,9 @@ class MPSLauncher:
                 continue
             _flatten_arg(a, all_flat_args)
 
-        # Flattened runtime args must line up 1:1 with the keep mask; a mismatch
-        # would silently truncate via zip() and pass wrong buffers, so fail loud.
+        # Apply keep mask: drop constexpr-in-tuple positions. Args must line up
+        # 1:1 with the mask from __init__; a mismatch would silently pass wrong
+        # buffers via zip() truncation, so fail loudly.
         if len(all_flat_args) != len(self._flat_arg_keep):
             raise RuntimeError(
                 f"flat arg count {len(all_flat_args)} does not match signature "
@@ -409,6 +389,8 @@ class MPSLauncher:
             v for v, keep in zip(all_flat_args, self._flat_arg_keep) if keep
         ]
 
+        # Separate pointer args from scalar args.
+        # IR param order after Pass 5b: [ptr0, ptr1, ..., packed_scalar_buf]
         ptr_args = [flat_args[i] for i in self.ptr_indices]
         scalar_values = [flat_args[i] for i in self.scalar_indices]
 
@@ -440,6 +422,7 @@ class MPSLauncher:
             *reordered_args,
             threads=[gridX * self.lx, gridY * self.ly, gridZ * self.lz],
             group_size=[self.lx, self.ly, self.lz],
+            threadgroup_mem=self._smem_bytes,
         )
 
         if launch_exit_hook:

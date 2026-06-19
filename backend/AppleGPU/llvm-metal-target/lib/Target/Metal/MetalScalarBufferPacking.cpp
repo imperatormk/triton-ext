@@ -198,7 +198,7 @@ static bool scalarBufferPacking(Module &M) {
         }
         continue;
       }
-      if (T->isVectorTy())
+      if (T->isVectorTy() || T->isAggregateType())
         continue;
       ScalarParams.push_back({i, T, false, false});
     }

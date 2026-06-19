@@ -318,6 +318,12 @@ class MPSBackend(BaseBackend):
 
         pm.run(mod, 'make_llir')
 
+        # Dynamic threadgroup memory: the arena is now a kernel param, so the
+        # writer reports staticTG=0. Carry the real arena size (set by the
+        # rebase in ConvertTritonAppleGPUToLLVM) to the dispatch length binding.
+        metadata["_dynamic_smem_bytes"] = mod.get_int_attr(
+            "applegpu.dynamic_smem_bytes")
+
         # Convert MLIR LLVM dialect → LLVM module
         llvm.init_targets()
         context = llvm.context()
@@ -420,7 +426,11 @@ class MPSBackend(BaseBackend):
         # llc run also returns the real threadgroup total, replacing the
         # front-end estimate.
         result, tg_bytes = _get_metalir_compile()(llvm_ir)
-        metadata["shared"] = tg_bytes
+        # With dynamic TG the arena lives in a kernel param, so the writer's
+        # static total is ~0; use the rebased arena size as the dispatch length
+        # and the budget figure the autotuner checks against the 32KB cap.
+        dyn_smem = metadata.pop("_dynamic_smem_bytes", None)
+        metadata["shared"] = dyn_smem if dyn_smem else tg_bytes
         if debug:
             open(f'/tmp/dot_kernel_{kname}.metallib', 'wb').write(result)
         return result

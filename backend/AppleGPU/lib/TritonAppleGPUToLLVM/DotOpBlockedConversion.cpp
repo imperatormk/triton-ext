@@ -697,18 +697,41 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                          (2 * bStripBytes <= 16384) && (batchSize == 1) &&
                          (matWarpsCEarly > 1);
 
-    // Each batch slice needs its own TG region so MMA ops don't cross-
-    // contaminate between warps on different batches. Buffer fits the max over
-    // phases (A strip / C strip / 1-2 B strips).
+    auto cWpc = cEnc.getWarpsPerCTA();
+    int64_t matWarpsC = cWpc[rowDim] * cWpc[colDim];
+    int64_t numTotalWarps = 1;
+    for (auto w : cWpc)
+      numTotalWarps *= w;
+    int64_t numBatchWarps = numTotalWarps / matWarpsC;
+
+    bool batchConsistent = true;
+    if (batchSize > 1) {
+      auto aWpc = aSrcEnc.getWarpsPerCTA();
+      auto bWpc = bSrcEnc.getWarpsPerCTA();
+      int64_t matWarpsA = aWpc[rowDim] * aWpc[colDim];
+      int64_t matWarpsB = bWpc[rowDim] * bWpc[colDim];
+      if (matWarpsA != matWarpsC || matWarpsB != matWarpsC)
+        batchConsistent = false;
+    }
+
+    int64_t batchRounds = 1;
+    if (batchSize > 1 && (numBatchWarps < batchSize || !batchConsistent))
+      batchRounds = batchSize;
+
+    // Warp-distributed batches need one TG region per simultaneously resident
+    // batch slice so MMA ops don't cross-contaminate. Sequential batch rounds
+    // reuse the same region for one batch at a time.
     int64_t phase3Strips = useDoubleBufB ? 2 : 1;
     int64_t tgSizeNeeded = std::max(tgStripSize, phase3Strips * 8 * Npad);
-    int64_t tgSize = tgSizeNeeded * batchSize;
-    // Alias the scatter buffer into global_smem (fixes the batched int8 dot3d
-    // 32KB overflow). Integer dots only: those are the OOR cases and carry only
-    // f32 GEPs on global_smem. Float dots keep a typed __tg_dot_ab global since
-    // mixing typed GEPs on one global trips the metallib reader.
+    int64_t residentBatchSlices = (batchRounds > 1) ? 1 : batchSize;
+    int64_t tgSize = tgSizeNeeded * residentBatchSlices;
+    // Alias f32-typed scatter buffers into global_smem when available. This
+    // fixes batched int8/f16 dot3d OORs where upstream convert_layout scratch
+    // already reserves most/all of the 32KB budget and the dot scratch is live
+    // in a disjoint phase. Non-f32 native f16/bf16 dots keep a typed global to
+    // avoid mixed element-typed GEPs on the same TG object.
     Value ptrTG;
-    if (isa<IntegerType>(aElemTy))
+    if (abTgElemTy == f32Ty)
       ptrTG = getOrGrowSharedArena(rewriter, loc, mod, tgSize * 4);
     if (!ptrTG) {
       auto tgBuf = getOrCreateTGGlobal(
@@ -716,7 +739,6 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       ptrTG =
           LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy, tgBuf.getName());
     }
-
     // ── Async copy intrinsics (when device pointers available) ────────
     auto devPtrTy = LLVMPointerType::get(ctx, 1);
     auto ptrTy0 = LLVMPointerType::get(ctx, 0);
@@ -868,13 +890,6 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
 
     // Runtime batch-offset pointer for SIMD matrix load/store. Each batch slice
     // gets its own tgStripSize TG region (no cross-warp contamination).
-    auto cWpc = cEnc.getWarpsPerCTA();
-    int64_t matWarpsC = cWpc[rowDim] * cWpc[colDim];
-    int64_t numTotalWarps = 1;
-    for (auto w : cWpc)
-      numTotalWarps *= w;
-    int64_t numBatchWarps = numTotalWarps / matWarpsC;
-
     // Per-operand batch warp index = warpId / (row*col warpsPerCTA): which
     // batch slice each warp handles.
     auto makeBatchWarpIdx = [&](ttg::BlockedEncodingAttr enc) -> Value {
@@ -1114,20 +1129,6 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // one batch (single pass). numBatchWarps<batchSize: one batch per round,
     // all to the TG base, runtime batch filtering selecting the round's data.
 
-    bool batchConsistent = true;
-    if (batchSize > 1) {
-      auto aWpc = aSrcEnc.getWarpsPerCTA();
-      auto bWpc = bSrcEnc.getWarpsPerCTA();
-      int64_t matWarpsA = aWpc[rowDim] * aWpc[colDim];
-      int64_t matWarpsB = bWpc[rowDim] * bWpc[colDim];
-      if (matWarpsA != matWarpsC || matWarpsB != matWarpsC)
-        batchConsistent = false;
-    }
-
-    int64_t batchRounds = 1;
-    if (batchSize > 1 && (numBatchWarps < batchSize || !batchConsistent))
-      batchRounds = batchSize;
-
     for (int64_t batchRound = 0; batchRound < batchRounds; ++batchRound) {
       Value curPtrTGBatch = ptrTGBatch;
       int64_t scatterBatchRound = -1; // -1 = warp-distributed (no filter)
@@ -1226,10 +1227,11 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             Value matB = emitSGLoad(abLoadFn, curSlotPtr, Npad, Npad, bOff);
 
             for (int64_t tm = 0; tm < tilesM; ++tm) {
+              Value matA = matA_tiles[tm][tk];
               matC_tiles[tm][tn] =
                   LLVM::CallOp::create(
                       rewriter, loc, abMmaFn,
-                      ValueRange{matA_tiles[tm][tk], matB, matC_tiles[tm][tn]})
+                      ValueRange{matA, matB, matC_tiles[tm][tn]})
                       .getResult();
             }
           }
@@ -1265,10 +1267,11 @@ struct DotOpBlockedConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             Value matB = emitSGLoad(abLoadFn, curPtrTGBatch, Npad, Npad, bOff);
 
             for (int64_t tm = 0; tm < tilesM; ++tm) {
+              Value matA = matA_tiles[tm][tk];
               matC_tiles[tm][tn] =
                   LLVM::CallOp::create(
                       rewriter, loc, abMmaFn,
-                      ValueRange{matA_tiles[tm][tk], matB, matC_tiles[tm][tn]})
+                      ValueRange{matA, matB, matC_tiles[tm][tn]})
                       .getResult();
             }
           }

@@ -35,15 +35,21 @@ static void MetalKernel_dealloc(MetalKernelObject *self) {
 
 static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
                                   PyObject *kwargs) {
-  PyObject *threads_obj = NULL, *group_obj = NULL;
+  PyObject *threads_obj = NULL, *group_obj = NULL, *tgmem_obj = NULL;
   if (kwargs) {
     threads_obj = PyDict_GetItemString(kwargs, "threads");
     group_obj = PyDict_GetItemString(kwargs, "group_size");
+    tgmem_obj = PyDict_GetItemString(kwargs, "threadgroup_mem");
   }
   if (!threads_obj || !group_obj) {
     PyErr_SetString(PyExc_ValueError, "threads and group_size required");
     return NULL;
   }
+
+  // Dynamic threadgroup memory: when nonzero the kernel declares a trailing
+  // addrspace(3) param; bind its byte length at TG location-index 0 (a separate
+  // index space from device setBuffer, so no clash with the buffer args).
+  long tgmem = tgmem_obj ? PyLong_AsLong(tgmem_obj) : 0;
 
   long tx = PyLong_AsLong(PyList_GetItem(threads_obj, 0));
   long ty = PyLong_AsLong(PyList_GetItem(threads_obj, 1));
@@ -110,6 +116,9 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
       @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
         [enc setComputePipelineState:self->pso];
+
+        if (tgmem > 0)
+          [enc setThreadgroupMemoryLength:tgmem atIndex:0];
 
         for (Py_ssize_t i = 0; i < nargs; i++) {
           auto &info = argInfos[i];

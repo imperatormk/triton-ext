@@ -270,54 +270,6 @@ static bool insertIdentityBitcastsAtNonByteAccesses(Value *Root) {
   return Changed;
 }
 
-static bool scalarizeVec1Users(Value *V, Type *I32Ty) {
-  return false; // disabled for now
-  bool Changed = false;
-  SmallVector<Instruction *, 8> Vec1Users;
-  std::function<void(Value *)> FindVec1 = [&](Value *V) {
-    for (auto *U : V->users()) {
-      if (auto *SI = dyn_cast<StoreInst>(U)) {
-        if (SI->getPointerOperand() == V) {
-          auto *VT =
-              dyn_cast<FixedVectorType>(SI->getValueOperand()->getType());
-          if (VT && VT->getNumElements() == 1)
-            Vec1Users.push_back(SI);
-        }
-      } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-        auto *VT = dyn_cast<FixedVectorType>(LI->getType());
-        if (VT && VT->getNumElements() == 1)
-          Vec1Users.push_back(LI);
-      } else if (isa<GetElementPtrInst>(U)) {
-        FindVec1(U);
-      }
-    }
-  };
-  FindVec1(V);
-  for (auto *I : Vec1Users) {
-    if (auto *SI = dyn_cast<StoreInst>(I)) {
-      IRBuilder<> B(SI);
-      Value *Scalar = B.CreateExtractElement(SI->getValueOperand(),
-                                             ConstantInt::get(I32Ty, 0));
-      B.CreateAlignedStore(Scalar, SI->getPointerOperand(), SI->getAlign(),
-                           SI->isVolatile());
-      SI->eraseFromParent();
-      Changed = true;
-    } else if (auto *LI = dyn_cast<LoadInst>(I)) {
-      IRBuilder<> B(LI);
-      auto *VT = cast<FixedVectorType>(LI->getType());
-      auto *Scalar =
-          B.CreateAlignedLoad(VT->getElementType(), LI->getPointerOperand(),
-                              LI->getAlign(), LI->isVolatile());
-      Value *Vec = B.CreateInsertElement(UndefValue::get(VT), Scalar,
-                                         ConstantInt::get(I32Ty, 0));
-      LI->replaceAllUsesWith(Vec);
-      LI->eraseFromParent();
-      Changed = true;
-    }
-  }
-  return Changed;
-}
-
 // Replace a `load <N x i1>` consumed only by constant-index extractelements
 // with scalar byte loads + bit extraction: AGX AIR->ISA lowering fatal-errors
 // on any `<N x i1>` threadgroup load. Bit-packed, so lane K is byte K/8 bit
@@ -764,8 +716,6 @@ static bool mergeByteMMA(Module &M,
   bool Changed = false;
   auto &Ctx = M.getContext();
   auto &DL = M.getDataLayout();
-  Type *I32 = Type::getInt32Ty(Ctx);
-
   auto *ByteGV = ByteGlobals[0];
   expandConstantExprUsers(ByteGV);
 
@@ -787,7 +737,6 @@ static bool mergeByteMMA(Module &M,
     Check(ByteGV);
   }
 
-  Changed |= scalarizeVec1Users(ByteGV, I32);
   Changed |= foldExtractInsert(M);
 
   if (HasWideVec)
@@ -889,8 +838,6 @@ static bool retypeByteGlobals(Module &M) {
   bool Changed = false;
   auto &Ctx = M.getContext();
   auto &DL = M.getDataLayout();
-  Type *I32 = Type::getInt32Ty(Ctx);
-
   SmallVector<GlobalVariable *, 4> ByteGlobals;
   collectTGByteGlobals(M, ByteGlobals);
 
@@ -908,7 +855,6 @@ static bool retypeByteGlobals(Module &M) {
     if (!StoreTy)
       continue;
 
-    Changed |= scalarizeVec1Users(GV, I32);
     Changed |= foldExtractInsert(M);
 
     StoreTy = inferElementType(GV);
@@ -1565,85 +1511,6 @@ static bool fixMismatchedTGGEPs(Module &M) {
   return Changed;
 }
 
-// 14g: Scalarize wide-vector stores to a TG global also accessed at a different
-// vector width: a mixed-width store/load on one global fails materializeAll.
-static bool scalarizeMixedWidthTGVecStores(Module &M) {
-  return false; // disabled for now
-  bool Changed = false;
-  Type *I32 = Type::getInt32Ty(M.getContext());
-  const DataLayout &DL = M.getDataLayout();
-
-  // Walk the def-use chain from a TG global pointer through GEPs/bitcasts and
-  // collect the loads/stores plus their (vector) element counts.
-  auto collect = [&](GlobalVariable &GV, SmallVectorImpl<StoreInst *> &Stores,
-                     unsigned &MaxStoreElems, unsigned &MinAccessElems,
-                     bool &SawNarrowerAccess) {
-    SmallVector<Value *, 16> Work{&GV};
-    SmallPtrSet<Value *, 16> Seen;
-    while (!Work.empty()) {
-      Value *V = Work.pop_back_val();
-      if (!Seen.insert(V).second)
-        continue;
-      for (User *U : V->users()) {
-        if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U)) {
-          Work.push_back(U);
-          continue;
-        }
-        Type *AccTy = nullptr;
-        StoreInst *SI = dyn_cast<StoreInst>(U);
-        if (SI && SI->getPointerOperand() == V)
-          AccTy = SI->getValueOperand()->getType();
-        else if (auto *LI = dyn_cast<LoadInst>(U))
-          AccTy = LI->getType();
-        if (!AccTy)
-          continue;
-        unsigned Elems = 1;
-        if (auto *VT = dyn_cast<FixedVectorType>(AccTy))
-          Elems = VT->getNumElements();
-        MinAccessElems = std::min(MinAccessElems, Elems);
-        if (SI && SI->getPointerOperand() == V) {
-          if (Elems > 1) {
-            Stores.push_back(SI);
-            MaxStoreElems = std::max(MaxStoreElems, Elems);
-          }
-        }
-      }
-    }
-    SawNarrowerAccess = MinAccessElems < MaxStoreElems;
-  };
-
-  for (GlobalVariable &GV : M.globals()) {
-    if (GV.getAddressSpace() != ASThreadgroup)
-      continue;
-    SmallVector<StoreInst *, 8> WideStores;
-    unsigned MaxStoreElems = 1, MinAccessElems = ~0u;
-    bool Mixed = false;
-    collect(GV, WideStores, MaxStoreElems, MinAccessElems, Mixed);
-    if (!Mixed || WideStores.empty())
-      continue;
-
-    for (StoreInst *SI : WideStores) {
-      auto *VT = cast<FixedVectorType>(SI->getValueOperand()->getType());
-      Type *ElemTy = VT->getElementType();
-      IRBuilder<> B(SI);
-      Value *Vec = SI->getValueOperand();
-      Value *BasePtr = SI->getPointerOperand();
-      Align A = SI->getAlign();
-      for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
-        Value *Elt = B.CreateExtractElement(Vec, ConstantInt::get(I32, i));
-        Value *Ptr = i == 0 ? BasePtr
-                            : B.CreateInBoundsGEP(ElemTy, BasePtr,
-                                                  ConstantInt::get(I32, i));
-        Align EltAlign = i == 0 ? A : DL.getABITypeAlign(ElemTy);
-        B.CreateAlignedStore(Elt, Ptr, EltAlign, SI->isVolatile());
-      }
-      SI->eraseFromParent();
-      Changed = true;
-    }
-  }
-  return Changed;
-}
-
 static bool rewriteTGGlobalGEPs(Module &M) {
   // Cheap early-out: nothing to do unless there is an array-typed TG global.
   bool HasArrayTG = false;
@@ -1677,7 +1544,6 @@ static bool rewriteTGGlobalGEPs(Module &M) {
   }
 
   Changed |= fixMismatchedTGGEPs(M);
-  Changed |= scalarizeMixedWidthTGVecStores(M);
   return Changed;
 }
 

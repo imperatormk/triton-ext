@@ -82,7 +82,6 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMetalTarget() {
   initializeMetalLowerAtomicRMWLegacyPass(*PR);
   initializeMetalSplitI64ShuffleLegacyPass(*PR);
   initializeMetalScalarStoreGuardLegacyPass(*PR);
-  initializeMetalScalarizeShuffleOperandsLegacyPass(*PR);
   initializeMetalTGGlobalCoalesceLegacyPass(*PR);
   initializeMetalTGBarrierInsertLegacyPass(*PR);
   initializeMetalDeviceLoadsVolatileLegacyPass(*PR);
@@ -141,8 +140,6 @@ public:
     // EARLY, while the in-bounds predicate icmp/assume are intact, so the
     // separation guard uses the REAL mask. No-op on single-output kernels.
     addPass(createMetalCrossBufferStoreSeparateLegacyPass());
-    // addPass(createMetalScalarizeShuffleOperandsLegacyPass()); // disabled for
-    // now
     addPass(createMetalInlineNonKernelLegacyPass());
     // Apple GPU has no double type; demote f64 to f32 before serialization
     // (any surviving double crashes the Metal shader compiler).

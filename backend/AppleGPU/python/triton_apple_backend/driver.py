@@ -327,6 +327,7 @@ class MPSLauncher:
 
         warp_size = 32
         self._requested_threads = getattr(metadata, "num_warps", 4) * warp_size
+        self._smem_bytes = int(getattr(metadata, "shared", 0) or 0)
         self.ly = 1
         self.lz = 1
 
@@ -421,6 +422,7 @@ class MPSLauncher:
             *reordered_args,
             threads=[gridX * self.lx, gridY * self.ly, gridZ * self.lz],
             group_size=[self.lx, self.ly, self.lz],
+            threadgroup_mem=self._smem_bytes,
         )
 
         if launch_exit_hook:

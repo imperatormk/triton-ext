@@ -135,6 +135,20 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                 makeI64Vec2(rewriter, loc, 1, pitch), off};
       return LLVM::CallOp::create(rewriter, loc, fn, args).getResult();
     };
+    // Transposed TG simdgroup load from a COLUMN-MAJOR staging buffer: swaps
+    // the 2D stride to {pitch,1} so the logical (k,n) tile is read transposed
+    // in place, reaching the same packed MMA register a row-major B would.
+    auto emitSGLoadT = [&](LLVMFuncOp fn, Value ptr, int64_t pitch,
+                           Value off) -> Value {
+      SmallVector<Value> args;
+      if (canonSG)
+        args = {ptr, makeI64(rewriter, loc, pitch), off,
+                makeI1True(rewriter, loc)};
+      else
+        args = {ptr, makeI64Vec2(rewriter, loc, 8, pitch),
+                makeI64Vec2(rewriter, loc, pitch, 1), off};
+      return LLVM::CallOp::create(rewriter, loc, fn, args).getResult();
+    };
     auto emitSGStore = [&](LLVMFuncOp fn, Value mat, Value ptr,
                            int64_t shapeDim, int64_t pitch, Value off) {
       SmallVector<Value> args;
@@ -411,9 +425,9 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // local_load of the staging buffer. Only a plain row-major strip
     // (maxPhase==1, order=[1,0], shape==operand shape) can be SG-loaded at
     // constant pitch. Returns {base ptr (as3), row pitch}; null -> registers.
-    auto resolveSmemOperand =
-        [&](Value tritonVal,
-            RankedTensorType opTy) -> std::pair<Value, int64_t> {
+    auto resolveSmemOperand = [&](Value tritonVal, RankedTensorType opTy,
+                                  bool *colMajorOut =
+                                      nullptr) -> std::pair<Value, int64_t> {
       Value src = tritonVal;
       if (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
         src = cvt.getSrc();
@@ -433,7 +447,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       if (!shEnc || shEnc.getMaxPhase() != 1)
         return {Value(), 0};
       auto shOrder = shEnc.getOrder();
-      if (shOrder.size() != 2 || shOrder[0] != 1)
+      if (shOrder.size() != 2)
+        return {Value(), 0};
+      bool colMajor = (shOrder[0] == 0);
+      if (colMajor && !colMajorOut)
         return {Value(), 0};
       Value llStruct = rewriter.getRemappedValue(localLoad.getSrc());
       if (!llStruct)
@@ -441,7 +458,10 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
           loc, llStruct,
           getTypeConverter()->convertType(memTy.getElementType()), rewriter);
-      return {smemObj.getBase(), memTy.getShape()[1]};
+      if (colMajorOut)
+        *colMajorOut = colMajor;
+      int64_t pitch = colMajor ? memTy.getShape()[0] : memTy.getShape()[1];
+      return {smemObj.getBase(), pitch};
     };
 
     auto [elemsA, aOffsets, aSrcEnc] =
@@ -687,11 +707,13 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     // scatter, no per-strip barriers).
     Value aSmemBase, bSmemBase;
     int64_t aSmemPitch = 0, bSmemPitch = 0;
+    bool bSmemColMajor = false;
     {
       if (!aRoute.useDevice)
         std::tie(aSmemBase, aSmemPitch) = resolveSmemOperand(op.getA(), aType);
       if (!bRoute.useDevice)
-        std::tie(bSmemBase, bSmemPitch) = resolveSmemOperand(op.getB(), bType);
+        std::tie(bSmemBase, bSmemPitch) =
+            resolveSmemOperand(op.getB(), bType, &bSmemColMajor);
     }
     aRoute.useSmem = !aRoute.useDevice && static_cast<bool>(aSmemBase);
     bRoute.useSmem = !bRoute.useDevice && static_cast<bool>(bSmemBase);
@@ -1247,15 +1269,27 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
       // tiles, the device origin adding the runtime warp offset on top of the
       // compile-time step. A tiles for tk+1 prefetched before MMA of tk.
       Value aDevStride, bDevStride, aDevTranspose, bDevTranspose;
+      Value aDevShape, bDevShape;
+      auto makeDevShape = [&](Value rowStride) -> Value {
+        auto ty = LLVM::getVectorType(IntegerType::get(ctx, 64), 2);
+        Value vec = UndefOp::create(rewriter, loc, ty);
+        Value i0 = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+        Value i1 = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+        Value eight = arith::ConstantIntOp::create(rewriter, loc, 8, 64);
+        vec = InsertElementOp::create(rewriter, loc, ty, vec, rowStride, i0);
+        vec = InsertElementOp::create(rewriter, loc, ty, vec, eight, i1);
+        return vec;
+      };
       if (aRoute.useDevice) {
         aDevStride = makeDevMmaStride(aColStride, aRowStride);
         aDevTranspose = makeDevMmaTranspose(aColStride, aRowStride);
+        aDevShape = makeDevShape(aRowStride);
       }
       if (bRoute.useDevice) {
         bDevStride = makeDevMmaStride(bColStride, bRowStride);
         bDevTranspose = makeDevMmaTranspose(bColStride, bRowStride);
+        bDevShape = makeDevShape(bRowStride);
       }
-      Value mmaShape = makeI64Vec2(rewriter, loc, 8, 8);
       Value zeroOff = makeI64Vec2(rewriter, loc, 0, 0);
 
       auto dWpc = cMmaEnc.getWarpsPerCTA();
@@ -1287,7 +1321,13 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
                                 aSmemBase, ArrayRef<LLVM::GEPArg>{flat});
       }
       if (bRoute.useSmem) {
-        Value flat = arith::ExtUIOp::create(rewriter, loc, i64Ty, warpColElem);
+        Value colUnit = warpColElem;
+        if (bSmemColMajor) {
+          Value pitchB =
+              arith::ConstantIntOp::create(rewriter, loc, bSmemPitch, 32);
+          colUnit = arith::MulIOp::create(rewriter, loc, warpColElem, pitchB);
+        }
+        Value flat = arith::ExtUIOp::create(rewriter, loc, i64Ty, colUnit);
         ptrSmemBWarp =
             LLVM::GEPOp::create(rewriter, loc, tgPtrTy, abTgScatterTy,
                                 bSmemBase, ArrayRef<LLVM::GEPArg>{flat});
@@ -1306,12 +1346,14 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             aPtrs, aOffsetsL, aRowStride, aColStride, aBaseRowL, aBaseColL,
             k * warpsM * 8, tk * 8, warpRowElem, nullptr);
         return isIntInput ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
-                          : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape,
+                          : emitDevSGLoad(devLoadFn, aTilePtr, aDevShape,
                                           aDevStride, zeroOff, aDevTranspose);
       };
       auto loadBTile = [&](int64_t tk, int64_t j) -> Value {
         if (bRoute.useSmem) {
           Value bOff = makeI64Vec2(rewriter, loc, j * warpsN * 8, tk * 8);
+          if (bSmemColMajor)
+            return emitSGLoadT(abTgLoadFn, ptrSmemBWarp, bSmemPitch, bOff);
           return emitSGLoad(abTgLoadFn, ptrSmemBWarp, bSmemPitch, bSmemPitch,
                             bOff);
         }
@@ -1319,7 +1361,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
             bPtrs, bOffsetsL, bRowStride, bColStride, bBaseRowL, bBaseColL,
             tk * 8, j * warpsN * 8, nullptr, warpColElem);
         return isIntInput ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
-                          : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape,
+                          : emitDevSGLoad(devLoadFn, bTilePtr, bDevShape,
                                           bDevStride, zeroOff, bDevTranspose);
       };
 
@@ -1382,7 +1424,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
               /*extraCol=*/aKRef ? nullptr : tkElemOff, aKRef);
           return isIntInput
                      ? emitDevSGLoadInt8(aTilePtr, aRowStride, aColStride)
-                     : emitDevSGLoad(devLoadFn, aTilePtr, mmaShape, aDevStride,
+                     : emitDevSGLoad(devLoadFn, aTilePtr, aDevShape, aDevStride,
                                      zeroOff, aDevTranspose);
         };
         auto loadBTileRT = [&](Value tkElemOff, int64_t j,
@@ -1393,7 +1435,7 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
               /*extraRow=*/bKRef ? nullptr : tkElemOff, warpColElem, bKRef);
           return isIntInput
                      ? emitDevSGLoadInt8(bTilePtr, bRowStride, bColStride)
-                     : emitDevSGLoad(devLoadFn, bTilePtr, mmaShape, bDevStride,
+                     : emitDevSGLoad(devLoadFn, bTilePtr, bDevShape, bDevStride,
                                      zeroOff, bDevTranspose);
         };
 

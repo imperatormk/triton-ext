@@ -84,6 +84,9 @@ Value makeI64(OpBuilder &b, Location loc, int64_t v) {
 Value makeI1False(OpBuilder &b, Location loc) {
   return arith::ConstantIntOp::create(b, loc, 0, 1);
 }
+Value makeI1True(OpBuilder &b, Location loc) {
+  return arith::ConstantIntOp::create(b, loc, 1, 1);
+}
 
 unsigned getTargetOSMajor() {
   if (const char *e = std::getenv("TRITON_MPS_TARGET_OS_MAJOR")) {

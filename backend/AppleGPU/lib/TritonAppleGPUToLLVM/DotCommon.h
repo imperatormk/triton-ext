@@ -53,6 +53,7 @@ Type getSimdgroupMatrixType(MLIRContext *ctx);
 Value makeI64Vec2(OpBuilder &b, Location loc, int64_t a, int64_t b_val);
 Value makeI64(OpBuilder &b, Location loc, int64_t v);
 Value makeI1False(OpBuilder &b, Location loc);
+Value makeI1True(OpBuilder &b, Location loc);
 
 // air.simdgroup_matrix_8x8_{load,store} signature differs by OS: macOS<=15 uses
 // (elements_per_row, origin, transpose); macOS>=16 uses 3-vector

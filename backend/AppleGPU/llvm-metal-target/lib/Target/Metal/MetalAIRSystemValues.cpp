@@ -160,6 +160,11 @@ static bool airSystemValues(Module &M) {
               SysArg, ConstantInt::get(I32, K), USV.Info->Dims[K]);
         }
         for (CallInst *CI : USV.Calls) {
+          if (CI->getType()->isVectorTy()) {
+            CI->replaceAllUsesWith(SysArg);
+            CI->eraseFromParent();
+            continue;
+          }
           SmallVector<ExtractValueInst *, 4> Extracts;
           for (User *U : CI->users())
             if (auto *EV = dyn_cast<ExtractValueInst>(U))

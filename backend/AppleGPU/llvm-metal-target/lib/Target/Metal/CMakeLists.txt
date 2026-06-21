@@ -113,6 +113,7 @@ llvm_map_components_to_libnames(_metal_llvm_libs
   CodeGenTypes
   Core
   MC
+  Object
   Passes
   ScalarOpts
   SelectionDAG

@@ -78,8 +78,29 @@ static bool scalarBufferPacking(Module &M) {
     if (!F.isDeclaration() && !CalledFns.count(&F))
       Funcs.push_back(&F);
 
+  // Pre-baked !air.kernel arg-descriptor metadata means a final ABI; repacking
+  // would rewrite the signature while leaving the descriptor on the old layout,
+  // desyncing the binding. Triton kernels arrive without it, so are unaffected.
+  auto hasPrebakedArgMD = [&](Function &F) -> bool {
+    auto *KMD = M.getNamedMetadata("air.kernel");
+    if (!KMD)
+      return false;
+    for (unsigned k = 0; k < KMD->getNumOperands(); k++) {
+      auto *Node = KMD->getOperand(k);
+      if (Node->getNumOperands() < 1)
+        continue;
+      auto *FnMD = dyn_cast_if_present<ValueAsMetadata>(Node->getOperand(0));
+      if (FnMD && FnMD->getValue() == &F)
+        return true;
+    }
+    return false;
+  };
+
   for (Function *FPtr : Funcs) {
     Function &F = *FPtr;
+
+    if (hasPrebakedArgMD(F))
+      continue;
 
     // Collect system value param indices from pre-baked metadata
     SmallDenseSet<unsigned, 4> SysValParams;
@@ -252,6 +273,25 @@ static bool scalarBufferPacking(Module &M) {
         Function::Create(NewFTy, F.getLinkage(), F.getAddressSpace(), "", &M);
     NewF->copyAttributesFrom(&F);
     NewF->splice(NewF->begin(), &F);
+
+    // Args are renumbered (scalars dropped, buffer appended), so remap arg
+    // attributes via OldToNew or a dropped pointer's readonly/dereferenceable
+    // would land on an incompatible surviving arg. The buffer pointer gets
+    // none.
+    {
+      const AttributeList &OldAL = F.getAttributes();
+      AttributeList NewAL = AttributeList::get(
+          M.getContext(), OldAL.getFnAttrs(), OldAL.getRetAttrs(), {});
+      for (unsigned i = 0; i < F.arg_size(); i++) {
+        if (ScalarIdxSet.count(i))
+          continue;
+        AttributeSet AS = OldAL.getParamAttrs(i);
+        if (AS.hasAttributes())
+          NewAL = NewAL.addParamAttributes(M.getContext(), OldToNew[i],
+                                           AttrBuilder(M.getContext(), AS));
+      }
+      NewF->setAttributes(NewAL);
+    }
 
     for (unsigned i = 0; i < F.arg_size(); i++) {
       if (ScalarIdxSet.count(i))

@@ -216,9 +216,7 @@ static int64_t denseSplatAttr(Operation *op, StringRef name) {
 // annotates each rem with tt.contiguity = dense<C>; C >= tile extent means no
 // element wraps inside the tile. Returns true only if >=1 modulo AND all
 // block-aligned.
-static bool allModuloBlockAligned(Value v, ArrayRef<int64_t> tileShape,
-                                  unsigned budget = 128) {
-  (void)tileShape;
+static bool allModuloBlockAligned(Value v, unsigned budget = 128) {
   llvm::SmallVector<Value, 16> worklist;
   llvm::SmallPtrSet<Operation *, 32> visited;
   worklist.push_back(v);
@@ -1132,7 +1130,7 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     // safe only when the tile is proven fully in-bounds. Also gates the modulo
     // below.
     bool tileFullyInBounds =
-        allModuloBlockAligned(op.getSrc(), shape) && functionModuloIsSafe(op);
+        allModuloBlockAligned(op.getSrc()) && functionModuloIsSafe(op);
 
     // Async DMA takes no mask or a UNIFORM scalar gating the whole copy. A
     // non-uniform mask is dropped only when the tile is proven in-bounds; else
@@ -1207,8 +1205,7 @@ struct AsyncCopyGlobalToLocalOpAppleConversion
     }
     // AxisInfo (pre-conversion) often returns null here; fall back to the
     // IR-based proof (every wrap annotated contiguous across the tile extent).
-    if (canAsyncDMA && !allowModulo &&
-        allModuloBlockAligned(op.getSrc(), shape))
+    if (canAsyncDMA && !allowModulo && allModuloBlockAligned(op.getSrc()))
       allowModulo = true;
 
     // Function-level live-wrap guard: the pipeliner hides the modulo in the

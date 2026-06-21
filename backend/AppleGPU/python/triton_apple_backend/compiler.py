@@ -354,10 +354,7 @@ class MPSBackend(BaseBackend):
                         _f.write(_pre)
                 except Exception:
                     _preopt_path = None
-            llvm.optimize_module(llvm_mod,
-                                 _opt_level,
-                                 disable_slp_vectorizer=bool(
-                                     os.environ.get('METAL_DISABLE_SLP')))
+            llvm.optimize_module(llvm_mod, _opt_level)
             if _preopt_path:
                 try:
                     os.unlink(_preopt_path)

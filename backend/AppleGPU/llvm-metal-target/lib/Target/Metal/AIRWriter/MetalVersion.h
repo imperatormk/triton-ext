@@ -52,11 +52,11 @@ struct MetalVersion {
   static constexpr unsigned AIRMajor = 2;
 
   static MetalVersion fromOSMajor(unsigned OS) {
-    unsigned TripleOS = (OS >= 16) ? 26 : OS;
+    unsigned TripleOS = (OS >= 16) ? OS + 10 : OS;
     unsigned MSLMaj = (OS >= 16) ? 4 : 3;
     unsigned MSLMin = (OS >= 16) ? 0 : (OS - 13);
     // MTLB container format byte (header byte 8), from `xcrun metal`:
-    // 13->7, 14->7, 15->8, 16->9.
+    // 13->7, 14->7, 15->8, 16->9, 17->9.
     unsigned CByte = (OS <= 14) ? 7 : (OS == 15 ? 8 : 9);
     return {OS, OS - 8, OS + 12, TripleOS, MSLMaj, MSLMin, CByte};
   }
@@ -79,8 +79,9 @@ struct MetalVersion {
     if (I == 0)
       return fromOSMajor(16); // no digits -> fallback
 
-    // Apple renumbered the macOS-16 era as macOS 26; map it back.
-    unsigned OS = (Num == 26) ? 16 : Num;
+    // Apple renumbered the macOS-16 era as macOS 26; map it back (26->16,
+    // 27->17, ...).
+    unsigned OS = (Num >= 26) ? Num - 10 : Num;
     return fromOSMajor(OS);
   }
 

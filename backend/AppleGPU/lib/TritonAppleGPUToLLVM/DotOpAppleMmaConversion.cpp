@@ -40,6 +40,422 @@ struct OperandRouting {
 struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
+  // Build (or reuse) an opaque named struct type by name.
+  static LLVM::LLVMStructType getNamedStruct(MLIRContext *ctx, StringRef name,
+                                             ArrayRef<Type> body, bool opaque) {
+    auto st = LLVM::LLVMStructType::getIdentified(ctx, name);
+    if (opaque)
+      return st;
+    if (st.getBody().empty())
+      (void)st.setBody(body, /*isPacked=*/false);
+    return st;
+  }
+
+  // Emit Apple's matmul2d cooperative_tensor ABI for a tt.dot, writing C
+  // directly to device memory. Mirrors matmul2d_ref_pso_xpc.ll (tile MTxNT,
+  // descriptor K=-1 so the runtime loops the full contraction). Returns
+  // failure() — leaving the rewriter untouched — on any gate miss so the 8x8
+  // path runs byte-identically.
+  LogicalResult
+  tryLowerCoopMatmul2d(tt::DotOp op, OpAdaptor adaptor,
+                       ConversionPatternRewriter &rewriter) const {
+    const char *envCoop = ::getenv("METAL_COOP_MMA");
+    if (!envCoop || !*envCoop || envCoop[0] == '0')
+      return failure();
+    if (dotcommon::getTargetOSMajor() < 16)
+      return failure();
+
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    auto mod = op->getParentOfType<ModuleOp>();
+
+    auto cType = cast<RankedTensorType>(op.getC().getType());
+    auto aType = cast<RankedTensorType>(op.getA().getType());
+    auto bType = cast<RankedTensorType>(op.getB().getType());
+    auto cMmaEnc = dyn_cast<AppleMmaEncodingAttr>(cType.getEncoding());
+    if (!cMmaEnc)
+      return failure();
+    if (!cType.getElementType().isF32() || !aType.getElementType().isF32() ||
+        !bType.getElementType().isF32())
+      return failure();
+
+    int64_t M = cType.getShape()[0];
+    int64_t N = cType.getShape()[1];
+    int64_t K = aType.getShape()[1];
+
+    // Single-dot full-K shape only: C must be a fresh zero accumulator, not a
+    // loop-carried iter-arg (which would need cross-iteration accumulation a
+    // per-dot pattern cannot provide).
+    {
+      Value c = op.getC();
+      auto cst = c.getDefiningOp<arith::ConstantOp>();
+      if (!cst)
+        return failure();
+      auto dea = dyn_cast<DenseElementsAttr>(cst.getValue());
+      if (!dea || !dea.isSplat())
+        return failure();
+      auto fv = dyn_cast<FloatAttr>(dea.getSplatValue<Attribute>());
+      if (!fv || !fv.getValue().isZero())
+        return failure();
+    }
+
+    // A,B device base pointers + row strides via the affine pointer resolver.
+    auto loadPtrTensor = [&](Value v) -> Value {
+      Value src = v;
+      if (auto cvt = v.getDefiningOp<ttg::ConvertLayoutOp>())
+        src = cvt.getSrc();
+      auto ld = src.getDefiningOp<tt::LoadOp>();
+      if (!ld || ld.getMask())
+        return Value();
+      return ld.getPtr();
+    };
+    auto i64Ty = IntegerType::get(ctx, 64);
+    auto remapStride = [&](Value s, int64_t c) -> Value {
+      if (c != INT64_MIN)
+        return arith::ConstantIntOp::create(rewriter, loc, c, 64);
+      if (!s)
+        return Value();
+      Value r = rewriter.getRemappedValue(s);
+      if (!r)
+        return Value();
+      auto it = dyn_cast<IntegerType>(r.getType());
+      if (!it)
+        return Value();
+      if (it.getWidth() < 64)
+        r = arith::ExtSIOp::create(rewriter, loc, i64Ty, r);
+      else if (it.getWidth() > 64)
+        r = arith::TruncIOp::create(rewriter, loc, i64Ty, r);
+      return r;
+    };
+    auto affine = [&](Value v, Value &row, Value &col) -> bool {
+      Value pt = loadPtrTensor(v);
+      if (!pt)
+        return false;
+      AffineMmaPtrInfo info;
+      if (!extractAffineMmaPtrInfo(pt, info))
+        return false;
+      row = remapStride(info.rowStride, info.rowStrideConst);
+      col = remapStride(info.colStride, info.colStrideConst);
+      return row && col;
+    };
+
+    // Lane-INDEPENDENT per-CTA tile base pointer. The descriptor base matmul2d
+    // reads must be identical across the threadgroup (it is the shared tile
+    // origin, not a per-lane element). Reconstruct it from the affine pointer's
+    // scalar base + (rowStart·rowStride + colStart·colStride), where rowStart/
+    // colStart are the pid-derived tile origin (e.g. pid_m*BM) — NOT from the
+    // converted per-thread pointer struct (which carries a runtime per-lane
+    // term that no static offset can cancel).
+    auto i32TyB = IntegerType::get(ctx, 32);
+    auto originScalar = [&](Value ssa, int64_t cst) -> Value {
+      if (ssa) {
+        Value r = rewriter.getRemappedValue(ssa);
+        if (!r)
+          return Value();
+        if (auto it = dyn_cast<IntegerType>(r.getType())) {
+          if (it.getWidth() < 64)
+            r = arith::ExtSIOp::create(rewriter, loc, i64Ty, r);
+          else if (it.getWidth() > 64)
+            r = arith::TruncIOp::create(rewriter, loc, i64Ty, r);
+        } else {
+          return Value();
+        }
+        return r;
+      }
+      return arith::ConstantIntOp::create(rewriter, loc, cst, 64);
+    };
+    // base = devbase + rowStart*rowStride + colStart*colStride (in elements).
+    auto tileOriginBase = [&](Value ptrTensor, Value rowStride, Value colStride,
+                              bool peelModulo) -> Value {
+      AsyncCopyPtrInfo info;
+      if (!extractAsyncCopyPtrInfo(ptrTensor, info, peelModulo))
+        return Value();
+      if (!info.basePtr)
+        return Value();
+      Value devBase = rewriter.getRemappedValue(info.basePtr);
+      if (!devBase || !isa<LLVM::LLVMPointerType>(devBase.getType()))
+        return Value();
+      Value r0 = originScalar(info.rowStart, info.rowStartConst);
+      Value c0 = originScalar(info.colStart, info.colStartConst);
+      if (!r0 || !c0)
+        return Value();
+      Value off = arith::AddIOp::create(
+          rewriter, loc, arith::MulIOp::create(rewriter, loc, r0, rowStride),
+          arith::MulIOp::create(rewriter, loc, c0, colStride));
+      return LLVM::GEPOp::create(rewriter, loc, devBase.getType(),
+                                 Float32Type::get(ctx), devBase,
+                                 ArrayRef<LLVM::GEPArg>{off});
+    };
+    (void)i32TyB;
+
+    // Non-emitting gate checks first (no IR mutation): the affine A/B views
+    // must resolve, and there must be a single downstream tt.store.
+    {
+      Value aPt = loadPtrTensor(op.getA()), bPt = loadPtrTensor(op.getB());
+      AffineMmaPtrInfo ia, ib;
+      if (!aPt || !bPt || !extractAffineMmaPtrInfo(aPt, ia) ||
+          !extractAffineMmaPtrInfo(bPt, ib))
+        return failure();
+      AsyncCopyPtrInfo aa, bb;
+      if (!extractAsyncCopyPtrInfo(aPt, aa, /*allowModulo=*/true) ||
+          !extractAsyncCopyPtrInfo(bPt, bb, /*allowModulo=*/true))
+        return failure();
+    }
+
+    // C device pointer + stride from the (single) downstream tt.store.
+    tt::StoreOp cStore;
+    for (auto *user : op.getResult().getUsers()) {
+      if (auto st = dyn_cast<tt::StoreOp>(user)) {
+        cStore = st;
+        break;
+      }
+      if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(user))
+        for (auto *u2 : cvt.getResult().getUsers())
+          if (auto st = dyn_cast<tt::StoreOp>(u2))
+            cStore = st;
+    }
+    if (!cStore || cStore.getMask())
+      return failure();
+
+    // ── Emit the matmul2d ABI at the STORE site. ──
+    OpBuilder::InsertionGuard emitGuard(rewriter);
+    rewriter.setInsertionPoint(cStore);
+
+    Value aRow, aCol, bRow, bCol;
+    if (!affine(op.getA(), aRow, aCol) || !affine(op.getB(), bRow, bCol))
+      return failure();
+
+    AffineMmaPtrInfo cInfo;
+    if (!extractAffineMmaPtrInfo(cStore.getPtr(), cInfo))
+      return failure();
+    Value cRow = remapStride(cInfo.rowStride, cInfo.rowStrideConst);
+    Value cCol = remapStride(cInfo.colStride, cInfo.colStrideConst);
+    if (!cRow || !cCol)
+      return failure();
+
+    // Per-CTA tile base pointers (lane-independent): devbase + tile origin.
+    Value aPtA = loadPtrTensor(op.getA()), bPtB = loadPtrTensor(op.getB());
+    Value aBase = tileOriginBase(aPtA, aRow, aCol, /*peelModulo=*/true);
+    Value bBase = tileOriginBase(bPtB, bRow, bCol, /*peelModulo=*/true);
+    Value cBase =
+        tileOriginBase(cStore.getPtr(), cRow, cCol, /*peelModulo=*/true);
+    if (!aBase || !bBase || !cBase)
+      return failure();
+
+    auto i8Ty = IntegerType::get(ctx, 8);
+    auto i16Ty = IntegerType::get(ctx, 16);
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto voidTy = LLVM::LLVMVoidType::get(ctx);
+    auto devPtrTy = LLVM::LLVMPointerType::get(ctx, 1);
+    auto ptr0Ty = LLVM::LLVMPointerType::get(ctx, 0);
+
+    auto descStructTy = getNamedStruct(
+        ctx, "struct.mpp::tensor_ops::matmul2d_descriptor",
+        {i32Ty, i32Ty, i32Ty, i8Ty, i8Ty, i8Ty, i32Ty}, /*opaque=*/false);
+    auto arrTy =
+        getNamedStruct(ctx, "struct.metal::array",
+                       {LLVM::LLVMArrayType::get(i32Ty, 2)}, /*opaque=*/false);
+    auto tensorTy =
+        getNamedStruct(ctx, "struct._tensor_t", {}, /*opaque=*/true);
+    auto tensorPtrTy = LLVM::LLVMPointerType::get(ctx, 0); // %struct._tensor_t*
+
+    auto declFn = [&](StringRef name, LLVM::LLVMFunctionType fnTy,
+                      StringRef section = "") -> LLVM::LLVMFuncOp {
+      if (auto f = mod.lookupSymbol<LLVM::LLVMFuncOp>(name))
+        return f;
+      OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPointToStart(mod.getBody());
+      auto f = LLVM::LLVMFuncOp::create(rewriter, mod.getLoc(), name, fnTy,
+                                        LLVM::Linkage::External);
+      if (!section.empty())
+        f.setSection(section);
+      return f;
+    };
+
+    auto descSizeFn =
+        declFn("air.get_descriptor_size_tensor",
+               LLVM::LLVMFunctionType::get(i16Ty, {i16Ty, i16Ty}, false));
+    auto initFn =
+        declFn("air.init_strided_private_tensor.i32.global",
+               LLVM::LLVMFunctionType::get(
+                   voidTy, {tensorPtrTy, i16Ty, devPtrTy, ptr0Ty, ptr0Ty, i8Ty},
+                   false));
+    auto sliceFn = declFn(
+        "air.slice_private_tensor_private_tensor.s.i32",
+        LLVM::LLVMFunctionType::get(
+            voidTy, {tensorPtrTy, tensorPtrTy, i16Ty, ptr0Ty, ptr0Ty}, false));
+    auto extentFn = declFn(
+        "air.get_extent_private_tensor.i32",
+        LLVM::LLVMFunctionType::get(i32Ty, {tensorPtrTy, i16Ty, i16Ty}, false));
+    auto sgSizeFn = declFn("air.get_simdgroup_size.i32",
+                           LLVM::LLVMFunctionType::get(i32Ty, {}, false));
+    auto mmFn =
+        declFn("__tensorops_impl_matmul2d_op_run_dv_f32_dv_f32_dv_f32",
+               LLVM::LLVMFunctionType::get(
+                   voidTy,
+                   {ptr0Ty, ptr0Ty, i32Ty, ptr0Ty, i32Ty, ptr0Ty, i32Ty, i32Ty},
+                   false),
+               "air.externally_defined");
+
+    auto cI32 = [&](int64_t v) {
+      return arith::ConstantIntOp::create(rewriter, loc, v, 32);
+    };
+    auto cI16 = [&](int64_t v) {
+      return LLVM::ConstantOp::create(rewriter, loc, i16Ty,
+                                      rewriter.getI16IntegerAttr(v));
+    };
+    auto cI8 = [&](int64_t v) {
+      return LLVM::ConstantOp::create(rewriter, loc, i8Ty,
+                                      rewriter.getI8IntegerAttr(v));
+    };
+    Value one64 = arith::ConstantIntOp::create(rewriter, loc, 1, 64);
+
+    // Descriptor-size for the dynamic %struct._tensor_t allocas.
+    Value dsz16 = LLVM::CallOp::create(rewriter, loc, descSizeFn,
+                                       ValueRange{cI16(2), cI16(4)})
+                      .getResult();
+    Value dsz = LLVM::ZExtOp::create(rewriter, loc, i64Ty, dsz16);
+
+    auto allocDesc = [&]() -> Value {
+      return LLVM::AllocaOp::create(rewriter, loc, ptr0Ty, i8Ty, dsz, 8);
+    };
+    auto allocArr = [&]() -> Value {
+      return LLVM::AllocaOp::create(rewriter, loc, ptr0Ty, arrTy, one64, 4);
+    };
+    // Store {e0,e1} into a metal::array via struct-typed GEPs. (MLIR's GEP
+    // canonicalizer may rewrite these to i8 byte-offset GEPs; the AIR writer's
+    // PointeeTypeMap handles that form.)
+    auto fillArr = [&](Value v0, Value v1) -> Value {
+      Value a = allocArr();
+      Value g0 = LLVM::GEPOp::create(rewriter, loc, ptr0Ty, arrTy, a,
+                                     ArrayRef<LLVM::GEPArg>{0, 0, 0});
+      LLVM::StoreOp::create(rewriter, loc, v0, g0);
+      Value g1 = LLVM::GEPOp::create(rewriter, loc, ptr0Ty, arrTy, a,
+                                     ArrayRef<LLVM::GEPArg>{0, 0, 1});
+      LLVM::StoreOp::create(rewriter, loc, v1, g1);
+      return a;
+    };
+    auto trunc32 = [&](Value v) -> Value {
+      if (v.getType() == i32Ty)
+        return v;
+      return arith::TruncIOp::create(rewriter, loc, i32Ty, v);
+    };
+
+    // Build a full row-major device tensor descriptor.
+    //  ext = {dim0=contiguous, dim1}, str = {1, pitch}.
+    auto buildDesc = [&](Value base, Value ext0, Value ext1,
+                         Value pitch) -> Value {
+      Value d = allocDesc();
+      Value extA = fillArr(trunc32(ext0), trunc32(ext1));
+      Value strA = fillArr(cI32(1), trunc32(pitch));
+      LLVM::CallOp::create(rewriter, loc, initFn,
+                           ValueRange{d, cI16(2), base, extA, strA, cI8(0)});
+      return d;
+    };
+
+    Value Mv = cI32(M), Nv = cI32(N), Kv = cI32(K);
+    // A[M,K] row-major: ext(K,M) str(1,K). pitch = aRow (=K).
+    Value descA = buildDesc(aBase, Kv, Mv, trunc32(aRow));
+    // B[K,N]: ext(N,K) str(1,N). pitch = bRow (=N).
+    Value descB = buildDesc(bBase, Nv, Kv, trunc32(bRow));
+    // C[M,N]: ext(N,M) str(1,N). pitch = cRow (=N).
+    Value descC = buildDesc(cBase, Nv, Mv, trunc32(cRow));
+
+    // Slice each full descriptor at offset (0,0) with full extents (identity:
+    // the bases already point at this program's MxN/MxK/KxN tile).
+    auto sliceDesc = [&](Value full, Value e0, Value e1) -> Value {
+      Value sd = allocDesc();
+      Value offA = fillArr(cI32(0), cI32(0));
+      Value extA = fillArr(trunc32(e0), trunc32(e1));
+      LLVM::CallOp::create(rewriter, loc, sliceFn,
+                           ValueRange{sd, full, cI16(2), offA, extA});
+      return sd;
+    };
+    Value sA = sliceDesc(descA, Kv, Mv);
+    Value sB = sliceDesc(descB, Nv, Kv);
+    Value sC = sliceDesc(descC, Nv, Mv);
+
+    // 20-byte descriptor {MT,NT,-1,0,0,0,0}; alloca + element stores (avoids a
+    // global + memcpy).
+    Value descAlloca =
+        LLVM::AllocaOp::create(rewriter, loc, ptr0Ty, descStructTy, one64, 4);
+    auto storeField = [&](int64_t idx, Value v) {
+      Value g =
+          LLVM::GEPOp::create(rewriter, loc, ptr0Ty, descStructTy, descAlloca,
+                              ArrayRef<LLVM::GEPArg>{0, (int32_t)idx});
+      LLVM::StoreOp::create(rewriter, loc, v, g);
+    };
+    storeField(0, cI32(M));  // MT
+    storeField(1, cI32(N));  // NT
+    storeField(2, cI32(-1)); // K dynamic
+    storeField(3, cI8(0));
+    storeField(4, cI8(0));
+    storeField(5, cI8(0));
+    storeField(6, cI32(0)); // mode
+
+    // matmul2d's last arg = simdgroup_size × (number of participating
+    // simdgroups). The threadgroup has exactly num_warps simdgroups, so
+    // SG = num_warps (the execution_simdgroups<SG> the MPP runtime partitions
+    // the tile across). On Apple7 tile64/sg2 is the aten-beating sweet spot.
+    int64_t SG = std::max(1, ttg::lookupNumWarps(op));
+    Value sgsz =
+        LLVM::CallOp::create(rewriter, loc, sgSizeFn, ValueRange{}).getResult();
+    if (SG > 1 && dotcommon::isPowerOf2(SG))
+      sgsz =
+          arith::ShLIOp::create(rewriter, loc, sgsz, cI32(dotcommon::log2(SG)));
+    else if (SG > 1)
+      sgsz = arith::MulIOp::create(rewriter, loc, sgsz, cI32(SG));
+
+    LLVM::CallOp::create(
+        rewriter, loc, mmFn,
+        ValueRange{descAlloca, sA, cI32(2), sB, cI32(2), sC, cI32(2), sgsz});
+
+    // The dot's C result is now in device memory; the downstream store is
+    // redundant. Replace the dot with a zero fragment struct (consumed only by
+    // that store, which writes the same zeros harmlessly over our result —
+    // unless we also elide it). To stay correct we leave the store but point it
+    // nowhere: simplest is to return a value the store re-writes. Since
+    // matmul2d already wrote C, we must PREVENT the store from clobbering.
+    // Erase it.
+    rewriter.eraseOp(cStore);
+
+    auto outLLVMTy = getTypeConverter()->convertType(cType);
+    if (!isa<LLVM::LLVMStructType>(outLLVMTy))
+      return failure();
+
+    // matmul2d read A/B straight from device memory via the descriptors, so the
+    // dot's A/B operand loads (and their layout converts) become dead once the
+    // dot is replaced. Erase them so their 8x8 scatter/gather prologue
+    // (per-thread shuffles + barrier) is never emitted — that dead prologue
+    // otherwise dominates the kernel time.
+    Value aVal = op.getA(), bVal = op.getB();
+
+    // Replace the dot with a dead zero fragment, inserted at the dot itself so
+    // it dominates wherever the framework still tracks the value.
+    rewriter.setInsertionPoint(op);
+    Value result = LLVM::ZeroOp::create(rewriter, loc, outLLVMTy);
+    rewriter.replaceOp(op, result);
+
+    auto eraseOperandLoad = [&](Value v) {
+      Operation *cvt = nullptr;
+      Value src = v;
+      if (auto c = v.getDefiningOp<ttg::ConvertLayoutOp>()) {
+        cvt = c;
+        src = c.getSrc();
+      }
+      auto ld = src.getDefiningOp<tt::LoadOp>();
+      if (cvt && cvt->getResult(0).use_empty())
+        rewriter.eraseOp(cvt);
+      if (ld && ld->getResult(0).use_empty())
+        rewriter.eraseOp(ld);
+    };
+    eraseOperandLoad(aVal);
+    eraseOperandLoad(bVal);
+    (void)tensorTy;
+    (void)extentFn;
+    return success();
+  }
+
   LogicalResult
   matchAndRewrite(tt::DotOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -56,6 +472,15 @@ struct DotOpAppleMmaConversion : public ConvertOpToLLVMPattern<tt::DotOp> {
     unsigned rank = cType.getRank();
     if (rank != 2)
       return failure();
+
+    // Apple cooperative_tensor (matmul2d) path: gated by METAL_COOP_MMA + a
+    // Metal4/Apple7+ OS check. Fires only for the single-dot full-K, zero-C
+    // GEMM tile shape it can correctly accelerate; falls through
+    // (byte-identical 8x8) otherwise. matmul2d owns the entire K reduction
+    // internally and writes the C tile directly to device memory (descriptor
+    // K=-1), mirroring the proven ct_gemm reference.
+    if (succeeded(tryLowerCoopMatmul2d(op, adaptor, rewriter)))
+      return success();
 
     auto aType = cast<RankedTensorType>(op.getA().getType());
     auto bType = cast<RankedTensorType>(op.getB().getType());

@@ -83,6 +83,11 @@ public:
 
   ValueEnumerator(llvm::Module &M, const PointeeTypeMap &PTM);
 
+  /// Set once enumeration freezes the type table. After this, ptrTypeIdx must
+  /// resolve to a pre-registered entry; appending a new typed-pointer slot at
+  /// emit time would index past the table the reader already sized.
+  bool frozen = false;
+
   /// Get type index for a non-pointer type.
   unsigned typeIdx(llvm::Type *T);
 

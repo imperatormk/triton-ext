@@ -31,9 +31,10 @@ namespace llvm {
 namespace metal {
 
 // Forward declaration
-void emitConstantsBlock(BitstreamWriter &W, ValueEnumerator &E,
-                        ArrayRef<const Constant *> Constants,
-                        unsigned CodeSize);
+void emitConstantsBlock(
+    BitstreamWriter &W, ValueEnumerator &E,
+    ArrayRef<const Constant *> Constants, unsigned CodeSize,
+    const DenseMap<const Constant *, unsigned> *PoisonPtrTypeIdx = nullptr);
 
 void emitFunctionBlock(BitstreamWriter &W, const Function &F,
                        ValueEnumerator &E, const MetadataEnumerator &MD) {
@@ -75,6 +76,9 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         FuncConsts.push_back(C);
       }
   };
+  // A poison/undef pointer collapses to the AS0 default; pin it to the callee
+  // param's type index so its SETTYPE matches the operand the reader checks.
+  DenseMap<const Constant *, unsigned> PoisonPtrTypeIdx;
   for (const BasicBlock *BB : BBOrder)
     for (auto &I : *BB) {
       for (auto &Op : I.operands())
@@ -83,6 +87,35 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
       // record references it like one.
       if (auto *SV = dyn_cast<ShuffleVectorInst>(&I))
         CollectConst(SV->getShuffleMaskForBitcode());
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        auto It = E.funcTypeParamIndices.find(CI->getFunctionType());
+        if (It != E.funcTypeParamIndices.end())
+          for (unsigned J = 0; J < CI->arg_size() && J < It->second.size(); J++)
+            if (auto *AC = dyn_cast<Constant>(CI->getArgOperand(J)))
+              if (isa<UndefValue>(AC) && AC->getType()->isPointerTy())
+                PoisonPtrTypeIdx.try_emplace(AC, It->second[J]);
+      }
+      // Same for a poison/undef load/store address: pin it to ptr(accessed
+      // type).
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (auto *PC = dyn_cast<Constant>(SI->getPointerOperand()))
+          if (isa<UndefValue>(PC))
+            PoisonPtrTypeIdx.try_emplace(
+                PC,
+                E.ptrTypeIdx(PC->getType(), SI->getValueOperand()->getType()));
+      }
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (auto *PC = dyn_cast<Constant>(LI->getPointerOperand()))
+          if (isa<UndefValue>(PC))
+            PoisonPtrTypeIdx.try_emplace(
+                PC, E.ptrTypeIdx(PC->getType(), LI->getType()));
+      }
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+        if (auto *PC = dyn_cast<Constant>(GEP->getPointerOperand()))
+          if (isa<UndefValue>(PC))
+            PoisonPtrTypeIdx.try_emplace(
+                PC, E.ptrTypeIdx(PC->getType(), GEP->getSourceElementType()));
+      }
     }
 
   // Instruction results
@@ -115,7 +148,7 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
   W.EmitRecord(bitc::FUNC_CODE_DECLAREBLOCKS, DV);
 
   // Function constants
-  emitConstantsBlock(W, E, FuncConsts, 5);
+  emitConstantsBlock(W, E, FuncConsts, 5, &PoisonPtrTypeIdx);
 
   // BB indices follow the emitted (RPO) order so branch/phi block references
   // match the stream the reader rebuilds.
@@ -173,37 +206,15 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
       } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
         V.push_back(GEP->isInBounds() ? 1 : 0);
         // Metal GPU JIT requires GEP source type to match the pointer's
-        // pointee. For AS1 pointers collapsed to float*, remap i32 GEP source
-        // to float (same stride), but ONLY if all terminal users consume float.
+        // pointee. The analysis (PointeeTypeMap Phase 6) already collapsed AS1
+        // float buffers to float*; consult that result instead of re-deriving
+        // the MMA-float rule here, so source and pointee can't diverge.
         Type *GepSrcTy = GEP->getSourceElementType();
         if (GEP->getPointerAddressSpace() == metal::AS::Device &&
             GepSrcTy->isIntegerTy(32)) {
-          bool AllTerminalFloat = true;
-          SmallVector<const GetElementPtrInst *, 8> Worklist;
-          Worklist.push_back(GEP);
-          while (!Worklist.empty() && AllTerminalFloat) {
-            auto *G = Worklist.pop_back_val();
-            for (auto *U : G->users()) {
-              if (auto *SubGEP = dyn_cast<GetElementPtrInst>(U)) {
-                Worklist.push_back(SubGEP);
-              } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-                if (!LI->getType()->isFloatTy()) {
-                  AllTerminalFloat = false;
-                  break;
-                }
-              } else if (auto *SI = dyn_cast<StoreInst>(U)) {
-                if (!SI->getValueOperand()->getType()->isFloatTy()) {
-                  AllTerminalFloat = false;
-                  break;
-                }
-              } else {
-                AllTerminalFloat = false;
-                break;
-              }
-            }
-          }
-          if (AllTerminalFloat)
-            GepSrcTy = Type::getFloatTy(F.getContext());
+          if (auto *PtmTy = E.PTM.get(const_cast<GetElementPtrInst *>(GEP)))
+            if (PtmTy->isFloatTy())
+              GepSrcTy = PtmTy;
         }
         V.push_back(E.typeIdx(GepSrcTy));
         for (auto &Op : GEP->operands())
@@ -331,7 +342,7 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         Type *AllocTy = AI->getAllocatedType();
         if (AllocTy->isPointerTy() && AllocTy->getPointerAddressSpace() == 3) {
           if (auto *EvTy =
-                  StructType::getTypeByName(AI->getContext(), "event_t"))
+                  StructType::getTypeByName(AI->getContext(), kEventTypeName))
             V.push_back(
                 E.ptrTypeIdx(PointerType::get(AI->getContext(), 3), EvTy));
           else

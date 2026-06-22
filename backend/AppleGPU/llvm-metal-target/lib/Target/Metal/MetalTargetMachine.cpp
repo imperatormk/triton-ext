@@ -21,6 +21,7 @@
 #include "MetalDeviceLoadsVolatile.h"
 #include "MetalInlineNonKernel.h"
 #include "MetalLLVMToAIRIntrinsics.h"
+#include "MetalLegalizeUnsupportedIR.h"
 #include "MetalNormalizeAllocas.h"
 #include "MetalPrepare.h"
 #include "MetalScalarBufferPacking.h"
@@ -65,6 +66,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMetalTarget() {
   initializeScalarizeMaskedMemIntrinLegacyPassPass(*PR);
   initializePostInlineEntryExitInstrumenterPass(*PR);
   initializeMetalInlineNonKernelLegacyPass(*PR);
+  initializeMetalLegalizeUnsupportedIRLegacyPass(*PR);
   initializeMetalLLVMToAIRIntrinsicsLegacyPass(*PR);
   initializeMetalBarrierRenameLegacyPass(*PR);
   initializeMetalScalarStoreGuardLegacyPass(*PR);
@@ -119,6 +121,7 @@ public:
     // AIR bitcode has no switch encoding; lower to branch chains first.
     addPass(createLowerSwitchPass());
     addPass(createMetalInlineNonKernelLegacyPass());
+    addPass(createMetalLegalizeUnsupportedIRLegacyPass());
     addPass(createMetalLLVMToAIRIntrinsicsLegacyPass());
     addPass(createMetalBarrierRenameLegacyPass());
     addPass(createMetalScalarStoreGuardLegacyPass());

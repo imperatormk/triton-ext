@@ -36,6 +36,7 @@ set(METAL_CODEGEN_SOURCES
   MetalDeviceLoadsVolatile.cpp
   MetalInlineNonKernel.cpp
   MetalLLVMToAIRIntrinsics.cpp
+  MetalLegalizeUnsupportedIR.cpp
   MetalNormalizeAllocas.cpp
   MetalPrepare.cpp
   MetalScalarBufferPacking.cpp
@@ -59,9 +60,13 @@ set(METAL_DESC_SOURCES
 )
 
 set(METAL_AIRWRITER_SOURCES
+  AIRWriter/AggregateScalarize.cpp
   AIRWriter/BitcodeEmitter.cpp
+  AIRWriter/ConstantExprLower.cpp
   AIRWriter/ConstantsWriter.cpp
+  AIRWriter/CoopTensorLowering.cpp
   AIRWriter/FunctionWriter.cpp
+  AIRWriter/LowerPointerVectors.cpp
   AIRWriter/LowerVectorSelect.cpp
   AIRWriter/MetadataWriter.cpp
   # MetalEmbedderPass is registered in MetalPassRegistry.def for `opt -passes=`
@@ -69,7 +74,10 @@ set(METAL_AIRWRITER_SOURCES
   AIRWriter/MetalEmbedderPass.cpp
   AIRWriter/MetallibWriter.cpp
   AIRWriter/MetalWriterPass.cpp
+  AIRWriter/NormalizeGEPs.cpp
+  AIRWriter/PointeeRules.cpp
   AIRWriter/PointeeTypeMap.cpp
+  AIRWriter/PointerPointeeRepair.cpp
   AIRWriter/TypeTableWriter.cpp
   AIRWriter/ValueEnumerator.cpp
 )

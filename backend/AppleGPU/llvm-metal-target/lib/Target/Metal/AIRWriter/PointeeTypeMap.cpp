@@ -15,7 +15,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "PointeeTypeMap.h"
+#include "CoopTensorLowering.h"
 #include "MetalConstraints.h"
+#include "PointeeRules.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 
@@ -26,7 +28,13 @@ namespace metal {
 
 AnalysisKey PointeeTypeAnalysis::Key;
 
-static bool isIntegerDevicePointer(Value *Ptr);
+StructType *getOrCreateEventType(LLVMContext &Ctx) {
+  if (StructType *EventTy = StructType::getTypeByName(Ctx, kEventTypeName))
+    return EventTy;
+  return StructType::create(Ctx, kEventTypeName);
+}
+
+static bool isNonFloatScalarDevicePointer(Value *Ptr);
 
 // Infer pointee from usage: load/store/GEP, then GEP source type and atomic
 // intrinsic name inference.
@@ -39,9 +47,13 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
                                      SmallPtrSetImpl<Value *> &Visited) {
   if (!Visited.insert(Ptr).second)
     return nullptr;
+  // users() asserts without a use-list; such values carry no usage evidence.
+  if (!Ptr->hasUseList())
+    return nullptr;
   // Prioritize load/store over GEP source types; recurse through GEP chains.
-  // Do NOT follow atomic intrinsic calls through GEP chains (the atomic
-  // mismatch is handled by InferTypedPointersPass Phase 1b).
+  // Do NOT follow atomic intrinsics through GEP chains: a float buffer through
+  // a float GEP into an i32 CAS must keep the GEP source type (float); the
+  // atomic mismatch is handled by InferTypedPointersPass Phase 1b.
   Type *GepType = nullptr;
   for (auto *U : Ptr->users()) {
     if (auto *LI = dyn_cast<LoadInst>(U))
@@ -50,8 +62,10 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
       if (SI->getPointerOperand() == Ptr)
         return SI->getValueOperand()->getType();
     }
-    // Follow identity ptr->ptr bitcasts only on DEVICE (addrspace 1) pointers;
-    // AS3 smem array globals must keep their array GEP element type.
+    // Follow identity ptr->ptr bitcasts only on DEVICE (addrspace 1) pointers.
+    // NOT for addrspace(3): smem array globals must keep their array GEP
+    // element type, else the writer rejects "gep type does not match pointee
+    // type".
     if (auto *BC = dyn_cast<BitCastInst>(U)) {
       if (BC->getType()->isPointerTy() &&
           BC->getType()->getPointerAddressSpace() == AS::Device)
@@ -92,19 +106,21 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
     if (auto *CI = dyn_cast<CallInst>(U)) {
       if (auto *Callee = CI->getCalledFunction()) {
         StringRef Name = Callee->getName();
+        auto &Ctx = Ptr->getContext();
         // The simdgroup-matrix intrinsic's pointer suffix is definitive
-        // element-type evidence, outvoting byte-form GEP source types. Test
-        // bf16 before f16: substring overlap.
-        if (Name.starts_with("air.simdgroup_matrix_8x8_")) {
-          auto &Ctx = Ptr->getContext();
-          if (Name.contains("p1bf16") || Name.contains("p3bf16"))
-            return Type::getBFloatTy(Ctx);
-          if (Name.contains("p1f16") || Name.contains("p3f16"))
-            return Type::getHalfTy(Ctx);
-          if (Name.contains("p1i8") || Name.contains("p3i8"))
-            return Type::getInt8Ty(Ctx);
-          if (Name.contains("p1f32") || Name.contains("p3f32"))
-            return Type::getFloatTy(Ctx);
+        // element-type evidence, outvoting byte-form GEP source types.
+        if (Type *Elem = mmaElemFromName(Name, Ctx))
+          return Elem;
+        // Tensor-handle pinning for cooperative_tensor / matmul2d builtins.
+        {
+          unsigned ArgNo = ~0u;
+          for (unsigned J = 0; J < CI->arg_size(); ++J)
+            if (CI->getArgOperand(J) == Ptr) {
+              ArgNo = J;
+              break;
+            }
+          if (Type *Want = tensorHandlePointee(Name, ArgNo, Ptr, Ctx))
+            return Want;
         }
         // Only use atomic type when the pointer is NOT a GEP result; GEP
         // results keep their source element type (atomic mismatch handled via
@@ -121,14 +137,16 @@ Type *PointeeTypeMap::inferFromUsage(Value *Ptr,
   return GepType;
 }
 
-// With MMA intrinsics present, the Metal GPU JIT crashes on ANY non-float
-// device pointer; collapse all addrspace(1) entries to float*.
+// With MMA intrinsics present the JIT rejects an ambiguously-typed device
+// pointer; pin each addrspace(1) entry to float* EXCEPT genuine non-float
+// scalar buffers (int8-dot/half/bfloat), which keep their element type.
 void PointeeTypeMap::collapseDevicePointersToFloat(Module &M) {
   Type *F32 = Type::getFloatTy(M.getContext());
   for (auto &[Ptr, Ty] : map) {
     auto *PtrTy = Ptr->getType();
     if (auto *PT = dyn_cast<PointerType>(PtrTy)) {
-      if (PT->getAddressSpace() == AS::Device && !isIntegerDevicePointer(Ptr))
+      if (PT->getAddressSpace() == AS::Device &&
+          !isNonFloatScalarDevicePointer(Ptr))
         Ty = F32;
     }
   }
@@ -146,13 +164,6 @@ void PointeeTypeMap::remapI1ToI8(Module &M) {
 // This analysis MUST be self-contained - it may be re-run after pipeline passes
 // invalidate it, so all Metal-specific overrides (MMA, async copy) live here.
 
-// MMA intrinsic names shared with InferTypedPointersPass via PointeeTypeMap.h
-// (namespace mma_intrinsics); the override logic is intentionally duplicated.
-static constexpr const char *kMMALoad = mma_intrinsics::kLoad;
-static constexpr const char *kMMAStore = mma_intrinsics::kStore;
-static constexpr const char *kMMALoadDev = mma_intrinsics::kLoadDev;
-static constexpr const char *kMMAStoreDev = mma_intrinsics::kStoreDev;
-
 static bool functionUsesMMA(const Function &F) {
   for (const auto &BB : F)
     for (const auto &I : BB)
@@ -163,24 +174,37 @@ static bool functionUsesMMA(const Function &F) {
   return false;
 }
 
-// The MMA collapse forces device pointers to float*; preserve any device
-// pointer whose inferred usage is a concrete non-float scalar (int/half/bfloat
-// buffer), which is never fed to a float MMA intrinsic.
-static bool isNonFloatScalarDevicePointer(Value *Ptr) {
-  Type *Ty = PointeeTypeMap::inferFromUsage(Ptr);
+// MMA collapse forces device pointers to float*, but an MMA kernel can have a
+// genuine non-float scalar device buffer (i32 int8-dot output, half/bfloat
+// input). Collapsing those to float* makes the writer reject "load/store type
+// does not match pointee type". Preserve any device pointer whose inferred
+// usage is a concrete non-float scalar (int/half/bfloat).
+static bool isNonFloatScalar(Type *Ty) {
   if (!Ty)
     return false;
   if (Ty->isIntegerTy() && !Ty->isIntegerTy(1))
     return true;
-  if (Ty->isHalfTy() || Ty->isBFloatTy())
-    return true;
-  return false;
+  return Ty->isHalfTy() || Ty->isBFloatTy();
 }
 
-// Back-compat name kept for the call sites; the predicate now covers half and
-// bfloat device buffers in addition to integers.
-static bool isIntegerDevicePointer(Value *Ptr) {
-  return isNonFloatScalarDevicePointer(Ptr);
+static bool isNonFloatScalarDevicePointer(Value *Ptr) {
+  if (isNonFloatScalar(PointeeTypeMap::inferFromUsage(Ptr)))
+    return true;
+  // An identity ptr->ptr device bitcast feeding a non-float load/store must not
+  // collapse to float*, or the writer rejects "load/store type does not match
+  // pointee type". Catch the access type at the immediate use directly.
+  if (auto *BC = dyn_cast<BitCastInst>(Ptr))
+    if (BC->getType()->isPointerTy() && BC->getSrcTy() == BC->getDestTy())
+      for (auto *U : BC->users()) {
+        if (auto *LI = dyn_cast<LoadInst>(U))
+          if (isNonFloatScalar(LI->getType()))
+            return true;
+        if (auto *SI = dyn_cast<StoreInst>(U))
+          if (SI->getPointerOperand() == BC &&
+              isNonFloatScalar(SI->getValueOperand()->getType()))
+            return true;
+      }
+  return false;
 }
 
 PointeeTypeMap buildPointeeTypeMap(Module &M) {
@@ -218,7 +242,8 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
           PTM.set(&I, Ty);
       }
 
-  // Phase 2b: Force float* for device pointer phi nodes
+  // Phase 2b: device pointer phis carry the atomic element type (if they feed
+  // an atomic) else float*; the shared phi rule enforces this.
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB) {
@@ -227,7 +252,8 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
           continue;
         if (PN->getType()->getPointerAddressSpace() != AS::Device)
           continue;
-        PTM.set(PN, F32);
+        if (Type *Ty = requiredPhiPointee(PN, PTM))
+          PTM.set(PN, Ty);
       }
 
   // Phase 3: Global variables
@@ -242,16 +268,15 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
         if (!I.getType()->isPointerTy() || PTM.has(&I))
           continue;
         if (auto *PHI = dyn_cast<PHINode>(&I))
-          for (unsigned J = 0; J < PHI->getNumIncomingValues(); ++J)
-            if (auto *Ty = PTM.get(PHI->getIncomingValue(J))) {
-              PTM.set(&I, Ty);
-              break;
-            }
+          if (Type *Ty = requiredPhiPointee(PHI, PTM))
+            PTM.set(&I, Ty);
         if (isa<IntToPtrInst>(&I))
           if (auto *Ty = PointeeTypeMap::inferFromUsage(&I))
             PTM.set(&I, Ty);
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
           PTM.set(&I, GEP->getResultElementType());
+        if (auto *AI = dyn_cast<AllocaInst>(&I))
+          PTM.set(&I, AI->getAllocatedType());
       }
 
   // Phase 5: i1* → i8*
@@ -267,49 +292,31 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
       for (auto &Arg : F.args())
         if (Arg.getType()->isPointerTy() &&
             Arg.getType()->getPointerAddressSpace() == AS::Device &&
-            !isIntegerDevicePointer(&Arg))
+            !isNonFloatScalarDevicePointer(&Arg))
           PTM.set(&Arg, F32);
 
       for (auto &BB : F)
         for (auto &I : BB)
           if (I.getType()->isPointerTy() &&
               I.getType()->getPointerAddressSpace() == AS::Device &&
-              !isIntegerDevicePointer(&I))
+              !isNonFloatScalarDevicePointer(&I))
             PTM.set(&I, F32);
 
       for (auto &Arg : F.args())
         if (Arg.getType()->isPointerTy() &&
             Arg.getType()->getPointerAddressSpace() == AS::Device &&
-            !PTM.has(&Arg) && !isIntegerDevicePointer(&Arg))
+            !PTM.has(&Arg) && !isNonFloatScalarDevicePointer(&Arg))
           PTM.set(&Arg, F32);
     }
 
     // MMA declaration params → typed pointer (float*/half*/bfloat*)
-    {
-      Type *F16 = Type::getHalfTy(M.getContext());
-      Type *BF16 = Type::getBFloatTy(M.getContext());
-      for (auto &F : M) {
-        if (!F.isDeclaration())
-          continue;
-        StringRef Name = F.getName();
-        Type *PtrPointee = nullptr;
-        if (Name == kMMALoad || Name == kMMAStore || Name == kMMALoadDev ||
-            Name == kMMAStoreDev)
-          PtrPointee = F32;
-        else if (Name.contains("p1f16") &&
-                 Name.starts_with("air.simdgroup_matrix_8x8_"))
-          PtrPointee = F16;
-        else if ((Name.contains("p1bf16") || Name.contains("p3bf16")) &&
-                 Name.starts_with("air.simdgroup_matrix_8x8_"))
-          PtrPointee = BF16;
-        else if ((Name.contains("p1f16") || Name.contains("p3f16")) &&
-                 Name.starts_with("air.simdgroup_matrix_8x8_"))
-          PtrPointee = F16;
-        if (PtrPointee)
-          for (auto &Arg : F.args())
-            if (Arg.getType()->isPointerTy())
-              PTM.set(&Arg, PtrPointee);
-      }
+    for (auto &F : M) {
+      if (!F.isDeclaration())
+        continue;
+      if (Type *PtrPointee = mmaElemFromName(F.getName(), M.getContext()))
+        for (auto &Arg : F.args())
+          if (Arg.getType()->isPointerTy())
+            PTM.set(&Arg, PtrPointee);
     }
 
     // MMA kernel device pointer args → float*
@@ -318,7 +325,7 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
         for (auto &Arg : F.args())
           if (Arg.getType()->isPointerTy() &&
               Arg.getType()->getPointerAddressSpace() == AS::Device &&
-              !isIntegerDevicePointer(&Arg))
+              !isNonFloatScalarDevicePointer(&Arg))
             PTM.set(&Arg, F32);
 
     // MMA call site pointer operands → typed pointer
@@ -329,18 +336,7 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
           if (!CI || !CI->getCalledFunction())
             continue;
           StringRef Name = CI->getCalledFunction()->getName();
-          if (!Name.starts_with("air.simdgroup_matrix_8x8_"))
-            continue;
-          Type *PtrPointee = nullptr;
-          if (Name == kMMALoad || Name == kMMAStore || Name == kMMALoadDev ||
-              Name == kMMAStoreDev)
-            PtrPointee = F32;
-          else if (Name.contains("p1f16") || Name.contains("p3f16"))
-            PtrPointee = Type::getHalfTy(M.getContext());
-          else if (Name.contains("p1bf16") || Name.contains("p3bf16"))
-            PtrPointee = Type::getBFloatTy(M.getContext());
-          else if (Name.contains("p3f32"))
-            PtrPointee = F32;
+          Type *PtrPointee = mmaElemFromName(Name, M.getContext());
           if (PtrPointee)
             for (unsigned J = 0; J < CI->arg_size(); J++)
               if (CI->getArgOperand(J)->getType()->isPointerTy())
@@ -350,9 +346,7 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
 
   // Phase 7: Async copy overrides (AFTER MMA collapse, re-applies i8*)
   if (HasAsyncCopy) {
-    StructType *EventTy = StructType::getTypeByName(M.getContext(), "event_t");
-    if (!EventTy)
-      EventTy = StructType::create(M.getContext(), "event_t");
+    StructType *EventTy = getOrCreateEventType(M.getContext());
 
     for (auto &F : M) {
       if (!F.isDeclaration())
@@ -421,40 +415,10 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
         }
   }
 
-  // Phase 8: Fix up ptr-to-ptr bitcasts for typed pointer transitions.
-  // Some upstream passes leave identity bitcasts (ptr→ptr) before non-float
-  // device loads from phi pointers; MMA collapse clobbers their PTM to float*.
-  // Re-infer from load/store usage.
-  for (auto &F : M)
-    for (auto &BB : F)
-      for (auto &I : BB) {
-        auto *BC = dyn_cast<BitCastInst>(&I);
-        if (!BC || !BC->getType()->isPointerTy())
-          continue;
-        if (BC->getSrcTy() != BC->getDestTy())
-          continue;
-        if (BC->getType()->getPointerAddressSpace() != AS::Device)
-          continue;
-        for (auto *U : BC->users()) {
-          if (auto *LI = dyn_cast<LoadInst>(U)) {
-            if (!LI->getType()->isFloatTy()) {
-              PTM.set(BC, LI->getType());
-              break;
-            }
-          }
-          if (auto *SI = dyn_cast<StoreInst>(U)) {
-            if (SI->getPointerOperand() == BC &&
-                !SI->getValueOperand()->getType()->isFloatTy()) {
-              PTM.set(BC, SI->getValueOperand()->getType());
-              break;
-            }
-          }
-        }
-      }
-
-  // Phase 8b: Unify pointer-typed select arms to one pointee (the JIT derives
-  // the result pointee from the arm type IDs and rejects disagreement),
-  // preferring a concrete (non-inttoptr) arm's type.
+  // Phase 8b: Unify pointer-typed select arms. The Metal GPU JIT refuses to
+  // materialize a `select i1, ptr, ptr` whose arm pointee types disagree. Force
+  // both arms and the select to one pointee, preferring a concrete
+  // (non-inttoptr) arm.
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB) {
@@ -463,18 +427,9 @@ PointeeTypeMap buildPointeeTypeMap(Module &M) {
           continue;
         Value *TV = Sel->getTrueValue();
         Value *FV = Sel->getFalseValue();
-        Type *TT = PTM.get(TV);
-        Type *FT = PTM.get(FV);
-        if (TT == FT)
+        if (PTM.get(TV) == PTM.get(FV))
           continue;
-        // Prefer the arm that is NOT an inttoptr (concrete typed pointer).
-        Type *Unified = nullptr;
-        if (TT && !isa<IntToPtrInst>(TV))
-          Unified = TT;
-        else if (FT && !isa<IntToPtrInst>(FV))
-          Unified = FT;
-        else
-          Unified = TT ? TT : FT;
+        Type *Unified = requiredSelectPointee(Sel, PTM);
         if (!Unified)
           continue;
         PTM.set(TV, Unified);

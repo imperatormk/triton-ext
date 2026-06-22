@@ -16,6 +16,7 @@
 #define MODULE_PASS(NAME, CREATE_PASS)
 #endif
 MODULE_PASS("metal-inline-non-kernel", MetalInlineNonKernelPass())
+MODULE_PASS("metal-legalize-unsupported-ir", MetalLegalizeUnsupportedIRPass())
 MODULE_PASS("metal-llvm-to-air-intrinsics", MetalLLVMToAIRIntrinsicsPass())
 MODULE_PASS("metal-barrier-rename", MetalBarrierRenamePass())
 MODULE_PASS("metal-scalar-store-guard", MetalScalarStoreGuardPass())

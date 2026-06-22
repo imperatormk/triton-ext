@@ -83,6 +83,11 @@ public:
 
   ValueEnumerator(llvm::Module &M, const PointeeTypeMap &PTM);
 
+  /// Set once enumeration freezes the type table. After this, ptrTypeIdx must
+  /// resolve to a pre-registered entry; appending a new typed-pointer slot at
+  /// emit time would index past the table the reader already sized.
+  bool frozen = false;
+
   /// Get type index for a non-pointer type.
   unsigned typeIdx(llvm::Type *T);
 
@@ -91,6 +96,13 @@ public:
 
   /// Get typed pointer index for a Value using PTM inference.
   unsigned ptrTypeIdxForValue(const llvm::Value *V);
+
+  /// Type index for a Value in the value table: a Function resolves to
+  /// ptr(its function type), a GlobalVariable to its per-global typed pointer,
+  /// other pointers via PTM inference, scalars directly. (Unlike typeIdx(),
+  /// which collapses AS0 function pointers and would resolve a Function to
+  /// null.)
+  unsigned typeIdxForValue(const llvm::Value *V);
 
   /// Get type index for a global variable's pointer type (uses value type as
   /// pointee).
@@ -116,6 +128,9 @@ private:
   unsigned addFunctionType(llvm::FunctionType *FT, const llvm::Function *F);
   unsigned addEntry(TypeEntry E);
   void collectMetadataConstants(const llvm::MDNode *N);
+  void
+  collectMetadataConstants(const llvm::MDNode *N,
+                           llvm::SmallPtrSetImpl<const llvm::MDNode *> &Seen);
 };
 
 } // namespace metal

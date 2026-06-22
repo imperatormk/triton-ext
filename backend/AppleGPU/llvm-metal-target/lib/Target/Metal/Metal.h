@@ -25,6 +25,14 @@ void initializeMetalInlineNonKernelLegacyPass(PassRegistry &);
 /// Pass to inline all calls to defined functions (AIR has no call stack).
 ModulePass *createMetalInlineNonKernelLegacyPass();
 
+/// Initializer for the Metal legalize-unsupported-IR pass.
+void initializeMetalLegalizeUnsupportedIRLegacyPass(PassRegistry &);
+
+/// Pass to strip/lower constructs the AIR v1 bitcode + AGX JIT can't encode
+/// (lifetime intrinsics, wide integers, freeze, nneg zext, disjoint,
+/// scmp/ucmp).
+ModulePass *createMetalLegalizeUnsupportedIRLegacyPass();
+
 /// Initializer for the Metal LLVM-to-AIR intrinsic renaming pass.
 void initializeMetalLLVMToAIRIntrinsicsLegacyPass(PassRegistry &);
 

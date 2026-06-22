@@ -17,6 +17,8 @@
 #include "ValueEnumerator.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
@@ -83,7 +85,7 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
   // inferredPointee[PtrAs3] = EventTy so a bare typeIdx(PtrAs3) resolves to
   // event_t*3 (needed for wait_simdgroup_events param 1).
   {
-    StructType *EventTy = StructType::getTypeByName(Ctx, "event_t");
+    StructType *EventTy = StructType::getTypeByName(Ctx, kEventTypeName);
     if (EventTy) {
       addType(EventTy);
       auto *PtrAs3 = PointerType::get(Ctx, 3);
@@ -136,6 +138,23 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
           ptrTypeIdx(PointerType::get(M.getContext(), 0),
                      AI->getAllocatedType());
         }
+        // Register ptr(accessed type) for poison/undef addresses so the type
+        // table has the slot FunctionWriter's PoisonPtrTypeIdx SETTYPE
+        // references.
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          if (isa<UndefValue>(SI->getPointerOperand()))
+            ptrTypeIdx(SI->getPointerOperand()->getType(),
+                       SI->getValueOperand()->getType());
+        }
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          if (isa<UndefValue>(LI->getPointerOperand()))
+            ptrTypeIdx(LI->getPointerOperand()->getType(), LI->getType());
+        }
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+          if (isa<UndefValue>(GEP->getPointerOperand()))
+            ptrTypeIdx(GEP->getPointerOperand()->getType(),
+                       GEP->getSourceElementType());
+        }
         // GEP result ptr(elementType, addrspace). PTM override for device (AS1)
         // pointers; keep GEP's own element type for AS3 byte globals (stay
         // i8*).
@@ -162,17 +181,17 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
             ptrTypeIdx(PointerType::get(M.getContext(), AddrSpace), Pointee);
           }
         }
-        // Bitcast ptr→ptr changes the typed pointer in Metal v1; create a
-        // separate typed pointer entry from PTM.
-        if (auto *BC = dyn_cast<BitCastInst>(&I)) {
-          if (BC->getType()->isPointerTy() &&
-              BC->getSrcTy() == BC->getDestTy()) {
-            if (auto *PtmTy = PTM.get(BC)) {
-              unsigned AddrSpace = BC->getType()->getPointerAddressSpace();
-              ptrTypeIdx(PointerType::get(M.getContext(), AddrSpace), PtmTy);
-            }
-          }
-        }
+        // Any remaining pointer-producing instruction whose result carries a
+        // PTM pointee (inttoptr, bitcast, addrspacecast, ...) emits a CAST
+        // record keyed on that pointee; register its typed pointer so the
+        // writer never indexes past the frozen type table. Alloca and GEP keep
+        // their own pointee derivation above.
+        if (!isa<AllocaInst>(&I) && !isa<GetElementPtrInst>(&I) &&
+            I.getType()->isPointerTy())
+          if (auto *PtmTy = PTM.get(&I))
+            ptrTypeIdx(PointerType::get(M.getContext(),
+                                        I.getType()->getPointerAddressSpace()),
+                       PtmTy);
       }
     }
   }
@@ -202,6 +221,17 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
   for (auto &NMD : M.named_metadata())
     for (unsigned I = 0; I < NMD.getNumOperands(); I++)
       collectMetadataConstants(NMD.getOperand(I));
+
+  // Instruction-attached metadata (tbaa/alias.scope) can wrap constants the
+  // MetadataEnumerator references by moduleConstIdx but no code operand uses.
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        SmallVector<std::pair<unsigned, MDNode *>, 4> MDs;
+        I.getAllMetadataOtherThanDebugLoc(MDs);
+        for (auto &P : MDs)
+          collectMetadataConstants(P.second);
+      }
 
   for (auto &GV : M.globals())
     if (GV.hasInitializer())
@@ -236,6 +266,8 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
       }
     }
   }
+
+  frozen = true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -258,7 +290,26 @@ unsigned ValueEnumerator::ptrTypeIdxForValue(const Value *V) {
     Pointee = Ty;
   if (!Pointee)
     Pointee = pointeeType(V->getType());
+  if (frozen && !typeMap.count(TypeEntry{V->getType(), Pointee})) {
+    std::string Msg;
+    raw_string_ostream OS(Msg);
+    OS << "AIRWriter: pointer value '" << V->getName()
+       << "' resolves to an unregistered typed-pointer entry at emit time; "
+          "its producing instruction was not enumerated (would desync the "
+          "frozen type table). Add it to ValueEnumerator's registration loop.";
+    report_fatal_error(StringRef(OS.str()));
+  }
   return ptrTypeIdx(V->getType(), Pointee);
+}
+
+unsigned ValueEnumerator::typeIdxForValue(const Value *V) {
+  if (auto *F = dyn_cast<Function>(V))
+    return ptrTypeIdx(F->getType(), F->getFunctionType());
+  if (auto *GV = dyn_cast<GlobalVariable>(V))
+    return globalPtrTypeIdx(GV);
+  if (V->getType()->isPointerTy())
+    return ptrTypeIdxForValue(V);
+  return typeIdx(V->getType());
 }
 
 unsigned ValueEnumerator::ptrTypeIdx(Type *PtrTy, Type *Pointee) {
@@ -379,7 +430,7 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
     if (F && F->isDeclaration() &&
         F->getName().starts_with("air.simdgroup_async_copy")) {
       auto &Ctx = F->getContext();
-      if (auto *EventTy = StructType::getTypeByName(Ctx, "event_t"))
+      if (auto *EventTy = StructType::getTypeByName(Ctx, kEventTypeName))
         RetPointee = EventTy;
     }
     // For declarations, infer from how call results are typed in PTM
@@ -444,16 +495,27 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
 
     if (!Pointee && F && !F->isDeclaration() && I < F->arg_size())
       Pointee = pointeeTypeForValue(F->getArg(I));
-    // For declarations, infer from call site arguments
+    // For declarations, infer from call site args, skipping poison/undef (they
+    // collapse to the AS default). Scan every function sharing this
+    // FunctionType (the cache key) so an uncalled sibling doesn't lock in the
+    // default pointee.
     if (!Pointee && F && F->isDeclaration()) {
-      for (auto *U : F->users()) {
-        if (auto *CI = dyn_cast<CallInst>(U)) {
-          if (I < CI->arg_size()) {
-            Pointee = pointeeTypeForValue(CI->getArgOperand(I));
-            if (Pointee)
-              break;
+      for (auto &Sib : *F->getParent()) {
+        if (Sib.getFunctionType() != FT)
+          continue;
+        for (auto *U : Sib.users()) {
+          if (auto *CI = dyn_cast<CallInst>(U)) {
+            if (CI->getCalledFunction() == &Sib && I < CI->arg_size()) {
+              if (isa<UndefValue>(CI->getArgOperand(I)))
+                continue;
+              Pointee = pointeeTypeForValue(CI->getArgOperand(I));
+              if (Pointee)
+                break;
+            }
           }
         }
+        if (Pointee)
+          break;
       }
     }
     if (!Pointee)
@@ -490,12 +552,21 @@ void ValueEnumerator::addModuleConstant(const Constant *C) {
 }
 
 void ValueEnumerator::collectMetadataConstants(const MDNode *N) {
+  SmallPtrSet<const MDNode *, 16> Seen;
+  collectMetadataConstants(N, Seen);
+}
+
+void ValueEnumerator::collectMetadataConstants(
+    const MDNode *N, SmallPtrSetImpl<const MDNode *> &Seen) {
+  // tbaa/alias-scope graphs are cyclic; guard against unbounded recursion.
+  if (!N || !Seen.insert(N).second)
+    return;
   for (unsigned I = 0; I < N->getNumOperands(); I++) {
     if (auto *VAM = dyn_cast_or_null<ValueAsMetadata>(N->getOperand(I)))
       if (auto *C = dyn_cast<Constant>(VAM->getValue()))
         addModuleConstant(C);
     if (auto *Sub = dyn_cast_or_null<MDNode>(N->getOperand(I)))
-      collectMetadataConstants(Sub);
+      collectMetadataConstants(Sub, Seen);
   }
 }
 

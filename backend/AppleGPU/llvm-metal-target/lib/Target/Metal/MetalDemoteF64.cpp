@@ -569,3 +569,8 @@ INITIALIZE_PASS(MetalDemoteF64Legacy, DEBUG_TYPE, "Metal Demote f64 to f32",
 ModulePass *llvm::createMetalDemoteF64LegacyPass() {
   return new MetalDemoteF64Legacy();
 }
+
+// TODO: AGX has no f64 silicon, so this narrows f64->f32 (lossy: 53->24
+// mantissa bits). The only precision-preserving alternative is double-double
+// (two-f32 limb) software emulation of every f64 op, which is far slower and
+// not yet worth it; revisit if a kernel needs true f64 accuracy.

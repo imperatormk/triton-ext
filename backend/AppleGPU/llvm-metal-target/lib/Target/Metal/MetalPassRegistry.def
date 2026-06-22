@@ -18,6 +18,7 @@
 MODULE_PASS("metal-inline-non-kernel", MetalInlineNonKernelPass())
 MODULE_PASS("metal-demote-f64", MetalDemoteF64Pass())
 MODULE_PASS("metal-lower-fneg", MetalLowerFNegPass())
+MODULE_PASS("metal-legalize-unsupported-ir", MetalLegalizeUnsupportedIRPass())
 MODULE_PASS("metal-nan-min-max", MetalNaNMinMaxPass())
 MODULE_PASS("metal-llvm-to-air-intrinsics", MetalLLVMToAIRIntrinsicsPass())
 MODULE_PASS("metal-barrier-rename", MetalBarrierRenamePass())

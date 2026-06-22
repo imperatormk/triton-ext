@@ -1,4 +1,4 @@
-//===- IntegerLegalize.cpp - AGX-JIT integer/intrinsic legalization -------===//
+//===- MetalLegalizeUnsupportedIR.cpp - Strip unsupported IR -------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,25 +6,29 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Pre-serialization legalizations that bring integer arithmetic, freeze, and a
-// handful of intrinsics into the subset the AGX JIT and AIR v1 bitcode accept.
-// Each enforces a single AIR/AGX limitation; see the per-function notes.
+// Strip/lower newer-LLVM constructs the AIR v1 bitcode and AGX JIT can't
+// encode. Each transform enforces a single AIR/AGX limitation; see the
+// per-function notes.
 //
 //===----------------------------------------------------------------------===//
 
-#include "IntegerLegalize.h"
+#include "MetalLegalizeUnsupportedIR.h"
+#include "Metal.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Module.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 
-namespace llvm {
-namespace metal {
+#define DEBUG_TYPE "metal-legalize-unsupported-ir"
+
+namespace {
 
 // The Metal AIR backend has no lowering for llvm.scmp/llvm.ucmp ("Undefined
 // symbols: llvm.scmp.*"). Expand inline: scmp(a,b) = zext(a>b) - zext(a<b),
@@ -258,5 +262,33 @@ void stripDisjointFlags(Module &M) {
             BO->setIsDisjoint(false);
 }
 
-} // namespace metal
-} // namespace llvm
+bool legalizeUnsupportedIR(Module &M) {
+  stripLifetimeIntrinsics(M);
+  expandWideIntegers(M);
+  lowerFreezeInsts(M);
+  canonicalizeNNegZExt(M);
+  stripDisjointFlags(M);
+  lowerCmpIntrinsics(M);
+  return true;
+}
+
+} // namespace
+
+PreservedAnalyses
+MetalLegalizeUnsupportedIRPass::run(Module &M, ModuleAnalysisManager &AM) {
+  return legalizeUnsupportedIR(M) ? PreservedAnalyses::none()
+                                  : PreservedAnalyses::all();
+}
+
+bool MetalLegalizeUnsupportedIRLegacy::runOnModule(Module &M) {
+  return legalizeUnsupportedIR(M);
+}
+
+char MetalLegalizeUnsupportedIRLegacy::ID = 0;
+
+INITIALIZE_PASS(MetalLegalizeUnsupportedIRLegacy, DEBUG_TYPE,
+                "Metal Legalize Unsupported IR", false, false)
+
+ModulePass *llvm::createMetalLegalizeUnsupportedIRLegacyPass() {
+  return new MetalLegalizeUnsupportedIRLegacy();
+}

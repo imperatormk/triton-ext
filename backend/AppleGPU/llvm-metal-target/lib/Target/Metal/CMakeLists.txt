@@ -40,6 +40,7 @@ set(METAL_CODEGEN_SOURCES
   MetalDeviceLoadsVolatile.cpp
   MetalInlineNonKernel.cpp
   MetalLLVMToAIRIntrinsics.cpp
+  MetalLegalizeUnsupportedIR.cpp
   MetalLowerAtomicRMW.cpp
   MetalLowerFNeg.cpp
   MetalNaNMinMax.cpp
@@ -76,7 +77,6 @@ set(METAL_AIRWRITER_SOURCES
   AIRWriter/ConstantsWriter.cpp
   AIRWriter/CoopTensorLowering.cpp
   AIRWriter/FunctionWriter.cpp
-  AIRWriter/IntegerLegalize.cpp
   AIRWriter/LowerPointerVectors.cpp
   AIRWriter/LowerVectorSelect.cpp
   AIRWriter/MetadataWriter.cpp

@@ -37,6 +37,14 @@ void initializeMetalLowerFNegLegacyPass(PassRegistry &);
 /// Pass to rewrite `fneg x` as `fsub -0.0, x`.
 ModulePass *createMetalLowerFNegLegacyPass();
 
+/// Initializer for the Metal legalize-unsupported-IR pass.
+void initializeMetalLegalizeUnsupportedIRLegacyPass(PassRegistry &);
+
+/// Pass to strip/lower constructs the AIR v1 bitcode + AGX JIT can't encode
+/// (lifetime intrinsics, wide integers, freeze, nneg zext, disjoint,
+/// scmp/ucmp).
+ModulePass *createMetalLegalizeUnsupportedIRLegacyPass();
+
 /// Initializer for the Metal NaN-safe min/max pass.
 void initializeMetalNaNMinMaxLegacyPass(PassRegistry &);
 

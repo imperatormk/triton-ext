@@ -25,6 +25,7 @@
 #include "MetalDeviceLoadsVolatile.h"
 #include "MetalInlineNonKernel.h"
 #include "MetalLLVMToAIRIntrinsics.h"
+#include "MetalLegalizeUnsupportedIR.h"
 #include "MetalLowerAtomicRMW.h"
 #include "MetalLowerFNeg.h"
 #include "MetalNaNMinMax.h"
@@ -76,6 +77,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMetalTarget() {
   initializeMetalInlineNonKernelLegacyPass(*PR);
   initializeMetalDemoteF64LegacyPass(*PR);
   initializeMetalLowerFNegLegacyPass(*PR);
+  initializeMetalLegalizeUnsupportedIRLegacyPass(*PR);
   initializeMetalNaNMinMaxLegacyPass(*PR);
   initializeMetalLLVMToAIRIntrinsicsLegacyPass(*PR);
   initializeMetalBarrierRenameLegacyPass(*PR);
@@ -145,6 +147,7 @@ public:
     // (any surviving double crashes the Metal shader compiler).
     addPass(createMetalDemoteF64LegacyPass());
     addPass(createMetalLowerFNegLegacyPass());
+    addPass(createMetalLegalizeUnsupportedIRLegacyPass());
     addPass(createMetalNaNMinMaxLegacyPass());
     addPass(createMetalLLVMToAIRIntrinsicsLegacyPass());
     addPass(createMetalBarrierRenameLegacyPass());

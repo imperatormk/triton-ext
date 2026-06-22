@@ -17,7 +17,6 @@
 #include "BitcodeEncoding.h"
 #include "ConstantExprLower.h"
 #include "CoopTensorLowering.h"
-#include "IntegerLegalize.h"
 #include "LowerPointerVectors.h"
 #include "LowerVectorSelect.h"
 #include "MetadataWriter.h"
@@ -387,15 +386,11 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, PointeeTypeMap &PTM) {
     // Pre-serialization IR fixups: bring the O3 module into the subset Metal v1
     // bitcode + AGX JIT accept, refining the PTM in place. Four ordered stages;
     // stage A's lowering reshapes the IR the later type fixups inspect.
-    // Stage A: legalize / lower constructs the AGX JIT can't take.
+    // Stage A: legalize / lower constructs the AGX JIT can't take. (The pure
+    // IR strips — lifetime/wide-int/freeze/nneg/disjoint/scmp — run earlier as
+    // the MetalLegalizeUnsupportedIR codegen-prepare pass, asm-visible.)
     retagTensorOpsExternallyDefined(M);
-    stripLifetimeIntrinsics(M);
-    expandWideIntegers(M);
-    lowerFreezeInsts(M);
-    canonicalizeNNegZExt(M);
-    stripDisjointFlags(M);
     scalarizeBoolVectorCasts(M);
-    lowerCmpIntrinsics(M);
     lowerVectorPointerToInt(M);
     lowerVectorSelects(M);
     removeRedundantBitcasts(M, PTM);

@@ -1,78 +1,67 @@
 # llvm-metal-target
 
-An **out-of-tree fork** of `llvm/lib/Target/Metal` from the
-[`imperatormk/llvm-project`](https://github.com/imperatormk/llvm-project) branch
-`metal-target-poc`.
+An **out-of-tree fork** of an LLVM AIR (Apple GPU) codegen target, kept in sync
+with its canonical twin (the `AIR` target on the `metal-target-poc` llvm-project
+branch).
 
 ## Why this exists
 
-Triton-main pins its LLVM at SHA `87717bf9` and ships prebuilt LLVM tarballs to
-`~/.triton/llvm/llvm-87717bf9-macos-arm64/`. The triton-ext AppleGPU backend
-cannot patch that pinned LLVM, but it still needs the Metal/AIR codegen target
-to translate LLVM IR into a `.metallib`.
+Triton pins its LLVM to a specific commit and ships prebuilt LLVM tarballs under
+`~/.triton/llvm/`. The triton-ext AppleGPU backend cannot patch that pinned
+LLVM, but it still needs an AIR codegen target to translate LLVM IR into a
+`.metallib`.
 
-This directory builds the Metal target as a **plugin shared library**
-(`libLLVMMetalTarget.dylib`) plus a thin driver (`metal-llc`) that
-`triton_apple_backend/compiler.py` can invoke in place of the in-tree
-`llc -mtriple=air -filetype=obj`.
+This directory builds that target as a **plugin shared library**
+(`libLLVMMetalTarget.dylib`) plus a thin driver (`metal-llc`, in/out: LLVM
+bitcode to metallib) that `triton_apple_backend/compiler.py` invokes via
+`subprocess`.
 
 ## Layout
 
 ```text
 llvm-metal-target/
 ├── CMakeLists.txt              top-level: find_package(LLVM CONFIG)
-├── README.md                   this file
-├── STAGE_2_NOTES.md            known build gaps and the plan to close them
-├── MIRROR_MANIFEST.txt         source files mirrored + their in-tree origin
-├── lib/Target/Metal/           mirror of llvm/lib/Target/Metal
-│   ├── *.cpp *.h *.td *.def
-│   ├── AIRWriter/
+├── lib/Target/Metal/           the AIR codegen target
+│   ├── *.cpp *.h *.td *.def    TargetMachine + IR-legalization passes
+│   ├── AIRWriter/              LLVM IR to AIR bitcode writer (typed-pointer
+│   │                           reconstruction, metadata, metallib container)
 │   ├── MCTargetDesc/
 │   └── TargetInfo/
-├── tools/metal-llc/            minimal llc shim (bitcode in, metallib out)
-└── test/                       placeholder for lit tests
+└── test/                       lit tests (FileCheck against emitted IR)
 ```
 
-## Build (stage 2 territory)
+The writer (`AIRWriter/`) is the substantial part: it reconstructs the typed
+POINTER records and `!air.*` kernel metadata the AGX driver requires, and
+serializes the metallib. Its file structure is kept symmetric with the twin so
+changes transfer between the two.
+
+## Build
+
+Built as part of the parent triton-ext build
+(`ninja -C build metal-llc libapplegpu_backend.dylib` from the repo root; see
+`backend/AppleGPU/README.md`). To build this target standalone against any LLVM
+install:
 
 ```sh
-cmake -B build -S . \
-  -DLLVM_DIR=$HOME/.triton/llvm/llvm-87717bf9-macos-arm64/lib/cmake/llvm
+cmake -B build -S . -DLLVM_DIR=<llvm install>/lib/cmake/llvm
 cmake --build build -j
 ```
 
-By default `LLVM_DIR` points at Triton's prebuilt LLVM. Override it to build
-against any other LLVM 21.x install.
+`LLVM_DIR` defaults to Triton's prebuilt LLVM under `~/.triton/llvm/`.
 
 ## How the AppleGPU backend consumes it
 
-The plan: `triton_apple_backend.compiler._find_llc()` already honours the
-`METAL_LLC_PATH` env var. Once stage 2 produces a working `build/bin/metal-llc`,
-point that env var at it:
+`triton_apple_backend.compiler._find_llc()` honours the `METAL_LLC_PATH` env
+var, falling back to `build/bin/metal-llc`:
 
 ```sh
 export METAL_LLC_PATH=$PWD/build/bin/metal-llc
 ```
 
-A later refinement may swap the subprocess for an in-process `dlopen` of
-`libLLVMMetalTarget.dylib` driven by `ctypes` (env: `METAL_TARGET_DYLIB_PATH`)
-to avoid the fork/exec.
+## Upstream twin
 
-## Upstream reference
-
-The authoritative source remains
-`/Users/zimski/projects/oss/triton-main/llvm-project/llvm/lib/Target/Metal/` on
-the `metal-target-poc` branch. This directory is a **fork**, not a mirror:
-expect divergence as we work around the gaps in Triton's pinned LLVM (see
-`STAGE_2_NOTES.md`).
-
-## Sync workflow
-
-When the in-tree branch moves forward:
-
-1. `diff -ru` the in-tree `Metal/` against `lib/Target/Metal/` here using
-   `MIRROR_MANIFEST.txt` as the file list.
-1. Cherry-pick changes that don't touch the Triple::air / MetalLib hooks.
-1. Re-apply the out-of-tree shims listed in `STAGE_2_NOTES.md` if the in-tree
-   files now reference newly-added APIs.
-1. Bump the timestamps + sizes in `MIRROR_MANIFEST.txt`.
+The canonical source is the `AIR` codegen target on the `metal-target-poc`
+llvm-project branch (`llvm/lib/Target/AIR/`, files prefixed `AIR*`). This
+`Metal*`-prefixed directory stays symmetric with it: writer/transform fixes land
+in both. It is a fork, not a mirror; expect deliberate divergence where we work
+around the gaps in Triton's pinned LLVM.

@@ -11,6 +11,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
@@ -25,8 +26,8 @@ namespace metal {
 // (AS1)/TG (AS3) ptrs must be typed; with MMA intrinsics all device ptrs become
 // float*; i1* crashes the JIT so remap to i8*.
 //
-// The override logic is near-duplicated in PointeeTypeAnalysis::run and
-// InferTypedPointersPass::run and must stay in sync; change BOTH.
+// The pointee-typing rules shared by the one-shot analysis and the
+// post-mutation repairs live once in PointeeRules.h; both call those functions.
 namespace mma_intrinsics {
 inline constexpr const char *kLoad =
     "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
@@ -83,6 +84,15 @@ private:
 // Pure function of the module (no analysis-manager state), so callers outside
 // the new-PM machinery (e.g. the legacy metallib writer pass) can call it.
 PointeeTypeMap buildPointeeTypeMap(llvm::Module &M);
+
+// The async-copy event handle named-struct. The single owner of the "event_t"
+// named type: the analysis (Phase 7) creates it via getOrCreateEventType when a
+// module uses async copy; the enumerator and function writer only look it up by
+// kEventTypeName and stay no-op when absent (creating an unused event_t would
+// leak it into the emitted type table). LLVM 14 readers reject forward
+// references, so it must exist before function-type processing.
+inline constexpr llvm::StringRef kEventTypeName = "event_t";
+llvm::StructType *getOrCreateEventType(llvm::LLVMContext &Ctx);
 
 struct PointeeTypeAnalysis : llvm::AnalysisInfoMixin<PointeeTypeAnalysis> {
   using Result = PointeeTypeMap;

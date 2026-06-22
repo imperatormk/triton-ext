@@ -17,6 +17,8 @@
 #include "ValueEnumerator.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
@@ -83,7 +85,7 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
   // inferredPointee[PtrAs3] = EventTy so a bare typeIdx(PtrAs3) resolves to
   // event_t*3 (needed for wait_simdgroup_events param 1).
   {
-    StructType *EventTy = StructType::getTypeByName(Ctx, "event_t");
+    StructType *EventTy = StructType::getTypeByName(Ctx, kEventTypeName);
     if (EventTy) {
       addType(EventTy);
       auto *PtrAs3 = PointerType::get(Ctx, 3);
@@ -179,17 +181,17 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
             ptrTypeIdx(PointerType::get(M.getContext(), AddrSpace), Pointee);
           }
         }
-        // Bitcast ptr→ptr changes the typed pointer in Metal v1; create a
-        // separate typed pointer entry from PTM.
-        if (auto *BC = dyn_cast<BitCastInst>(&I)) {
-          if (BC->getType()->isPointerTy() &&
-              BC->getSrcTy() == BC->getDestTy()) {
-            if (auto *PtmTy = PTM.get(BC)) {
-              unsigned AddrSpace = BC->getType()->getPointerAddressSpace();
-              ptrTypeIdx(PointerType::get(M.getContext(), AddrSpace), PtmTy);
-            }
-          }
-        }
+        // Any remaining pointer-producing instruction whose result carries a
+        // PTM pointee (inttoptr, bitcast, addrspacecast, ...) emits a CAST
+        // record keyed on that pointee; register its typed pointer so the
+        // writer never indexes past the frozen type table. Alloca and GEP keep
+        // their own pointee derivation above.
+        if (!isa<AllocaInst>(&I) && !isa<GetElementPtrInst>(&I) &&
+            I.getType()->isPointerTy())
+          if (auto *PtmTy = PTM.get(&I))
+            ptrTypeIdx(PointerType::get(M.getContext(),
+                                        I.getType()->getPointerAddressSpace()),
+                       PtmTy);
       }
     }
   }
@@ -264,6 +266,8 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
       }
     }
   }
+
+  frozen = true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -286,6 +290,15 @@ unsigned ValueEnumerator::ptrTypeIdxForValue(const Value *V) {
     Pointee = Ty;
   if (!Pointee)
     Pointee = pointeeType(V->getType());
+  if (frozen && !typeMap.count(TypeEntry{V->getType(), Pointee})) {
+    std::string Msg;
+    raw_string_ostream OS(Msg);
+    OS << "AIRWriter: pointer value '" << V->getName()
+       << "' resolves to an unregistered typed-pointer entry at emit time; "
+          "its producing instruction was not enumerated (would desync the "
+          "frozen type table). Add it to ValueEnumerator's registration loop.";
+    report_fatal_error(StringRef(OS.str()));
+  }
   return ptrTypeIdx(V->getType(), Pointee);
 }
 
@@ -417,7 +430,7 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
     if (F && F->isDeclaration() &&
         F->getName().starts_with("air.simdgroup_async_copy")) {
       auto &Ctx = F->getContext();
-      if (auto *EventTy = StructType::getTypeByName(Ctx, "event_t"))
+      if (auto *EventTy = StructType::getTypeByName(Ctx, kEventTypeName))
         RetPointee = EventTy;
     }
     // For declarations, infer from how call results are typed in PTM

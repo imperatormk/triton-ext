@@ -15,6 +15,7 @@
 
 #include "MetalEmbedderPass.h"
 #include "BitcodeEmitter.h"
+#include "ConstantExprLower.h"
 #include "MetallibWriter.h"
 #include "PointeeTypeMap.h"
 #include "llvm/ADT/ArrayRef.h"

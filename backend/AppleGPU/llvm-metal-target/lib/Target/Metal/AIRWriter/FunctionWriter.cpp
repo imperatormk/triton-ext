@@ -206,37 +206,15 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
       } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
         V.push_back(GEP->isInBounds() ? 1 : 0);
         // Metal GPU JIT requires GEP source type to match the pointer's
-        // pointee. For AS1 pointers collapsed to float*, remap i32 GEP source
-        // to float (same stride), but ONLY if all terminal users consume float.
+        // pointee. The analysis (PointeeTypeMap Phase 6) already collapsed AS1
+        // float buffers to float*; consult that result instead of re-deriving
+        // the MMA-float rule here, so source and pointee can't diverge.
         Type *GepSrcTy = GEP->getSourceElementType();
         if (GEP->getPointerAddressSpace() == metal::AS::Device &&
             GepSrcTy->isIntegerTy(32)) {
-          bool AllTerminalFloat = true;
-          SmallVector<const GetElementPtrInst *, 8> Worklist;
-          Worklist.push_back(GEP);
-          while (!Worklist.empty() && AllTerminalFloat) {
-            auto *G = Worklist.pop_back_val();
-            for (auto *U : G->users()) {
-              if (auto *SubGEP = dyn_cast<GetElementPtrInst>(U)) {
-                Worklist.push_back(SubGEP);
-              } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-                if (!LI->getType()->isFloatTy()) {
-                  AllTerminalFloat = false;
-                  break;
-                }
-              } else if (auto *SI = dyn_cast<StoreInst>(U)) {
-                if (!SI->getValueOperand()->getType()->isFloatTy()) {
-                  AllTerminalFloat = false;
-                  break;
-                }
-              } else {
-                AllTerminalFloat = false;
-                break;
-              }
-            }
-          }
-          if (AllTerminalFloat)
-            GepSrcTy = Type::getFloatTy(F.getContext());
+          if (auto *PtmTy = E.PTM.get(const_cast<GetElementPtrInst *>(GEP)))
+            if (PtmTy->isFloatTy())
+              GepSrcTy = PtmTy;
         }
         V.push_back(E.typeIdx(GepSrcTy));
         for (auto &Op : GEP->operands())
@@ -364,7 +342,7 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         Type *AllocTy = AI->getAllocatedType();
         if (AllocTy->isPointerTy() && AllocTy->getPointerAddressSpace() == 3) {
           if (auto *EvTy =
-                  StructType::getTypeByName(AI->getContext(), "event_t"))
+                  StructType::getTypeByName(AI->getContext(), kEventTypeName))
             V.push_back(
                 E.ptrTypeIdx(PointerType::get(AI->getContext(), 3), EvTy));
           else

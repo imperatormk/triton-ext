@@ -70,11 +70,19 @@ set(METAL_DESC_SOURCES
 )
 
 set(METAL_AIRWRITER_SOURCES
+  AIRWriter/AggregateScalarize.cpp
   AIRWriter/BitcodeEmitter.cpp
+  AIRWriter/ConstantExprLower.cpp
   AIRWriter/ConstantsWriter.cpp
+  AIRWriter/CoopTensorLowering.cpp
   AIRWriter/FunctionWriter.cpp
+  AIRWriter/IntegerLegalize.cpp
+  AIRWriter/LowerPointerVectors.cpp
   AIRWriter/LowerVectorSelect.cpp
   AIRWriter/MetadataWriter.cpp
+  AIRWriter/NormalizeGEPs.cpp
+  AIRWriter/PointeeRules.cpp
+  AIRWriter/PointerPointeeRepair.cpp
   # MetalEmbedderPass is registered in MetalPassRegistry.def for `opt -passes=`
   # use; keep compiling it even though the AsmPrinter pipeline is bypassed.
   AIRWriter/MetalEmbedderPass.cpp

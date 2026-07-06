@@ -420,8 +420,7 @@ struct ConvertLayoutOpAppleConversion
     // Per-lane (row,col) base for a distributed dst from its LinearLayout,
     // holding register bases at 0 (matches emitOffsetForLayout's register-
     // relative offsets). Used when the dst is a #dot_op (no makeBase fields).
-    auto makeBaseLL =
-        [&](Attribute enc) -> std::tuple<Value, Value, Value> {
+    auto makeBaseLL = [&](Attribute enc) -> std::tuple<Value, Value, Value> {
       auto ll = triton::gpu::toLinearLayout(shape, enc);
       auto kReg = rewriter.getStringAttr("register");
       auto kLane = rewriter.getStringAttr("lane");
@@ -438,8 +437,7 @@ struct ConvertLayoutOpAppleConversion
 
     // LinearLayout-based per-register offsets (blocked or AppleMma source).
     Attribute srcEncAttr = srcMmaEnc ? Attribute(srcMmaEnc) : Attribute(srcEnc);
-    Attribute dstEncAttr =
-        dstEnc ? Attribute(dstEnc) : Attribute(dstDotEnc);
+    Attribute dstEncAttr = dstEnc ? Attribute(dstEnc) : Attribute(dstDotEnc);
     auto srcOffsets = emitOffsetForLayout(srcEncAttr, srcTy);
     auto dstOffsets = emitOffsetForLayout(dstEncAttr, dstTy);
 

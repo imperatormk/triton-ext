@@ -460,10 +460,13 @@ class MPSBackend(BaseBackend):
 
     def add_stages(self, stages, options, language):
         if language == Language.GLUON:
-            stages["ttgir"] = lambda src, meta: self.gluon_to_ttgir(src, meta, options)
+            stages["ttgir"] = lambda src, meta: self.gluon_to_ttgir(
+                src, meta, options)
         else:
-            stages["ttir"] = lambda src, meta: self.make_ttir(src, meta, options)
-            stages["ttgir"] = lambda src, meta: self.make_ttgir(src, meta, options)
+            stages["ttir"] = lambda src, meta: self.make_ttir(
+                src, meta, options)
+            stages["ttgir"] = lambda src, meta: self.make_ttgir(
+                src, meta, options)
         stages["llir"] = lambda src, meta: self.make_llir(src, meta, options)
         stages["metallib"] = lambda src, meta: self.make_metallib(
             src, meta, options)

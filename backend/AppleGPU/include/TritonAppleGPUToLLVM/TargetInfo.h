@@ -24,6 +24,10 @@ public:
 
   void warpSync(Location loc, RewriterBase &rewriter) const override;
 
+  Value getGlobalTimer(RewriterBase &rewriter, Location loc) const override;
+
+  StringRef getAtomicSyncScope(MemSyncScope scope) const override;
+
   void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     Value ctaId, Value val, Value pred) const override;
 

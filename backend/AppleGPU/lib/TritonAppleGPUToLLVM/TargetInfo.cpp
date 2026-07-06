@@ -106,6 +106,26 @@ void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
   barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
 }
 
+Value TargetInfo::getGlobalTimer(RewriterBase &rewriter, Location loc) const {
+  // Apple AIR exposes no globaltimer special register; the timer intrinsic is
+  // only reachable from profiling ops that never appear in an MPS kernel.
+  auto i64Ty = rewriter.getIntegerType(64);
+  return LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                  rewriter.getI64IntegerAttr(0));
+}
+
+StringRef TargetInfo::getAtomicSyncScope(MemSyncScope scope) const {
+  switch (scope) {
+  case MemSyncScope::CTA:
+    return "threadgroup";
+  case MemSyncScope::GPU:
+    return "device";
+  case MemSyncScope::SYSTEM:
+    return {};
+  }
+  llvm_unreachable("unknown memory synchronization scope");
+}
+
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
                               Value ctaId, Value val, Value pred) const {
   assert(!ctaId && "Apple does not support cross-CTA transfers");

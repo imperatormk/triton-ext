@@ -31,6 +31,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 
 namespace mlir::triton::applegpu {
 
@@ -69,13 +70,25 @@ struct ConvertLayoutOpAppleConversion
     auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
     auto dstTy = cast<RankedTensorType>(op.getResult().getType());
 
-    // DotOperandEncoding target: identity pass-through from blocked source (the
-    // dot lowering peels the cvt). NOT for an MMA source - its per-thread
-    // element count differs, so the shared LinearLayout cvt must handle it.
+    // DotOperandEncoding target from a blocked source: peel only when a tt.dot
+    // actually consumes the result (the dot lowering reads the cvt SOURCE, so
+    // the converted struct is dead). With no dot consumer the dot_op struct is
+    // materialized - its per-thread element count differs from the source, so
+    // the conversion must be lowered for real (falls through to the TG path).
     if (isa<ttg::DotOperandEncodingAttr>(dstTy.getEncoding()) &&
         isa<ttg::BlockedEncodingAttr>(srcTy.getEncoding())) {
-      rewriter.replaceOp(op, adaptor.getSrc());
-      return success();
+      bool consumedByDot = !op->use_empty();
+      for (OpOperand &use : op->getUses()) {
+        auto dot = dyn_cast<triton::DotOp>(use.getOwner());
+        if (!dot || use.getOperandNumber() >= 2) {
+          consumedByDot = false;
+          break;
+        }
+      }
+      if (consumedByDot) {
+        rewriter.replaceOp(op, adaptor.getSrc());
+        return success();
+      }
     }
 
     // A/B operands of an AppleMma dot need no lowering: the dot pattern reads
@@ -123,7 +136,12 @@ struct ConvertLayoutOpAppleConversion
     auto srcEnc = dyn_cast<ttg::BlockedEncodingAttr>(srcTy.getEncoding());
     auto srcMmaEnc = dyn_cast<AppleMmaEncodingAttr>(srcTy.getEncoding());
     auto dstEnc = dyn_cast<ttg::BlockedEncodingAttr>(dstTy.getEncoding());
-    if (!dstEnc || (!srcEnc && !srcMmaEnc))
+    // A blocked source may also target a #dot_op destination that no tt.dot
+    // consumes (materialized dot-operand tensor). Its per-register offsets and
+    // per-lane base come from the layout's LinearLayout; everything else in the
+    // TG scatter/gather is layout-agnostic.
+    auto dstDotEnc = dyn_cast<ttg::DotOperandEncodingAttr>(dstTy.getEncoding());
+    if ((!dstEnc && !(dstDotEnc && srcEnc)) || (!srcEnc && !srcMmaEnc))
       return failure();
 
     // Defer no-shared-memory converts to upstream simd_shuffle. Exceptions stay
@@ -399,10 +417,31 @@ struct ConvertLayoutOpAppleConversion
       return {bR, bC, truePred};
     };
 
+    // Per-lane (row,col) base for a distributed dst from its LinearLayout,
+    // holding register bases at 0 (matches emitOffsetForLayout's register-
+    // relative offsets). Used when the dst is a #dot_op (no makeBase fields).
+    auto makeBaseLL =
+        [&](Attribute enc) -> std::tuple<Value, Value, Value> {
+      auto ll = triton::gpu::toLinearLayout(shape, enc);
+      auto kReg = rewriter.getStringAttr("register");
+      auto kLane = rewriter.getStringAttr("lane");
+      auto kWarp = rewriter.getStringAttr("warp");
+      auto kBlock = rewriter.getStringAttr("block");
+      Value zero = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+      SmallVector<std::pair<StringAttr, Value>> ins{
+          {kReg, zero}, {kLane, laneId}, {kWarp, warpId}, {kBlock, zero}};
+      auto outs = applyLinearLayout(loc, rewriter, ll, ins);
+      Value bR = outs[rd].second, bC = outs[cd].second;
+      Value truePred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+      return {bR, bC, truePred};
+    };
+
     // LinearLayout-based per-register offsets (blocked or AppleMma source).
     Attribute srcEncAttr = srcMmaEnc ? Attribute(srcMmaEnc) : Attribute(srcEnc);
+    Attribute dstEncAttr =
+        dstEnc ? Attribute(dstEnc) : Attribute(dstDotEnc);
     auto srcOffsets = emitOffsetForLayout(srcEncAttr, srcTy);
-    auto dstOffsets = emitOffsetForLayout(dstEnc, dstTy);
+    auto dstOffsets = emitOffsetForLayout(dstEncAttr, dstTy);
 
     SmallVector<std::pair<int64_t, int64_t>> srcCoords, dstCoords;
     for (auto &off : srcOffsets)
@@ -464,7 +503,8 @@ struct ConvertLayoutOpAppleConversion
 
     auto [srcBaseRow, srcBaseCol, srcPred] =
         srcMmaEnc ? makeBaseMma(srcMmaEnc) : makeBase(srcEnc);
-    auto [dstBaseRow, dstBaseCol, dstPred] = makeBase(dstEnc);
+    auto [dstBaseRow, dstBaseCol, dstPred] =
+        dstEnc ? makeBase(dstEnc) : makeBaseLL(dstEncAttr);
 
     // Flat index into the strip; row offset is relative to strip start.
     auto stripFlatIdx = [&](Value bR, Value bC, int64_t rOff, int64_t cOff,

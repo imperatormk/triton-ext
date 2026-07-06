@@ -11,7 +11,7 @@ import re
 import subprocess
 import tempfile
 
-from triton.backends.compiler import BaseBackend, GPUTarget
+from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm
 
 
@@ -155,6 +155,7 @@ class MPSOptions:
     num_ctas: int = 1
     arch: str = "apple_m"
     backend_name: str = "mps"
+    warp_size: int = 32
 
     # simdgroup tile — fixed by hardware
     simdgroup_m: int = 8
@@ -168,6 +169,7 @@ class MPSOptions:
     instrumentation_mode: str = "none"
     sanitize_overflow: bool = False
     allowed_dot_input_precisions: tuple = ("ieee", )
+    default_dot_input_precision: str = "ieee"
     supported_fp8_dtypes: tuple = ()
 
     def hash(self):
@@ -212,6 +214,9 @@ class MPSBackend(BaseBackend):
 
     def get_module_map(self):
         return {}
+
+    def get_target_name(self, options) -> str:
+        return f"mps:{options.arch}"
 
     def load_dialects(self, ctx):
         # Plugin dialect is registered automatically via TRITON_PASS_PLUGIN_PATH
@@ -432,9 +437,33 @@ class MPSBackend(BaseBackend):
             open(f'/tmp/dot_kernel_{kname}.metallib', 'wb').write(result)
         return result
 
+    # ── Gluon frontend: AST is lowered directly to TTGIR, so we skip make_ttir
+    # and only run the dialect-generic Gluon passes that resolve explicit/auto
+    # layouts before rejoining the shared TTGIR → LLIR → metallib path.
+    def gluon_to_ttgir(self, src, metadata, options):
+        mod = src
+        pm = ir.pass_manager(mod.context)
+        _pmaybe_enable_debug(pm)
+
+        passes.gluon.add_inliner(pm)
+        passes.gluon.add_infer_coalesced_encodings(pm)
+        passes.gluon.add_resolve_auto_encodings(pm)
+        passes.gluon.add_canonicalizer(pm)
+        passes.common.add_sccp(pm)
+        passes.ttir.add_loop_aware_cse(pm)
+        passes.gluon.add_canonicalizer(pm)
+        passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+
+        pm.run(mod, 'gluon_to_ttgir')
+        metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
+        return mod
+
     def add_stages(self, stages, options, language):
-        stages["ttir"] = lambda src, meta: self.make_ttir(src, meta, options)
-        stages["ttgir"] = lambda src, meta: self.make_ttgir(src, meta, options)
+        if language == Language.GLUON:
+            stages["ttgir"] = lambda src, meta: self.gluon_to_ttgir(src, meta, options)
+        else:
+            stages["ttir"] = lambda src, meta: self.make_ttir(src, meta, options)
+            stages["ttgir"] = lambda src, meta: self.make_ttgir(src, meta, options)
         stages["llir"] = lambda src, meta: self.make_llir(src, meta, options)
         stages["metallib"] = lambda src, meta: self.make_metallib(
             src, meta, options)

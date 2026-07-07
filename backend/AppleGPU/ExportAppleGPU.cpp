@@ -96,17 +96,15 @@ using namespace mlir::triton;
 
 TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
   static plugin::PassInfo passes[] = {
-      {"add_accelerate_matmul", "0.1.0", addAccelerateMatmul,
+      {"accelerate_matmul", "0.1.0", addAccelerateMatmul,
        registerAccelerateMatmul},
-      {"add_simplify_gather", "0.1.0", addSimplifyGather,
-       registerSimplifyGather},
-      {"add_store_shuffle_layout", "0.1.0", addStoreShuffleLayout,
+      {"simplify_gather", "0.1.0", addSimplifyGather, registerSimplifyGather},
+      {"store_shuffle_layout", "0.1.0", addStoreShuffleLayout,
        registerStoreShuffleLayout},
-      {"add_widen_staging", "0.1.0", addWidenStaging, registerWidenStaging},
-      {"add_to_llvmir", "0.1.0", addToLLVMIR, registerToLLVMIR},
-      {"add_lower_gpu_to_air", "0.1.0", addLowerGPUToAIR,
-       registerLowerGPUToAIR},
-      {"add_reconcile_unrealized_casts", "0.1.0", addReconcileUnrealizedCasts,
+      {"widen_staging", "0.1.0", addWidenStaging, registerWidenStaging},
+      {"to_llvmir", "0.1.0", addToLLVMIR, registerToLLVMIR},
+      {"lower_gpu_to_air", "0.1.0", addLowerGPUToAIR, registerLowerGPUToAIR},
+      {"reconcile_unrealized_casts", "0.1.0", addReconcileUnrealizedCasts,
        registerReconcileUnrealizedCasts},
   };
 

@@ -1,4 +1,18 @@
 
+function(triton_ext_link_mlir_lib target mlir_lib)
+    if(NOT TARGET ${mlir_lib})
+        message(FATAL_ERROR "triton_ext_link_mlir_lib: MLIR target '${mlir_lib}'"
+                            " not found (was find_package(MLIR) run?)")
+    endif()
+
+    target_link_libraries(${target} PUBLIC ${mlir_lib})
+    if(APPLE)
+        target_link_options(${target} PRIVATE -Wl,-dead_strip)
+    else()
+        target_link_options(${target} PRIVATE -Wl,--gc-sections)
+    endif()
+endfunction()
+
 # Function to get the current Triton git hash
 function(get_triton_git_hash triton_source_dir result_var)
     # Try to get git hash from the triton source directory

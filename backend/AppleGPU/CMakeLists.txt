@@ -56,8 +56,9 @@ add_mlir_library(TritonAppleGPUBackend
     LINK_LIBS PUBLIC
     TritonExtensionSupport
     ${TRITON_LIB}
-    MLIRMathTransforms
 )
+
+triton_ext_link_mlir_lib(TritonAppleGPUBackend MLIRMathTransforms)
 
 set_target_properties(TritonAppleGPUBackend PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY

@@ -6,6 +6,7 @@
 // from air.* intrinsics.
 
 #include "TritonAppleGPUToLLVM/Passes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -75,9 +76,12 @@ private:
   ModuleOp mod;
   raw_ostream &os;
   int nextId = 0;
+  int indent = 1;
   llvm::DenseMap<Value, SmallVector<std::string>> valMap;
 
   std::string fresh() { return "v" + std::to_string(nextId++); }
+
+  std::string ind() const { return std::string(indent * 4, ' '); }
 
   // Number of per-thread registers (unrolled elements) for a value.
   int regCount(Value v) {
@@ -98,33 +102,36 @@ private:
   LogicalResult emitFunc(tt::FuncOp func) {
     auto fnTy = func.getFunctionType();
     os << "kernel void " << func.getName() << "(\n";
+
+    // Match the runtime ABI (driver.py): pointer args first, each in its own
+    // buffer; then all scalar args packed with natural alignment into a single
+    // trailing buffer. Scalars are read back by reinterpreting a byte offset.
     unsigned buffer = 0;
     SmallVector<std::string> argLines;
+    SmallVector<BlockArgument> scalarArgs;
     for (auto [i, argTy] : llvm::enumerate(fnTy.getInputs())) {
       BlockArgument arg = func.getArgument(i);
-      std::string id = fresh();
-      std::string line;
       if (auto pt = dyn_cast<tt::PointerType>(argTy)) {
+        std::string id = fresh();
         std::string sc = mslScalarType(pt.getPointeeType());
-        line = "    device " + sc + "* " + id + " [[buffer(" +
-               std::to_string(buffer++) + ")]]";
+        argLines.push_back("    device " + sc + "* " + id + " [[buffer(" +
+                           std::to_string(buffer++) + ")]]");
         bindScalar(arg, id);
-      } else if (auto st = dyn_cast<IntegerType>(argTy)) {
-        std::string sc = mslScalarType(argTy);
-        line = "    constant " + sc + "& " + id + " [[buffer(" +
-               std::to_string(buffer++) + ")]]";
-        bindScalar(arg, id);
-      } else if (isa<FloatType>(argTy)) {
-        std::string sc = mslScalarType(argTy);
-        line = "    constant " + sc + "& " + id + " [[buffer(" +
-               std::to_string(buffer++) + ")]]";
-        bindScalar(arg, id);
+      } else if (isa<IntegerType, FloatType>(argTy)) {
+        scalarArgs.push_back(arg);
       } else {
         func.emitError("EmitMSL: unsupported kernel argument type");
         return failure();
       }
-      argLines.push_back(line);
     }
+
+    std::string argbufId;
+    if (!scalarArgs.empty()) {
+      argbufId = fresh();
+      argLines.push_back("    constant char* " + argbufId + " [[buffer(" +
+                         std::to_string(buffer++) + ")]]");
+    }
+
     tgposId = fresh();
     tidId = fresh();
     argLines.push_back("    uint3 " + tgposId +
@@ -133,11 +140,24 @@ private:
                        " [[thread_position_in_threadgroup]]");
     os << llvm::join(argLines, ",\n") << ") {\n";
 
+    int off = 0;
+    for (BlockArgument arg : scalarArgs) {
+      Type ty = arg.getType();
+      int size = ty.getIntOrFloatBitWidth() / 8;
+      off = (off + size - 1) / size * size;
+      std::string sc = mslScalarType(ty);
+      std::string id = fresh();
+      os << ind() << sc << " " << id << " = *(constant " << sc << "*)("
+         << argbufId << " + " << off << ");\n";
+      bindScalar(arg, id);
+      off += size;
+    }
+
     // lane = tid.x & (warpSize-1); warp = tid.x >> log2(warpSize)
     laneId = fresh();
     warpId = fresh();
-    os << "    int " << laneId << " = (int)(" << tidId << ".x & 31u);\n";
-    os << "    int " << warpId << " = (int)(" << tidId << ".x >> 5);\n";
+    os << ind() << "int " << laneId << " = (int)(" << tidId << ".x & 31u);\n";
+    os << ind() << "int " << warpId << " = (int)(" << tidId << ".x >> 5);\n";
 
     Block &body = func.getBody().front();
     for (Operation &op : body) {
@@ -218,8 +238,18 @@ private:
       return emitFloatBinary(op);
     if (auto c = dyn_cast<arith::CmpIOp>(op))
       return emitCmpI(c);
+    if (auto c = dyn_cast<arith::CmpFOp>(op))
+      return emitCmpF(c);
+    if (auto s = dyn_cast<arith::SelectOp>(op))
+      return emitSelect(s);
+    if (auto f = dyn_cast<scf::ForOp>(op))
+      return emitFor(f);
+    if (auto i = dyn_cast<scf::IfOp>(op))
+      return emitIf(i);
+    if (isa<scf::YieldOp>(op))
+      return success();
     if (isa<tt::ReturnOp>(op)) {
-      os << "    return;\n";
+      os << ind() << "return;\n";
       return success();
     }
     op->emitError("EmitMSL: unhandled op '" + op->getName().getStringRef() +
@@ -246,7 +276,7 @@ private:
         else
           lit = std::to_string(
               dense.getSplatValue<APInt>().getSExtValue());
-        os << "    " << sc << " " << id << " = " << lit << ";\n";
+        os << ind() << "" << sc << " " << id << " = " << lit << ";\n";
         ids.push_back(id);
       }
       valMap[res] = ids;
@@ -263,7 +293,7 @@ private:
       op.emitError("EmitMSL: unsupported scalar constant");
       return failure();
     }
-    os << "    " << sc << " " << id << " = " << lit << ";\n";
+    os << ind() << "" << sc << " " << id << " = " << lit << ";\n";
     bindScalar(res, id);
     return success();
   }
@@ -273,7 +303,7 @@ private:
     const char *comp = op.getAxis() == tt::ProgramIDDim::X   ? "x"
                        : op.getAxis() == tt::ProgramIDDim::Y ? "y"
                                                              : "z";
-    os << "    int " << id << " = (int)(" << tgposId << "." << comp << ");\n";
+    os << ind() << "int " << id << " = (int)(" << tgposId << "." << comp << ");\n";
     bindScalar(op.getResult(), id);
     return success();
   }
@@ -286,7 +316,7 @@ private:
     for (int r = 0; r < rc; ++r) {
       std::string id = fresh();
       std::string off = layoutOffsetExpr(rt, r);
-      os << "    int " << id << " = " << start << " + " << off << ";\n";
+      os << ind() << "int " << id << " = " << start << " + " << off << ";\n";
       ids.push_back(id);
     }
     valMap[op.getResult()] = ids;
@@ -330,7 +360,7 @@ private:
       std::string id = fresh();
       const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
       const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
-      os << "    " << sc.str() << " " << id << " = (" << a << " " << binop.str()
+      os << ind() << "" << sc.str() << " " << id << " = (" << a << " " << binop.str()
          << " " << b << ");\n";
       ids.push_back(id);
     }
@@ -367,6 +397,158 @@ private:
     return emitElementwise(op, o, "bool");
   }
 
+  LogicalResult emitCmpF(arith::CmpFOp op) {
+    const char *o;
+    switch (op.getPredicate()) {
+    case arith::CmpFPredicate::OLT:
+    case arith::CmpFPredicate::ULT:
+      o = "<";
+      break;
+    case arith::CmpFPredicate::OLE:
+    case arith::CmpFPredicate::ULE:
+      o = "<=";
+      break;
+    case arith::CmpFPredicate::OGT:
+    case arith::CmpFPredicate::UGT:
+      o = ">";
+      break;
+    case arith::CmpFPredicate::OGE:
+    case arith::CmpFPredicate::UGE:
+      o = ">=";
+      break;
+    case arith::CmpFPredicate::OEQ:
+    case arith::CmpFPredicate::UEQ:
+      o = "==";
+      break;
+    case arith::CmpFPredicate::ONE:
+    case arith::CmpFPredicate::UNE:
+      o = "!=";
+      break;
+    default:
+      op.emitError("EmitMSL: unsupported cmpf predicate");
+      return failure();
+    }
+    return emitElementwise(op, o, "bool");
+  }
+
+  LogicalResult emitSelect(arith::SelectOp op) {
+    Value res = op.getResult();
+    auto &cond = names(op.getCondition());
+    auto &tval = names(op.getTrueValue());
+    auto &fval = names(op.getFalseValue());
+    std::string sc = mslScalarType(elementScalarType(res.getType()));
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      const std::string &c = cond[cond.size() == 1 ? 0 : r];
+      const std::string &t = tval[tval.size() == 1 ? 0 : r];
+      const std::string &f = fval[fval.size() == 1 ? 0 : r];
+      os << ind() << sc << " " << id << " = " << c << " ? " << t << " : " << f
+         << ";\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  LogicalResult emitRegionBody(Region &region) {
+    Block &blk = region.front();
+    for (Operation &op : blk.without_terminator())
+      if (failed(emitOp(&op)))
+        return failure();
+    return success();
+  }
+
+  // Reassign the destination variable names from a yield's operands. Used to
+  // resolve scf loop-carried and if-result values MSL-style.
+  void emitYieldAssign(Operation *term,
+                       const SmallVector<SmallVector<std::string>> &dsts) {
+    for (auto [i, operand] : llvm::enumerate(term->getOperands())) {
+      auto &src = names(operand);
+      const SmallVector<std::string> &dst = dsts[i];
+      for (size_t r = 0; r < dst.size(); ++r)
+        os << ind() << dst[r] << " = " << src[src.size() == 1 ? 0 : r]
+           << ";\n";
+    }
+  }
+
+  SmallVector<std::string> declResultVars(Value v, StringRef init) {
+    std::string sc = mslScalarType(elementScalarType(v.getType()));
+    int rc = regCount(v);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      os << ind() << sc << " " << id;
+      if (!init.empty())
+        os << " = " << init.str();
+      os << ";\n";
+      ids.push_back(id);
+    }
+    return ids;
+  }
+
+  LogicalResult emitFor(scf::ForOp op) {
+    SmallVector<SmallVector<std::string>> carried;
+    for (auto [init, res] :
+         llvm::zip(op.getInitArgs(), op.getResults())) {
+      auto &initNames = names(init);
+      SmallVector<std::string> vars =
+          declResultVars(res, StringRef());
+      for (size_t r = 0; r < vars.size(); ++r)
+        os << ind() << vars[r] << " = "
+           << initNames[initNames.size() == 1 ? 0 : r] << ";\n";
+      valMap[op.getRegionIterArg(carried.size())] = vars;
+      valMap[res] = vars;
+      carried.push_back(vars);
+    }
+
+    std::string iv = fresh();
+    const std::string &lo = names(op.getLowerBound())[0];
+    const std::string &hi = names(op.getUpperBound())[0];
+    const std::string &st = names(op.getStep())[0];
+    bindScalar(op.getInductionVar(), iv);
+    os << ind() << "for (int " << iv << " = " << lo << "; " << iv << " < " << hi
+       << "; " << iv << " += " << st << ") {\n";
+    ++indent;
+    if (failed(emitRegionBody(op.getRegion())))
+      return failure();
+    emitYieldAssign(op.getBody()->getTerminator(), carried);
+    --indent;
+    os << ind() << "}\n";
+    return success();
+  }
+
+  LogicalResult emitIf(scf::IfOp op) {
+    SmallVector<SmallVector<std::string>> results;
+    for (Value res : op.getResults())
+      results.push_back(declResultVars(res, StringRef()));
+
+    const std::string &c = names(op.getCondition())[0];
+    os << ind() << "if (" << c << ") {\n";
+    ++indent;
+    if (failed(emitRegionBody(op.getThenRegion())))
+      return failure();
+    if (!results.empty())
+      emitYieldAssign(op.thenBlock()->getTerminator(), results);
+    --indent;
+    os << ind() << "}";
+    if (!op.getElseRegion().empty()) {
+      os << " else {\n";
+      ++indent;
+      if (failed(emitRegionBody(op.getElseRegion())))
+        return failure();
+      if (!results.empty())
+        emitYieldAssign(op.elseBlock()->getTerminator(), results);
+      --indent;
+      os << ind() << "}";
+    }
+    os << "\n";
+    for (auto [i, res] : llvm::enumerate(op.getResults()))
+      valMap[res] = results[i];
+    return success();
+  }
+
   LogicalResult emitAddPtr(tt::AddPtrOp op) {
     Value res = op.getResult();
     auto &base = names(op.getPtr());
@@ -379,7 +561,7 @@ private:
       std::string id = fresh();
       const std::string &b = base[base.size() == 1 ? 0 : r];
       const std::string &o = offs[offs.size() == 1 ? 0 : r];
-      os << "    device " << sc << "* " << id << " = " << b << " + " << o
+      os << ind() << "device " << sc << "* " << id << " = " << b << " + " << o
          << ";\n";
       ids.push_back(id);
     }
@@ -394,17 +576,21 @@ private:
     std::string sc = mslScalarType(scalarTy);
     bool hasMask = op.getMask() != nullptr;
     SmallVector<std::string> *mask = hasMask ? &names(op.getMask()) : nullptr;
+    SmallVector<std::string> *other =
+        op.getOther() ? &names(op.getOther()) : nullptr;
     int rc = regCount(res);
     SmallVector<std::string> ids;
     for (int r = 0; r < rc; ++r) {
       std::string id = fresh();
       const std::string &p = ptrs[r];
-      os << "    " << sc << " " << id << " = 0;\n";
+      std::string init =
+          other ? (*other)[other->size() == 1 ? 0 : r] : std::string("0");
+      os << ind() << sc << " " << id << " = " << init << ";\n";
       if (hasMask) {
         const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
-        os << "    if (" << m << ") " << id << " = *" << p << ";\n";
+        os << ind() << "if (" << m << ") " << id << " = *" << p << ";\n";
       } else {
-        os << "    " << id << " = *" << p << ";\n";
+        os << ind() << id << " = *" << p << ";\n";
       }
       ids.push_back(id);
     }
@@ -423,9 +609,9 @@ private:
       const std::string &v = vals[vals.size() == 1 ? 0 : r];
       if (hasMask) {
         const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
-        os << "    if (" << m << ") *" << p << " = " << v << ";\n";
+        os << ind() << "if (" << m << ") *" << p << " = " << v << ";\n";
       } else {
-        os << "    *" << p << " = " << v << ";\n";
+        os << ind() << "*" << p << " = " << v << ";\n";
       }
     }
     return success();

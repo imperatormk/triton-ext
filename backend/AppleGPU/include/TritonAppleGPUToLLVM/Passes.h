@@ -13,6 +13,12 @@ std::unique_ptr<mlir::Pass> createConvertTritonAppleGPUToLLVMPass();
 // Lower remaining gpu.thread_id / gpu.block_dim → air intrinsics / constants
 std::unique_ptr<mlir::Pass> createLowerGPUToAirPass();
 
+// Emit MSL (Metal Shading Language) source directly from TritonGPU IR, with no
+// dependence on air.* intrinsics. Writes the source to the file named by the
+// TRITON_MSL_OUT env var (or stderr if unset). Terminal alternative to the
+// AIR/metallib path.
+std::unique_ptr<mlir::Pass> createEmitMSLPass();
+
 // Populate just the dot op patterns (for use in combined lowering passes)
 void populateDotOpToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
                                  mlir::RewritePatternSet &patterns,

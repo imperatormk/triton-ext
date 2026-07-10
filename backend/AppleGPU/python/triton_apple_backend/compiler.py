@@ -297,6 +297,62 @@ class MPSBackend(BaseBackend):
         metadata["shared"] = mod.get_int_attr("ttg.shared") or 0
         return mod
 
+    # ── MSL path: TTGIR → MSL source (no air.*), gated behind the flag ─────
+    def make_msl(self, mod, metadata, options):
+        with tempfile.NamedTemporaryFile(suffix='.metal', delete=False) as f:
+            msl_path = f.name
+        pm = ir.pass_manager(mod.context)
+        _pmaybe_enable_debug(pm)
+        old = os.environ.get('TRITON_MSL_OUT')
+        os.environ['TRITON_MSL_OUT'] = msl_path
+        try:
+            _plugin.add_emit_msl(pm)
+            pm.run(mod, 'make_msl')
+        finally:
+            if old is None:
+                os.environ.pop('TRITON_MSL_OUT', None)
+            else:
+                os.environ['TRITON_MSL_OUT'] = old
+        with open(msl_path, 'r') as f:
+            msl = f.read()
+        os.unlink(msl_path)
+        if os.environ.get('TRITON_MPS_DEBUG'):
+            print("=== emitted MSL ===")
+            print(msl)
+        metadata["_msl_src"] = msl
+        m = re.search(r'kernel void (\w+)\(', msl)
+        if not m:
+            raise RuntimeError("no 'kernel void' entry found in emitted MSL")
+        metadata["name"] = m.group(1)
+        metadata["shared"] = 0
+        return mod
+
+    def make_msl_metallib(self, mod, metadata, options):
+        msl = metadata.pop("_msl_src")
+        with tempfile.NamedTemporaryFile(suffix='.metal', delete=False) as f:
+            src_path = f.name
+            f.write(msl.encode())
+        air_path = src_path + '.air'
+        lib_path = src_path + '.metallib'
+        try:
+            subprocess.run(
+                ['xcrun', '-sdk', 'macosx', 'metal', '-c', src_path, '-o',
+                 air_path], check=True, capture_output=True)
+            subprocess.run(
+                ['xcrun', '-sdk', 'macosx', 'metallib', air_path, '-o',
+                 lib_path], check=True, capture_output=True)
+            with open(lib_path, 'rb') as f:
+                return f.read()
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"MSL compile failed:\n{e.stderr.decode(errors='replace')}")
+        finally:
+            for p in (src_path, air_path, lib_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
     # ── Stage 3: LLVM IR with simdgroup intrinsics ─────────────────────────
     def make_llir(self, mod, metadata, options):
         # Exports TRITON_MPS_TARGET_OS_MAJOR, which the C++ DotOp->AIR pass reads
@@ -467,6 +523,12 @@ class MPSBackend(BaseBackend):
                 src, meta, options)
             stages["ttgir"] = lambda src, meta: self.make_ttgir(
                 src, meta, options)
-        stages["llir"] = lambda src, meta: self.make_llir(src, meta, options)
-        stages["metallib"] = lambda src, meta: self.make_metallib(
-            src, meta, options)
+        if os.environ.get('TRITON_MPS_EMIT_MSL_MLIR'):
+            stages["msl"] = lambda src, meta: self.make_msl(src, meta, options)
+            stages["metallib"] = lambda src, meta: self.make_msl_metallib(
+                src, meta, options)
+        else:
+            stages["llir"] = lambda src, meta: self.make_llir(
+                src, meta, options)
+            stages["metallib"] = lambda src, meta: self.make_metallib(
+                src, meta, options)

@@ -39,6 +39,10 @@ static void addReconcileUnrealizedCasts(mlir::PassManager *pm,
                                         const std::vector<std::string> &) {
   pm->addPass(mlir::createReconcileUnrealizedCastsPass());
 }
+static void addEmitMSL(mlir::PassManager *pm,
+                       const std::vector<std::string> &) {
+  pm->addPass(mlir::triton::applegpu::createEmitMSLPass());
+}
 
 // ---------------------------------------------------------------------------
 // Pass "register" callbacks — register each pass with MLIR.
@@ -79,6 +83,11 @@ static void registerReconcileUnrealizedCasts() {
     return mlir::createReconcileUnrealizedCastsPass();
   });
 }
+static void registerEmitMSL() {
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::triton::applegpu::createEmitMSLPass();
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Dialect registration callback.
@@ -106,6 +115,7 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       {"lower_gpu_to_air", "0.1.0", addLowerGPUToAIR, registerLowerGPUToAIR},
       {"reconcile_unrealized_casts", "0.1.0", addReconcileUnrealizedCasts,
        registerReconcileUnrealizedCasts},
+      {"emit_msl", "0.1.0", addEmitMSL, registerEmitMSL},
   };
 
   static plugin::DialectInfo dialects[] = {

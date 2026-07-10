@@ -320,6 +320,10 @@ class MPSBackend(BaseBackend):
             print("=== emitted MSL ===")
             print(msl)
         metadata["_msl_src"] = msl
+        dump = os.environ.get('TRITON_MSL_DUMP')
+        if dump:
+            with open(dump, 'w') as df:
+                df.write(msl)
         m = re.search(r'kernel void (\w+)\(', msl)
         if not m:
             raise RuntimeError("no 'kernel void' entry found in emitted MSL")

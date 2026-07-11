@@ -54,6 +54,24 @@ static std::string mslScalarType(Type t) {
   return "";
 }
 
+static std::string mslUnsignedType(Type t) {
+  if (auto it = dyn_cast<IntegerType>(t)) {
+    switch (it.getWidth()) {
+    case 8:
+      return "uchar";
+    case 16:
+      return "ushort";
+    case 32:
+      return "uint";
+    case 64:
+      return "ulong";
+    default:
+      break;
+    }
+  }
+  return "";
+}
+
 static std::string mslKernelName(StringRef name) {
   if (name.starts_with("triton_"))
     return name.str();
@@ -727,9 +745,12 @@ private:
                                                               : "%";
     std::string sc =
         mslScalarType(elementScalarType(op->getResult(0).getType()));
-    if (isa<arith::DivUIOp, arith::RemUIOp>(op) && sc.front() != 'u')
-      sc = "u" + sc;
-    return emitElementwise(op, o, sc);
+    std::string opCast;
+    if (isa<arith::DivUIOp, arith::RemUIOp>(op)) {
+      opCast = mslUnsignedType(elementScalarType(op->getResult(0).getType()));
+      sc = opCast;
+    }
+    return emitElementwise(op, o, sc, opCast);
   }
 
   LogicalResult emitFloatBinary(Operation *op) {
@@ -766,18 +787,20 @@ private:
     return success();
   }
 
-  LogicalResult emitElementwise(Operation *op, StringRef binop, StringRef sc) {
+  LogicalResult emitElementwise(Operation *op, StringRef binop, StringRef sc,
+                                StringRef opCast = "") {
     Value res = op->getResult(0);
     auto &lhs = names(op->getOperand(0));
     auto &rhs = names(op->getOperand(1));
     int rc = regCount(res);
+    std::string pre = opCast.empty() ? "" : "(" + opCast.str() + ")";
     SmallVector<std::string> ids;
     for (int r = 0; r < rc; ++r) {
       std::string id = fresh();
       const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
       const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
-      os << ind() << "" << sc.str() << " " << id << " = (" << a << " " << binop.str()
-         << " " << b << ");\n";
+      os << ind() << "" << sc.str() << " " << id << " = (" << pre << a << " "
+         << binop.str() << " " << pre << b << ");\n";
       ids.push_back(id);
     }
     valMap[res] = ids;
@@ -890,13 +913,17 @@ private:
       op->emitError("EmitMSL: unhandled cast target type");
       return failure();
     }
+    std::string srcCast;
+    if (isa<arith::ExtUIOp, arith::UIToFPOp>(op))
+      srcCast = mslUnsignedType(elementScalarType(op->getOperand(0).getType()));
     auto &a = names(op->getOperand(0));
     int rc = regCount(res);
     SmallVector<std::string> ids;
     for (int r = 0; r < rc; ++r) {
       std::string id = fresh();
       const std::string &v = a[a.size() == 1 ? 0 : r];
-      os << ind() << dst << " " << id << " = static_cast<" << dst << ">(" << v
+      std::string src = srcCast.empty() ? v : "(" + srcCast + ")" + v;
+      os << ind() << dst << " " << id << " = static_cast<" << dst << ">(" << src
          << ");\n";
       ids.push_back(id);
     }
@@ -956,21 +983,30 @@ private:
 
   LogicalResult emitCmpI(arith::CmpIOp op) {
     const char *o;
+    bool uns = false;
     switch (op.getPredicate()) {
-    case arith::CmpIPredicate::slt:
     case arith::CmpIPredicate::ult:
+      uns = true;
+      [[fallthrough]];
+    case arith::CmpIPredicate::slt:
       o = "<";
       break;
-    case arith::CmpIPredicate::sle:
     case arith::CmpIPredicate::ule:
+      uns = true;
+      [[fallthrough]];
+    case arith::CmpIPredicate::sle:
       o = "<=";
       break;
-    case arith::CmpIPredicate::sgt:
     case arith::CmpIPredicate::ugt:
+      uns = true;
+      [[fallthrough]];
+    case arith::CmpIPredicate::sgt:
       o = ">";
       break;
-    case arith::CmpIPredicate::sge:
     case arith::CmpIPredicate::uge:
+      uns = true;
+      [[fallthrough]];
+    case arith::CmpIPredicate::sge:
       o = ">=";
       break;
     case arith::CmpIPredicate::eq:
@@ -980,7 +1016,9 @@ private:
       o = "!=";
       break;
     }
-    return emitElementwise(op, o, "bool");
+    std::string opCast =
+        uns ? mslUnsignedType(elementScalarType(op.getLhs().getType())) : "";
+    return emitElementwise(op, o, "bool", opCast);
   }
 
   LogicalResult emitCmpF(arith::CmpFOp op) {

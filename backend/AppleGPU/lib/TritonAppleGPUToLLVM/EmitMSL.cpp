@@ -183,6 +183,15 @@ private:
 
   LogicalResult emitFunc(tt::FuncOp func) {
     auto fnTy = func.getFunctionType();
+    // Pin the threadgroup size the runtime always dispatches (num_warps*32).
+    // Without it the Metal compiler picks an occupancy-driven ceiling that can
+    // fall below the requested size (register/threadgroup pressure), so a valid
+    // launch is rejected as OutOfResources; the attribute makes the compiler
+    // budget for exactly this size (spilling if needed) instead.
+    if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps")) {
+      int64_t threads = nw.getInt() * 32;
+      os << "[[max_total_threads_per_threadgroup(" << threads << ")]]\n";
+    }
     os << "kernel void " << mslKernelName(func.getName()) << "(\n";
 
     // Match the runtime ABI (driver.py): pointer args first, each in its own
@@ -1951,10 +1960,25 @@ private:
       auto aTy = cast<RankedTensorType>(d.getA().getType());
       auto bTy = cast<RankedTensorType>(d.getB().getType());
       auto cTy = cast<RankedTensorType>(d.getResult().getType());
-      int64_t aB = tileSize(aTy) * (bitsOf(aTy.getElementType()) / 8);
-      int64_t ab = aB + tileSize(bTy) * (bitsOf(bTy.getElementType()) / 8);
-      int64_t cBytes = tileSize(cTy) * (bitsOf(cTy.getElementType()) / 8);
-      poolBytes = std::max(poolBytes, std::max(ab, cBytes));
+      int rk = cTy.getRank();
+      int64_t M = cTy.getShape()[rk - 2];
+      int64_t N = cTy.getShape()[rk - 1];
+      int64_t Kd = aTy.getShape()[rk - 1];
+      int64_t ab = M * Kd * (bitsOf(aTy.getElementType()) / 8) +
+                   Kd * N * (bitsOf(bTy.getElementType()) / 8);
+      Type cE = cTy.getElementType();
+      int64_t need = ab;
+      if (!isa<IntegerType>(cE)) {
+        int64_t accBytes = 4;
+        int64_t cFull = M * N * accBytes;
+        if (ab + cFull <= 32768) {
+          need = ab + cFull;
+        } else {
+          int64_t band = dotCBandRows(M, N, ab, accBytes);
+          need = std::max(ab, band * N * accBytes);
+        }
+      }
+      poolBytes = std::max(poolBytes, need);
     } else if (auto r = dyn_cast<tt::ReduceOp>(op)) {
       auto st = cast<RankedTensorType>(r.getOperand(0).getType());
       tt::LinearLayout ll = ttg::toLinearLayout(st);
@@ -2007,6 +2031,32 @@ private:
     }
     (void)ctx;
     return expr.empty() ? "0" : expr;
+  }
+
+  // Row-major flat offset of register r within its batch slice: the row-major
+  // offset over the trailing (rank-1) out-dims only, dropping the leading batch
+  // dim. Used to index a single per-batch staging region reused across slices.
+  std::string sliceFlatOffset(RankedTensorType rt, int reg) {
+    tt::LinearLayout ll = ttg::toLinearLayout(rt);
+    auto outNames = llvm::to_vector(ll.getOutDimNames());
+    auto shape = rt.getShape();
+    int lo = std::max<int>(0, (int)outNames.size() - 2);
+    std::string expr;
+    int64_t stride = 1;
+    for (int d = (int)outNames.size() - 1; d >= lo; --d) {
+      std::string c = layoutCoordExpr(rt, reg, outNames[d]);
+      std::string term = stride == 1 ? c : ("(" + c + " * " +
+                                            std::to_string(stride) + ")");
+      expr = expr.empty() ? term : ("(" + expr + " + " + term + ")");
+      stride *= shape[d];
+    }
+    return expr.empty() ? "0" : expr;
+  }
+
+  std::string batchCoordExpr(RankedTensorType rt, int reg) {
+    tt::LinearLayout ll = ttg::toLinearLayout(rt);
+    auto outNames = llvm::to_vector(ll.getOutDimNames());
+    return layoutCoordExpr(rt, reg, outNames[0]);
   }
 
   // Row-major flat offset of source register r, with its out-dim coordinates
@@ -2286,6 +2336,23 @@ private:
     return "float";
   }
 
+  // Row band (multiple of 8) for the C store/readback so its threadgroup
+  // footprint never exceeds the A+B staging footprint that already sizes the
+  // pool. The full MxN accumulator at acc width can dwarf A+B (e.g. float32
+  // 128x128 C is 64KB vs 32KB A+B); banding the C round-trip over row groups
+  // keeps a single reused region small enough to fit alongside A/B in 32KB.
+  static int64_t dotCBandRows(int64_t M, int64_t N, int64_t abBytes,
+                              int64_t accBytes) {
+    int64_t rowBytes = N * accBytes;
+    int64_t band = abBytes / rowBytes;
+    band -= band % 8;
+    if (band < 8)
+      band = 8;
+    if (band > M)
+      band = M;
+    return band;
+  }
+
   LogicalResult emitDot(tt::DotOp op) {
     auto aTy = cast<RankedTensorType>(op.getA().getType());
     auto bTy = cast<RankedTensorType>(op.getB().getType());
@@ -2296,15 +2363,17 @@ private:
     if (isa<IntegerType>(aElem) || isa<IntegerType>(bElem) ||
         isa<IntegerType>(cElem))
       return emitDotScalar(op);
-    if (aTy.getRank() != 2 || !isDotOperandElem(aElem) ||
+    int rank = aTy.getRank();
+    if ((rank != 2 && rank != 3) || !isDotOperandElem(aElem) ||
         !isDotOperandElem(bElem) || aElem != bElem ||
         !(cElem.isF32() || cElem.isF16())) {
       op.emitError("EmitMSL: unsupported tt.dot operand/accumulator types");
       return failure();
     }
-    int64_t M = cTy.getShape()[0];
-    int64_t N = cTy.getShape()[1];
-    int64_t K = aTy.getShape()[1];
+    int64_t B = rank == 3 ? cTy.getShape()[0] : 1;
+    int64_t M = cTy.getShape()[rank - 2];
+    int64_t N = cTy.getShape()[rank - 1];
+    int64_t K = aTy.getShape()[rank - 1];
     if (M % 8 || N % 8 || K % 8) {
       op.emitError("EmitMSL: tt.dot tile dims must be multiples of 8");
       return failure();
@@ -2317,25 +2386,30 @@ private:
     std::string opScalar = sgOperandScalar(aElem);
     std::string accScalar = mslScalarType(cElem);
     std::string opFrag = sgFragType(aElem);
-    std::string accFrag = sgFragType(cElem);
+    std::string accFrag = "simdgroup_float8x8";
 
     int64_t aBytes = M * K * (bitsOf(aElem) / 8);
+    int64_t accBytes = 4;
+    int64_t abBytes = aBytes + N * K * (bitsOf(bElem) / 8);
+    int64_t cFull = M * N * accBytes;
+
+    // Two staging modes. DISJOINT: C gets its own pool region past A/B, so a
+    // warp computes and stores each fragment back-to-back with no intervening
+    // barrier; only one accumulator is live at a time, keeping register
+    // pressure (and thus the PSO's max threadgroup size) low. ALIASED: C reuses
+    // the A/B region and the M×N store is banded over row groups to fit; a
+    // uniform barrier separates A/B reads from C stores, so every fragment
+    // accumulator stays live at once. DISJOINT is preferred whenever A+B+C fits
+    // the 32KB threadgroup budget.
+    bool disjointC = abBytes + cFull <= 32768;
+    int64_t bandRows = disjointC ? M : dotCBandRows(M, N, abBytes, accBytes);
     std::string tgA = fresh(), tgB = fresh(), tgC = fresh();
     os << ind() << "threadgroup " << opScalar << "* " << tgA << " = "
        << poolRegion(0, opScalar) << ";\n";
     os << ind() << "threadgroup " << opScalar << "* " << tgB << " = "
        << poolRegion(aBytes, opScalar) << ";\n";
-    os << ind() << "threadgroup " << accScalar << "* " << tgC << " = "
-       << poolRegion(0, accScalar) << ";\n";
-
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    for (int r = 0, n = regCount(op.getA()); r < n; ++r)
-      os << ind() << tgA << "[" << flatTileOffset(aTy, r) << "] = " << aNames[r]
-         << ";\n";
-    for (int r = 0, n = regCount(op.getB()); r < n; ++r)
-      os << ind() << tgB << "[" << flatTileOffset(bTy, r) << "] = " << bNames[r]
-         << ";\n";
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << ind() << "threadgroup float* " << tgC << " = "
+       << poolRegion(disjointC ? abBytes : 0, "float") << ";\n";
 
     int64_t mT = M / 8, nT = N / 8, kT = K / 8;
     tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
@@ -2345,23 +2419,56 @@ private:
     if (numWarps > nFrag)
       numWarps = nFrag;
 
-    // Distribute the mTxnT output fragments round-robin across simdgroups: warp
-    // w owns fragments f with f % numWarps == w. Accumulators are declared for
-    // every fragment so a warp's owned registers stay live across the uniform
-    // barrier that separates the A/B-consuming compute phase from the C store
-    // phase (the store aliases the A region in the pool, so all A reads must
-    // finish first). The C readback below is layout-driven and warp-agnostic.
-    for (int64_t f = 0; f < nFrag; ++f) {
-      int64_t mi = f / nT, ni = f % nT;
-      std::string acc = "acc_" + std::to_string(mi) + "_" + std::to_string(ni);
-      os << ind() << accFrag << " " << acc << " = " << accFrag << "(0.0f);\n";
+    auto batchGuard = [&](RankedTensorType rt, int reg, int64_t bi)
+        -> std::string {
+      if (rank != 3)
+        return "";
+      return "if (" + batchCoordExpr(rt, reg) + " == " + std::to_string(bi) +
+             ") ";
+    };
+
+    int nRes = regCount(op.getResult());
+    SmallVector<std::string> ids(nRes);
+    for (int r = 0; r < nRes; ++r) {
+      ids[r] = fresh();
+      os << ind() << accScalar << " " << ids[r] << " = ("
+         << accScalar << ")0;\n";
     }
-    for (int64_t w = 0; w < numWarps; ++w) {
-      os << ind() << "if (" << warpId << " == " << w << ") {\n";
-      ++indent;
-      for (int64_t f = w; f < nFrag; f += numWarps) {
-        int64_t mi = f / nT, ni = f % nT;
-        std::string acc = "acc_" + std::to_string(mi) + "_" + std::to_string(ni);
+
+    auto outNames = llvm::to_vector(cLL.getOutDimNames());
+    StringAttr rowDim = outNames[rank - 2], colDim = outNames[rank - 1];
+    auto emitReadback = [&](int64_t bi, int64_t r0, int64_t r1) {
+      for (int r = 0; r < nRes; ++r) {
+        std::string base = cInit[cInit.size() == 1 ? 0 : r];
+        std::string rowExpr = layoutCoordExpr(cTy, r, rowDim);
+        std::string colExpr = layoutCoordExpr(cTy, r, colDim);
+        std::string bandOff = "((" + rowExpr + " - " + std::to_string(r0) +
+                              ") * " + std::to_string(N) + " + " + colExpr +
+                              ")";
+        std::string guard = "(" + rowExpr + " >= " + std::to_string(r0) +
+                            " && " + rowExpr + " < " + std::to_string(r1) + ")";
+        if (rank == 3)
+          guard = "(" + batchCoordExpr(cTy, r) + " == " + std::to_string(bi) +
+                  " && " + guard + ")";
+        os << ind() << "if " << guard << " " << ids[r] << " = " << tgC << "["
+           << bandOff << "] + " << base << ";\n";
+      }
+    };
+
+    // Per batch slice: stage the M×K / K×N operand slice into one reused pool
+    // region, run the 8×8 fragment MMA over K, then read the M×N accumulator
+    // back. Slices are barrier-separated and reuse the same pool.
+    for (int64_t bi = 0; bi < B; ++bi) {
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int r = 0, n = regCount(op.getA()); r < n; ++r)
+        os << ind() << batchGuard(aTy, r, bi) << tgA << "["
+           << sliceFlatOffset(aTy, r) << "] = " << aNames[r] << ";\n";
+      for (int r = 0, n = regCount(op.getB()); r < n; ++r)
+        os << ind() << batchGuard(bTy, r, bi) << tgB << "["
+           << sliceFlatOffset(bTy, r) << "] = " << bNames[r] << ";\n";
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+      auto emitFragMMA = [&](int64_t mi, int64_t ni, StringRef acc) {
         for (int64_t ki = 0; ki < kT; ++ki) {
           std::string fa = fresh(), fb = fresh();
           os << ind() << opFrag << " " << fa << ";\n";
@@ -2373,33 +2480,73 @@ private:
           os << ind() << "simdgroup_multiply_accumulate(" << acc << ", " << fa
              << ", " << fb << ", " << acc << ");\n";
         }
+      };
+
+      if (disjointC) {
+        for (int64_t w = 0; w < numWarps; ++w) {
+          os << ind() << "if (" << warpId << " == " << w << ") {\n";
+          ++indent;
+          for (int64_t f = w; f < nFrag; f += numWarps) {
+            int64_t mi = f / nT, ni = f % nT;
+            std::string acc = fresh();
+            os << ind() << accFrag << " " << acc << " = " << accFrag
+               << "(0.0f);\n";
+            emitFragMMA(mi, ni, acc);
+            os << ind() << "simdgroup_store(" << acc << ", " << tgC << " + "
+               << (mi * 8 * N + ni * 8) << ", " << N << ");\n";
+          }
+          --indent;
+          os << ind() << "}\n";
+        }
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        emitReadback(bi, 0, M);
+        continue;
       }
-      --indent;
-      os << ind() << "}\n";
-    }
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    for (int64_t w = 0; w < numWarps; ++w) {
-      os << ind() << "if (" << warpId << " == " << w << ") {\n";
-      ++indent;
-      for (int64_t f = w; f < nFrag; f += numWarps) {
+
+      std::string accBase = "acc_" + std::to_string(bi) + "_";
+      for (int64_t f = 0; f < nFrag; ++f) {
         int64_t mi = f / nT, ni = f % nT;
-        std::string acc = "acc_" + std::to_string(mi) + "_" + std::to_string(ni);
-        os << ind() << "simdgroup_store(" << acc << ", " << tgC << " + "
-           << (mi * 8 * N + ni * 8) << ", " << N << ");\n";
+        std::string acc =
+            accBase + std::to_string(mi) + "_" + std::to_string(ni);
+        os << ind() << accFrag << " " << acc << " = " << accFrag << "(0.0f);\n";
       }
-      --indent;
-      os << ind() << "}\n";
+      for (int64_t w = 0; w < numWarps; ++w) {
+        os << ind() << "if (" << warpId << " == " << w << ") {\n";
+        ++indent;
+        for (int64_t f = w; f < nFrag; f += numWarps) {
+          int64_t mi = f / nT, ni = f % nT;
+          std::string acc =
+              accBase + std::to_string(mi) + "_" + std::to_string(ni);
+          emitFragMMA(mi, ni, acc);
+        }
+        --indent;
+        os << ind() << "}\n";
+      }
+
+      for (int64_t r0 = 0; r0 < M; r0 += bandRows) {
+        int64_t r1 = std::min<int64_t>(r0 + bandRows, M);
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        for (int64_t w = 0; w < numWarps; ++w) {
+          os << ind() << "if (" << warpId << " == " << w << ") {\n";
+          ++indent;
+          for (int64_t f = w; f < nFrag; f += numWarps) {
+            int64_t mi = f / nT, ni = f % nT;
+            if (mi * 8 < r0 || mi * 8 >= r1)
+              continue;
+            std::string acc =
+                accBase + std::to_string(mi) + "_" + std::to_string(ni);
+            os << ind() << "simdgroup_store(" << acc << ", " << tgC << " + "
+               << ((mi * 8 - r0) * N + ni * 8) << ", " << N << ");\n";
+          }
+          --indent;
+          os << ind() << "}\n";
+        }
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        emitReadback(bi, r0, r1);
+      }
     }
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 
-    SmallVector<std::string> ids;
-    for (int r = 0, n = regCount(op.getResult()); r < n; ++r) {
-      std::string id = fresh();
-      std::string base = cInit[cInit.size() == 1 ? 0 : r];
-      os << ind() << accScalar << " " << id << " = " << tgC << "["
-         << flatTileOffset(cTy, r) << "] + " << base << ";\n";
-      ids.push_back(id);
-    }
     valMap[op.getResult()] = ids;
     return success();
   }
@@ -2415,13 +2562,15 @@ private:
     Type aElem = aTy.getElementType();
     Type bElem = bTy.getElementType();
     Type cElem = cTy.getElementType();
-    if (aTy.getRank() != 2) {
-      op.emitError("EmitMSL: scalar tt.dot requires 2-D operands");
+    int rank = aTy.getRank();
+    if (rank != 2 && rank != 3) {
+      op.emitError("EmitMSL: scalar tt.dot requires 2-D or 3-D operands");
       return failure();
     }
-    int64_t K = aTy.getShape()[1];
-    int64_t M = cTy.getShape()[0];
-    int64_t N = cTy.getShape()[1];
+    int64_t B = rank == 3 ? cTy.getShape()[0] : 1;
+    int64_t K = aTy.getShape()[rank - 1];
+    int64_t M = cTy.getShape()[rank - 2];
+    int64_t N = cTy.getShape()[rank - 1];
 
     std::string aScalar = mslScalarType(aElem);
     std::string bScalar = mslScalarType(bElem);
@@ -2437,37 +2586,59 @@ private:
        << poolRegion(0, aScalar) << ";\n";
     os << ind() << "threadgroup " << bScalar << "* " << tgB << " = "
        << poolRegion(aBytes, bScalar) << ";\n";
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    for (int r = 0, n = regCount(op.getA()); r < n; ++r)
-      os << ind() << tgA << "[" << flatTileOffset(aTy, r) << "] = " << aNames[r]
-         << ";\n";
-    for (int r = 0, n = regCount(op.getB()); r < n; ++r)
-      os << ind() << tgB << "[" << flatTileOffset(bTy, r) << "] = " << bNames[r]
-         << ";\n";
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 
     tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
     auto outNames = llvm::to_vector(cLL.getOutDimNames());
-    StringAttr d0 = outNames[0], d1 = outNames[1];
-    SmallVector<std::string> ids;
-    for (int r = 0, n = regCount(op.getResult()); r < n; ++r) {
-      std::string mExpr = layoutCoordExpr(cTy, r, d0);
-      std::string nExpr = layoutCoordExpr(cTy, r, d1);
-      std::string mrow = fresh(), ncol = fresh(), acc = fresh();
-      os << ind() << "int " << mrow << " = " << mExpr << ";\n";
-      os << ind() << "int " << ncol << " = " << nExpr << ";\n";
+    StringAttr dRow = outNames[rank - 2], dCol = outNames[rank - 1];
+
+    auto batchGuard = [&](RankedTensorType rt, int reg, int64_t bi)
+        -> std::string {
+      if (rank != 3)
+        return "";
+      return "if (" + batchCoordExpr(rt, reg) + " == " + std::to_string(bi) +
+             ") ";
+    };
+
+    int nRes = regCount(op.getResult());
+    SmallVector<std::string> ids(nRes);
+    for (int r = 0; r < nRes; ++r) {
+      ids[r] = fresh();
       std::string base = cInit[cInit.size() == 1 ? 0 : r];
-      os << ind() << accScalar << " " << acc << " = " << base << ";\n";
-      std::string kv = fresh();
-      os << ind() << "for (int " << kv << " = 0; " << kv << " < " << K << "; ++"
-         << kv << ") {\n";
-      ++indent;
-      os << ind() << acc << " += (" << accScalar << ")" << tgA << "[" << mrow
-         << " * " << K << " + " << kv << "] * (" << accScalar << ")" << tgB
-         << "[" << kv << " * " << N << " + " << ncol << "];\n";
-      --indent;
-      os << ind() << "}\n";
-      ids.push_back(acc);
+      os << ind() << accScalar << " " << ids[r] << " = " << base << ";\n";
+    }
+
+    for (int64_t bi = 0; bi < B; ++bi) {
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int r = 0, n = regCount(op.getA()); r < n; ++r)
+        os << ind() << batchGuard(aTy, r, bi) << tgA << "["
+           << sliceFlatOffset(aTy, r) << "] = " << aNames[r] << ";\n";
+      for (int r = 0, n = regCount(op.getB()); r < n; ++r)
+        os << ind() << batchGuard(bTy, r, bi) << tgB << "["
+           << sliceFlatOffset(bTy, r) << "] = " << bNames[r] << ";\n";
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+      for (int r = 0; r < nRes; ++r) {
+        std::string mrow = fresh(), ncol = fresh(), acc = fresh();
+        os << ind() << "int " << mrow << " = " << layoutCoordExpr(cTy, r, dRow)
+           << ";\n";
+        os << ind() << "int " << ncol << " = " << layoutCoordExpr(cTy, r, dCol)
+           << ";\n";
+        os << ind() << accScalar << " " << acc << " = (" << accScalar << ")0;\n";
+        std::string kv = fresh();
+        os << ind() << "for (int " << kv << " = 0; " << kv << " < " << K
+           << "; ++" << kv << ") {\n";
+        ++indent;
+        os << ind() << acc << " += (" << accScalar << ")" << tgA << "[" << mrow
+           << " * " << K << " + " << kv << "] * (" << accScalar << ")" << tgB
+           << "[" << kv << " * " << N << " + " << ncol << "];\n";
+        --indent;
+        os << ind() << "}\n";
+        std::string guard =
+            rank == 3 ? ("if (" + batchCoordExpr(cTy, r) + " == " +
+                         std::to_string(bi) + ") ")
+                      : "";
+        os << ind() << guard << ids[r] << " += " << acc << ";\n";
+      }
     }
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     valMap[op.getResult()] = ids;

@@ -416,6 +416,8 @@ private:
       return emitCast(op);
     if (isa<arith::BitcastOp, tt::BitcastOp>(op))
       return emitBitcast(op);
+    if (isa<tt::IntToPtrOp, tt::PtrToIntOp>(op))
+      return emitPtrIntCast(op);
     if (auto f = dyn_cast<tt::FpToFpOp>(op))
       return emitCast(op);
     if (auto c = dyn_cast<tt::ClampFOp>(op))
@@ -957,6 +959,29 @@ private:
     return success();
   }
 
+  LogicalResult emitPtrIntCast(Operation *op) {
+    Value res = op->getResult(0);
+    bool toPtr = isa<tt::IntToPtrOp>(op);
+    std::string dst = toPtr
+                          ? mslStorageType(res.getType())
+                          : mslScalarType(elementScalarType(res.getType()));
+    if (dst.empty()) {
+      op->emitError("EmitMSL: unhandled ptr/int cast type");
+      return failure();
+    }
+    auto &a = names(op->getOperand(0));
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      const std::string &v = a[a.size() == 1 ? 0 : r];
+      os << ind() << dst << " " << id << " = (" << dst << ")" << v << ";\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
   LogicalResult emitBitcast(Operation *op) {
     Value res = op->getResult(0);
     Type resElem = res.getType();
@@ -1088,7 +1113,12 @@ private:
     auto &cond = names(op.getCondition());
     auto &tval = names(op.getTrueValue());
     auto &fval = names(op.getFalseValue());
-    std::string sc = mslScalarType(elementScalarType(res.getType()));
+    Type resElem = res.getType();
+    if (auto rt = dyn_cast<RankedTensorType>(resElem))
+      resElem = rt.getElementType();
+    std::string sc = isa<tt::PointerType>(resElem)
+                         ? mslStorageType(res.getType())
+                         : mslScalarType(elementScalarType(res.getType()));
     int rc = regCount(res);
     SmallVector<std::string> ids;
     for (int r = 0; r < rc; ++r) {

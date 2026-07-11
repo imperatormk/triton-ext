@@ -393,11 +393,13 @@ private:
       valMap[res] = ids;
       return success();
     }
-    if (isa<arith::MaxNumFOp, arith::MaximumFOp, arith::MaxSIOp, arith::MaxUIOp>(
-            op))
+    if (isa<arith::MaximumFOp>(op))
+      return emitMinMax(op, "max", "", /*propagateNan=*/true);
+    if (isa<arith::MinimumFOp>(op))
+      return emitMinMax(op, "min", "", /*propagateNan=*/true);
+    if (isa<arith::MaxNumFOp, arith::MaxSIOp, arith::MaxUIOp>(op))
       return emitMinMax(op, "max");
-    if (isa<arith::MinNumFOp, arith::MinimumFOp, arith::MinSIOp, arith::MinUIOp>(
-            op))
+    if (isa<arith::MinNumFOp, arith::MinSIOp, arith::MinUIOp>(op))
       return emitMinMax(op, "min");
     if (auto c = dyn_cast<arith::CmpIOp>(op))
       return emitCmpI(c);
@@ -826,7 +828,8 @@ private:
     return success();
   }
 
-  LogicalResult emitMinMax(Operation *op, StringRef fn, StringRef opCast = "") {
+  LogicalResult emitMinMax(Operation *op, StringRef fn, StringRef opCast = "",
+                           bool propagateNan = false) {
     Value res = op->getResult(0);
     std::string sc = mslScalarType(elementScalarType(res.getType()));
     std::string pre = opCast.empty() ? "" : "(" + opCast.str() + ")";
@@ -838,8 +841,11 @@ private:
       std::string id = fresh();
       const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
       const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
-      os << ind() << sc << " " << id << " = " << fn.str() << "(" << pre << a
-         << ", " << pre << b << ");\n";
+      std::string expr = fn.str() + "(" + pre + a + ", " + pre + b + ")";
+      if (propagateNan)
+        expr = "((metal::isnan(" + a + ") || metal::isnan(" + b + ")) ? " + a +
+               " + " + b + " : " + expr + ")";
+      os << ind() << sc << " " << id << " = " << expr << ";\n";
       ids.push_back(id);
     }
     valMap[res] = ids;
@@ -993,8 +999,10 @@ private:
       const std::string &xv = x[x.size() == 1 ? 0 : r];
       const std::string &lv = lo[lo.size() == 1 ? 0 : r];
       const std::string &hv = hi[hi.size() == 1 ? 0 : r];
-      os << ind() << sc << " " << id << " = metal::clamp(" << xv << ", " << lv
-         << ", " << hv << ");\n";
+      std::string clamped = "metal::clamp(" + xv + ", " + lv + ", " + hv + ")";
+      if (op.getPropagateNan() == tt::PropagateNan::ALL)
+        clamped = "(metal::isnan(" + xv + ") ? " + xv + " : " + clamped + ")";
+      os << ind() << sc << " " << id << " = " << clamped << ";\n";
       ids.push_back(id);
     }
     valMap[res] = ids;

@@ -330,6 +330,23 @@ private:
           op, "^", mslScalarType(elementScalarType(op->getResult(0).getType())));
     if (isa<arith::AddFOp, arith::MulFOp, arith::SubFOp, arith::DivFOp>(op))
       return emitFloatBinary(op);
+    if (isa<arith::RemFOp>(op))
+      return emitMinMax(op, "metal::fmod");
+    if (isa<arith::NegFOp>(op)) {
+      Value res = op->getResult(0);
+      std::string sc = mslScalarType(elementScalarType(res.getType()));
+      auto &a = names(op->getOperand(0));
+      int rc = regCount(res);
+      SmallVector<std::string> ids;
+      for (int r = 0; r < rc; ++r) {
+        std::string id = fresh();
+        os << ind() << sc << " " << id << " = -" << a[a.size() == 1 ? 0 : r]
+           << ";\n";
+        ids.push_back(id);
+      }
+      valMap[res] = ids;
+      return success();
+    }
     if (isa<arith::MaxNumFOp, arith::MaximumFOp, arith::MaxSIOp, arith::MaxUIOp>(
             op))
       return emitMinMax(op, "max");
@@ -355,6 +372,14 @@ private:
       return emitCast(op);
     if (auto c = dyn_cast<tt::ClampFOp>(op))
       return emitClamp(c);
+    if (isa<tt::MulhiUIOp>(op))
+      return emitMinMax(op, "mulhi");
+    if (isa<tt::PreciseSqrtOp>(op))
+      return emitUnary(
+          op, "metal::sqrt",
+          mslScalarType(elementScalarType(op->getResult(0).getType())));
+    if (isa<tt::PreciseDivFOp>(op))
+      return emitFloatBinary(op);
     if (isa<tt::AssertOp>(op)) {
       for (Value r : op->getResults())
         valMap[r] = SmallVector<std::string>{};
@@ -736,22 +761,65 @@ private:
   LogicalResult emitMathUnary(Operation *op) {
     std::string sc = mslScalarType(elementScalarType(op->getResult(0).getType()));
     StringRef n = op->getName().getStringRef();
-    static const llvm::StringMap<const char *> fns = {
-        {"math.exp", "metal::exp"},     {"math.exp2", "metal::exp2"},
-        {"math.log", "metal::log"},     {"math.log2", "metal::log2"},
-        {"math.sin", "metal::sin"},     {"math.cos", "metal::cos"},
-        {"math.tan", "metal::tan"},     {"math.tanh", "metal::tanh"},
-        {"math.sqrt", "metal::sqrt"},   {"math.rsqrt", "metal::rsqrt"},
-        {"math.floor", "metal::floor"}, {"math.ceil", "metal::ceil"},
-        {"math.absf", "metal::abs"},    {"math.absi", "metal::abs"},
-        {"math.erf", "metal::erf"},     {"math.round", "metal::round"},
-        {"math.trunc", "metal::trunc"}, {"math.roundeven", "metal::rint"}};
-    auto it = fns.find(n);
-    if (it == fns.end()) {
-      op->emitError("EmitMSL: unhandled math op '" + n + "'");
-      return failure();
+    static const llvm::StringMap<const char *> unary = {
+        {"math.exp", "metal::exp"},       {"math.exp2", "metal::exp2"},
+        {"math.log", "metal::log"},       {"math.log2", "metal::log2"},
+        {"math.log10", "metal::log10"},   {"math.sin", "metal::sin"},
+        {"math.cos", "metal::cos"},       {"math.tan", "metal::tan"},
+        {"math.tanh", "metal::tanh"},     {"math.sinh", "metal::sinh"},
+        {"math.cosh", "metal::cosh"},     {"math.asin", "metal::asin"},
+        {"math.acos", "metal::acos"},     {"math.atan", "metal::atan"},
+        {"math.sqrt", "metal::sqrt"},     {"math.rsqrt", "metal::rsqrt"},
+        {"math.cbrt", "metal::cbrt"},     {"math.floor", "metal::floor"},
+        {"math.ceil", "metal::ceil"},     {"math.absf", "metal::abs"},
+        {"math.absi", "metal::abs"},      {"math.erf", "metal::erf"},
+        {"math.round", "metal::round"},   {"math.trunc", "metal::trunc"},
+        {"math.roundeven", "metal::rint"}};
+    if (auto it = unary.find(n); it != unary.end())
+      return emitUnary(op, it->second, sc);
+    static const llvm::StringMap<const char *> binary = {
+        {"math.atan2", "metal::atan2"},
+        {"math.powf", "metal::pow"},
+        {"math.fpowi", "metal::pow"},
+        {"math.copysign", "metal::copysign"}};
+    if (auto it = binary.find(n); it != binary.end())
+      return emitMinMax(op, it->second);
+    if (n == "math.fma")
+      return emitTernary(op, "metal::fma", sc);
+    if (n == "math.exp10") {
+      Value res = op->getResult(0);
+      auto &a = names(op->getOperand(0));
+      int rc = regCount(res);
+      SmallVector<std::string> ids;
+      for (int r = 0; r < rc; ++r) {
+        std::string id = fresh();
+        os << ind() << sc << " " << id << " = metal::pow((" << sc << ")10, "
+           << a[a.size() == 1 ? 0 : r] << ");\n";
+        ids.push_back(id);
+      }
+      valMap[res] = ids;
+      return success();
     }
-    return emitUnary(op, it->second, sc);
+    op->emitError("EmitMSL: unhandled math op '" + n + "'");
+    return failure();
+  }
+
+  LogicalResult emitTernary(Operation *op, StringRef fn, StringRef sc) {
+    Value res = op->getResult(0);
+    auto &a = names(op->getOperand(0));
+    auto &b = names(op->getOperand(1));
+    auto &c = names(op->getOperand(2));
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      os << ind() << sc.str() << " " << id << " = " << fn.str() << "("
+         << a[a.size() == 1 ? 0 : r] << ", " << b[b.size() == 1 ? 0 : r] << ", "
+         << c[c.size() == 1 ? 0 : r] << ");\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
   }
 
   LogicalResult emitCast(Operation *op) {

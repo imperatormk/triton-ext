@@ -54,6 +54,12 @@ static std::string mslScalarType(Type t) {
   return "";
 }
 
+static std::string mslKernelName(StringRef name) {
+  if (name.starts_with("triton_"))
+    return name.str();
+  return "triton_" + name.str();
+}
+
 static std::string mslStorageType(Type t) {
   if (auto rt = dyn_cast<RankedTensorType>(t))
     t = rt.getElementType();
@@ -159,7 +165,7 @@ private:
 
   LogicalResult emitFunc(tt::FuncOp func) {
     auto fnTy = func.getFunctionType();
-    os << "kernel void " << func.getName() << "(\n";
+    os << "kernel void " << mslKernelName(func.getName()) << "(\n";
 
     // Match the runtime ABI (driver.py): pointer args first, each in its own
     // buffer; then all scalar args packed with natural alignment into a single

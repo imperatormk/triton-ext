@@ -737,9 +737,17 @@ private:
       return emitMinMax(op, "max", "", /*propagateNan=*/true);
     if (isa<arith::MinimumFOp>(op))
       return emitMinMax(op, "min", "", /*propagateNan=*/true);
-    if (isa<arith::MaxNumFOp, arith::MaxSIOp, arith::MaxUIOp>(op))
+    if (isa<arith::MaxUIOp>(op))
+      return emitMinMax(
+          op, "max",
+          mslUnsignedType(elementScalarType(op->getResult(0).getType())));
+    if (isa<arith::MinUIOp>(op))
+      return emitMinMax(
+          op, "min",
+          mslUnsignedType(elementScalarType(op->getResult(0).getType())));
+    if (isa<arith::MaxNumFOp, arith::MaxSIOp>(op))
       return emitMinMax(op, "max");
-    if (isa<arith::MinNumFOp, arith::MinSIOp, arith::MinUIOp>(op))
+    if (isa<arith::MinNumFOp, arith::MinSIOp>(op))
       return emitMinMax(op, "min");
     if (auto c = dyn_cast<arith::CmpIOp>(op))
       return emitCmpI(c);

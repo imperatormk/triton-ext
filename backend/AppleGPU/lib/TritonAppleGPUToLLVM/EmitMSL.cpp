@@ -1774,14 +1774,8 @@ private:
     unsigned warpMask = reduceMask(ll, kWarp, redDim);
     int numWarps = ll.hasInDim(kWarp) ? ll.getInDimSize(kWarp) : 1;
 
-    int64_t warpByteStride = 0;
-    for (int k = 0; k < nOp; ++k)
-      warpByteStride +=
-          bitsOf(elementScalarType(op.getResult()[k].getType())) / 8;
-
     std::map<std::string, SmallVector<std::string>> groupResult;
 
-    int64_t slot = 0;
     for (auto &g : groups) {
       SmallVector<int> &regs = g.second;
       SmallVector<std::string> accs(nOp);
@@ -1823,7 +1817,7 @@ private:
         // its own lane offset. Warps that only vary over reduced-axis bits are
         // summed; surviving-axis warp bits stay fixed to this warp.
         SmallVector<std::string> scratch(nOp);
-        int64_t byteOff = slot * numWarps * 32 * warpByteStride;
+        int64_t byteOff = 0;
         for (int k = 0; k < nOp; ++k) {
           scratch[k] = fresh();
           os << ind() << "threadgroup " << scTys[k] << "* " << scratch[k]
@@ -1863,7 +1857,6 @@ private:
       }
 
       groupResult[g.first] = accs;
-      ++slot;
     }
 
     if (!tensorResult) {
@@ -2468,9 +2461,13 @@ private:
       }
       poolBytes = std::max(poolBytes, bytes);
     } else if (auto t = dyn_cast<tt::TransOp>(op)) {
-      auto st = cast<RankedTensorType>(t.getSrc().getType());
-      Type e = st.getElementType();
-      poolBytes = std::max(poolBytes, tileSize(st) * (bitsOf(e) / 8));
+      auto rt = cast<RankedTensorType>(t.getResult().getType());
+      Type e = rt.getElementType();
+      int64_t elemBytes = bitsOf(e) / 8;
+      int64_t bytes = tileSize(rt) * elemBytes;
+      if (bytes > 32768)
+        bytes = reshapeBandElems(tileSize(rt), elemBytes) * elemBytes;
+      poolBytes = std::max(poolBytes, bytes);
     } else if (auto c = dyn_cast<tt::CatOp>(op)) {
       auto rt = cast<RankedTensorType>(c.getResult().getType());
       Type e = rt.getElementType();
@@ -2521,14 +2518,10 @@ private:
       auto kWarp = StringAttr::get(op->getContext(), "warp");
       if (ll.hasInDim(kWarp)) {
         int64_t nw = ll.getInDimSize(kWarp);
-        int64_t nGroups = 1;
-        if (auto resT = dyn_cast<RankedTensorType>(r.getResult()[0].getType()))
-          nGroups = ttg::toLinearLayout(resT).getInDimSize(
-              StringAttr::get(op->getContext(), "register"));
         int64_t bytes = 0;
         for (Value res : r.getResult())
           bytes += nw * 32 * (bitsOf(elementScalarType(res.getType())) / 8);
-        poolBytes = std::max(poolBytes, nGroups * bytes);
+        poolBytes = std::max(poolBytes, bytes);
       }
     } else if (auto h = dyn_cast<tt::HistogramOp>(op)) {
       auto rt = cast<RankedTensorType>(h.getResult().getType());
@@ -2630,21 +2623,44 @@ private:
     std::string sc = mslScalarType(resTy.getElementType());
     auto &srcNames = names(src);
 
+    int srcRc = regCount(src);
+    int resRc = regCount(res);
+    int64_t elemBytes = bitsOf(resTy.getElementType()) / 8;
+    int64_t total = tileSize(resTy);
+
     std::string buf = fresh();
     os << ind() << "threadgroup " << sc << "* " << buf << " = "
        << poolRegion(0, sc) << ";\n";
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    for (int r = 0, n = regCount(src); r < n; ++r)
-      os << ind() << buf << "["
-         << transFlatOffset(srcTy, perm, resTy.getShape(), r)
-         << "] = " << srcNames[r] << ";\n";
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    SmallVector<std::string> ids;
-    for (int r = 0, n = regCount(res); r < n; ++r) {
-      std::string id = fresh();
-      os << ind() << sc << " " << id << " = " << buf << "["
-         << flatTileOffset(resTy, r) << "];\n";
-      ids.push_back(id);
+
+    int64_t band = total * elemBytes > 32768
+                       ? reshapeBandElems(total, elemBytes)
+                       : total;
+
+    SmallVector<std::string> ids = declResultVars(res, StringRef());
+
+    for (int64_t lo = 0; lo < total; lo += band) {
+      int64_t hi = std::min(lo + band, total);
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int r = 0; r < srcRc; ++r) {
+        std::string off = transFlatOffset(srcTy, perm, resTy.getShape(), r);
+        const std::string &sv = srcNames[srcNames.size() == 1 ? 0 : r];
+        if (band == total)
+          os << ind() << buf << "[" << off << "] = " << sv << ";\n";
+        else
+          os << ind() << "{ int __f = " << off << "; if (__f >= " << lo
+             << " && __f < " << hi << ") " << buf << "[__f - " << lo
+             << "] = " << sv << "; }\n";
+      }
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int r = 0; r < resRc; ++r) {
+        std::string off = flatTileOffset(resTy, r);
+        if (band == total)
+          os << ind() << ids[r] << " = " << buf << "[" << off << "];\n";
+        else
+          os << ind() << "{ int __f = " << off << "; if (__f >= " << lo
+             << " && __f < " << hi << ") " << ids[r] << " = " << buf
+             << "[__f - " << lo << "]; }\n";
+      }
     }
     valMap[res] = ids;
     return success();

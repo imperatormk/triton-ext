@@ -201,7 +201,17 @@ private:
     os << ind() << "int " << laneId << " = (int)(" << tidId << ".x & 31u);\n";
     os << ind() << "int " << warpId << " = (int)(" << tidId << ".x >> 5);\n";
 
+    poolBytes = 0;
     Block &body = func.getBody().front();
+    for (Operation &op : body)
+      scanPool(&op);
+    if (poolBytes > 0) {
+      poolBuf = "__pool";
+      os << ind() << "threadgroup char " << poolBuf << "[" << poolBytes
+         << "];\n";
+    }
+
+
     for (Operation &op : body) {
       if (failed(emitOp(&op)))
         return failure();
@@ -803,9 +813,11 @@ private:
     if (warpMask != 0) {
       auto kWarpDim = StringAttr::get(ctx, "warp");
       int numWarps = ll.getInDimSize(kWarpDim);
-      std::string scratch = "__red_scratch_" + std::to_string(nextId++);
-      os << ind() << "threadgroup " << sc << " " << scratch << "[" << numWarps
-         << "];\n";
+      std::string scratch = fresh();
+      os << ind() << "threadgroup " << sc << "* " << scratch << " = "
+         << poolRegion(0, sc) << ";\n";
+      (void)numWarps;
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       os << ind() << "if (" << laneId << " == 0) " << scratch << "[" << warpId
          << "] = " << acc << ";\n";
       os << ind()
@@ -827,12 +839,65 @@ private:
 
   int tgScratchId = 0;
 
+  // A single per-kernel threadgroup pool shared by every barrier-separated
+  // transient scratch site (convert-layout, dot A/B/C staging, cross-warp
+  // reduce). Each site is separated from the next by a threadgroup_barrier, so
+  // one region is reused rather than summed into the PSO budget. Buffers that
+  // stay live across a loop (ttg.local_alloc rotating stages) do NOT draw from
+  // the pool. Sized in bytes to the max single-site footprint; regions are
+  // reinterpreted to the site's element type.
+  std::string poolBuf;
+  int64_t poolBytes = 0;
+
+  static int64_t bitsOf(Type t) {
+    return isa<tt::PointerType>(t) ? 64 : t.getIntOrFloatBitWidth();
+  }
+
+  std::string poolRegion(int64_t byteOffset, StringRef sc) {
+    std::string base = byteOffset == 0
+                           ? poolBuf
+                           : "(" + poolBuf + " + " + std::to_string(byteOffset) +
+                                 ")";
+    return "((threadgroup " + sc.str() + "*)" + base + ")";
+  }
+
   // Full flat size (product of shape) of a tensor tile.
   int64_t tileSize(RankedTensorType rt) {
     int64_t n = 1;
     for (int64_t d : rt.getShape())
       n *= d;
     return n;
+  }
+
+  // Peak byte footprint of a single transient scratch site.
+  void scanPool(Operation *op) {
+    if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+      auto st = cast<RankedTensorType>(c.getSrc().getType());
+      Type e = st.getElementType();
+      int64_t bytes = tileSize(st) * (bitsOf(e) / 8);
+      poolBytes = std::max(poolBytes, bytes);
+    } else if (auto d = dyn_cast<tt::DotOp>(op)) {
+      auto aTy = cast<RankedTensorType>(d.getA().getType());
+      auto bTy = cast<RankedTensorType>(d.getB().getType());
+      auto cTy = cast<RankedTensorType>(d.getResult().getType());
+      int64_t aB = tileSize(aTy) * (bitsOf(aTy.getElementType()) / 8);
+      int64_t ab = aB + tileSize(bTy) * (bitsOf(bTy.getElementType()) / 8);
+      int64_t cBytes = tileSize(cTy) * (bitsOf(cTy.getElementType()) / 8);
+      poolBytes = std::max(poolBytes, std::max(ab, cBytes));
+    } else if (auto r = dyn_cast<tt::ReduceOp>(op)) {
+      auto st = cast<RankedTensorType>(r.getOperand(0).getType());
+      tt::LinearLayout ll = ttg::toLinearLayout(st);
+      auto kWarp = StringAttr::get(op->getContext(), "warp");
+      if (ll.hasInDim(kWarp)) {
+        int64_t nw = ll.getInDimSize(kWarp);
+        Type e = st.getElementType();
+        poolBytes = std::max(poolBytes, nw * (bitsOf(e) / 8));
+      }
+    }
+    for (Region &reg : op->getRegions())
+      for (Block &blk : reg)
+        for (Operation &o : blk)
+          scanPool(&o);
   }
 
   // Row-major flat offset expression (into a full tile buffer) for register r.
@@ -869,9 +934,10 @@ private:
     std::string sc = isPtr ? "ulong" : ptrTy;
     auto &srcNames = names(src);
 
-    std::string buf = "__cvt_scratch_" + std::to_string(tgScratchId++);
-    os << ind() << "threadgroup " << sc << " " << buf << "["
-       << tileSize(srcTy) << "];\n";
+    std::string bufptr = fresh();
+    os << ind() << "threadgroup " << sc << "* " << bufptr << " = "
+       << poolRegion(0, sc) << ";\n";
+    std::string buf = bufptr;
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     for (int r = 0, n = regCount(src); r < n; ++r) {
       std::string sv =
@@ -1040,15 +1106,14 @@ private:
     std::string opFrag = sgFragType(aElem);
     std::string accFrag = sgFragType(cElem);
 
-    std::string tgA = "__dotA_" + std::to_string(tgScratchId++);
-    std::string tgB = "__dotB_" + std::to_string(tgScratchId++);
-    std::string tgC = "__dotC_" + std::to_string(tgScratchId++);
-    os << ind() << "threadgroup " << opScalar << " " << tgA << "[" << M * K
-       << "];\n";
-    os << ind() << "threadgroup " << opScalar << " " << tgB << "[" << K * N
-       << "];\n";
-    os << ind() << "threadgroup " << accScalar << " " << tgC << "[" << M * N
-       << "];\n";
+    int64_t aBytes = M * K * (bitsOf(aElem) / 8);
+    std::string tgA = fresh(), tgB = fresh(), tgC = fresh();
+    os << ind() << "threadgroup " << opScalar << "* " << tgA << " = "
+       << poolRegion(0, opScalar) << ";\n";
+    os << ind() << "threadgroup " << opScalar << "* " << tgB << " = "
+       << poolRegion(aBytes, opScalar) << ";\n";
+    os << ind() << "threadgroup " << accScalar << "* " << tgC << " = "
+       << poolRegion(0, accScalar) << ";\n";
 
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     for (int r = 0, n = regCount(op.getA()); r < n; ++r)
@@ -1077,6 +1142,10 @@ private:
           os << ind() << "simdgroup_multiply_accumulate(" << acc << ", " << fa
              << ", " << fb << ", " << acc << ");\n";
         }
+      }
+    for (int64_t mi = 0; mi < mT; ++mi)
+      for (int64_t ni = 0; ni < nT; ++ni) {
+        std::string acc = "acc_" + std::to_string(mi) + "_" + std::to_string(ni);
         os << ind() << "simdgroup_store(" << acc << ", " << tgC << " + "
            << (mi * 8 * N + ni * 8) << ", " << N << ");\n";
       }

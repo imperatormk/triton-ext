@@ -468,6 +468,8 @@ private:
       return emitSplit(s);
     if (auto c = dyn_cast<tt::CatOp>(op))
       return emitCat(c);
+    if (auto g = dyn_cast<tt::GatherOp>(op))
+      return emitGather(g);
     if (auto r = dyn_cast<tt::ReshapeOp>(op))
       return emitReshape(r);
     if (auto a = dyn_cast<ttg::LocalAllocOp>(op))
@@ -2121,6 +2123,10 @@ private:
       auto rt = cast<RankedTensorType>(rs.getResult().getType());
       Type e = rt.getElementType();
       poolBytes = std::max(poolBytes, tileSize(rt) * (bitsOf(e) / 8));
+    } else if (auto g = dyn_cast<tt::GatherOp>(op)) {
+      auto st = cast<RankedTensorType>(g.getSrc().getType());
+      Type e = st.getElementType();
+      poolBytes = std::max(poolBytes, tileSize(st) * (bitsOf(e) / 8));
     } else if (auto d = dyn_cast<tt::DotOp>(op)) {
       auto aTy = cast<RankedTensorType>(d.getA().getType());
       auto bTy = cast<RankedTensorType>(d.getB().getType());
@@ -2302,6 +2308,60 @@ private:
       std::string id = fresh();
       os << ind() << sc << " " << id << " = " << buf << "["
          << flatTileOffset(resTy, r) << "];\n";
+      outs.push_back(id);
+    }
+    valMap[res] = outs;
+    return success();
+  }
+
+  // tt.gather %src[%idx] {axis}: out has idx's shape/layout;
+  // out[coords] = src[coords with dim `axis` replaced by idx[coords]].
+  // Stage the full src tile into threadgroup memory, then each thread reads its
+  // owned output element at the index-selected source offset.
+  LogicalResult emitGather(tt::GatherOp op) {
+    Value src = op.getSrc();
+    Value idx = op.getIndices();
+    Value res = op.getResult();
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    int axis = op.getAxis();
+    std::string sc = mslScalarType(elementScalarType(resTy));
+    auto &srcNames = names(src);
+    auto &idxNames = names(idx);
+    int srcRc = regCount(src);
+    int resRc = regCount(res);
+
+    auto srcShape = srcTy.getShape();
+    tt::LinearLayout resLL = ttg::toLinearLayout(resTy);
+    auto resOut = llvm::to_vector(resLL.getOutDimNames());
+
+    std::string buf = fresh();
+    os << ind() << "threadgroup " << sc << "* " << buf << " = "
+       << poolRegion(0, sc) << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    for (int r = 0; r < srcRc; ++r)
+      os << ind() << buf << "[" << flatTileOffset(srcTy, r)
+         << "] = " << srcNames[srcNames.size() == 1 ? 0 : r] << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+    SmallVector<std::string> outs;
+    for (int r = 0; r < resRc; ++r) {
+      std::string off;
+      int64_t stride = 1;
+      for (int d = (int)srcShape.size() - 1; d >= 0; --d) {
+        std::string c = (d == axis)
+                            ? ("(int)(" + idxNames[idxNames.size() == 1 ? 0 : r] +
+                               ")")
+                            : layoutCoordExpr(resTy, r, resOut[d]);
+        std::string term =
+            stride == 1 ? c : ("(" + c + " * " + std::to_string(stride) + ")");
+        off = off.empty() ? term : ("(" + off + " + " + term + ")");
+        stride *= srcShape[d];
+      }
+      if (off.empty())
+        off = "0";
+      std::string id = fresh();
+      os << ind() << sc << " " << id << " = " << buf << "[" << off << "];\n";
       outs.push_back(id);
     }
     valMap[res] = outs;

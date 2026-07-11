@@ -1082,6 +1082,23 @@ private:
     return mask;
   }
 
+  // Warp indices that hold DISTINCT reduced-axis data. A warp bit whose basis
+  // is zero on the reduced out-dim does not index that axis: warps that differ
+  // only in such replicated bits alias the same data, so combining all
+  // numWarps scratch slots would double-count. Representatives are the warps
+  // with every replicated bit clear.
+  SmallVector<int> distinctWarps(unsigned partitionMask, int numWarps) {
+    unsigned nbits = 0;
+    while ((1 << nbits) < numWarps)
+      ++nbits;
+    unsigned replicated = (~partitionMask) & ((1u << nbits) - 1u);
+    SmallVector<int> reps;
+    for (int w = 0; w < numWarps; ++w)
+      if ((w & replicated) == 0)
+        reps.push_back(w);
+    return reps;
+  }
+
   LogicalResult emitReduce(tt::ReduceOp op) {
     int nOp = op.getNumOperands();
     auto srcTy = cast<RankedTensorType>(op.getOperand(0).getType());
@@ -1160,13 +1177,15 @@ private:
         os << ind() << "if (" << laneId << " == 0) " << scratch[k] << "["
            << warpId << "] = " << accs[k] << ";\n";
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      SmallVector<int> reps = distinctWarps(warpMask, numWarps);
       SmallVector<std::string> wacc(nOp);
       for (int k = 0; k < nOp; ++k) {
         wacc[k] = fresh();
-        os << ind() << scTys[k] << " " << wacc[k] << " = " << scratch[k]
-           << "[0];\n";
+        os << ind() << scTys[k] << " " << wacc[k] << " = " << scratch[k] << "["
+           << reps[0] << "];\n";
       }
-      for (int w = 1; w < numWarps; ++w) {
+      for (size_t i = 1; i < reps.size(); ++i) {
+        int w = reps[i];
         SmallVector<std::string> wv(nOp);
         for (int k = 0; k < nOp; ++k) {
           wv[k] = fresh();
@@ -1204,6 +1223,95 @@ private:
     return bits;
   }
 
+  // Cross-warp inclusive carry for one register run. Applies the prefix of all
+  // lower warp partitions to the run's registers, and writes the run's grand
+  // total (inclusive across every lane and warp) to runTotalOut. laneScan holds
+  // each warp's lane-inclusive total. Self-brackets with threadgroup barriers.
+  LogicalResult emitScanWarpCarry(Region &region,
+                                  ArrayRef<std::pair<int, int32_t>> warpBits,
+                                  ArrayRef<int> regs,
+                                  SmallVectorImpl<std::string> &accs,
+                                  StringRef laneScan, StringRef sc, bool rev,
+                                  StringRef runTotalOut) {
+    if (warpBits.empty()) {
+      unsigned topLane = rev ? 0u : 31u;
+      os << ind() << runTotalOut << " = simd_shuffle(" << laneScan << ", "
+         << topLane << "u);\n";
+      return success();
+    }
+
+    int nParts = 1 << warpBits.size();
+    SmallVector<std::string> posTerms;
+    for (size_t r = 0; r < warpBits.size(); ++r) {
+      int bitIdx = warpBits[r].first;
+      posTerms.push_back("((((" + warpId + " >> " + std::to_string(bitIdx) +
+                         ") & 1) << " + std::to_string(r) + "))");
+    }
+    std::string warpPos = posTerms[0];
+    for (size_t i = 1; i < posTerms.size(); ++i)
+      warpPos = "(" + warpPos + " | " + posTerms[i] + ")";
+    std::string wpos = fresh();
+    os << ind() << "int " << wpos << " = " << warpPos << ";\n";
+
+    std::string scratch = fresh();
+    os << ind() << "threadgroup " << sc << "* " << scratch << " = "
+       << poolRegion(0, sc) << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    unsigned totLane = rev ? 0u : 31u;
+    os << ind() << "if (" << laneId << " == " << totLane << ") " << scratch
+       << "[" << wpos << "] = " << laneScan << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+    std::string grand = fresh();
+    os << ind() << sc << " " << grand << " = " << scratch << "[0];\n";
+    for (int p = 1; p < nParts; ++p) {
+      std::string comb = fresh();
+      os << ind() << sc << " " << comb << ";\n";
+      if (failed(emitCombine(region, comb,
+                             grand, scratch + "[" + std::to_string(p) + "]",
+                             sc)))
+        return failure();
+      os << ind() << grand << " = " << comb << ";\n";
+    }
+    os << ind() << runTotalOut << " = " << grand << ";\n";
+
+    std::string carry = fresh();
+    std::string loop;
+    if (rev) {
+      os << ind() << sc << " " << carry << " = " << scratch << "[" << wpos
+         << " + 1];\n";
+      loop = "for (int wp = " + wpos + " + 2; wp < " + std::to_string(nParts) +
+             "; ++wp) {";
+    } else {
+      os << ind() << sc << " " << carry << " = " << scratch << "[0];\n";
+      loop = "for (int wp = 1; wp < " + wpos + "; ++wp) {";
+    }
+    os << ind() << loop << "\n";
+    indent++;
+    std::string wv = fresh();
+    os << ind() << sc << " " << wv << " = " << scratch << "[wp];\n";
+    std::string comb = fresh();
+    os << ind() << sc << " " << comb << ";\n";
+    if (failed(emitCombine(region, comb, carry, wv, sc)))
+      return failure();
+    os << ind() << carry << " = " << comb << ";\n";
+    indent--;
+    os << ind() << "}\n";
+    std::string guard =
+        rev ? (wpos + " < " + std::to_string(nParts - 1)) : (wpos + " > 0");
+    for (int r : regs) {
+      std::string comb = fresh();
+      os << ind() << sc << " " << comb << ";\n";
+      if (failed(rev ? emitCombine(region, comb, accs[r], carry, sc)
+                     : emitCombine(region, comb, carry, accs[r], sc)))
+        return failure();
+      os << ind() << accs[r] << " = (" << guard << " ? " << comb << " : "
+         << accs[r] << ");\n";
+    }
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    return success();
+  }
+
   LogicalResult emitScan(tt::ScanOp op) {
     if (op.getNumOperands() != 1) {
       op.emitError("EmitMSL: only single-operand scan supported");
@@ -1224,109 +1332,119 @@ private:
     auto kWarp = StringAttr::get(ctx, "warp");
     auto outDim = *ll.getOutDimNames().begin();
 
-    SmallVector<int> regOrder(nReg);
+    auto laneBits = axisBits(ll, kLane, outDim);
+    auto warpBits = axisBits(ll, kWarp, outDim);
+
+    // Largest lane/warp axis stride: register bits above it are OUTER scan
+    // dimensions that straddle the lane/warp span, so registers group into
+    // coord-contiguous runs and the cross-run carry runs after lane/warp.
+    int32_t laneWarpReach = 0;
+    for (auto &pr : laneBits)
+      laneWarpReach = std::max(laneWarpReach, pr.second);
+    for (auto &pr : warpBits)
+      laneWarpReach = std::max(laneWarpReach, pr.second);
+
+    SmallVector<int> runId(nReg, 0);
+    for (int r = 0; r < nReg; ++r) {
+      int32_t c = registerCoords(srcTy, r)[0];
+      runId[r] = laneWarpReach ? (c / (2 * laneWarpReach)) : 0;
+    }
+    SmallVector<int> runOrder;
     for (int r = 0; r < nReg; ++r)
-      regOrder[r] = r;
-    llvm::sort(regOrder, [&](int a, int b) {
-      int32_t ca = registerCoords(srcTy, a)[0];
-      int32_t cb = registerCoords(srcTy, b)[0];
-      return rev ? ca > cb : ca < cb;
-    });
+      if (llvm::find(runOrder, runId[r]) == runOrder.end())
+        runOrder.push_back(runId[r]);
+    llvm::sort(runOrder, [&](int a, int b) { return rev ? a > b : a < b; });
 
     SmallVector<std::string> accs(nReg);
     for (int r = 0; r < nReg; ++r) {
       accs[r] = fresh();
       os << ind() << sc << " " << accs[r] << " = " << srcNames[r] << ";\n";
     }
-    for (int i = 1; i < nReg; ++i) {
-      std::string comb = fresh();
-      os << ind() << sc << " " << comb << ";\n";
-      if (failed(emitCombine(region, comb, accs[regOrder[i - 1]],
-                             accs[regOrder[i]], sc)))
-        return failure();
-      os << ind() << accs[regOrder[i]] << " = " << comb << ";\n";
-    }
 
-    auto laneBits = axisBits(ll, kLane, outDim);
-    std::string laneScan = fresh();
-    os << ind() << sc << " " << laneScan << " = " << accs[regOrder[nReg - 1]]
-       << ";\n";
     const char *shuf = rev ? "simd_shuffle_down" : "simd_shuffle_up";
-    for (auto &pr : laneBits) {
-      unsigned delta = 1u << pr.first;
-      std::string nb = fresh();
-      os << ind() << sc << " " << nb << " = " << shuf << "(" << laneScan
-         << ", " << delta << "u);\n";
-      std::string comb = fresh();
-      os << ind() << sc << " " << comb << ";\n";
-      if (failed(rev ? emitCombine(region, comb, laneScan, nb, sc)
-                     : emitCombine(region, comb, nb, laneScan, sc)))
-        return failure();
-      std::string guard =
-          rev ? (laneId + " <= " + std::to_string(31u - delta))
-              : (laneId + " >= " + std::to_string(delta));
-      os << ind() << laneScan << " = (" << guard << " ? " << comb << " : "
-         << laneScan << ");\n";
-    }
-    if (!laneBits.empty()) {
-      std::string lanePrefix = fresh();
-      os << ind() << sc << " " << lanePrefix << " = " << shuf << "(" << laneScan
-         << ", 1u);\n";
-      std::string guard = rev ? (laneId + " <= 30") : (laneId + " >= 1");
-      for (int r = 0; r < nReg; ++r) {
+    SmallVector<std::string> runTotals(runOrder.size());
+
+    for (size_t ri = 0; ri < runOrder.size(); ++ri) {
+      int run = runOrder[ri];
+      SmallVector<int> regs;
+      for (int r = 0; r < nReg; ++r)
+        if (runId[r] == run)
+          regs.push_back(r);
+      llvm::sort(regs, [&](int a, int b) {
+        int32_t ca = registerCoords(srcTy, a)[0];
+        int32_t cb = registerCoords(srcTy, b)[0];
+        return rev ? ca > cb : ca < cb;
+      });
+
+      for (size_t i = 1; i < regs.size(); ++i) {
         std::string comb = fresh();
         os << ind() << sc << " " << comb << ";\n";
-        if (failed(rev ? emitCombine(region, comb, accs[r], lanePrefix, sc)
-                       : emitCombine(region, comb, lanePrefix, accs[r], sc)))
+        if (failed(emitCombine(region, comb, accs[regs[i - 1]], accs[regs[i]],
+                               sc)))
           return failure();
-        os << ind() << accs[r] << " = (" << guard << " ? " << comb << " : "
-           << accs[r] << ");\n";
+        os << ind() << accs[regs[i]] << " = " << comb << ";\n";
       }
+
+      std::string laneScan = fresh();
+      os << ind() << sc << " " << laneScan << " = " << accs[regs.back()]
+         << ";\n";
+      for (auto &pr : laneBits) {
+        unsigned delta = 1u << pr.first;
+        std::string nb = fresh();
+        os << ind() << sc << " " << nb << " = " << shuf << "(" << laneScan
+           << ", " << delta << "u);\n";
+        std::string comb = fresh();
+        os << ind() << sc << " " << comb << ";\n";
+        if (failed(rev ? emitCombine(region, comb, laneScan, nb, sc)
+                       : emitCombine(region, comb, nb, laneScan, sc)))
+          return failure();
+        std::string guard = rev ? (laneId + " <= " + std::to_string(31u - delta))
+                                : (laneId + " >= " + std::to_string(delta));
+        os << ind() << laneScan << " = (" << guard << " ? " << comb << " : "
+           << laneScan << ");\n";
+      }
+      if (!laneBits.empty()) {
+        std::string lanePrefix = fresh();
+        os << ind() << sc << " " << lanePrefix << " = " << shuf << "("
+           << laneScan << ", 1u);\n";
+        std::string guard = rev ? (laneId + " <= 30") : (laneId + " >= 1");
+        for (int r : regs) {
+          std::string comb = fresh();
+          os << ind() << sc << " " << comb << ";\n";
+          if (failed(rev ? emitCombine(region, comb, accs[r], lanePrefix, sc)
+                         : emitCombine(region, comb, lanePrefix, accs[r], sc)))
+            return failure();
+          os << ind() << accs[r] << " = (" << guard << " ? " << comb << " : "
+             << accs[r] << ");\n";
+        }
+      }
+
+      runTotals[ri] = fresh();
+      os << ind() << sc << " " << runTotals[ri] << ";\n";
+      if (failed(emitScanWarpCarry(region, warpBits, regs, accs, laneScan, sc,
+                                   rev, runTotals[ri])))
+        return failure();
     }
 
-    auto warpBits = axisBits(ll, kWarp, outDim);
-    if (!warpBits.empty()) {
-      int numWarps = ll.getInDimSize(kWarp);
-      std::string scratch = fresh();
-      os << ind() << "threadgroup " << sc << "* " << scratch << " = "
-         << poolRegion(0, sc) << ";\n";
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-      unsigned totLane = rev ? 0u : 31u;
-      os << ind() << "if (" << laneId << " == " << totLane << ") " << scratch
-         << "[" << warpId << "] = " << laneScan << ";\n";
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-      std::string carry = fresh();
-      std::string loop;
-      if (rev) {
-        os << ind() << sc << " " << carry << " = " << scratch << "["
-           << warpId << " + 1];\n";
-        loop = "for (int wp = " + warpId + " + 2; wp < " +
-               std::to_string(numWarps) + "; ++wp) {";
-      } else {
-        os << ind() << sc << " " << carry << " = " << scratch << "[0];\n";
-        loop = "for (int wp = 1; wp < " + warpId + "; ++wp) {";
+    for (size_t ri = 1; ri < runOrder.size(); ++ri) {
+      std::string carry = runTotals[0];
+      for (size_t j = 1; j < ri; ++j) {
+        std::string comb = fresh();
+        os << ind() << sc << " " << comb << ";\n";
+        if (failed(emitCombine(region, comb, carry, runTotals[j], sc)))
+          return failure();
+        carry = comb;
       }
-      os << ind() << loop << "\n";
-      indent++;
-      std::string wv = fresh();
-      os << ind() << sc << " " << wv << " = " << scratch << "[wp];\n";
-      std::string comb = fresh();
-      os << ind() << sc << " " << comb << ";\n";
-      if (failed(emitCombine(region, comb, carry, wv, sc)))
-        return failure();
-      os << ind() << carry << " = " << comb << ";\n";
-      indent--;
-      os << ind() << "}\n";
-      std::string guard = rev ? (warpId + " < " + std::to_string(numWarps - 1))
-                              : (warpId + " > 0");
+      int run = runOrder[ri];
       for (int r = 0; r < nReg; ++r) {
+        if (runId[r] != run)
+          continue;
         std::string comb = fresh();
         os << ind() << sc << " " << comb << ";\n";
         if (failed(rev ? emitCombine(region, comb, accs[r], carry, sc)
                        : emitCombine(region, comb, carry, accs[r], sc)))
           return failure();
-        os << ind() << accs[r] << " = (" << guard << " ? " << comb << " : "
-           << accs[r] << ");\n";
+        os << ind() << accs[r] << " = " << comb << ";\n";
       }
     }
 

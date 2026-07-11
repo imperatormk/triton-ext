@@ -124,6 +124,14 @@ public:
     os << "#include <metal_stdlib>\n";
     os << "#include <metal_simdgroup_matrix>\n";
     os << "using namespace metal;\n\n";
+    os << "static inline float tt_erf(float x){\n"
+          "  float t = 1.0f/(1.0f+0.5f*metal::fabs(x));\n"
+          "  float y = t*metal::exp(-x*x-1.26551223f+t*(1.00002368f+t*(0.37409196f"
+          "+t*(0.09678418f+t*(-0.18628806f+t*(0.27886807f+t*(-1.13520398f"
+          "+t*(1.48851587f+t*(-0.82215223f+t*0.17087277f)))))))));\n"
+          "  float r = 1.0f - y;\n"
+          "  return x >= 0.0f ? r : -r;\n"
+          "}\n\n";
 
     SmallVector<tt::FuncOp> devFuncs, kernels;
     for (auto func : mod.getOps<tt::FuncOp>()) {
@@ -1100,6 +1108,24 @@ private:
                     : isa<arith::MulIOp>(op) ? "*"
                     : isa<arith::DivSIOp, arith::DivUIOp>(op) ? "/"
                                                               : "%";
+    Type resElem = elementScalarType(op->getResult(0).getType());
+    if (auto it = dyn_cast<IntegerType>(resElem); it && it.getWidth() == 1) {
+      Value res = op->getResult(0);
+      auto &lhs = names(op->getOperand(0));
+      auto &rhs = names(op->getOperand(1));
+      int rc = regCount(res);
+      SmallVector<std::string> ids;
+      for (int r = 0; r < rc; ++r) {
+        std::string id = fresh();
+        const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
+        const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
+        os << ind() << "bool " << id << " = (bool)((((int)" << a << ") " << o
+           << " ((int)" << b << ")) & 1);\n";
+        ids.push_back(id);
+      }
+      valMap[res] = ids;
+      return success();
+    }
     std::string sc =
         mslScalarType(elementScalarType(op->getResult(0).getType()));
     std::string opCast;
@@ -1196,8 +1222,8 @@ private:
     for (int r = 0; r < rc; ++r) {
       std::string id = fresh();
       const std::string &v = a[a.size() == 1 ? 0 : r];
-      os << ind() << sc.str() << " " << id << " = " << fn.str() << "(" << v
-         << ");\n";
+      os << ind() << sc.str() << " " << id << " = (" << sc.str() << ")"
+         << fn.str() << "(" << v << ");\n";
       ids.push_back(id);
     }
     valMap[res] = ids;
@@ -1217,8 +1243,8 @@ private:
         {"math.acos", "metal::acos"},     {"math.atan", "metal::atan"},
         {"math.sqrt", "metal::sqrt"},     {"math.rsqrt", "metal::rsqrt"},
         {"math.cbrt", "metal::cbrt"},     {"math.floor", "metal::floor"},
-        {"math.ceil", "metal::ceil"},     {"math.absf", "metal::abs"},
-        {"math.absi", "metal::abs"},      {"math.erf", "metal::erf"},
+        {"math.ceil", "metal::ceil"},     {"math.absf", "metal::fabs"},
+        {"math.absi", "metal::abs"},      {"math.erf", "tt_erf"},
         {"math.round", "metal::round"},   {"math.trunc", "metal::trunc"},
         {"math.roundeven", "metal::rint"}};
     if (auto it = unary.find(n); it != unary.end())
@@ -1823,8 +1849,10 @@ private:
           os << ind() << "threadgroup " << scTys[k] << "* " << scratch[k]
              << " = " << poolRegion(byteOff, scTys[k]) << ";\n";
           byteOff += numWarps * 32 *
-                     (bitsOf(elementScalarType(op.getResult()[k].getType())) /
-                      8);
+                     std::max<int64_t>(
+                         1, bitsOf(elementScalarType(
+                                op.getResult()[k].getType())) /
+                                8);
         }
         os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
         for (int k = 0; k < nOp; ++k)
@@ -2004,9 +2032,16 @@ private:
          << ");\n";
       return out;
     }
-    if (sc == "bfloat" || sc == "half" || sc == "short" || sc == "char" ||
-        sc == "bool") {
-      std::string bits = sc == "char" || sc == "bool" ? "uchar" : "ushort";
+    if (sc == "bool") {
+      std::string b = fresh(), s = fresh();
+      os << ind() << "uchar " << b << " = (uchar)" << val << ";\n";
+      os << ind() << "uchar " << s << " = " << op << "(" << b << ", " << arg
+         << ");\n";
+      os << ind() << sc << " " << out << " = (bool)" << s << ";\n";
+      return out;
+    }
+    if (sc == "bfloat" || sc == "half" || sc == "short" || sc == "char") {
+      std::string bits = sc == "char" ? "uchar" : "ushort";
       std::string b = fresh(), s = fresh();
       os << ind() << bits << " " << b << " = as_type<" << bits << ">(" << val
          << ");\n";
@@ -2520,7 +2555,9 @@ private:
         int64_t nw = ll.getInDimSize(kWarp);
         int64_t bytes = 0;
         for (Value res : r.getResult())
-          bytes += nw * 32 * (bitsOf(elementScalarType(res.getType())) / 8);
+          bytes += nw * 32 *
+                   std::max<int64_t>(
+                       1, bitsOf(elementScalarType(res.getType())) / 8);
         poolBytes = std::max(poolBytes, bytes);
       }
     } else if (auto h = dyn_cast<tt::HistogramOp>(op)) {

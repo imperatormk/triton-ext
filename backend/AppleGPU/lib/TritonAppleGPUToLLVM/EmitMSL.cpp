@@ -237,7 +237,8 @@ private:
     int off = 0;
     for (BlockArgument arg : scalarArgs) {
       Type ty = arg.getType();
-      int size = ty.getIntOrFloatBitWidth() / 8;
+      unsigned bits = ty.getIntOrFloatBitWidth();
+      int size = bits == 1 ? 1 : (int)(bits / 8);
       off = (off + size - 1) / size * size;
       std::string sc = mslScalarType(ty);
       std::string id = fresh();

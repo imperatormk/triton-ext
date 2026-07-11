@@ -17,6 +17,7 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseMap.h"
+#include <map>
 #include "llvm/Support/raw_ostream.h"
 
 #include <string>
@@ -1104,31 +1105,32 @@ private:
     return mask;
   }
 
-  // Warp indices that hold DISTINCT reduced-axis data. A warp bit whose basis
-  // is zero on the reduced out-dim does not index that axis: warps that differ
-  // only in such replicated bits alias the same data, so combining all
-  // numWarps scratch slots would double-count. Representatives are the warps
-  // with every replicated bit clear.
-  SmallVector<int> distinctWarps(unsigned partitionMask, int numWarps) {
-    unsigned nbits = 0;
-    while ((1 << nbits) < numWarps)
-      ++nbits;
-    unsigned replicated = (~partitionMask) & ((1u << nbits) - 1u);
-    SmallVector<int> reps;
-    for (int w = 0; w < numWarps; ++w)
-      if ((w & replicated) == 0)
-        reps.push_back(w);
-    return reps;
+  // All distinct values reachable by ORing subsets of the mask's set bits.
+  // Used to enumerate the reduced-axis warp partition offsets while keeping the
+  // surviving-axis warp bits fixed, so a cross-warp combine never mixes warps
+  // that hold different output elements.
+  SmallVector<int> subsetsOf(unsigned mask, int numWarps) {
+    SmallVector<int> bits;
+    for (int b = 0; b < 16; ++b)
+      if (mask & (1u << b))
+        bits.push_back(b);
+    SmallVector<int> vals;
+    for (int s = 0; s < (1 << bits.size()); ++s) {
+      int v = 0;
+      for (int i = 0; i < (int)bits.size(); ++i)
+        if (s & (1 << i))
+          v |= (1 << bits[i]);
+      if (v < numWarps)
+        vals.push_back(v);
+    }
+    return vals;
   }
 
   LogicalResult emitReduce(tt::ReduceOp op) {
     int nOp = op.getNumOperands();
     auto srcTy = cast<RankedTensorType>(op.getOperand(0).getType());
-    for (Value res : op.getResult())
-      if (isa<RankedTensorType>(res.getType())) {
-        op.emitError("EmitMSL: only scalar-result reduce supported");
-        return failure();
-      }
+    int axis = op.getAxis();
+    bool tensorResult = isa<RankedTensorType>(op.getResult()[0].getType());
 
     SmallVector<std::string> scTys(nOp);
     for (int k = 0; k < nOp; ++k)
@@ -1140,91 +1142,150 @@ private:
       srcNames[k] = &names(op.getOperand(k));
     int nReg = srcNames[0]->size();
 
-    SmallVector<std::string> accs(nOp);
-    for (int k = 0; k < nOp; ++k) {
-      accs[k] = fresh();
-      os << ind() << scTys[k] << " " << accs[k] << " = " << (*srcNames[k])[0]
-         << ";\n";
-    }
-    for (int r = 1; r < nReg; ++r) {
-      SmallVector<std::string> bVals(nOp);
-      for (int k = 0; k < nOp; ++k)
-        bVals[k] = (*srcNames[k])[r];
-      SmallVector<std::string> out;
-      if (failed(emitCombineN(region, accs, bVals, out)))
-        return failure();
-      for (int k = 0; k < nOp; ++k)
-        os << ind() << accs[k] << " = " << out[k] << ";\n";
-    }
-
     MLIRContext *ctx = op.getContext();
     tt::LinearLayout ll = ttg::toLinearLayout(srcTy);
     auto kLane = StringAttr::get(ctx, "lane");
     auto kWarp = StringAttr::get(ctx, "warp");
-    auto outDim = *ll.getOutDimNames().begin();
+    auto outDims = llvm::to_vector(ll.getOutDimNames());
+    auto redDim = outDims[axis];
 
-    unsigned laneMask = reduceMask(ll, kLane, outDim);
-    for (int bit = 31; bit >= 0; --bit) {
-      unsigned m = 1u << bit;
-      if ((laneMask & m) == 0)
-        continue;
-      SmallVector<std::string> others(nOp);
-      for (int k = 0; k < nOp; ++k) {
-        others[k] = fresh();
-        os << ind() << scTys[k] << " " << others[k] << " = simd_shuffle_xor("
-           << accs[k] << ", " << m << "u);\n";
-      }
-      SmallVector<std::string> out;
-      if (failed(emitCombineN(region, accs, others, out)))
-        return failure();
-      for (int k = 0; k < nOp; ++k)
-        os << ind() << accs[k] << " = " << out[k] << ";\n";
-    }
+    // Group source registers by their coordinate on every non-reduced out-dim
+    // (the surviving key). Registers in a group differ only along the reduced
+    // axis and reduce together into one output element.
+    auto survKey = [&](int reg) {
+      SmallVector<int32_t> coords = registerCoords(srcTy, reg);
+      std::string key;
+      for (int d = 0; d < (int)coords.size(); ++d)
+        if (d != axis)
+          key += std::to_string(coords[d]) + ",";
+      return key;
+    };
+    std::map<std::string, SmallVector<int>> groups;
+    for (int r = 0; r < nReg; ++r)
+      groups[survKey(r)].push_back(r);
 
-    unsigned warpMask = reduceMask(ll, kWarp, outDim);
-    if (warpMask != 0) {
-      int numWarps = ll.getInDimSize(kWarp);
-      SmallVector<std::string> scratch(nOp);
-      int64_t byteOff = 0;
+    unsigned laneMask = reduceMask(ll, kLane, redDim);
+    unsigned warpMask = reduceMask(ll, kWarp, redDim);
+    int numWarps = ll.hasInDim(kWarp) ? ll.getInDimSize(kWarp) : 1;
+
+    int64_t warpByteStride = 0;
+    for (int k = 0; k < nOp; ++k)
+      warpByteStride +=
+          bitsOf(elementScalarType(op.getResult()[k].getType())) / 8;
+
+    std::map<std::string, SmallVector<std::string>> groupResult;
+
+    int64_t slot = 0;
+    for (auto &g : groups) {
+      SmallVector<int> &regs = g.second;
+      SmallVector<std::string> accs(nOp);
       for (int k = 0; k < nOp; ++k) {
-        scratch[k] = fresh();
-        os << ind() << "threadgroup " << scTys[k] << "* " << scratch[k] << " = "
-           << poolRegion(byteOff, scTys[k]) << ";\n";
-        byteOff += numWarps * (bitsOf(elementScalarType(
-                                   op.getResult()[k].getType())) /
-                               8);
+        accs[k] = fresh();
+        os << ind() << scTys[k] << " " << accs[k] << " = "
+           << (*srcNames[k])[regs[0]] << ";\n";
       }
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-      for (int k = 0; k < nOp; ++k)
-        os << ind() << "if (" << laneId << " == 0) " << scratch[k] << "["
-           << warpId << "] = " << accs[k] << ";\n";
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-      SmallVector<int> reps = distinctWarps(warpMask, numWarps);
-      SmallVector<std::string> wacc(nOp);
-      for (int k = 0; k < nOp; ++k) {
-        wacc[k] = fresh();
-        os << ind() << scTys[k] << " " << wacc[k] << " = " << scratch[k] << "["
-           << reps[0] << "];\n";
-      }
-      for (size_t i = 1; i < reps.size(); ++i) {
-        int w = reps[i];
-        SmallVector<std::string> wv(nOp);
-        for (int k = 0; k < nOp; ++k) {
-          wv[k] = fresh();
-          os << ind() << scTys[k] << " " << wv[k] << " = " << scratch[k] << "["
-             << w << "];\n";
-        }
+      for (size_t i = 1; i < regs.size(); ++i) {
+        SmallVector<std::string> bVals(nOp);
+        for (int k = 0; k < nOp; ++k)
+          bVals[k] = (*srcNames[k])[regs[i]];
         SmallVector<std::string> out;
-        if (failed(emitCombineN(region, wacc, wv, out)))
+        if (failed(emitCombineN(region, accs, bVals, out)))
           return failure();
         for (int k = 0; k < nOp; ++k)
-          os << ind() << wacc[k] << " = " << out[k] << ";\n";
+          os << ind() << accs[k] << " = " << out[k] << ";\n";
       }
-      accs = wacc;
+
+      for (int bit = 31; bit >= 0; --bit) {
+        unsigned m = 1u << bit;
+        if ((laneMask & m) == 0)
+          continue;
+        SmallVector<std::string> others(nOp);
+        for (int k = 0; k < nOp; ++k) {
+          others[k] = fresh();
+          os << ind() << scTys[k] << " " << others[k] << " = simd_shuffle_xor("
+             << accs[k] << ", " << m << "u);\n";
+        }
+        SmallVector<std::string> out;
+        if (failed(emitCombineN(region, accs, others, out)))
+          return failure();
+        for (int k = 0; k < nOp; ++k)
+          os << ind() << accs[k] << " = " << out[k] << ";\n";
+      }
+
+      if (warpMask != 0) {
+        // Scratch is indexed by (warp * 32 + lane): the surviving axis may live
+        // partly on lanes, so each lane must recover ITS own output element.
+        // Every lane writes; each lane reads across the reduced-axis warps at
+        // its own lane offset. Warps that only vary over reduced-axis bits are
+        // summed; surviving-axis warp bits stay fixed to this warp.
+        SmallVector<std::string> scratch(nOp);
+        int64_t byteOff = slot * numWarps * 32 * warpByteStride;
+        for (int k = 0; k < nOp; ++k) {
+          scratch[k] = fresh();
+          os << ind() << "threadgroup " << scTys[k] << "* " << scratch[k]
+             << " = " << poolRegion(byteOff, scTys[k]) << ";\n";
+          byteOff += numWarps * 32 *
+                     (bitsOf(elementScalarType(op.getResult()[k].getType())) /
+                      8);
+        }
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        for (int k = 0; k < nOp; ++k)
+          os << ind() << scratch[k] << "[" << warpId << " * 32 + " << laneId
+             << "] = " << accs[k] << ";\n";
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        SmallVector<int> redVals = subsetsOf(warpMask, numWarps);
+        std::string base = "((" + warpId + " & " + std::to_string(~warpMask) +
+                           ") * 32 + " + laneId + ")";
+        SmallVector<std::string> wacc(nOp);
+        for (int k = 0; k < nOp; ++k) {
+          wacc[k] = fresh();
+          os << ind() << scTys[k] << " " << wacc[k] << " = " << scratch[k] << "["
+             << base << "];\n";
+        }
+        for (size_t i = 1; i < redVals.size(); ++i) {
+          SmallVector<std::string> wv(nOp);
+          for (int k = 0; k < nOp; ++k) {
+            wv[k] = fresh();
+            os << ind() << scTys[k] << " " << wv[k] << " = " << scratch[k] << "["
+               << base << " + " << (redVals[i] * 32) << "];\n";
+          }
+          SmallVector<std::string> out;
+          if (failed(emitCombineN(region, wacc, wv, out)))
+            return failure();
+          for (int k = 0; k < nOp; ++k)
+            os << ind() << wacc[k] << " = " << out[k] << ";\n";
+        }
+        accs = wacc;
+      }
+
+      groupResult[g.first] = accs;
+      ++slot;
     }
 
+    if (!tensorResult) {
+      for (int k = 0; k < nOp; ++k)
+        bindScalar(op.getResult()[k], groupResult.begin()->second[k]);
+      return success();
+    }
+
+    auto resTy = cast<RankedTensorType>(op.getResult()[0].getType());
+    int nResReg = regCount(op.getResult()[0]);
+    SmallVector<SmallVector<std::string>> resIds(nOp);
+    for (int r = 0; r < nResReg; ++r) {
+      SmallVector<int32_t> rc = registerCoords(resTy, r);
+      std::string key;
+      for (int32_t c : rc)
+        key += std::to_string(c) + ",";
+      auto it = groupResult.find(key);
+      if (it == groupResult.end()) {
+        op.emitError("EmitMSL: reduce result register has no source group");
+        return failure();
+      }
+      for (int k = 0; k < nOp; ++k)
+        resIds[k].push_back(it->second[k]);
+    }
     for (int k = 0; k < nOp; ++k)
-      bindScalar(op.getResult()[k], accs[k]);
+      valMap[op.getResult()[k]] = resIds[k];
     return success();
   }
 
@@ -1542,10 +1603,14 @@ private:
       auto kWarp = StringAttr::get(op->getContext(), "warp");
       if (ll.hasInDim(kWarp)) {
         int64_t nw = ll.getInDimSize(kWarp);
+        int64_t nGroups = 1;
+        if (auto resT = dyn_cast<RankedTensorType>(r.getResult()[0].getType()))
+          nGroups = ttg::toLinearLayout(resT).getInDimSize(
+              StringAttr::get(op->getContext(), "register"));
         int64_t bytes = 0;
         for (Value res : r.getResult())
-          bytes += nw * (bitsOf(elementScalarType(res.getType())) / 8);
-        poolBytes = std::max(poolBytes, bytes);
+          bytes += nw * 32 * (bitsOf(elementScalarType(res.getType())) / 8);
+        poolBytes = std::max(poolBytes, nGroups * bytes);
       }
     } else if (auto s = dyn_cast<tt::ScanOp>(op)) {
       auto st = cast<RankedTensorType>(s.getOperand(0).getType());

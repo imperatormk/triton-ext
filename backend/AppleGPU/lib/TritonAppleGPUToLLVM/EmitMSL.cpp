@@ -311,6 +311,8 @@ private:
       return emitStore(s);
     if (auto a = dyn_cast<tt::AtomicRMWOp>(op))
       return emitAtomicRMW(a);
+    if (auto a = dyn_cast<tt::AtomicCASOp>(op))
+      return emitAtomicCAS(a);
     if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp>(op))
       return emitIntBinary(op);
     if (isa<arith::AndIOp>(op))
@@ -1603,6 +1605,45 @@ private:
         os << ind() << id << " = " << call << ";\n";
       else
         os << ind() << "if (" << guard << ") " << id << " = " << call << ";\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  LogicalResult emitAtomicCAS(tt::AtomicCASOp op) {
+    Value res = op.getResult();
+    Type scalarTy = elementScalarType(res.getType());
+    std::string sc = mslScalarType(scalarTy);
+    if (isa<FloatType>(scalarTy) || scalarTy.getIntOrFloatBitWidth() != 32) {
+      op.emitError("EmitMSL: only 32-bit integer atomic_cas supported");
+      return failure();
+    }
+    std::string atomicTy = "atomic_int";
+
+    auto &ptrs = names(op.getPtr());
+    auto &cmps = names(op.getCmp());
+    auto &vals = names(op.getVal());
+    bool uniform = !isa<RankedTensorType>(op.getPtr().getType());
+    int rc = ptrs.size();
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      const std::string &p = ptrs[r];
+      const std::string &c = cmps[cmps.size() == 1 ? 0 : r];
+      const std::string &v = vals[vals.size() == 1 ? 0 : r];
+      std::string exp = fresh();
+      std::string id = fresh();
+      os << ind() << sc << " " << exp << " = " << c << ";\n";
+      std::string call = "atomic_compare_exchange_weak_explicit((device " +
+                         atomicTy + "*)" + p + ", &" + exp + ", " + v +
+                         ", memory_order_relaxed, memory_order_relaxed)";
+      std::string body = "while (" + exp + " == " + c + " && !(" + call +
+                         ")) {}";
+      if (uniform)
+        os << ind() << "if (" << tidId << ".x == 0) " << body << "\n";
+      else
+        os << ind() << body << "\n";
+      os << ind() << sc << " " << id << " = " << exp << ";\n";
       ids.push_back(id);
     }
     valMap[res] = ids;

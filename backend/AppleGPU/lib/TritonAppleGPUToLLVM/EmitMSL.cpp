@@ -79,6 +79,13 @@ static std::string mslKernelName(StringRef name) {
   return "triton_" + name.str();
 }
 
+static std::string mslDeviceFuncName(StringRef name) {
+  std::string out = "fn_";
+  for (char c : name)
+    out += (isalnum((unsigned char)c) || c == '_') ? c : '_';
+  return out;
+}
+
 static std::string mslStorageType(Type t) {
   if (auto rt = dyn_cast<RankedTensorType>(t))
     t = rt.getElementType();
@@ -117,10 +124,39 @@ public:
     os << "#include <metal_stdlib>\n";
     os << "#include <metal_simdgroup_matrix>\n";
     os << "using namespace metal;\n\n";
+
+    SmallVector<tt::FuncOp> devFuncs, kernels;
     for (auto func : mod.getOps<tt::FuncOp>()) {
+      if (func.isPublic())
+        kernels.push_back(func);
+      else
+        devFuncs.push_back(func);
+    }
+
+    // MSL forbids declaring threadgroup memory in a non-kernel function, so a
+    // shared pool is declared once in the kernel and passed down to every
+    // device function as a threadgroup pointer. Size it for the whole module.
+    globalPoolBytes = 0;
+    for (auto func : mod.getOps<tt::FuncOp>()) {
+      poolBytes = 0;
+      for (Block &blk : func.getBody())
+        for (Operation &op : blk)
+          scanPool(&op);
+      globalPoolBytes = std::max(globalPoolBytes, poolBytes);
+    }
+    moduleHasDevFuncs = !devFuncs.empty();
+
+    for (auto func : devFuncs)
+      if (failed(emitDeviceFuncProto(func, /*asDecl=*/true)))
+        return failure();
+    if (!devFuncs.empty())
+      os << "\n";
+    for (auto func : devFuncs)
+      if (failed(emitDeviceFunc(func)))
+        return failure();
+    for (auto func : kernels)
       if (failed(emitFunc(func)))
         return failure();
-    }
     return success();
   }
 
@@ -259,9 +295,10 @@ private:
     for (Block &blk : func.getBody())
       for (Operation &op : blk)
         scanPool(&op);
-    if (poolBytes > 0) {
+    int64_t kernelPool = moduleHasDevFuncs ? globalPoolBytes : poolBytes;
+    if (kernelPool > 0) {
       poolBuf = "__pool";
-      os << ind() << "threadgroup char " << poolBuf << "[" << poolBytes
+      os << ind() << "threadgroup char " << poolBuf << "[" << kernelPool
          << "];\n";
     }
 
@@ -275,6 +312,187 @@ private:
         return failure();
     }
     os << "}\n";
+    return success();
+  }
+
+  llvm::DenseMap<Operation *, std::string> devRetStruct;
+
+  // Multi-result callees return a small struct; declare it and remember the
+  // name so callers can bind each field.
+  LogicalResult declRetStruct(tt::FuncOp func) {
+    auto results = func.getFunctionType().getResults();
+    if (results.size() <= 1)
+      return success();
+    std::string name = mslDeviceFuncName(func.getName()) + "_ret";
+    devRetStruct[func] = name;
+    os << "struct " << name << " {\n";
+    for (auto [i, ty] : llvm::enumerate(results)) {
+      if (!isa<IntegerType, FloatType>(ty)) {
+        func.emitError("EmitMSL: unsupported device function result type");
+        return failure();
+      }
+      os << "  " << mslScalarType(ty) << " f" << i << ";\n";
+    }
+    os << "};\n";
+    return success();
+  }
+
+  std::string deviceRetType(tt::FuncOp func) {
+    auto results = func.getFunctionType().getResults();
+    if (results.empty())
+      return "void";
+    if (results.size() == 1)
+      return mslScalarType(results[0]);
+    return devRetStruct[func];
+  }
+
+  // Signature `RetType fn_name(args..., thread-context)`. Callee bodies may use
+  // program-id / thread builtins, so the kernel's thread context is threaded
+  // through every device call as trailing params.
+  LogicalResult emitDeviceSignature(tt::FuncOp func, bool bindArgs) {
+    auto fnTy = func.getFunctionType();
+    os << deviceRetType(func) << " " << mslDeviceFuncName(func.getName())
+       << "(";
+    SmallVector<std::string> params;
+    for (auto [i, argTy] : llvm::enumerate(fnTy.getInputs())) {
+      std::string id = bindArgs ? fresh() : ("a" + std::to_string(i));
+      if (auto pt = dyn_cast<tt::PointerType>(argTy)) {
+        params.push_back("device " + mslScalarType(pt.getPointeeType()) + "* " +
+                         id);
+      } else if (isa<IntegerType, FloatType>(argTy)) {
+        params.push_back(mslScalarType(argTy) + " " + id);
+      } else {
+        func.emitError("EmitMSL: unsupported device function argument type");
+        return failure();
+      }
+      if (bindArgs)
+        bindScalar(func.getArgument(i), id);
+    }
+    std::string tg = bindArgs ? fresh() : "__tgpos";
+    std::string ti = bindArgs ? fresh() : "__tid";
+    std::string nt = bindArgs ? fresh() : "__numtg";
+    params.push_back("uint3 " + tg);
+    params.push_back("uint3 " + ti);
+    params.push_back("uint3 " + nt);
+    std::string pp = bindArgs ? fresh() : "__poolptr";
+    if (globalPoolBytes > 0)
+      params.push_back("threadgroup char* " + pp);
+    if (bindArgs) {
+      tgposId = tg;
+      tidId = ti;
+      numTgId = nt;
+      devPoolPtr = pp;
+    }
+    os << llvm::join(params, ", ") << ")";
+    return success();
+  }
+
+  LogicalResult emitDeviceFuncProto(tt::FuncOp func, bool asDecl) {
+    if (failed(declRetStruct(func)))
+      return failure();
+    if (failed(emitDeviceSignature(func, /*bindArgs=*/false)))
+      return failure();
+    os << ";\n";
+    return success();
+  }
+
+  LogicalResult emitDeviceFunc(tt::FuncOp func) {
+    if (failed(emitDeviceSignature(func, /*bindArgs=*/true)))
+      return failure();
+    os << " {\n";
+
+    laneId = fresh();
+    warpId = fresh();
+    os << ind() << "int " << laneId << " = (int)(" << tidId << ".x & 31u);\n";
+    os << ind() << "int " << warpId << " = (int)(" << tidId << ".x >> 5);\n";
+
+    poolBuf = devPoolPtr;
+    curDevFunc = func;
+    Region &region = func.getBody();
+    if (region.hasOneBlock()) {
+      for (Operation &op : region.front())
+        if (failed(emitOp(&op)))
+          return failure();
+    } else {
+      if (failed(emitBlockCFG(region)))
+        return failure();
+    }
+    curDevFunc = nullptr;
+    os << "}\n";
+    return success();
+  }
+
+  tt::FuncOp curDevFunc;
+  std::string devPoolPtr;
+
+  LogicalResult emitReturn(tt::ReturnOp op) {
+    unsigned n = op.getNumOperands();
+    if (n == 0) {
+      os << ind() << "return;\n";
+      return success();
+    }
+    if (n == 1) {
+      auto &nm = names(op.getOperand(0));
+      os << ind() << "return " << nm[0] << ";\n";
+      return success();
+    }
+    std::string st = curDevFunc ? devRetStruct.lookup(curDevFunc) : "";
+    os << ind() << "return { ";
+    SmallVector<std::string> fields;
+    for (Value v : op.getOperands())
+      fields.push_back(names(v)[0]);
+    os << llvm::join(fields, ", ") << " };\n";
+    (void)st;
+    return success();
+  }
+
+  LogicalResult emitCall(tt::CallOp op) {
+    auto callee =
+        mod.lookupSymbol<tt::FuncOp>(op.getCalleeAttr().getValue());
+    if (!callee) {
+      op.emitError("EmitMSL: call to unknown callee");
+      return failure();
+    }
+    SmallVector<std::string> argExprs;
+    for (Value operand : op.getOperands()) {
+      auto &nm = names(operand);
+      if (nm.size() != 1) {
+        op.emitError("EmitMSL: tensor-valued call argument unsupported");
+        return failure();
+      }
+      argExprs.push_back(nm[0]);
+    }
+    argExprs.push_back(tgposId);
+    argExprs.push_back(tidId);
+    argExprs.push_back(numTgId);
+    if (globalPoolBytes > 0)
+      argExprs.push_back(poolBuf.empty() ? "__pool" : poolBuf);
+    std::string call = mslDeviceFuncName(callee.getName()) + "(" +
+                       llvm::join(argExprs, ", ") + ")";
+
+    unsigned nRes = op.getNumResults();
+    if (nRes == 0) {
+      os << ind() << call << ";\n";
+    } else if (nRes == 1) {
+      if (!isa<IntegerType, FloatType>(op.getResult(0).getType())) {
+        op.emitError("EmitMSL: tensor-valued call result unsupported");
+        return failure();
+      }
+      std::string id = fresh();
+      os << ind() << mslScalarType(op.getResult(0).getType()) << " " << id
+         << " = " << call << ";\n";
+      bindScalar(op.getResult(0), id);
+    } else {
+      std::string tmp = fresh();
+      os << ind() << deviceRetType(callee) << " " << tmp << " = " << call
+         << ";\n";
+      for (auto [i, res] : llvm::enumerate(op.getResults())) {
+        std::string id = fresh();
+        os << ind() << mslScalarType(res.getType()) << " " << id << " = " << tmp
+           << ".f" << i << ";\n";
+        bindScalar(res, id);
+      }
+    }
     return success();
   }
 
@@ -619,10 +837,10 @@ private:
       return success();
     if (isa<scf::YieldOp>(op))
       return success();
-    if (isa<tt::ReturnOp>(op)) {
-      os << ind() << "return;\n";
-      return success();
-    }
+    if (auto c = dyn_cast<tt::CallOp>(op))
+      return emitCall(c);
+    if (auto r = dyn_cast<tt::ReturnOp>(op))
+      return emitReturn(r);
     op->emitError("EmitMSL: unhandled op '" + op->getName().getStringRef() +
                   "'");
     return failure();
@@ -2195,6 +2413,8 @@ private:
   // reinterpreted to the site's element type.
   std::string poolBuf;
   int64_t poolBytes = 0;
+  int64_t globalPoolBytes = 0;
+  bool moduleHasDevFuncs = false;
 
   llvm::DenseMap<Block *, std::string> blockLabel;
   std::string cfgState;

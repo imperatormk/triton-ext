@@ -446,6 +446,8 @@ private:
       return emitWhile(w);
     if (auto r = dyn_cast<tt::ReduceOp>(op))
       return emitReduce(r);
+    if (auto h = dyn_cast<tt::HistogramOp>(op))
+      return emitHistogram(h);
     if (auto s = dyn_cast<tt::ScanOp>(op))
       return emitScan(s);
     if (auto d = dyn_cast<tt::DotOp>(op))
@@ -1483,6 +1485,88 @@ private:
     return success();
   }
 
+  LogicalResult emitHistogram(tt::HistogramOp op) {
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto resTy = cast<RankedTensorType>(op.getResult().getType());
+    int64_t nBins = tileSize(resTy);
+
+    int64_t threads = 32;
+    if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+      threads = nw.getInt() * 32;
+
+    std::string bins = fresh();
+    os << ind() << "threadgroup atomic_uint* " << bins << " = "
+       << poolRegion(0, "atomic_uint") << ";\n";
+    std::string zi = fresh();
+    os << ind() << "for (uint " << zi << " = " << tidId << ".x; " << zi << " < "
+       << nBins << "u; " << zi << " += " << threads << "u) "
+       << "atomic_store_explicit(&" << bins << "[" << zi
+       << "], 0u, memory_order_relaxed);\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+    auto &srcVals = names(op.getSrc());
+    SmallVector<std::string> *maskVals = nullptr;
+    if (op.getMask())
+      maskVals = &names(op.getMask());
+    std::string srcU =
+        mslUnsignedType(elementScalarType(op.getSrc().getType()));
+
+    MLIRContext *ctx = op.getContext();
+    tt::LinearLayout srcLL = ttg::toLinearLayout(srcTy);
+    auto kLane = StringAttr::get(ctx, "lane");
+    auto kWarp = StringAttr::get(ctx, "warp");
+    auto srcOut = llvm::to_vector(srcLL.getOutDimNames());
+    uint32_t freeMask = 0;
+    auto scanFree = [&](StringAttr in, int shift) {
+      if (!srcLL.hasInDim(in))
+        return;
+      for (int b = 0, n = srcLL.getInDimSizeLog2(in); b < n; ++b) {
+        bool moves = false;
+        for (auto od : srcOut)
+          if (srcLL.getBasis(in, b, od) != 0)
+            moves = true;
+        if (!moves)
+          freeMask |= 1u << (shift + b);
+      }
+    };
+    scanFree(kLane, 0);
+    scanFree(kWarp, 5);
+    std::string ownerGuard =
+        freeMask == 0
+            ? ""
+            : "(" + tidId + ".x & " + std::to_string(freeMask) + "u) == 0u";
+
+    for (int r = 0; r < (int)srcVals.size(); ++r) {
+      const std::string &v = srcVals[r];
+      std::string guard = "(" + srcU + ")" + v + " < " + std::to_string(nBins) +
+                          "u";
+      if (!ownerGuard.empty())
+        guard = ownerGuard + " && (" + guard + ")";
+      if (maskVals)
+        guard = "(" + (*maskVals)[maskVals->size() == 1 ? 0 : r] + ") && (" +
+                guard + ")";
+      os << ind() << "if (" << guard << ") atomic_fetch_add_explicit(&" << bins
+         << "[" << v << "], 1u, memory_order_relaxed);\n";
+    }
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+    auto outDims = llvm::to_vector(
+        ttg::toLinearLayout(resTy).getOutDimNames());
+    std::string resSc = mslScalarType(resTy.getElementType());
+    int nResReg = regCount(op.getResult());
+    SmallVector<std::string> resIds;
+    for (int r = 0; r < nResReg; ++r) {
+      std::string idx = layoutCoordExpr(resTy, r, outDims[0]);
+      std::string id = fresh();
+      os << ind() << resSc << " " << id << " = (" << resSc
+         << ")atomic_load_explicit(&" << bins << "[" << idx
+         << "], memory_order_relaxed);\n";
+      resIds.push_back(id);
+    }
+    valMap[op.getResult()] = resIds;
+    return success();
+  }
+
   // Ordered (bit, axisStride) pairs for an inDim (lane/warp), only for bits that
   // move along the scanned axis. Sorted by ascending axis stride.
   SmallVector<std::pair<int, int32_t>> axisBits(const tt::LinearLayout &ll,
@@ -1999,6 +2083,9 @@ private:
           bytes += nw * 32 * (bitsOf(elementScalarType(res.getType())) / 8);
         poolBytes = std::max(poolBytes, nGroups * bytes);
       }
+    } else if (auto h = dyn_cast<tt::HistogramOp>(op)) {
+      auto rt = cast<RankedTensorType>(h.getResult().getType());
+      poolBytes = std::max(poolBytes, tileSize(rt) * 4);
     } else if (auto s = dyn_cast<tt::ScanOp>(op)) {
       auto st = cast<RankedTensorType>(s.getOperand(0).getType());
       tt::LinearLayout ll = ttg::toLinearLayout(st);

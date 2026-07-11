@@ -466,7 +466,29 @@ def _y1(x):
     return tl.where(small, small_val, large_val)
 
 
+@triton.jit
+def _popc(x):
+    u = x.to(tl.uint32)
+    u = u - ((u >> 1) & 0x55555555)
+    u = (u & 0x33333333) + ((u >> 2) & 0x33333333)
+    u = (u + (u >> 4)) & 0x0F0F0F0F
+    return (((u * 0x01010101) >> 24) & 0x3F).to(tl.int32)
+
+
+@triton.jit
+def _clz(x):
+    u = x.to(tl.uint32)
+    u = u | (u >> 1)
+    u = u | (u >> 2)
+    u = u | (u >> 4)
+    u = u | (u >> 8)
+    u = u | (u >> 16)
+    return _popc((~u).to(tl.uint32))
+
+
 COMPOSITES = {
+    'clz': _clz,
+    'popc': _popc,
     'log1p': _log1p,
     'cbrt': _cbrt,
     'pow': _pow,

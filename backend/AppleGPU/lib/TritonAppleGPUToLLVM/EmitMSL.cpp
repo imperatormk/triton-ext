@@ -90,6 +90,12 @@ private:
   int indent = 1;
   llvm::DenseMap<Value, SmallVector<std::string>> valMap;
 
+  struct MemDescInfo {
+    std::string buf;
+    std::string baseOffset;
+  };
+  llvm::DenseMap<Value, MemDescInfo> memdescMap;
+
   std::string fresh() { return "v" + std::to_string(nextId++); }
 
   std::string ind() const { return std::string(indent * 4, ' '); }
@@ -302,6 +308,24 @@ private:
       return emitDot(d);
     if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op))
       return emitConvertLayout(c);
+    if (auto a = dyn_cast<ttg::LocalAllocOp>(op))
+      return emitLocalAlloc(a);
+    if (auto i = dyn_cast<ttg::MemDescIndexOp>(op))
+      return emitMemDescIndex(i);
+    if (auto c = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op))
+      return emitAsyncCopy(c);
+    if (auto l = dyn_cast<ttg::LocalStoreOp>(op))
+      return emitLocalStore(l);
+    if (auto l = dyn_cast<ttg::LocalLoadOp>(op))
+      return emitLocalLoad(l);
+    if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op)) {
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (Value r : op->getResults())
+        valMap[r] = SmallVector<std::string>{};
+      return success();
+    }
+    if (isa<ttg::LocalDeallocOp>(op))
+      return success();
     if (isa<scf::YieldOp>(op))
       return success();
     if (isa<tt::ReturnOp>(op)) {
@@ -598,17 +622,27 @@ private:
     return ids;
   }
 
+  static bool isDatalessType(Type t) {
+    return isa<ttg::AsyncTokenType>(t);
+  }
+
   LogicalResult emitFor(scf::ForOp op) {
     SmallVector<SmallVector<std::string>> carried;
-    for (auto [init, res] :
-         llvm::zip(op.getInitArgs(), op.getResults())) {
+    for (auto [i, init, res] :
+         llvm::enumerate(op.getInitArgs(), op.getResults())) {
+      if (isDatalessType(res.getType())) {
+        valMap[op.getRegionIterArg(i)] = SmallVector<std::string>{};
+        valMap[res] = SmallVector<std::string>{};
+        carried.push_back({});
+        continue;
+      }
       auto &initNames = names(init);
       SmallVector<std::string> vars =
           declResultVars(res, StringRef());
       for (size_t r = 0; r < vars.size(); ++r)
         os << ind() << vars[r] << " = "
            << initNames[initNames.size() == 1 ? 0 : r] << ";\n";
-      valMap[op.getRegionIterArg(carried.size())] = vars;
+      valMap[op.getRegionIterArg(i)] = vars;
       valMap[res] = vars;
       carried.push_back(vars);
     }
@@ -856,6 +890,99 @@ private:
       ids.push_back(id);
     }
     valMap[res] = ids;
+    return success();
+  }
+
+  // Pipelined (software-pipeliner) ops lower to SYNCHRONOUS threadgroup
+  // staging: MSL has no async copy and M3+ dropped the DMA hardware, so the
+  // rotating multi-buffer collapses to a plain threadgroup buffer written by a
+  // masked per-thread copy and read back with a barrier between.
+  static int64_t memdescFlatSize(ttg::MemDescType mt) {
+    int64_t n = 1;
+    for (int64_t d : mt.getShape())
+      n *= d;
+    return n;
+  }
+
+  LogicalResult emitLocalAlloc(ttg::LocalAllocOp op) {
+    auto mt = cast<ttg::MemDescType>(op.getResult().getType());
+    std::string sc = mslScalarType(mt.getElementType());
+    std::string buf = "__tg_buf_" + std::to_string(tgScratchId++);
+    os << ind() << "threadgroup " << sc << " " << buf << "["
+       << memdescFlatSize(mt) << "];\n";
+    memdescMap[op.getResult()] = {buf, "0"};
+    return success();
+  }
+
+  LogicalResult emitMemDescIndex(ttg::MemDescIndexOp op) {
+    auto srcMt = cast<ttg::MemDescType>(op.getSrc().getType());
+    auto resMt = cast<ttg::MemDescType>(op.getResult().getType());
+    MemDescInfo parent = memdescMap[op.getSrc()];
+    int64_t sliceSize = memdescFlatSize(resMt);
+    (void)srcMt;
+    const std::string &idx = names(op.getIndex())[0];
+    std::string base = parent.baseOffset == "0"
+                           ? ("(" + idx + " * " + std::to_string(sliceSize) +
+                              ")")
+                           : ("(" + parent.baseOffset + " + " + idx + " * " +
+                              std::to_string(sliceSize) + ")");
+    memdescMap[op.getResult()] = {parent.buf, base};
+    return success();
+  }
+
+  std::string memdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
+                              int reg) {
+    std::string off = flatTileOffset(tileTy, reg);
+    if (info.baseOffset == "0")
+      return off;
+    return "(" + info.baseOffset + " + " + off + ")";
+  }
+
+  LogicalResult emitAsyncCopy(ttg::AsyncCopyGlobalToLocalOp op) {
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
+    MemDescInfo dst = memdescMap[op.getResult()];
+    auto &ptrs = names(op.getSrc());
+    bool hasMask = op.getMask() != nullptr;
+    SmallVector<std::string> *mask =
+        hasMask ? &names(op.getMask()) : nullptr;
+    for (int r = 0, n = regCount(op.getSrc()); r < n; ++r) {
+      std::string addr = dst.buf + "[" + memdescElemAddr(dst, srcTy, r) + "]";
+      std::string load = "*" + ptrs[r];
+      if (hasMask) {
+        const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
+        os << ind() << "if (" << m << ") " << addr << " = " << load << ";\n";
+      } else {
+        os << ind() << addr << " = " << load << ";\n";
+      }
+    }
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    valMap[op.getResult()] = SmallVector<std::string>{};
+    return success();
+  }
+
+  LogicalResult emitLocalStore(ttg::LocalStoreOp op) {
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
+    MemDescInfo dst = memdescMap[op.getDst()];
+    auto &vals = names(op.getSrc());
+    for (int r = 0, n = regCount(op.getSrc()); r < n; ++r)
+      os << ind() << dst.buf << "[" << memdescElemAddr(dst, srcTy, r)
+         << "] = " << vals[r] << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    return success();
+  }
+
+  LogicalResult emitLocalLoad(ttg::LocalLoadOp op) {
+    auto resTy = cast<RankedTensorType>(op.getResult().getType());
+    MemDescInfo src = memdescMap[op.getSrc()];
+    std::string sc = mslScalarType(resTy.getElementType());
+    SmallVector<std::string> ids;
+    for (int r = 0, n = regCount(op.getResult()); r < n; ++r) {
+      std::string id = fresh();
+      os << ind() << sc << " " << id << " = " << src.buf << "["
+         << memdescElemAddr(src, resTy, r) << "];\n";
+      ids.push_back(id);
+    }
+    valMap[op.getResult()] = ids;
     return success();
   }
 

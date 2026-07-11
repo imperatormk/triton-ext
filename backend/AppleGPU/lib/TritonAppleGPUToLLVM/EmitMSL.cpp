@@ -313,7 +313,8 @@ private:
       return emitAtomicRMW(a);
     if (auto a = dyn_cast<tt::AtomicCASOp>(op))
       return emitAtomicCAS(a);
-    if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp>(op))
+    if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp, arith::DivSIOp,
+            arith::DivUIOp, arith::RemSIOp, arith::RemUIOp>(op))
       return emitIntBinary(op);
     if (isa<arith::AndIOp>(op))
       return emitElementwise(
@@ -321,6 +322,9 @@ private:
     if (isa<arith::OrIOp>(op))
       return emitElementwise(
           op, "|", mslScalarType(elementScalarType(op->getResult(0).getType())));
+    if (isa<arith::XOrIOp>(op))
+      return emitElementwise(
+          op, "^", mslScalarType(elementScalarType(op->getResult(0).getType())));
     if (isa<arith::AddFOp, arith::MulFOp, arith::SubFOp, arith::DivFOp>(op))
       return emitFloatBinary(op);
     if (isa<arith::MaxNumFOp, arith::MaximumFOp, arith::MaxSIOp, arith::MaxUIOp>(
@@ -339,6 +343,8 @@ private:
       return emitFor(f);
     if (auto i = dyn_cast<scf::IfOp>(op))
       return emitIf(i);
+    if (auto w = dyn_cast<scf::WhileOp>(op))
+      return emitWhile(w);
     if (auto r = dyn_cast<tt::ReduceOp>(op))
       return emitReduce(r);
     if (auto s = dyn_cast<tt::ScanOp>(op))
@@ -372,7 +378,8 @@ private:
       return success();
     }
     if (isa<mlir::gpu::BarrierOp>(op)) {
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup | "
+                     "mem_flags::mem_device);\n";
       return success();
     }
     if (isa<ttg::LocalDeallocOp>(op))
@@ -521,8 +528,14 @@ private:
   LogicalResult emitIntBinary(Operation *op) {
     const char *o = isa<arith::AddIOp>(op)   ? "+"
                     : isa<arith::SubIOp>(op) ? "-"
-                                             : "*";
-    return emitElementwise(op, o, "int");
+                    : isa<arith::MulIOp>(op) ? "*"
+                    : isa<arith::DivSIOp, arith::DivUIOp>(op) ? "/"
+                                                              : "%";
+    std::string sc =
+        mslScalarType(elementScalarType(op->getResult(0).getType()));
+    if (isa<arith::DivUIOp, arith::RemUIOp>(op) && sc.front() != 'u')
+      sc = "u" + sc;
+    return emitElementwise(op, o, sc);
   }
 
   LogicalResult emitFloatBinary(Operation *op) {
@@ -763,7 +776,56 @@ private:
     return success();
   }
 
-  // Emit the combiner region as an MSL statement writing `dst` from operands
+  LogicalResult emitWhile(scf::WhileOp op) {
+    SmallVector<SmallVector<std::string>> carried;
+    for (auto [i, init] : llvm::enumerate(op.getInits())) {
+      auto &initNames = names(init);
+      SmallVector<std::string> vars = declResultVars(init, StringRef());
+      for (size_t r = 0; r < vars.size(); ++r)
+        os << ind() << vars[r] << " = "
+           << initNames[initNames.size() == 1 ? 0 : r] << ";\n";
+      valMap[op.getBeforeArguments()[i]] = vars;
+      carried.push_back(vars);
+    }
+
+    SmallVector<SmallVector<std::string>> results;
+    for (Value res : op.getResults())
+      results.push_back(declResultVars(res, StringRef()));
+
+    os << ind() << "while (true) {\n";
+    ++indent;
+    if (failed(emitRegionBody(op.getBefore())))
+      return failure();
+    auto cond = cast<scf::ConditionOp>(op.getBefore().front().getTerminator());
+    const std::string &c = names(cond.getCondition())[0];
+    os << ind() << "if (!(" << c << ")) {\n";
+    ++indent;
+    for (auto [i, fwd] : llvm::enumerate(cond.getArgs())) {
+      auto &src = names(fwd);
+      for (size_t r = 0; r < results[i].size(); ++r)
+        os << ind() << results[i][r] << " = " << src[src.size() == 1 ? 0 : r]
+           << ";\n";
+    }
+    os << ind() << "break;\n";
+    --indent;
+    os << ind() << "}\n";
+
+    for (auto [i, fwd] : llvm::enumerate(cond.getArgs())) {
+      SmallVector<std::string> fwdNames = names(fwd);
+      valMap[op.getAfterArguments()[i]] = fwdNames;
+    }
+
+    if (failed(emitRegionBody(op.getAfter())))
+      return failure();
+    emitYieldAssign(op.getAfter().front().getTerminator(), carried);
+    --indent;
+    os << ind() << "}\n";
+
+    for (auto [i, res] : llvm::enumerate(op.getResults()))
+      valMap[res] = results[i];
+    return success();
+  }
+
   // Single-result, single-op wrapper over emitCombineN. `dst` must be a
   // predeclared MSL variable; assigns the combined value into it.
   LogicalResult emitCombine(Region &region, StringRef dst, StringRef a,

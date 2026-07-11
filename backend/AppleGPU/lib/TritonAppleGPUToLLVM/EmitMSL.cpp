@@ -313,6 +313,10 @@ private:
       return emitMakeRange(r);
     if (auto s = dyn_cast<tt::SplatOp>(op))
       return emitSplat(s);
+    if (auto u = dyn_cast<tt::UnsplatOp>(op)) {
+      bindScalar(u.getResult(), names(u.getSrc())[0]);
+      return success();
+    }
     if (auto e = dyn_cast<tt::ExpandDimsOp>(op))
       return emitReshapeLike(e.getResult(), e.getSrc(), e.getAxis(), true);
     if (auto b = dyn_cast<tt::BroadcastOp>(op))
@@ -455,6 +459,8 @@ private:
       return success();
     }
     if (isa<ttg::LocalDeallocOp>(op))
+      return success();
+    if (op->getName().getStringRef() == "llvm.intr.assume")
       return success();
     if (isa<scf::YieldOp>(op))
       return success();

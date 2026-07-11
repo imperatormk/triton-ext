@@ -3585,6 +3585,51 @@ private:
     return success();
   }
 
+  // Integer RTNE narrowing of `v` to `sc`. Metal fast-math elides a plain
+  // (half)/(bfloat) cast whose only consumer re-widens to float (the CAS add),
+  // dropping the round; the integer path forces one the optimizer cannot cancel.
+  std::string emitRoundedHalfValue(const std::string &sc, const std::string &v) {
+    std::string f = fresh(), u = fresh(), h = fresh();
+    os << ind() << "float " << f << " = (float)(" << v << ");\n";
+    os << ind() << "uint " << u << " = as_type<uint>(" << f << ");\n";
+    std::string bits = fresh();
+    os << ind() << "ushort " << bits << ";\n";
+    if (sc == "bfloat") {
+      std::string r = fresh();
+      os << ind() << "uint " << r << " = (" << u << " >> 16) & 1u;\n";
+      os << ind() << bits << " = (ushort)(((" << u << " + 0x7fffu + " << r
+         << ") >> 16) & 0xffffu);\n";
+    } else {
+      std::string sgn = fresh(), ex = fresh(), mant = fresh(), m = fresh(),
+                  rem = fresh();
+      os << ind() << "uint " << sgn << " = (" << u << " >> 16) & 0x8000u;\n";
+      os << ind() << "int " << ex << " = (int)((" << u
+         << " >> 23) & 0xffu) - 112;\n";
+      os << ind() << "uint " << mant << " = " << u << " & 0x7fffffu;\n";
+      os << ind() << "if (" << ex << " <= 0) {\n";
+      ++indent;
+      os << ind() << bits << " = (ushort)" << sgn << ";\n";
+      --indent;
+      os << ind() << "} else if (" << ex << " >= 31) {\n";
+      ++indent;
+      os << ind() << bits << " = (ushort)(" << sgn << " | 0x7c00u);\n";
+      --indent;
+      os << ind() << "} else {\n";
+      ++indent;
+      os << ind() << "uint " << m << " = " << mant << " >> 13;\n";
+      os << ind() << "uint " << rem << " = " << mant << " & 0x1fffu;\n";
+      os << ind() << bits << " = (ushort)(" << sgn << " | ((uint)" << ex
+         << " << 10) | " << m << ");\n";
+      os << ind() << "if (" << rem << " > 0x1000u || (" << rem
+         << " == 0x1000u && (" << m << " & 1u))) " << bits << " += 1;\n";
+      --indent;
+      os << ind() << "}\n";
+    }
+    os << ind() << sc << " " << h << " = as_type<" << sc << ">(" << bits
+       << ");\n";
+    return h;
+  }
+
   // For a 16-bit-float element pointer p, emit statements binding a uint* to the
   // containing aligned 32-bit word and a bool selecting the high half-word.
   // Returns {wordPtr, isHigh} identifiers.
@@ -3609,7 +3654,7 @@ private:
   // word, and CAS-loop until it lands. Binds `id` to the pre-op value.
   void emitPacked16CASLoop(const std::string &wordPtr, const std::string &isHigh,
                            const std::string &sc, const std::string &curId,
-                           const std::string &newFloatExpr,
+                           const std::string &newHalfExpr,
                            const std::string &id) {
     std::string word = fresh(), lane = fresh(), newLane = fresh(),
                 newWord = fresh();
@@ -3620,10 +3665,9 @@ private:
     os << ind() << "ushort " << lane << " = (ushort)((" << isHigh << ") ? ("
        << word << " >> 16) : (" << word << " & 0xffffu));\n";
     os << ind() << id << " = as_type<" << sc << ">(" << lane << ");\n";
-    os << ind() << "float " << curId << " = (float)as_type<" << sc << ">("
-       << lane << ");\n";
-    os << ind() << sc << " " << newLane << " = (" << sc << ")(" << newFloatExpr
+    os << ind() << sc << " " << curId << " = as_type<" << sc << ">(" << lane
        << ");\n";
+    os << ind() << sc << " " << newLane << " = " << newHalfExpr << ";\n";
     os << ind() << "uint " << newWord << " = (" << isHigh
        << ") ? ((" << word << " & 0x0000ffffu) | ((uint)as_type<ushort>("
        << newLane << ") << 16)) : ((" << word
@@ -3781,11 +3825,13 @@ private:
       }
       if (floatEmulated) {
         std::string cur = fresh();
-        std::string newExpr = floatRmwExpr(kind, cur, "(float)(" + v + ")");
         if (bw == 16) {
+          std::string vh = emitRoundedHalfValue(sc, v);
+          std::string newExpr = floatRmwExpr(kind, cur, vh);
           auto base = emitPacked16Base(p, sc);
           emitPacked16CASLoop(base.first, base.second, sc, cur, newExpr, id);
         } else {
+          std::string newExpr = floatRmwExpr(kind, cur, "(float)(" + v + ")");
           emitFloat32CASLoop(p, cur, newExpr, id);
         }
       } else {

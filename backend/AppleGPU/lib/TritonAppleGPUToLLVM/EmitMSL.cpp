@@ -325,6 +325,8 @@ private:
     if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp, arith::DivSIOp,
             arith::DivUIOp, arith::RemSIOp, arith::RemUIOp>(op))
       return emitIntBinary(op);
+    if (isa<arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp>(op))
+      return emitShift(op);
     if (isa<arith::AndIOp>(op))
       return emitElementwise(
           op, "&", mslScalarType(elementScalarType(op->getResult(0).getType())));
@@ -709,6 +711,30 @@ private:
     std::string sc =
         mslScalarType(elementScalarType(op->getResult(0).getType()));
     return emitElementwise(op, o, sc);
+  }
+
+  LogicalResult emitShift(Operation *op) {
+    std::string sc =
+        mslScalarType(elementScalarType(op->getResult(0).getType()));
+    std::string usc = sc.front() == 'u' ? sc : "u" + sc;
+    const char *o = isa<arith::ShLIOp>(op) ? "<<" : ">>";
+    bool logical = isa<arith::ShLIOp, arith::ShRUIOp>(op);
+    Value res = op->getResult(0);
+    auto &lhs = names(op->getOperand(0));
+    auto &rhs = names(op->getOperand(1));
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
+      const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
+      std::string lcast = logical ? usc + "(" + a + ")" : a;
+      os << ind() << sc << " " << id << " = (" << lcast << " " << o << " " << b
+         << ");\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
   }
 
   LogicalResult emitElementwise(Operation *op, StringRef binop, StringRef sc) {

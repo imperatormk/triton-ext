@@ -345,6 +345,8 @@ private:
       return emitDot(d);
     if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op))
       return emitConvertLayout(c);
+    if (auto t = dyn_cast<tt::TransOp>(op))
+      return emitTrans(t);
     if (auto a = dyn_cast<ttg::LocalAllocOp>(op))
       return emitLocalAlloc(a);
     if (auto i = dyn_cast<ttg::MemDescIndexOp>(op))
@@ -1081,6 +1083,10 @@ private:
       Type e = st.getElementType();
       int64_t bytes = tileSize(st) * (bitsOf(e) / 8);
       poolBytes = std::max(poolBytes, bytes);
+    } else if (auto t = dyn_cast<tt::TransOp>(op)) {
+      auto st = cast<RankedTensorType>(t.getSrc().getType());
+      Type e = st.getElementType();
+      poolBytes = std::max(poolBytes, tileSize(st) * (bitsOf(e) / 8));
     } else if (auto d = dyn_cast<tt::DotOp>(op)) {
       auto aTy = cast<RankedTensorType>(d.getA().getType());
       auto bTy = cast<RankedTensorType>(d.getB().getType());
@@ -1134,6 +1140,55 @@ private:
     }
     (void)ctx;
     return expr.empty() ? "0" : expr;
+  }
+
+  // Row-major flat offset of source register r, with its out-dim coordinates
+  // permuted by `perm` and strides taken from `resShape` (the transposed
+  // shape). Places the source element at its transposed logical position.
+  std::string transFlatOffset(RankedTensorType srcTy, ArrayRef<int32_t> perm,
+                              ArrayRef<int64_t> resShape, int reg) {
+    tt::LinearLayout ll = ttg::toLinearLayout(srcTy);
+    auto outNames = llvm::to_vector(ll.getOutDimNames());
+    int rank = outNames.size();
+    std::string expr;
+    int64_t stride = 1;
+    for (int d = rank - 1; d >= 0; --d) {
+      std::string c = layoutCoordExpr(srcTy, reg, outNames[perm[d]]);
+      std::string term = stride == 1 ? c : ("(" + c + " * " +
+                                            std::to_string(stride) + ")");
+      expr = expr.empty() ? term : ("(" + expr + " + " + term + ")");
+      stride *= resShape[d];
+    }
+    return expr.empty() ? "0" : expr;
+  }
+
+  LogicalResult emitTrans(tt::TransOp op) {
+    Value src = op.getSrc();
+    Value res = op.getResult();
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    auto perm = op.getOrder();
+    std::string sc = mslScalarType(resTy.getElementType());
+    auto &srcNames = names(src);
+
+    std::string buf = fresh();
+    os << ind() << "threadgroup " << sc << "* " << buf << " = "
+       << poolRegion(0, sc) << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    for (int r = 0, n = regCount(src); r < n; ++r)
+      os << ind() << buf << "["
+         << transFlatOffset(srcTy, perm, resTy.getShape(), r)
+         << "] = " << srcNames[r] << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    SmallVector<std::string> ids;
+    for (int r = 0, n = regCount(res); r < n; ++r) {
+      std::string id = fresh();
+      os << ind() << sc << " " << id << " = " << buf << "["
+         << flatTileOffset(resTy, r) << "];\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
   }
 
   // General layout conversion via a full-tile threadgroup round-trip: every

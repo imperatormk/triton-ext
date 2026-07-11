@@ -1096,8 +1096,11 @@ private:
     const std::string &hi = names(op.getUpperBound())[0];
     const std::string &st = names(op.getStep())[0];
     bindScalar(op.getInductionVar(), iv);
-    os << ind() << "for (int " << iv << " = " << lo << "; " << iv << " < " << hi
-       << "; " << iv << " += " << st << ") {\n";
+    std::string ivTy = mslScalarType(op.getInductionVar().getType());
+    if (ivTy.empty())
+      ivTy = "int";
+    os << ind() << "for (" << ivTy << " " << iv << " = " << lo << "; " << iv
+       << " < " << hi << "; " << iv << " += " << st << ") {\n";
     ++indent;
     if (failed(emitRegionBody(op.getRegion())))
       return failure();

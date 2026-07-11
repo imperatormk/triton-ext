@@ -313,8 +313,20 @@ private:
       return emitAtomicRMW(a);
     if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp>(op))
       return emitIntBinary(op);
+    if (isa<arith::AndIOp>(op))
+      return emitElementwise(
+          op, "&", mslScalarType(elementScalarType(op->getResult(0).getType())));
+    if (isa<arith::OrIOp>(op))
+      return emitElementwise(
+          op, "|", mslScalarType(elementScalarType(op->getResult(0).getType())));
     if (isa<arith::AddFOp, arith::MulFOp, arith::SubFOp, arith::DivFOp>(op))
       return emitFloatBinary(op);
+    if (isa<arith::MaxNumFOp, arith::MaximumFOp, arith::MaxSIOp, arith::MaxUIOp>(
+            op))
+      return emitMinMax(op, "max");
+    if (isa<arith::MinNumFOp, arith::MinimumFOp, arith::MinSIOp, arith::MinUIOp>(
+            op))
+      return emitMinMax(op, "min");
     if (auto c = dyn_cast<arith::CmpIOp>(op))
       return emitCmpI(c);
     if (auto c = dyn_cast<arith::CmpFOp>(op))
@@ -537,6 +549,25 @@ private:
     return success();
   }
 
+  LogicalResult emitMinMax(Operation *op, StringRef fn) {
+    Value res = op->getResult(0);
+    std::string sc = mslScalarType(elementScalarType(res.getType()));
+    auto &lhs = names(op->getOperand(0));
+    auto &rhs = names(op->getOperand(1));
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
+      const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
+      os << ind() << sc << " " << id << " = " << fn.str() << "(" << a << ", "
+         << b << ");\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
   LogicalResult emitCmpI(arith::CmpIOp op) {
     const char *o;
     switch (op.getPredicate()) {
@@ -729,54 +760,36 @@ private:
   }
 
   // Emit the combiner region as an MSL statement writing `dst` from operands
-  // `a` and `b`, translating its single arith op. Reused for register, lane
-  // and warp combine steps.
+  // Single-result, single-op wrapper over emitCombineN. `dst` must be a
+  // predeclared MSL variable; assigns the combined value into it.
   LogicalResult emitCombine(Region &region, StringRef dst, StringRef a,
                             StringRef b, StringRef sc) {
+    SmallVector<std::string> res;
+    if (failed(emitCombineN(region, {a.str()}, {b.str()}, res)))
+      return failure();
+    os << ind() << dst.str() << " = " << res[0] << ";\n";
+    return success();
+  }
+
+  // Evaluate a reduce/scan combiner region: bind its 2N block args to the
+  // operand names, emit each region op via emitOp, and return the N terminator
+  // result names. Region args are ordered a0,a1,...,aN-1,b0,b1,...,bN-1 per the
+  // combiner ABI (all left operands, then all right operands).
+  LogicalResult emitCombineN(Region &region, ArrayRef<std::string> aVals,
+                             ArrayRef<std::string> bVals,
+                             SmallVectorImpl<std::string> &results) {
     Block &blk = region.front();
-    Value lhs = blk.getArgument(0);
-    Value rhs = blk.getArgument(1);
-    bindScalar(lhs, a.str());
-    bindScalar(rhs, b.str());
-    std::string expr;
-    for (Operation &o : blk.without_terminator()) {
-      std::string id = fresh();
-      if (isa<arith::AddFOp>(o))
-        os << ind() << sc.str() << " " << id << " = (" << names(o.getOperand(0))[0]
-           << " + " << names(o.getOperand(1))[0] << ");\n";
-      else if (isa<arith::MulFOp>(o))
-        os << ind() << sc.str() << " " << id << " = (" << names(o.getOperand(0))[0]
-           << " * " << names(o.getOperand(1))[0] << ");\n";
-      else if (isa<arith::AddIOp>(o))
-        os << ind() << sc.str() << " " << id << " = (" << names(o.getOperand(0))[0]
-           << " + " << names(o.getOperand(1))[0] << ");\n";
-      else if (isa<arith::MulIOp>(o))
-        os << ind() << sc.str() << " " << id << " = (" << names(o.getOperand(0))[0]
-           << " * " << names(o.getOperand(1))[0] << ");\n";
-      else if (isa<arith::MaxNumFOp, arith::MaximumFOp>(o))
-        os << ind() << sc.str() << " " << id << " = max("
-           << names(o.getOperand(0))[0] << ", " << names(o.getOperand(1))[0]
-           << ");\n";
-      else if (isa<arith::MinNumFOp, arith::MinimumFOp>(o))
-        os << ind() << sc.str() << " " << id << " = min("
-           << names(o.getOperand(0))[0] << ", " << names(o.getOperand(1))[0]
-           << ");\n";
-      else if (isa<arith::MaxSIOp, arith::MaxUIOp>(o))
-        os << ind() << sc.str() << " " << id << " = max("
-           << names(o.getOperand(0))[0] << ", " << names(o.getOperand(1))[0]
-           << ");\n";
-      else if (isa<arith::MinSIOp, arith::MinUIOp>(o))
-        os << ind() << sc.str() << " " << id << " = min("
-           << names(o.getOperand(0))[0] << ", " << names(o.getOperand(1))[0]
-           << ");\n";
-      else {
-        o.emitError("EmitMSL: unsupported reduce combiner op");
-        return failure();
-      }
-      bindScalar(o.getResult(0), id);
-      expr = id;
+    int n = aVals.size();
+    for (int i = 0; i < n; ++i) {
+      bindScalar(blk.getArgument(i), aVals[i]);
+      bindScalar(blk.getArgument(n + i), bVals[i]);
     }
-    os << ind() << dst.str() << " = " << expr << ";\n";
+    for (Operation &o : blk.without_terminator())
+      if (failed(emitOp(&o)))
+        return failure();
+    Operation *term = blk.getTerminator();
+    for (Value r : term->getOperands())
+      results.push_back(names(r)[0]);
     return success();
   }
 
@@ -795,26 +808,40 @@ private:
   }
 
   LogicalResult emitReduce(tt::ReduceOp op) {
-    if (op.getNumOperands() != 1) {
-      op.emitError("EmitMSL: only single-operand reduce supported");
-      return failure();
-    }
-    Value src = op.getOperand(0);
-    auto srcTy = cast<RankedTensorType>(src.getType());
-    Value res = op.getResult()[0];
-    if (isa<RankedTensorType>(res.getType())) {
-      op.emitError("EmitMSL: only scalar-result reduce supported");
-      return failure();
-    }
-    std::string sc = mslScalarType(elementScalarType(res.getType()));
-    Region &region = op.getCombineOp();
-    auto &srcNames = names(src);
-
-    std::string acc = fresh();
-    os << ind() << sc << " " << acc << " = " << srcNames[0] << ";\n";
-    for (size_t r = 1; r < srcNames.size(); ++r)
-      if (failed(emitCombine(region, acc, acc, srcNames[r], sc)))
+    int nOp = op.getNumOperands();
+    auto srcTy = cast<RankedTensorType>(op.getOperand(0).getType());
+    for (Value res : op.getResult())
+      if (isa<RankedTensorType>(res.getType())) {
+        op.emitError("EmitMSL: only scalar-result reduce supported");
         return failure();
+      }
+
+    SmallVector<std::string> scTys(nOp);
+    for (int k = 0; k < nOp; ++k)
+      scTys[k] = mslScalarType(elementScalarType(op.getResult()[k].getType()));
+    Region &region = op.getCombineOp();
+
+    SmallVector<SmallVector<std::string> *> srcNames(nOp);
+    for (int k = 0; k < nOp; ++k)
+      srcNames[k] = &names(op.getOperand(k));
+    int nReg = srcNames[0]->size();
+
+    SmallVector<std::string> accs(nOp);
+    for (int k = 0; k < nOp; ++k) {
+      accs[k] = fresh();
+      os << ind() << scTys[k] << " " << accs[k] << " = " << (*srcNames[k])[0]
+         << ";\n";
+    }
+    for (int r = 1; r < nReg; ++r) {
+      SmallVector<std::string> bVals(nOp);
+      for (int k = 0; k < nOp; ++k)
+        bVals[k] = (*srcNames[k])[r];
+      SmallVector<std::string> out;
+      if (failed(emitCombineN(region, accs, bVals, out)))
+        return failure();
+      for (int k = 0; k < nOp; ++k)
+        os << ind() << accs[k] << " = " << out[k] << ";\n";
+    }
 
     MLIRContext *ctx = op.getContext();
     tt::LinearLayout ll = ttg::toLinearLayout(srcTy);
@@ -827,38 +854,61 @@ private:
       unsigned m = 1u << bit;
       if ((laneMask & m) == 0)
         continue;
-      std::string other = fresh();
-      os << ind() << sc << " " << other << " = simd_shuffle_xor(" << acc << ", "
-         << m << "u);\n";
-      if (failed(emitCombine(region, acc, acc, other, sc)))
+      SmallVector<std::string> others(nOp);
+      for (int k = 0; k < nOp; ++k) {
+        others[k] = fresh();
+        os << ind() << scTys[k] << " " << others[k] << " = simd_shuffle_xor("
+           << accs[k] << ", " << m << "u);\n";
+      }
+      SmallVector<std::string> out;
+      if (failed(emitCombineN(region, accs, others, out)))
         return failure();
+      for (int k = 0; k < nOp; ++k)
+        os << ind() << accs[k] << " = " << out[k] << ";\n";
     }
 
     unsigned warpMask = reduceMask(ll, kWarp, outDim);
     if (warpMask != 0) {
-      auto kWarpDim = StringAttr::get(ctx, "warp");
-      int numWarps = ll.getInDimSize(kWarpDim);
-      std::string scratch = fresh();
-      os << ind() << "threadgroup " << sc << "* " << scratch << " = "
-         << poolRegion(0, sc) << ";\n";
-      (void)numWarps;
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-      os << ind() << "if (" << laneId << " == 0) " << scratch << "[" << warpId
-         << "] = " << acc << ";\n";
-      os << ind()
-         << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-      std::string wacc = fresh();
-      os << ind() << sc << " " << wacc << " = " << scratch << "[0];\n";
-      for (int w = 1; w < numWarps; ++w) {
-        std::string wv = fresh();
-        os << ind() << sc << " " << wv << " = " << scratch << "[" << w << "];\n";
-        if (failed(emitCombine(region, wacc, wacc, wv, sc)))
-          return failure();
+      int numWarps = ll.getInDimSize(kWarp);
+      SmallVector<std::string> scratch(nOp);
+      int64_t byteOff = 0;
+      for (int k = 0; k < nOp; ++k) {
+        scratch[k] = fresh();
+        os << ind() << "threadgroup " << scTys[k] << "* " << scratch[k] << " = "
+           << poolRegion(byteOff, scTys[k]) << ";\n";
+        byteOff += numWarps * (bitsOf(elementScalarType(
+                                   op.getResult()[k].getType())) /
+                               8);
       }
-      acc = wacc;
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int k = 0; k < nOp; ++k)
+        os << ind() << "if (" << laneId << " == 0) " << scratch[k] << "["
+           << warpId << "] = " << accs[k] << ";\n";
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      SmallVector<std::string> wacc(nOp);
+      for (int k = 0; k < nOp; ++k) {
+        wacc[k] = fresh();
+        os << ind() << scTys[k] << " " << wacc[k] << " = " << scratch[k]
+           << "[0];\n";
+      }
+      for (int w = 1; w < numWarps; ++w) {
+        SmallVector<std::string> wv(nOp);
+        for (int k = 0; k < nOp; ++k) {
+          wv[k] = fresh();
+          os << ind() << scTys[k] << " " << wv[k] << " = " << scratch[k] << "["
+             << w << "];\n";
+        }
+        SmallVector<std::string> out;
+        if (failed(emitCombineN(region, wacc, wv, out)))
+          return failure();
+        for (int k = 0; k < nOp; ++k)
+          os << ind() << wacc[k] << " = " << out[k] << ";\n";
+      }
+      accs = wacc;
     }
 
-    bindScalar(res, acc);
+    for (int k = 0; k < nOp; ++k)
+      bindScalar(op.getResult()[k], accs[k]);
     return success();
   }
 
@@ -1046,8 +1096,10 @@ private:
       auto kWarp = StringAttr::get(op->getContext(), "warp");
       if (ll.hasInDim(kWarp)) {
         int64_t nw = ll.getInDimSize(kWarp);
-        Type e = st.getElementType();
-        poolBytes = std::max(poolBytes, nw * (bitsOf(e) / 8));
+        int64_t bytes = 0;
+        for (Value res : r.getResult())
+          bytes += nw * (bitsOf(elementScalarType(res.getType())) / 8);
+        poolBytes = std::max(poolBytes, bytes);
       }
     } else if (auto s = dyn_cast<tt::ScanOp>(op)) {
       auto st = cast<RankedTensorType>(s.getOperand(0).getType());

@@ -849,6 +849,32 @@ private:
       return emitCall(c);
     if (auto r = dyn_cast<tt::ReturnOp>(op))
       return emitReturn(r);
+    if (op->getName().getStringRef() == "ub.poison") {
+      Value res = op->getResult(0);
+      Type elem = res.getType();
+      if (auto rt = dyn_cast<RankedTensorType>(elem))
+        elem = rt.getElementType();
+      bool isPtr = isa<tt::PointerType>(elem);
+      std::string sc =
+          isPtr ? mslStorageType(res.getType())
+                : mslScalarType(elementScalarType(res.getType()));
+      if (sc.empty()) {
+        op->emitError("EmitMSL: unhandled poison type");
+        return failure();
+      }
+      int rc = regCount(res);
+      SmallVector<std::string> ids;
+      for (int r = 0; r < rc; ++r) {
+        std::string id = fresh();
+        if (isPtr)
+          os << ind() << sc << " " << id << " = nullptr;\n";
+        else
+          os << ind() << sc << " " << id << " = (" << sc << ")0;\n";
+        ids.push_back(id);
+      }
+      valMap[res] = ids;
+      return success();
+    }
     op->emitError("EmitMSL: unhandled op '" + op->getName().getStringRef() +
                   "'");
     return failure();
@@ -1516,7 +1542,12 @@ private:
   }
 
   SmallVector<std::string> declResultVars(Value v, StringRef init) {
-    std::string sc = mslScalarType(elementScalarType(v.getType()));
+    Type elem = v.getType();
+    if (auto rt = dyn_cast<RankedTensorType>(elem))
+      elem = rt.getElementType();
+    std::string sc = isa<tt::PointerType>(elem)
+                         ? mslStorageType(v.getType())
+                         : mslScalarType(elementScalarType(v.getType()));
     int rc = regCount(v);
     SmallVector<std::string> ids;
     for (int r = 0; r < rc; ++r) {

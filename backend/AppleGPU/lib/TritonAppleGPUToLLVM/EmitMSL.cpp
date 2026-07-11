@@ -2688,6 +2688,19 @@ private:
     } else if (auto ca = dyn_cast<tt::AtomicCASOp>(op)) {
       if (!isa<RankedTensorType>(ca.getPtr().getType()))
         poolBytes = std::max<int64_t>(poolBytes, 8);
+    } else if (auto ar = dyn_cast<tt::AtomicRMWOp>(op)) {
+      if (auto ptrTy = dyn_cast<RankedTensorType>(ar.getPtr().getType())) {
+        tt::LinearLayout ll = ttg::toLinearLayout(ptrTy);
+        MLIRContext *c = op->getContext();
+        unsigned warpFree =
+            ll.getFreeVariableMasks().lookup(StringAttr::get(c, "warp"));
+        if (warpFree) {
+          int64_t eb = std::max<int64_t>(
+              1, bitsOf(elementScalarType(ar.getResult().getType())) / 8);
+          int64_t rc = ll.getInDimSize(StringAttr::get(c, "register"));
+          poolBytes = std::max<int64_t>(poolBytes, rc * 32 * eb);
+        }
+      }
     } else if (auto s = dyn_cast<tt::ScanOp>(op)) {
       auto st = cast<RankedTensorType>(s.getOperand(0).getType());
       tt::LinearLayout ll = ttg::toLinearLayout(st);
@@ -4049,7 +4062,55 @@ private:
         --indent;
         os << ind() << "}\n";
       }
+      // The atomic ran only on the canonical lane; replica lanes hold init0.
+      // Broadcast the returned pre-op value across the lane-replicas so a
+      // downstream use of the result (use_result kernels) reads it on every
+      // lane that logically owns this element.
+      if (!uniform && laneFree) {
+        std::string src = "(uint)(" + laneId + " & " +
+                          std::to_string(~laneFree & 31) + ")";
+        std::string bc = fresh();
+        os << ind() << sc << " " << bc << " = simd_shuffle(" << id << ", "
+           << src << ");\n";
+        id = bc;
+      }
       ids[r] = id;
+    }
+
+    // Cross-warp replicas: when the pointer layout replicates an element across
+    // warps, only the canonical warp ran the atomic, so replica warps hold
+    // init0. Stage the canonical warp's per-lane results through threadgroup
+    // memory keyed by (register, canonical-lane) so every warp reads the true
+    // pre-op value for its logical element.
+    if (!uniform && warpFree) {
+      std::string bcbuf = fresh();
+      os << ind() << "threadgroup " << sc << "* " << bcbuf << " = "
+         << poolRegion(0, sc) << ";\n";
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      std::string wcanon =
+          "((" + warpId + " & " + std::to_string(warpFree) + ") == 0)";
+      for (int r = 0; r < rc; ++r) {
+        if (regFree && (r & regFree) != 0)
+          continue;
+        std::string laneKey =
+            "(" + laneId + " & " + std::to_string(~laneFree & 31) + ")";
+        std::string slot =
+            "(" + std::to_string(r) + " * 32 + " + laneKey + ")";
+        os << ind() << "if (" << wcanon << ") " << bcbuf << "[" << slot
+           << "] = " << ids[r] << ";\n";
+      }
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int r = 0; r < rc; ++r) {
+        int src = regFree ? (r & ~regFree) : r;
+        std::string laneKey =
+            "(" + laneId + " & " + std::to_string(~laneFree & 31) + ")";
+        std::string slot =
+            "(" + std::to_string(src) + " * 32 + " + laneKey + ")";
+        std::string bc = fresh();
+        os << ind() << sc << " " << bc << " = " << bcbuf << "[" << slot
+           << "];\n";
+        ids[r] = bc;
+      }
     }
     valMap[res] = ids;
     return success();

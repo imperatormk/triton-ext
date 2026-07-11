@@ -33,7 +33,7 @@ namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 
 static std::string mslScalarType(Type t) {
-  if (t.isF32())
+  if (t.isF32() || t.isF64())
     return "float";
   if (t.isF16())
     return "half";

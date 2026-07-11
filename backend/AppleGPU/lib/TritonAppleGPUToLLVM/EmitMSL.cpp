@@ -6,6 +6,7 @@
 // from air.* intrinsics.
 
 #include "TritonAppleGPUToLLVM/Passes.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -56,6 +57,18 @@ static std::string mslStorageType(Type t) {
   if (auto pt = dyn_cast<tt::PointerType>(t))
     return "device " + mslScalarType(pt.getPointeeType()) + "*";
   return mslScalarType(t);
+}
+
+static std::string barrierMemFlags(ttg::AddrSpace addrSpace) {
+  uint32_t bits = static_cast<uint32_t>(addrSpace);
+  bool device = bits & (static_cast<uint32_t>(ttg::AddrSpace::GlobalRead) |
+                        static_cast<uint32_t>(ttg::AddrSpace::GlobalWrite));
+  bool tg = bits & static_cast<uint32_t>(ttg::AddrSpace::Local);
+  if (device && tg)
+    return "mem_flags::mem_threadgroup | mem_flags::mem_device";
+  if (device)
+    return "mem_flags::mem_device";
+  return "mem_flags::mem_threadgroup";
 }
 
 static Type elementScalarType(Type t) {
@@ -329,9 +342,19 @@ private:
     if (auto l = dyn_cast<ttg::LocalLoadOp>(op))
       return emitLocalLoad(l);
     if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op)) {
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup | "
+                     "mem_flags::mem_device);\n";
       for (Value r : op->getResults())
         valMap[r] = SmallVector<std::string>{};
+      return success();
+    }
+    if (auto b = dyn_cast<ttg::BarrierOp>(op)) {
+      os << ind() << "threadgroup_barrier(" << barrierMemFlags(b.getAddrSpace())
+         << ");\n";
+      return success();
+    }
+    if (isa<mlir::gpu::BarrierOp>(op)) {
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       return success();
     }
     if (isa<ttg::LocalDeallocOp>(op))

@@ -1475,11 +1475,9 @@ private:
         if ((laneMask & m) == 0)
           continue;
         SmallVector<std::string> others(nOp);
-        for (int k = 0; k < nOp; ++k) {
-          others[k] = fresh();
-          os << ind() << scTys[k] << " " << others[k] << " = simd_shuffle_xor("
-             << accs[k] << ", " << m << "u);\n";
-        }
+        for (int k = 0; k < nOp; ++k)
+          others[k] = emitShuffle("simd_shuffle_xor", scTys[k], accs[k],
+                                  std::to_string(m) + "u");
         SmallVector<std::string> out;
         if (failed(emitCombineN(region, accs, others, out)))
           return failure();

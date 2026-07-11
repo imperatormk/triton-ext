@@ -384,11 +384,10 @@ private:
       return emitJoin(j);
     if (auto s = dyn_cast<tt::SplitOp>(op))
       return emitSplit(s);
-    if (isa<tt::CatOp>(op)) {
-      op->emitError("EmitMSL: tt.cat needs a cross-thread threadgroup "
-                    "round-trip, not yet supported");
-      return failure();
-    }
+    if (auto c = dyn_cast<tt::CatOp>(op))
+      return emitCat(c);
+    if (auto r = dyn_cast<tt::ReshapeOp>(op))
+      return emitReshape(r);
     if (auto a = dyn_cast<ttg::LocalAllocOp>(op))
       return emitLocalAlloc(a);
     if (auto i = dyn_cast<ttg::MemDescIndexOp>(op))
@@ -1381,6 +1380,14 @@ private:
       auto st = cast<RankedTensorType>(t.getSrc().getType());
       Type e = st.getElementType();
       poolBytes = std::max(poolBytes, tileSize(st) * (bitsOf(e) / 8));
+    } else if (auto c = dyn_cast<tt::CatOp>(op)) {
+      auto rt = cast<RankedTensorType>(c.getResult().getType());
+      Type e = rt.getElementType();
+      poolBytes = std::max(poolBytes, tileSize(rt) * (bitsOf(e) / 8));
+    } else if (auto rs = dyn_cast<tt::ReshapeOp>(op)) {
+      auto rt = cast<RankedTensorType>(rs.getResult().getType());
+      Type e = rt.getElementType();
+      poolBytes = std::max(poolBytes, tileSize(rt) * (bitsOf(e) / 8));
     } else if (auto d = dyn_cast<tt::DotOp>(op)) {
       auto aTy = cast<RankedTensorType>(d.getA().getType());
       auto bTy = cast<RankedTensorType>(d.getB().getType());
@@ -1473,6 +1480,77 @@ private:
       os << ind() << buf << "["
          << transFlatOffset(srcTy, perm, resTy.getShape(), r)
          << "] = " << srcNames[r] << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    SmallVector<std::string> ids;
+    for (int r = 0, n = regCount(res); r < n; ++r) {
+      std::string id = fresh();
+      os << ind() << sc << " " << id << " = " << buf << "["
+         << flatTileOffset(resTy, r) << "];\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  // tt.reshape preserves row-major linear order. Elements can move across
+  // threads, so we round-trip through a full-tile threadgroup buffer keyed by
+  // the row-major flat offset both layouts agree on.
+  LogicalResult emitReshape(tt::ReshapeOp op) {
+    Value src = op.getSrc();
+    Value res = op.getResult();
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    std::string sc = mslScalarType(resTy.getElementType());
+    auto &srcNames = names(src);
+    int srcRc = regCount(src);
+    int resRc = regCount(res);
+
+    std::string buf = fresh();
+    os << ind() << "threadgroup " << sc << "* " << buf << " = "
+       << poolRegion(0, sc) << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    for (int r = 0; r < srcRc; ++r)
+      os << ind() << buf << "[" << flatTileOffset(srcTy, r)
+         << "] = " << srcNames[r] << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    SmallVector<std::string> outs;
+    for (int r = 0; r < resRc; ++r) {
+      std::string id = fresh();
+      os << ind() << sc << " " << id << " = " << buf << "["
+         << flatTileOffset(resTy, r) << "];\n";
+      outs.push_back(id);
+    }
+    valMap[res] = outs;
+    return success();
+  }
+
+  // tt.cat concatenates two same-layout operands along the leading dim. The
+  // result layout redistributes elements across threads, so it needs a full
+  // threadgroup round-trip: both halves write to their concatenated logical
+  // offset (the second half shifted past the first's flat size), then every
+  // thread reads back its result registers.
+  LogicalResult emitCat(tt::CatOp op) {
+    Value lhs = op.getLhs();
+    Value rhs = op.getRhs();
+    Value res = op.getResult();
+    auto lhsTy = cast<RankedTensorType>(lhs.getType());
+    auto rhsTy = cast<RankedTensorType>(rhs.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    std::string sc = mslScalarType(resTy.getElementType());
+    auto &lhsNames = names(lhs);
+    auto &rhsNames = names(rhs);
+    int64_t lhsFlat = tileSize(lhsTy);
+
+    std::string buf = fresh();
+    os << ind() << "threadgroup " << sc << "* " << buf << " = "
+       << poolRegion(0, sc) << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    for (int r = 0, n = regCount(lhs); r < n; ++r)
+      os << ind() << buf << "[" << flatTileOffset(lhsTy, r)
+         << "] = " << lhsNames[r] << ";\n";
+    for (int r = 0, n = regCount(rhs); r < n; ++r)
+      os << ind() << buf << "[" << flatTileOffset(rhsTy, r) << " + " << lhsFlat
+         << "] = " << rhsNames[r] << ";\n";
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     SmallVector<std::string> ids;
     for (int r = 0, n = regCount(res); r < n; ++r) {

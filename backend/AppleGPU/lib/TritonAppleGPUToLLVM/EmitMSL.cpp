@@ -440,22 +440,44 @@ private:
     Value res = op.getResult();
     if (auto rt = dyn_cast<RankedTensorType>(res.getType())) {
       auto dense = dyn_cast<DenseElementsAttr>(op.getValue());
-      if (!dense || !dense.isSplat()) {
-        op.emitError("EmitMSL: only splat tensor constants supported");
+      if (!dense) {
+        op.emitError("EmitMSL: unsupported tensor constant");
         return failure();
       }
       std::string sc = mslScalarType(rt.getElementType());
+      bool isFloat = isa<FloatType>(rt.getElementType());
       int rc = regCount(res);
       SmallVector<std::string> ids;
+      if (dense.isSplat()) {
+        std::string lit = isFloat
+                              ? floatLit(dense.getSplatValue<APFloat>())
+                              : std::to_string(
+                                    dense.getSplatValue<APInt>().getSExtValue());
+        for (int r = 0; r < rc; ++r) {
+          std::string id = fresh();
+          os << ind() << sc << " " << id << " = " << lit << ";\n";
+          ids.push_back(id);
+        }
+        valMap[res] = ids;
+        return success();
+      }
+
+      std::string tbl = fresh();
+      os << ind() << sc << " " << tbl << "[" << dense.getNumElements()
+         << "] = {";
+      int64_t n = 0;
+      if (isFloat) {
+        for (const APFloat &v : dense.getValues<APFloat>())
+          os << (n++ ? ", " : "") << floatLit(v);
+      } else {
+        for (const APInt &v : dense.getValues<APInt>())
+          os << (n++ ? ", " : "") << std::to_string(v.getSExtValue());
+      }
+      os << "};\n";
       for (int r = 0; r < rc; ++r) {
         std::string id = fresh();
-        std::string lit;
-        if (isa<FloatType>(rt.getElementType()))
-          lit = floatLit(dense.getSplatValue<APFloat>());
-        else
-          lit = std::to_string(
-              dense.getSplatValue<APInt>().getSExtValue());
-        os << ind() << "" << sc << " " << id << " = " << lit << ";\n";
+        os << ind() << sc << " " << id << " = " << tbl << "["
+           << flatTileOffset(rt, r) << "];\n";
         ids.push_back(id);
       }
       valMap[res] = ids;

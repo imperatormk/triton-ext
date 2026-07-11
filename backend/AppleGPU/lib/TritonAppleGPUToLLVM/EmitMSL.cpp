@@ -48,6 +48,14 @@ static std::string mslScalarType(Type t) {
   return "";
 }
 
+static std::string mslStorageType(Type t) {
+  if (auto rt = dyn_cast<RankedTensorType>(t))
+    t = rt.getElementType();
+  if (auto pt = dyn_cast<tt::PointerType>(t))
+    return "device " + mslScalarType(pt.getPointeeType()) + "*";
+  return mslScalarType(t);
+}
+
 static Type elementScalarType(Type t) {
   if (auto rt = dyn_cast<RankedTensorType>(t))
     t = rt.getElementType();
@@ -270,6 +278,8 @@ private:
       return emitLoad(l);
     if (auto s = dyn_cast<tt::StoreOp>(op))
       return emitStore(s);
+    if (auto a = dyn_cast<tt::AtomicRMWOp>(op))
+      return emitAtomicRMW(a);
     if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp>(op))
       return emitIntBinary(op);
     if (isa<arith::AddFOp, arith::MulFOp, arith::SubFOp, arith::DivFOp>(op))
@@ -817,22 +827,30 @@ private:
     Value res = op.getResult();
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
-    std::string sc = mslScalarType(elementScalarType(resTy));
+    Type elemTy = resTy.getElementType();
+    bool isPtr = isa<tt::PointerType>(elemTy);
+    std::string ptrTy = mslStorageType(resTy);
+    std::string sc = isPtr ? "ulong" : ptrTy;
     auto &srcNames = names(src);
 
     std::string buf = "__cvt_scratch_" + std::to_string(tgScratchId++);
     os << ind() << "threadgroup " << sc << " " << buf << "["
        << tileSize(srcTy) << "];\n";
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    for (int r = 0, n = regCount(src); r < n; ++r)
-      os << ind() << buf << "[" << flatTileOffset(srcTy, r) << "] = "
-         << srcNames[r] << ";\n";
+    for (int r = 0, n = regCount(src); r < n; ++r) {
+      std::string sv =
+          isPtr ? "(ulong)" + srcNames[r] : srcNames[r];
+      os << ind() << buf << "[" << flatTileOffset(srcTy, r) << "] = " << sv
+         << ";\n";
+    }
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     SmallVector<std::string> ids;
     for (int r = 0, n = regCount(res); r < n; ++r) {
       std::string id = fresh();
-      os << ind() << sc << " " << id << " = " << buf << "["
-         << flatTileOffset(resTy, r) << "];\n";
+      std::string rd = buf + "[" + flatTileOffset(resTy, r) + "]";
+      if (isPtr)
+        rd = "(" + ptrTy + ")" + rd;
+      os << ind() << ptrTy << " " << id << " = " << rd << ";\n";
       ids.push_back(id);
     }
     valMap[res] = ids;
@@ -986,6 +1004,88 @@ private:
       }
     }
     return success();
+  }
+
+  LogicalResult emitAtomicRMW(tt::AtomicRMWOp op) {
+    Value res = op.getResult();
+    Type scalarTy = elementScalarType(res.getType());
+    std::string sc = mslScalarType(scalarTy);
+    bool isFloat = isa<FloatType>(scalarTy);
+    tt::RMWOp kind = op.getAtomicRmwOp();
+
+    std::string atomicTy;
+    if (isFloat)
+      atomicTy = "atomic_float";
+    else if (kind == tt::RMWOp::UMAX || kind == tt::RMWOp::UMIN)
+      atomicTy = "atomic_uint";
+    else
+      atomicTy = scalarTy.getIntOrFloatBitWidth() == 64 ? "atomic_long"
+                                                        : "atomic_int";
+
+    const char *fn = nullptr;
+    switch (kind) {
+    case tt::RMWOp::ADD:
+    case tt::RMWOp::FADD:
+      fn = "atomic_fetch_add_explicit";
+      break;
+    case tt::RMWOp::MAX:
+    case tt::RMWOp::UMAX:
+      fn = "atomic_fetch_max_explicit";
+      break;
+    case tt::RMWOp::MIN:
+    case tt::RMWOp::UMIN:
+      fn = "atomic_fetch_min_explicit";
+      break;
+    case tt::RMWOp::AND:
+      fn = "atomic_fetch_and_explicit";
+      break;
+    case tt::RMWOp::OR:
+      fn = "atomic_fetch_or_explicit";
+      break;
+    case tt::RMWOp::XOR:
+      fn = "atomic_fetch_xor_explicit";
+      break;
+    case tt::RMWOp::XCHG:
+      fn = "atomic_exchange_explicit";
+      break;
+    default:
+      op.emitError("EmitMSL: unsupported atomic rmw kind");
+      return failure();
+    }
+
+    auto &ptrs = names(op.getPtr());
+    auto &vals = names(op.getVal());
+    bool hasMask = op.getMask() != nullptr;
+    SmallVector<std::string> *mask = hasMask ? &names(op.getMask()) : nullptr;
+    bool uniform = !isa<RankedTensorType>(op.getPtr().getType());
+    int rc = ptrs.size();
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      const std::string &p = ptrs[r];
+      const std::string &v = vals[vals.size() == 1 ? 0 : r];
+      std::string id = fresh();
+      std::string call = std::string(fn) + "((device " + atomicTy + "*)" + p +
+                         ", " + v + ", memory_order_relaxed)";
+      os << ind() << sc << " " << id << " = " << init0(sc) << ";\n";
+      std::string guard;
+      if (uniform)
+        guard = tidId + ".x == 0";
+      if (hasMask) {
+        const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
+        guard = guard.empty() ? m : guard + " && " + m;
+      }
+      if (guard.empty())
+        os << ind() << id << " = " << call << ";\n";
+      else
+        os << ind() << "if (" << guard << ") " << id << " = " << call << ";\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  static std::string init0(const std::string &sc) {
+    return sc == "float" || sc == "half" ? "0.0" : "0";
   }
 };
 

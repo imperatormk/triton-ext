@@ -3746,16 +3746,47 @@ private:
     auto &vals = names(op.getValue());
     bool hasMask = op.getMask() != nullptr;
     SmallVector<std::string> *mask = hasMask ? &names(op.getMask()) : nullptr;
+    bool uniform = !isa<RankedTensorType>(op.getPtr().getType());
     int rc = ptrs.size();
+
+    // Redundant-thread predicate: when the pointer layout replicates an element
+    // across lanes/warps, only the canonical thread may write, else racing
+    // threads clobber each other on a read-modify-write to the same address.
+    unsigned laneFree = 0, warpFree = 0;
+    if (!uniform) {
+      auto ptrTy = cast<RankedTensorType>(op.getPtr().getType());
+      tt::LinearLayout ll = ttg::toLinearLayout(ptrTy);
+      MLIRContext *c = op.getContext();
+      auto masks = ll.getFreeVariableMasks();
+      laneFree = masks.lookup(StringAttr::get(c, "lane"));
+      warpFree = masks.lookup(StringAttr::get(c, "warp"));
+    }
+    std::string threadPred;
+    if (uniform) {
+      threadPred = tidId + ".x == 0";
+    } else {
+      if (laneFree)
+        threadPred = "((" + laneId + " & " + std::to_string(laneFree) +
+                     ") == 0)";
+      if (warpFree) {
+        std::string wp =
+            "((" + warpId + " & " + std::to_string(warpFree) + ") == 0)";
+        threadPred = threadPred.empty() ? wp : threadPred + " && " + wp;
+      }
+    }
+
     for (int r = 0; r < rc; ++r) {
       const std::string &p = ptrs[r];
       const std::string &v = vals[vals.size() == 1 ? 0 : r];
+      std::string guard = threadPred;
       if (hasMask) {
         const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
-        os << ind() << "if (" << m << ") *" << p << " = " << v << ";\n";
-      } else {
-        os << ind() << "*" << p << " = " << v << ";\n";
+        guard = guard.empty() ? m : guard + " && " + m;
       }
+      if (guard.empty())
+        os << ind() << "*" << p << " = " << v << ";\n";
+      else
+        os << ind() << "if (" << guard << ") *" << p << " = " << v << ";\n";
     }
     return success();
   }

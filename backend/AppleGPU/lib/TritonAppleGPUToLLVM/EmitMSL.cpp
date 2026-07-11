@@ -349,6 +349,8 @@ private:
       return emitAtomicRMW(a);
     if (auto a = dyn_cast<tt::AtomicCASOp>(op))
       return emitAtomicCAS(a);
+    if (auto a = dyn_cast<tt::AtomicPollOp>(op))
+      return emitAtomicPoll(a);
     if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp, arith::DivSIOp,
             arith::DivUIOp, arith::RemSIOp, arith::RemUIOp>(op))
       return emitIntBinary(op);
@@ -2540,12 +2542,95 @@ private:
     return success();
   }
 
+  // For a 16-bit-float element pointer p, emit statements binding a uint* to the
+  // containing aligned 32-bit word and a bool selecting the high half-word.
+  // Returns {wordPtr, isHigh} identifiers.
+  std::pair<std::string, std::string> emitPacked16Base(const std::string &p,
+                                                       const std::string &sc) {
+    std::string bytePtr = fresh(), wordAddr = fresh(), isHigh = fresh(),
+                wordPtr = fresh();
+    os << ind() << "device uchar *" << bytePtr
+       << " = (device uchar *)(" << p << ");\n";
+    os << ind() << "size_t " << wordAddr << " = (size_t)" << bytePtr
+       << " & ~(size_t)3;\n";
+    os << ind() << "bool " << isHigh << " = ((size_t)" << bytePtr
+       << " & 2u) != 0u;\n";
+    os << ind() << "device atomic_uint *" << wordPtr
+       << " = (device atomic_uint *)" << wordAddr << ";\n";
+    (void)sc;
+    return {wordPtr, isHigh};
+  }
+
+  // Extract the selected 16-bit-float lane from a loaded 32-bit word into a
+  // float, apply `newFloatExpr` (which may reference `curId`), repack into the
+  // word, and CAS-loop until it lands. Binds `id` to the pre-op value.
+  void emitPacked16CASLoop(const std::string &wordPtr, const std::string &isHigh,
+                           const std::string &sc, const std::string &curId,
+                           const std::string &newFloatExpr,
+                           const std::string &id) {
+    std::string word = fresh(), lane = fresh(), newLane = fresh(),
+                newWord = fresh();
+    os << ind() << "uint " << word
+       << " = atomic_load_explicit(" << wordPtr << ", memory_order_relaxed);\n";
+    os << ind() << "while (true) {\n";
+    ++indent;
+    os << ind() << "ushort " << lane << " = (ushort)((" << isHigh << ") ? ("
+       << word << " >> 16) : (" << word << " & 0xffffu));\n";
+    os << ind() << id << " = as_type<" << sc << ">(" << lane << ");\n";
+    os << ind() << "float " << curId << " = (float)as_type<" << sc << ">("
+       << lane << ");\n";
+    os << ind() << sc << " " << newLane << " = (" << sc << ")(" << newFloatExpr
+       << ");\n";
+    os << ind() << "uint " << newWord << " = (" << isHigh
+       << ") ? ((" << word << " & 0x0000ffffu) | ((uint)as_type<ushort>("
+       << newLane << ") << 16)) : ((" << word
+       << " & 0xffff0000u) | (uint)as_type<ushort>(" << newLane << "));\n";
+    os << ind() << "if (atomic_compare_exchange_weak_explicit(" << wordPtr
+       << ", &" << word << ", " << newWord
+       << ", memory_order_relaxed, memory_order_relaxed)) break;\n";
+    --indent;
+    os << ind() << "}\n";
+  }
+
+  // f32 atomic RMW via a 32-bit CAS loop (Metal's atomic_float only supports
+  // fetch_add; max/min/xchg need emulation). `newFloatExpr` references `curId`.
+  void emitFloat32CASLoop(const std::string &p, const std::string &curId,
+                          const std::string &newFloatExpr,
+                          const std::string &id) {
+    std::string wordPtr = fresh(), word = fresh(), newWord = fresh();
+    os << ind() << "device atomic_uint *" << wordPtr
+       << " = (device atomic_uint *)(" << p << ");\n";
+    os << ind() << "uint " << word
+       << " = atomic_load_explicit(" << wordPtr << ", memory_order_relaxed);\n";
+    os << ind() << "while (true) {\n";
+    ++indent;
+    os << ind() << id << " = as_type<float>(" << word << ");\n";
+    os << ind() << "float " << curId << " = as_type<float>(" << word << ");\n";
+    os << ind() << "uint " << newWord << " = as_type<uint>((float)("
+       << newFloatExpr << "));\n";
+    os << ind() << "if (atomic_compare_exchange_weak_explicit(" << wordPtr
+       << ", &" << word << ", " << newWord
+       << ", memory_order_relaxed, memory_order_relaxed)) break;\n";
+    --indent;
+    os << ind() << "}\n";
+  }
+
   LogicalResult emitAtomicRMW(tt::AtomicRMWOp op) {
     Value res = op.getResult();
     Type scalarTy = elementScalarType(res.getType());
     std::string sc = mslScalarType(scalarTy);
     bool isFloat = isa<FloatType>(scalarTy);
+    unsigned bw = scalarTy.getIntOrFloatBitWidth();
     tt::RMWOp kind = op.getAtomicRmwOp();
+
+    bool floatNative = isFloat && bw == 32 &&
+                       (kind == tt::RMWOp::ADD || kind == tt::RMWOp::FADD);
+    bool floatEmulated = isFloat && !floatNative;
+
+    if (floatEmulated && bw != 16 && bw != 32) {
+      op.emitError("EmitMSL: unsupported floating-point atomic rmw width");
+      return failure();
+    }
 
     std::string atomicTy;
     if (isFloat)
@@ -2553,38 +2638,39 @@ private:
     else if (kind == tt::RMWOp::UMAX || kind == tt::RMWOp::UMIN)
       atomicTy = "atomic_uint";
     else
-      atomicTy = scalarTy.getIntOrFloatBitWidth() == 64 ? "atomic_long"
-                                                        : "atomic_int";
+      atomicTy = bw == 64 ? "atomic_long" : "atomic_int";
 
     const char *fn = nullptr;
-    switch (kind) {
-    case tt::RMWOp::ADD:
-    case tt::RMWOp::FADD:
-      fn = "atomic_fetch_add_explicit";
-      break;
-    case tt::RMWOp::MAX:
-    case tt::RMWOp::UMAX:
-      fn = "atomic_fetch_max_explicit";
-      break;
-    case tt::RMWOp::MIN:
-    case tt::RMWOp::UMIN:
-      fn = "atomic_fetch_min_explicit";
-      break;
-    case tt::RMWOp::AND:
-      fn = "atomic_fetch_and_explicit";
-      break;
-    case tt::RMWOp::OR:
-      fn = "atomic_fetch_or_explicit";
-      break;
-    case tt::RMWOp::XOR:
-      fn = "atomic_fetch_xor_explicit";
-      break;
-    case tt::RMWOp::XCHG:
-      fn = "atomic_exchange_explicit";
-      break;
-    default:
-      op.emitError("EmitMSL: unsupported atomic rmw kind");
-      return failure();
+    if (!floatEmulated) {
+      switch (kind) {
+      case tt::RMWOp::ADD:
+      case tt::RMWOp::FADD:
+        fn = "atomic_fetch_add_explicit";
+        break;
+      case tt::RMWOp::MAX:
+      case tt::RMWOp::UMAX:
+        fn = "atomic_fetch_max_explicit";
+        break;
+      case tt::RMWOp::MIN:
+      case tt::RMWOp::UMIN:
+        fn = "atomic_fetch_min_explicit";
+        break;
+      case tt::RMWOp::AND:
+        fn = "atomic_fetch_and_explicit";
+        break;
+      case tt::RMWOp::OR:
+        fn = "atomic_fetch_or_explicit";
+        break;
+      case tt::RMWOp::XOR:
+        fn = "atomic_fetch_xor_explicit";
+        break;
+      case tt::RMWOp::XCHG:
+        fn = "atomic_exchange_explicit";
+        break;
+      default:
+        op.emitError("EmitMSL: unsupported atomic rmw kind");
+        return failure();
+      }
     }
 
     auto &ptrs = names(op.getPtr());
@@ -2598,8 +2684,6 @@ private:
       const std::string &p = ptrs[r];
       const std::string &v = vals[vals.size() == 1 ? 0 : r];
       std::string id = fresh();
-      std::string call = std::string(fn) + "((device " + atomicTy + "*)" + p +
-                         ", " + v + ", memory_order_relaxed)";
       os << ind() << sc << " " << id << " = " << init0(sc) << ";\n";
       std::string guard;
       if (uniform)
@@ -2608,25 +2692,65 @@ private:
         const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
         guard = guard.empty() ? m : guard + " && " + m;
       }
-      if (guard.empty())
+      bool guarded = !guard.empty();
+      if (guarded) {
+        os << ind() << "if (" << guard << ") {\n";
+        ++indent;
+      }
+      if (floatEmulated) {
+        std::string cur = fresh();
+        std::string newExpr = floatRmwExpr(kind, cur, "(float)(" + v + ")");
+        if (bw == 16) {
+          auto base = emitPacked16Base(p, sc);
+          emitPacked16CASLoop(base.first, base.second, sc, cur, newExpr, id);
+        } else {
+          emitFloat32CASLoop(p, cur, newExpr, id);
+        }
+      } else {
+        std::string call = std::string(fn) + "((device " + atomicTy + "*)" + p +
+                           ", " + v + ", memory_order_relaxed)";
         os << ind() << id << " = " << call << ";\n";
-      else
-        os << ind() << "if (" << guard << ") " << id << " = " << call << ";\n";
+      }
+      if (guarded) {
+        --indent;
+        os << ind() << "}\n";
+      }
       ids.push_back(id);
     }
     valMap[res] = ids;
     return success();
   }
 
+  static std::string floatRmwExpr(tt::RMWOp kind, const std::string &cur,
+                                  const std::string &v) {
+    switch (kind) {
+    case tt::RMWOp::ADD:
+    case tt::RMWOp::FADD:
+      return cur + " + " + v;
+    case tt::RMWOp::MAX:
+      return "fmax(" + cur + ", " + v + ")";
+    case tt::RMWOp::MIN:
+      return "fmin(" + cur + ", " + v + ")";
+    case tt::RMWOp::XCHG:
+      return v;
+    default:
+      return v;
+    }
+  }
+
   LogicalResult emitAtomicCAS(tt::AtomicCASOp op) {
     Value res = op.getResult();
     Type scalarTy = elementScalarType(res.getType());
     std::string sc = mslScalarType(scalarTy);
-    if (isa<FloatType>(scalarTy) || scalarTy.getIntOrFloatBitWidth() != 32) {
-      op.emitError("EmitMSL: only 32-bit integer atomic_cas supported");
+    bool isFloat = isa<FloatType>(scalarTy);
+    unsigned bw = scalarTy.getIntOrFloatBitWidth();
+
+    bool packed16 = isFloat && bw == 16;
+    bool word32 = bw == 32;
+    if (!packed16 && !word32) {
+      op.emitError("EmitMSL: unsupported atomic_cas element width");
       return failure();
     }
-    std::string atomicTy = "atomic_int";
 
     auto &ptrs = names(op.getPtr());
     auto &cmps = names(op.getCmp());
@@ -2638,22 +2762,174 @@ private:
       const std::string &p = ptrs[r];
       const std::string &c = cmps[cmps.size() == 1 ? 0 : r];
       const std::string &v = vals[vals.size() == 1 ? 0 : r];
-      std::string exp = fresh();
       std::string id = fresh();
-      os << ind() << sc << " " << exp << " = " << c << ";\n";
-      std::string call = "atomic_compare_exchange_weak_explicit((device " +
-                         atomicTy + "*)" + p + ", &" + exp + ", " + v +
-                         ", memory_order_relaxed, memory_order_relaxed)";
-      std::string body = "while (" + exp + " == " + c + " && !(" + call +
-                         ")) {}";
-      if (uniform)
-        os << ind() << "if (" << tidId << ".x == 0) " << body << "\n";
+      bool uni = uniform;
+      if (uni) {
+        os << ind() << sc << " " << id << " = " << c << ";\n";
+        os << ind() << "if (" << tidId << ".x == 0) {\n";
+        ++indent;
+      }
+      if (packed16)
+        emitPacked16CAS(p, c, v, sc, id, !uni);
+      else if (isFloat)
+        emitFloat32CAS(p, c, v, id, !uni);
       else
-        os << ind() << body << "\n";
-      os << ind() << sc << " " << id << " = " << exp << ";\n";
+        emitInt32CAS(p, c, v, sc, id, !uni);
+      if (uni) {
+        --indent;
+        os << ind() << "}\n";
+      }
       ids.push_back(id);
     }
     valMap[res] = ids;
+    return success();
+  }
+
+  void emitInt32CAS(const std::string &p, const std::string &c,
+                    const std::string &v, const std::string &sc,
+                    const std::string &id, bool declare) {
+    std::string exp = fresh();
+    os << ind() << sc << " " << exp << " = " << c << ";\n";
+    std::string call = "atomic_compare_exchange_weak_explicit((device "
+                       "atomic_int *)" +
+                       p + ", &" + exp + ", " + v +
+                       ", memory_order_relaxed, memory_order_relaxed)";
+    os << ind() << "while (" << exp << " == " << c << " && !(" << call
+       << ")) {}\n";
+    os << ind() << (declare ? sc + " " : "") << id << " = " << exp << ";\n";
+  }
+
+  void emitFloat32CAS(const std::string &p, const std::string &c,
+                      const std::string &v, const std::string &id,
+                      bool declare) {
+    std::string exp = fresh(), cbits = fresh();
+    os << ind() << "uint " << exp << " = as_type<uint>(" << c << ");\n";
+    os << ind() << "uint " << cbits << " = as_type<uint>(" << c << ");\n";
+    std::string call = "atomic_compare_exchange_weak_explicit((device "
+                       "atomic_uint *)" +
+                       p + ", &" + exp + ", as_type<uint>(" + v +
+                       "), memory_order_relaxed, memory_order_relaxed)";
+    os << ind() << "while (" << exp << " == " << cbits << " && !(" << call
+       << ")) {}\n";
+    os << ind() << (declare ? std::string("float ") : "") << id
+       << " = as_type<float>(" << exp << ");\n";
+  }
+
+  void emitPacked16CAS(const std::string &p, const std::string &c,
+                       const std::string &v, const std::string &sc,
+                       const std::string &id, bool declare) {
+    auto base = emitPacked16Base(p, sc);
+    const std::string &wordPtr = base.first, &isHigh = base.second;
+    std::string word = fresh(), cur = fresh(), lane = fresh(), newWord = fresh(),
+                matched = fresh();
+    os << ind() << "ushort " << cur
+       << " = as_type<ushort>((" << sc << ")(" << c << "));\n";
+    os << ind() << "ushort " << lane
+       << " = as_type<ushort>((" << sc << ")(" << v << "));\n";
+    os << ind() << "uint " << word
+       << " = atomic_load_explicit(" << wordPtr << ", memory_order_relaxed);\n";
+    os << ind() << (declare ? std::string(sc) + " " : "") << id << " = "
+       << init0(sc) << ";\n";
+    os << ind() << "while (true) {\n";
+    ++indent;
+    std::string got = fresh();
+    os << ind() << "ushort " << got << " = (ushort)((" << isHigh << ") ? ("
+       << word << " >> 16) : (" << word << " & 0xffffu));\n";
+    os << ind() << id << " = as_type<" << sc << ">(" << got << ");\n";
+    os << ind() << "if (" << got << " != " << cur << ") break;\n";
+    os << ind() << "uint " << newWord << " = (" << isHigh
+       << ") ? ((" << word << " & 0x0000ffffu) | ((uint)" << lane
+       << " << 16)) : ((" << word << " & 0xffff0000u) | (uint)" << lane
+       << ");\n";
+    os << ind() << "if (atomic_compare_exchange_weak_explicit(" << wordPtr
+       << ", &" << word << ", " << newWord
+       << ", memory_order_relaxed, memory_order_relaxed)) break;\n";
+    --indent;
+    os << ind() << "}\n";
+  }
+
+  LogicalResult emitAtomicPoll(tt::AtomicPollOp op) {
+    Type expTy = op.getExpected().getType();
+    unsigned bw = expTy.getIntOrFloatBitWidth();
+    if (bw != 16 && bw != 32) {
+      op.emitError("EmitMSL: atomic_poll supports only 16/32-bit; this target "
+                   "lacks 64-bit device atomics");
+      return failure();
+    }
+    bool acquire = op.getSem() == tt::MemSemantic::ACQUIRE;
+
+    const std::string &p = names(op.getPtr())[0];
+    const std::string &exp = names(op.getExpected())[0];
+
+    std::string barrierFlags =
+        acquire ? "mem_flags::mem_device | mem_flags::mem_threadgroup"
+                : "mem_flags::mem_threadgroup";
+    std::string result = fresh();
+
+    // Binds `wordPtr` to a device atomic_uint* on the aligned containing word
+    // and returns an expression evaluating to the polled value: the full word
+    // for 32-bit, or the masked 16-bit lane for 16-bit (Metal has no 16-bit
+    // device atomic).
+    auto emitProbe = [&](std::string &loadExpr) -> std::string {
+      std::string wordPtr = fresh();
+      if (bw == 16) {
+        std::string isHigh = fresh();
+        os << ind() << "bool " << isHigh << " = ((size_t)(" << p
+           << ") & 2u) != 0u;\n";
+        os << ind() << "device atomic_uint *" << wordPtr
+           << " = (device atomic_uint *)((size_t)(" << p
+           << ") & ~(size_t)3);\n";
+        loadExpr = "(ushort)((" + isHigh + ") ? (atomic_load_explicit(" +
+                   wordPtr + ", memory_order_relaxed) >> 16) : " +
+                   "(atomic_load_explicit(" + wordPtr +
+                   ", memory_order_relaxed) & 0xffffu))";
+      } else {
+        os << ind() << "device atomic_uint *" << wordPtr
+           << " = (device atomic_uint *)(" << p << ");\n";
+        loadExpr =
+            "atomic_load_explicit(" + wordPtr + ", memory_order_relaxed)";
+      }
+      return wordPtr;
+    };
+    std::string wordTy = bw == 16 ? "ushort" : "uint";
+
+    if (!op.getTimeout()) {
+      // Without a timeout the poll can only complete on a match, so every
+      // thread rendezvouses and the result is a compile-time true (no shared
+      // memory needed to broadcast).
+      os << ind() << "if (" << tidId << ".x == 0) {\n";
+      ++indent;
+      std::string want = fresh(), loadExpr;
+      emitProbe(loadExpr);
+      os << ind() << wordTy << " " << want << " = (" << wordTy << ")" << exp
+         << ";\n";
+      os << ind() << "while (" << loadExpr << " != " << want << ") {}\n";
+      --indent;
+      os << ind() << "}\n";
+      os << ind() << "threadgroup_barrier(" << barrierFlags << ");\n";
+      os << ind() << "bool " << result << " = true;\n";
+      valMap[op.getResult()] = {result};
+      return success();
+    }
+
+    // MSL has no in-kernel global timer; only timeout_ns==0 (single probe) is
+    // expressible. The elected thread's match is broadcast through a scratch
+    // threadgroup flag so every thread returns the same value.
+    std::string flag = fresh();
+    os << ind() << "threadgroup bool " << flag << ";\n";
+    os << ind() << "if (" << tidId << ".x == 0) {\n";
+    ++indent;
+    std::string want = fresh(), loaded = fresh(), loadExpr;
+    emitProbe(loadExpr);
+    os << ind() << wordTy << " " << want << " = (" << wordTy << ")" << exp
+       << ";\n";
+    os << ind() << wordTy << " " << loaded << " = " << loadExpr << ";\n";
+    os << ind() << flag << " = (" << loaded << " == " << want << ");\n";
+    --indent;
+    os << ind() << "}\n";
+    os << ind() << "threadgroup_barrier(" << barrierFlags << ");\n";
+    os << ind() << "bool " << result << " = " << flag << ";\n";
+    valMap[op.getResult()] = {result};
     return success();
   }
 

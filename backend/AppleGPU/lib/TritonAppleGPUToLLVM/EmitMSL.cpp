@@ -2181,6 +2181,9 @@ private:
     } else if (auto h = dyn_cast<tt::HistogramOp>(op)) {
       auto rt = cast<RankedTensorType>(h.getResult().getType());
       poolBytes = std::max(poolBytes, tileSize(rt) * 4);
+    } else if (auto ca = dyn_cast<tt::AtomicCASOp>(op)) {
+      if (!isa<RankedTensorType>(ca.getPtr().getType()))
+        poolBytes = std::max<int64_t>(poolBytes, 8);
     } else if (auto s = dyn_cast<tt::ScanOp>(op)) {
       auto st = cast<RankedTensorType>(s.getOperand(0).getType());
       tt::LinearLayout ll = ttg::toLinearLayout(st);
@@ -3306,8 +3309,45 @@ private:
     SmallVector<std::string> *mask = hasMask ? &names(op.getMask()) : nullptr;
     bool uniform = !isa<RankedTensorType>(op.getPtr().getType());
     int rc = ptrs.size();
-    SmallVector<std::string> ids;
+
+    // Redundant-thread predicate: when the pointer layout replicates an element
+    // across lanes/warps/registers, only the canonical thread/register may
+    // perform the atomic, else the update lands multiple times.
+    unsigned laneFree = 0, warpFree = 0, regFree = 0;
+    if (!uniform) {
+      auto ptrTy = cast<RankedTensorType>(op.getPtr().getType());
+      tt::LinearLayout ll = ttg::toLinearLayout(ptrTy);
+      MLIRContext *c = op.getContext();
+      auto masks = ll.getFreeVariableMasks();
+      laneFree = masks.lookup(StringAttr::get(c, "lane"));
+      warpFree = masks.lookup(StringAttr::get(c, "warp"));
+      regFree = masks.lookup(StringAttr::get(c, "register"));
+    }
+    std::string threadPred;
+    if (laneFree)
+      threadPred = "((" + laneId + " & " + std::to_string(laneFree) + ") == 0)";
+    if (warpFree) {
+      std::string wp =
+          "((" + warpId + " & " + std::to_string(warpFree) + ") == 0)";
+      threadPred = threadPred.empty() ? wp : threadPred + " && " + wp;
+    }
+
+    // Device atomics are relaxed-only on Metal; a release/acq_rel RMW (e.g. a
+    // spinlock unlock via atomic_xchg) needs an explicit device release fence
+    // so the critical-section stores are visible before the lock is dropped.
+    tt::MemSemantic sem = op.getSem();
+    if (sem == tt::MemSemantic::RELEASE ||
+        sem == tt::MemSemantic::ACQUIRE_RELEASE)
+      os << ind()
+         << "atomic_thread_fence(mem_flags::mem_device, "
+            "memory_order_release);\n";
+
+    SmallVector<std::string> ids(rc);
     for (int r = 0; r < rc; ++r) {
+      if (regFree && (r & regFree) != 0) {
+        ids[r] = ids[r & ~regFree];
+        continue;
+      }
       const std::string &p = ptrs[r];
       const std::string &v = vals[vals.size() == 1 ? 0 : r];
       std::string id = fresh();
@@ -3315,6 +3355,8 @@ private:
       std::string guard;
       if (uniform)
         guard = tidId + ".x == 0";
+      else if (!threadPred.empty())
+        guard = threadPred;
       if (hasMask) {
         const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
         guard = guard.empty() ? m : guard + " && " + m;
@@ -3342,7 +3384,7 @@ private:
         --indent;
         os << ind() << "}\n";
       }
-      ids.push_back(id);
+      ids[r] = id;
     }
     valMap[res] = ids;
     return success();
@@ -3365,6 +3407,10 @@ private:
     }
   }
 
+  // Metal device atomics accept ONLY memory_order_relaxed (the toolchain
+  // rejects acquire/release/acq_rel on a thread_scope_device atomic). All
+  // cross-threadgroup ordering therefore comes from explicit device fences
+  // (atomic_thread_fence(mem_device, ...)), not from the atomic op's order.
   LogicalResult emitAtomicCAS(tt::AtomicCASOp op) {
     Value res = op.getResult();
     Type scalarTy = elementScalarType(res.getType());
@@ -3405,6 +3451,22 @@ private:
       if (uni) {
         --indent;
         os << ind() << "}\n";
+        // Cross-threadgroup spinlock: lane 0 owns the CAS, so its result must
+        // be broadcast to every lane (else non-acquiring lanes see the stale
+        // compare value and enter the critical section early). The acquire
+        // device fence between the store and the reload publishes post-lock
+        // memory to the whole threadgroup.
+        std::string bcast = fresh();
+        os << ind() << "threadgroup " << sc << "* " << bcast << " = "
+           << poolRegion(0, sc) << ";\n";
+        os << ind() << "if (" << tidId << ".x == 0) " << bcast << "[0] = " << id
+           << ";\n";
+        os << ind()
+           << "atomic_thread_fence(mem_flags::mem_device, "
+              "memory_order_acquire);\n";
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        os << ind() << id << " = " << bcast << "[0];\n";
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       }
       ids.push_back(id);
     }

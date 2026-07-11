@@ -380,6 +380,15 @@ private:
       return emitConvertLayout(c);
     if (auto t = dyn_cast<tt::TransOp>(op))
       return emitTrans(t);
+    if (auto j = dyn_cast<tt::JoinOp>(op))
+      return emitJoin(j);
+    if (auto s = dyn_cast<tt::SplitOp>(op))
+      return emitSplit(s);
+    if (isa<tt::CatOp>(op)) {
+      op->emitError("EmitMSL: tt.cat needs a cross-thread threadgroup "
+                    "round-trip, not yet supported");
+      return failure();
+    }
     if (auto a = dyn_cast<ttg::LocalAllocOp>(op))
       return emitLocalAlloc(a);
     if (auto i = dyn_cast<ttg::MemDescIndexOp>(op))
@@ -547,6 +556,82 @@ private:
       ids.push_back(srcNames[srcNames.size() == 1 ? 0 : it->second]);
     }
     valMap[res] = ids;
+    return success();
+  }
+
+  static uint64_t coordKey(ArrayRef<int32_t> c) {
+    uint64_t k = 0;
+    for (int32_t v : c)
+      k = k * 100003u + (uint32_t)v + 1;
+    return k;
+  }
+
+  // tt.join(a, b): both operands share a layout; result adds a trailing size-2
+  // dim whose two entries live in the same thread (distinct registers). Result
+  // register r with trailing coord t sources from operand t at the result
+  // coords minus the trailing dim.
+  LogicalResult emitJoin(tt::JoinOp op) {
+    Value res = op.getResult();
+    auto resTy = cast<RankedTensorType>(res.getType());
+    int trailing = resTy.getRank() - 1;
+    SmallVector<SmallVector<std::string> *> srcNames = {&names(op.getLhs()),
+                                                        &names(op.getRhs())};
+    auto srcTy = cast<RankedTensorType>(op.getLhs().getType());
+    int srcRc = regCount(op.getLhs());
+
+    llvm::DenseMap<uint64_t, int> srcByCoord;
+    for (int r = 0; r < srcRc; ++r)
+      srcByCoord[coordKey(registerCoords(srcTy, r))] = r;
+
+    int resRc = regCount(res);
+    SmallVector<std::string> ids(resRc);
+    for (int r = 0; r < resRc; ++r) {
+      SmallVector<int32_t> rc = registerCoords(resTy, r);
+      int t = rc[trailing];
+      rc.pop_back();
+      auto it = srcByCoord.find(coordKey(rc));
+      if (it == srcByCoord.end() || t < 0 || t > 1) {
+        op.emitError("EmitMSL: join register coordinate has no source");
+        return failure();
+      }
+      auto &sn = *srcNames[t];
+      ids[r] = sn[sn.size() == 1 ? 0 : it->second];
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  // tt.split(x): inverse of join. Two results share a layout; result k register
+  // r sources from x at the result coords with trailing coord k appended.
+  LogicalResult emitSplit(tt::SplitOp op) {
+    Value src = op.getOperand();
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    int trailing = srcTy.getRank() - 1;
+    auto &srcNames = names(src);
+    int srcRc = regCount(src);
+
+    llvm::DenseMap<uint64_t, int> srcByCoord;
+    for (int r = 0; r < srcRc; ++r)
+      srcByCoord[coordKey(registerCoords(srcTy, r))] = r;
+
+    for (int k = 0; k < 2; ++k) {
+      Value res = op.getResult(k);
+      auto resTy = cast<RankedTensorType>(res.getType());
+      int resRc = regCount(res);
+      SmallVector<std::string> ids(resRc);
+      for (int r = 0; r < resRc; ++r) {
+        SmallVector<int32_t> rc = registerCoords(resTy, r);
+        rc.push_back(k);
+        auto it = srcByCoord.find(coordKey(rc));
+        if (it == srcByCoord.end()) {
+          op.emitError("EmitMSL: split register coordinate has no source");
+          return failure();
+        }
+        (void)trailing;
+        ids[r] = srcNames[srcNames.size() == 1 ? 0 : it->second];
+      }
+      valMap[res] = ids;
+    }
     return success();
   }
 

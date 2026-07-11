@@ -1845,11 +1845,9 @@ private:
     Type aElem = aTy.getElementType();
     Type bElem = bTy.getElementType();
     Type cElem = cTy.getElementType();
-    if (isa<IntegerType>(aElem) || isa<IntegerType>(bElem)) {
-      op.emitError("EmitMSL: integer tt.dot unsupported (simdgroup_matrix has "
-                   "no int path); needs a non-simdgroup fallback");
-      return failure();
-    }
+    if (isa<IntegerType>(aElem) || isa<IntegerType>(bElem) ||
+        isa<IntegerType>(cElem))
+      return emitDotScalar(op);
     if (aTy.getRank() != 2 || !isDotOperandElem(aElem) ||
         !isDotOperandElem(bElem) || aElem != bElem ||
         !(cElem.isF32() || cElem.isF16())) {
@@ -1954,6 +1952,76 @@ private:
          << flatTileOffset(cTy, r) << "] + " << base << ";\n";
       ids.push_back(id);
     }
+    valMap[op.getResult()] = ids;
+    return success();
+  }
+
+  // Non-simdgroup tt.dot for integer operands: simdgroup_matrix has no integer
+  // path. A/B tiles are staged row-major into threadgroup memory, then each
+  // thread computes its owned C output registers with a scalar K-loop
+  // accumulating in the (wider) result element type. Correctness over speed.
+  LogicalResult emitDotScalar(tt::DotOp op) {
+    auto aTy = cast<RankedTensorType>(op.getA().getType());
+    auto bTy = cast<RankedTensorType>(op.getB().getType());
+    auto cTy = cast<RankedTensorType>(op.getResult().getType());
+    Type aElem = aTy.getElementType();
+    Type bElem = bTy.getElementType();
+    Type cElem = cTy.getElementType();
+    if (aTy.getRank() != 2) {
+      op.emitError("EmitMSL: scalar tt.dot requires 2-D operands");
+      return failure();
+    }
+    int64_t K = aTy.getShape()[1];
+    int64_t M = cTy.getShape()[0];
+    int64_t N = cTy.getShape()[1];
+
+    std::string aScalar = mslScalarType(aElem);
+    std::string bScalar = mslScalarType(bElem);
+    std::string accScalar = mslScalarType(cElem);
+
+    auto &aNames = names(op.getA());
+    auto &bNames = names(op.getB());
+    auto &cInit = names(op.getC());
+
+    int64_t aBytes = M * K * (bitsOf(aElem) / 8);
+    std::string tgA = fresh(), tgB = fresh();
+    os << ind() << "threadgroup " << aScalar << "* " << tgA << " = "
+       << poolRegion(0, aScalar) << ";\n";
+    os << ind() << "threadgroup " << bScalar << "* " << tgB << " = "
+       << poolRegion(aBytes, bScalar) << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    for (int r = 0, n = regCount(op.getA()); r < n; ++r)
+      os << ind() << tgA << "[" << flatTileOffset(aTy, r) << "] = " << aNames[r]
+         << ";\n";
+    for (int r = 0, n = regCount(op.getB()); r < n; ++r)
+      os << ind() << tgB << "[" << flatTileOffset(bTy, r) << "] = " << bNames[r]
+         << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+    tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
+    auto outNames = llvm::to_vector(cLL.getOutDimNames());
+    StringAttr d0 = outNames[0], d1 = outNames[1];
+    SmallVector<std::string> ids;
+    for (int r = 0, n = regCount(op.getResult()); r < n; ++r) {
+      std::string mExpr = layoutCoordExpr(cTy, r, d0);
+      std::string nExpr = layoutCoordExpr(cTy, r, d1);
+      std::string mrow = fresh(), ncol = fresh(), acc = fresh();
+      os << ind() << "int " << mrow << " = " << mExpr << ";\n";
+      os << ind() << "int " << ncol << " = " << nExpr << ";\n";
+      std::string base = cInit[cInit.size() == 1 ? 0 : r];
+      os << ind() << accScalar << " " << acc << " = " << base << ";\n";
+      std::string kv = fresh();
+      os << ind() << "for (int " << kv << " = 0; " << kv << " < " << K << "; ++"
+         << kv << ") {\n";
+      ++indent;
+      os << ind() << acc << " += (" << accScalar << ")" << tgA << "[" << mrow
+         << " * " << K << " + " << kv << "] * (" << accScalar << ")" << tgB
+         << "[" << kv << " * " << N << " + " << ncol << "];\n";
+      --indent;
+      os << ind() << "}\n";
+      ids.push_back(acc);
+    }
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     valMap[op.getResult()] = ids;
     return success();
   }

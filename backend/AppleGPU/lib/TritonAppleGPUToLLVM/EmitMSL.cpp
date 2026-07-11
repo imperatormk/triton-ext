@@ -198,10 +198,13 @@ private:
 
     tgposId = fresh();
     tidId = fresh();
+    numTgId = fresh();
     argLines.push_back("    uint3 " + tgposId +
                        " [[threadgroup_position_in_grid]]");
     argLines.push_back("    uint3 " + tidId +
                        " [[thread_position_in_threadgroup]]");
+    argLines.push_back("    uint3 " + numTgId +
+                       " [[threadgroups_per_grid]]");
     os << llvm::join(argLines, ",\n") << ") {\n";
 
     int off = 0;
@@ -242,7 +245,7 @@ private:
     return success();
   }
 
-  std::string tgposId, tidId, laneId, warpId;
+  std::string tgposId, tidId, numTgId, laneId, warpId;
 
   // Build the MSL offset expression for register `reg` of a distributed 1-D
   // tensor value, using its TritonGPU LinearLayout. block/lane/warp are runtime
@@ -304,6 +307,8 @@ private:
       return emitConstant(c);
     if (auto p = dyn_cast<tt::GetProgramIdOp>(op))
       return emitProgramId(p);
+    if (auto n = dyn_cast<tt::GetNumProgramsOp>(op))
+      return emitNumPrograms(n);
     if (auto r = dyn_cast<tt::MakeRangeOp>(op))
       return emitMakeRange(r);
     if (auto s = dyn_cast<tt::SplatOp>(op))
@@ -539,6 +544,17 @@ private:
                        : op.getAxis() == tt::ProgramIDDim::Y ? "y"
                                                              : "z";
     os << ind() << "int " << id << " = (int)(" << tgposId << "." << comp << ");\n";
+    bindScalar(op.getResult(), id);
+    return success();
+  }
+
+  LogicalResult emitNumPrograms(tt::GetNumProgramsOp op) {
+    std::string id = fresh();
+    const char *comp = op.getAxis() == tt::ProgramIDDim::X   ? "x"
+                       : op.getAxis() == tt::ProgramIDDim::Y ? "y"
+                                                             : "z";
+    os << ind() << "int " << id << " = (int)(" << numTgId << "." << comp
+       << ");\n";
     bindScalar(op.getResult(), id);
     return success();
   }

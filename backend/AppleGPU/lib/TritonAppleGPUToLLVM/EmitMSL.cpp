@@ -64,6 +64,7 @@ public:
 
   LogicalResult emit() {
     os << "#include <metal_stdlib>\n";
+    os << "#include <metal_simdgroup_matrix>\n";
     os << "using namespace metal;\n\n";
     for (auto func : mod.getOps<tt::FuncOp>()) {
       if (failed(emitFunc(func)))
@@ -91,6 +92,31 @@ private:
     tt::LinearLayout ll = ttg::toLinearLayout(rt);
     auto kReg = StringAttr::get(v.getContext(), "register");
     return ll.getInDimSize(kReg);
+  }
+
+  // Per-register out-dim coordinate of a distributed tensor value, evaluated
+  // at lane=warp=block=0 (the compile-time register component). Returns the
+  // coordinate along each out-dim in tensor-dim order (dim0, dim1, ...).
+  SmallVector<int32_t> registerCoords(RankedTensorType rt, int reg) {
+    MLIRContext *ctx = rt.getContext();
+    tt::LinearLayout ll = ttg::toLinearLayout(rt);
+    auto kReg = StringAttr::get(ctx, "register");
+    auto kLane = StringAttr::get(ctx, "lane");
+    auto kWarp = StringAttr::get(ctx, "warp");
+    auto kBlock = StringAttr::get(ctx, "block");
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    ins.push_back({kReg, reg});
+    if (ll.hasInDim(kLane))
+      ins.push_back({kLane, 0});
+    if (ll.hasInDim(kWarp))
+      ins.push_back({kWarp, 0});
+    if (ll.hasInDim(kBlock))
+      ins.push_back({kBlock, 0});
+    auto outs = ll.apply(ins);
+    SmallVector<int32_t> coords;
+    for (auto &p : outs)
+      coords.push_back(p.second);
+    return coords;
   }
 
   SmallVector<std::string> &names(Value v) { return valMap[v]; }
@@ -175,13 +201,21 @@ private:
   // ids; register bits are compile-time constant. Contributions XOR together
   // (general linear-layout semantics).
   std::string layoutOffsetExpr(RankedTensorType rt, int reg) {
+    tt::LinearLayout ll = ttg::toLinearLayout(rt);
+    auto outDim = *ll.getOutDimNames().begin();
+    return layoutCoordExpr(rt, reg, outDim);
+  }
+
+  // MSL expression for the coordinate of register `reg` along a single tensor
+  // out-dim (dim0, dim1, ...). block/lane/warp are runtime ids; register bits
+  // are compile-time constant. Contributions XOR together.
+  std::string layoutCoordExpr(RankedTensorType rt, int reg, StringAttr outDim) {
     MLIRContext *ctx = rt.getContext();
     tt::LinearLayout ll = ttg::toLinearLayout(rt);
     auto kReg = StringAttr::get(ctx, "register");
     auto kLane = StringAttr::get(ctx, "lane");
     auto kWarp = StringAttr::get(ctx, "warp");
     auto kBlock = StringAttr::get(ctx, "block");
-    auto outDim = *ll.getOutDimNames().begin();
 
     SmallVector<std::string> terms;
 
@@ -226,6 +260,10 @@ private:
       return emitMakeRange(r);
     if (auto s = dyn_cast<tt::SplatOp>(op))
       return emitSplat(s);
+    if (auto e = dyn_cast<tt::ExpandDimsOp>(op))
+      return emitReshapeLike(e.getResult(), e.getSrc(), e.getAxis(), true);
+    if (auto b = dyn_cast<tt::BroadcastOp>(op))
+      return emitReshapeLike(b.getResult(), b.getSrc(), -1, false);
     if (auto a = dyn_cast<tt::AddPtrOp>(op))
       return emitAddPtr(a);
     if (auto l = dyn_cast<tt::LoadOp>(op))
@@ -248,6 +286,10 @@ private:
       return emitIf(i);
     if (auto r = dyn_cast<tt::ReduceOp>(op))
       return emitReduce(r);
+    if (auto d = dyn_cast<tt::DotOp>(op))
+      return emitDot(d);
+    if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op))
+      return emitConvertLayout(c);
     if (isa<scf::YieldOp>(op))
       return success();
     if (isa<tt::ReturnOp>(op)) {
@@ -340,6 +382,52 @@ private:
     for (int r = 0; r < rc; ++r)
       ids.push_back(src);
     valMap[op.getResult()] = ids;
+    return success();
+  }
+
+  // Map result registers to source registers by matching per-register
+  // coordinates. Handles tt.expand_dims (insert a size-1 dim at `axis`) and
+  // tt.broadcast (replicate size-1 source dims). Value carries through; only
+  // the register->register permutation/replication changes.
+  LogicalResult emitReshapeLike(Value res, Value src, int axis, bool isExpand) {
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    auto &srcNames = names(src);
+    int srcRc = regCount(src);
+    int resRc = regCount(res);
+
+    llvm::DenseMap<uint64_t, int> srcByCoord;
+    auto keyOf = [](ArrayRef<int32_t> c) -> uint64_t {
+      uint64_t k = 0;
+      for (int32_t v : c)
+        k = k * 100003u + (uint32_t)v + 1;
+      return k;
+    };
+    for (int r = 0; r < srcRc; ++r)
+      srcByCoord[keyOf(registerCoords(srcTy, r))] = r;
+
+    auto srcShape = srcTy.getShape();
+    SmallVector<std::string> ids;
+    for (int r = 0; r < resRc; ++r) {
+      SmallVector<int32_t> rc = registerCoords(resTy, r);
+      SmallVector<int32_t> sc;
+      if (isExpand) {
+        for (int d = 0; d < (int)rc.size(); ++d)
+          if (d != axis)
+            sc.push_back(rc[d]);
+      } else {
+        for (int d = 0; d < (int)rc.size(); ++d)
+          sc.push_back(srcShape[d] == 1 ? 0 : rc[d]);
+      }
+      auto it = srcByCoord.find(keyOf(sc));
+      if (it == srcByCoord.end()) {
+        res.getDefiningOp()->emitError(
+            "EmitMSL: reshape register coordinate has no source");
+        return failure();
+      }
+      ids.push_back(srcNames[srcNames.size() == 1 ? 0 : it->second]);
+    }
+    valMap[res] = ids;
     return success();
   }
 
@@ -688,6 +776,147 @@ private:
     }
 
     bindScalar(res, acc);
+    return success();
+  }
+
+  int tgScratchId = 0;
+
+  // Full flat size (product of shape) of a tensor tile.
+  int64_t tileSize(RankedTensorType rt) {
+    int64_t n = 1;
+    for (int64_t d : rt.getShape())
+      n *= d;
+    return n;
+  }
+
+  // Row-major flat offset expression (into a full tile buffer) for register r.
+  std::string flatTileOffset(RankedTensorType rt, int reg) {
+    MLIRContext *ctx = rt.getContext();
+    tt::LinearLayout ll = ttg::toLinearLayout(rt);
+    auto outNames = llvm::to_vector(ll.getOutDimNames());
+    auto shape = rt.getShape();
+    std::string expr;
+    int64_t stride = 1;
+    for (int d = (int)outNames.size() - 1; d >= 0; --d) {
+      std::string c = layoutCoordExpr(rt, reg, outNames[d]);
+      std::string term = stride == 1 ? c : ("(" + c + " * " +
+                                            std::to_string(stride) + ")");
+      expr = expr.empty() ? term : ("(" + expr + " + " + term + ")");
+      stride *= shape[d];
+    }
+    (void)ctx;
+    return expr.empty() ? "0" : expr;
+  }
+
+  // General layout conversion via a full-tile threadgroup round-trip: every
+  // thread writes its source registers at their (row,col) tile offset, barrier,
+  // then reads its destination registers back from the same offsets. Correct
+  // for arbitrary distributed src/dst layouts (moves data across lanes/warps).
+  LogicalResult emitConvertLayout(ttg::ConvertLayoutOp op) {
+    Value src = op.getSrc();
+    Value res = op.getResult();
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    std::string sc = mslScalarType(elementScalarType(resTy));
+    auto &srcNames = names(src);
+
+    std::string buf = "__cvt_scratch_" + std::to_string(tgScratchId++);
+    os << ind() << "threadgroup " << sc << " " << buf << "["
+       << tileSize(srcTy) << "];\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    for (int r = 0, n = regCount(src); r < n; ++r)
+      os << ind() << buf << "[" << flatTileOffset(srcTy, r) << "] = "
+         << srcNames[r] << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    SmallVector<std::string> ids;
+    for (int r = 0, n = regCount(res); r < n; ++r) {
+      std::string id = fresh();
+      os << ind() << sc << " " << id << " = " << buf << "["
+         << flatTileOffset(resTy, r) << "];\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  // Lower tt.dot to MSL simdgroup_matrix 8x8 fragment MMA. A (MxK) and B (KxN)
+  // per-thread registers are staged row-major into threadgroup memory; one
+  // simdgroup cooperatively runs the 8x8 fragment MMA loop over K into an MxN
+  // accumulator, stores it to threadgroup, and every thread reads its C result
+  // registers back. Emits simdgroup_load / simdgroup_multiply_accumulate /
+  // simdgroup_store only, never air.*.
+  LogicalResult emitDot(tt::DotOp op) {
+    auto aTy = cast<RankedTensorType>(op.getA().getType());
+    auto bTy = cast<RankedTensorType>(op.getB().getType());
+    auto cTy = cast<RankedTensorType>(op.getResult().getType());
+    if (aTy.getRank() != 2 || !aTy.getElementType().isF32() ||
+        !bTy.getElementType().isF32() || !cTy.getElementType().isF32()) {
+      op.emitError("EmitMSL: only rank-2 f32 tt.dot supported");
+      return failure();
+    }
+    int64_t M = cTy.getShape()[0];
+    int64_t N = cTy.getShape()[1];
+    int64_t K = aTy.getShape()[1];
+    if (M % 8 || N % 8 || K % 8) {
+      op.emitError("EmitMSL: tt.dot tile dims must be multiples of 8");
+      return failure();
+    }
+
+    auto &aNames = names(op.getA());
+    auto &bNames = names(op.getB());
+    auto &cInit = names(op.getC());
+
+    std::string tgA = "__dotA_" + std::to_string(tgScratchId++);
+    std::string tgB = "__dotB_" + std::to_string(tgScratchId++);
+    std::string tgC = "__dotC_" + std::to_string(tgScratchId++);
+    os << ind() << "threadgroup float " << tgA << "[" << M * K << "];\n";
+    os << ind() << "threadgroup float " << tgB << "[" << K * N << "];\n";
+    os << ind() << "threadgroup float " << tgC << "[" << M * N << "];\n";
+
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    for (int r = 0, n = regCount(op.getA()); r < n; ++r)
+      os << ind() << tgA << "[" << flatTileOffset(aTy, r) << "] = " << aNames[r]
+         << ";\n";
+    for (int r = 0, n = regCount(op.getB()); r < n; ++r)
+      os << ind() << tgB << "[" << flatTileOffset(bTy, r) << "] = " << bNames[r]
+         << ";\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+    int64_t mT = M / 8, nT = N / 8, kT = K / 8;
+    os << ind() << "if (" << warpId << " == 0) {\n";
+    ++indent;
+    for (int64_t mi = 0; mi < mT; ++mi)
+      for (int64_t ni = 0; ni < nT; ++ni) {
+        std::string acc = "acc_" + std::to_string(mi) + "_" + std::to_string(ni);
+        os << ind() << "simdgroup_float8x8 " << acc
+           << " = simdgroup_float8x8(0.0f);\n";
+        for (int64_t ki = 0; ki < kT; ++ki) {
+          std::string fa = fresh(), fb = fresh();
+          os << ind() << "simdgroup_float8x8 " << fa << ";\n";
+          os << ind() << "simdgroup_load(" << fa << ", " << tgA << " + "
+             << (mi * 8 * K + ki * 8) << ", " << K << ");\n";
+          os << ind() << "simdgroup_float8x8 " << fb << ";\n";
+          os << ind() << "simdgroup_load(" << fb << ", " << tgB << " + "
+             << (ki * 8 * N + ni * 8) << ", " << N << ");\n";
+          os << ind() << "simdgroup_multiply_accumulate(" << acc << ", " << fa
+             << ", " << fb << ", " << acc << ");\n";
+        }
+        os << ind() << "simdgroup_store(" << acc << ", " << tgC << " + "
+           << (mi * 8 * N + ni * 8) << ", " << N << ");\n";
+      }
+    --indent;
+    os << ind() << "}\n";
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+    SmallVector<std::string> ids;
+    for (int r = 0, n = regCount(op.getResult()); r < n; ++r) {
+      std::string id = fresh();
+      std::string base = cInit[cInit.size() == 1 ? 0 : r];
+      os << ind() << "float " << id << " = " << tgC << "["
+         << flatTileOffset(cTy, r) << "] + " << base << ";\n";
+      ids.push_back(id);
+    }
+    valMap[op.getResult()] = ids;
     return success();
   }
 

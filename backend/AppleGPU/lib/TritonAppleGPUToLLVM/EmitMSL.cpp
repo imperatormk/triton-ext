@@ -2431,6 +2431,16 @@ private:
     return "((threadgroup " + sc.str() + "*)" + base + ")";
   }
 
+  // Elements per band for a threadgroup-staged reshape whose full tile exceeds
+  // the 32KB budget: the largest chunk of flat offsets that fits.
+  static int64_t reshapeBandElems(int64_t totalElems, int64_t elemBytes) {
+    int64_t cap = 32768 / elemBytes;
+    if (cap < 1)
+      cap = 1;
+    int64_t nBands = (totalElems + cap - 1) / cap;
+    return (totalElems + nBands - 1) / nBands;
+  }
+
   // Full flat size (product of shape) of a tensor tile.
   int64_t tileSize(RankedTensorType rt) {
     int64_t n = 1;
@@ -2453,6 +2463,8 @@ private:
         if (bandRows < 1)
           bandRows = 1;
         bytes = bandRows * N * elemBytes;
+      } else if (bytes > 32768) {
+        bytes = reshapeBandElems(tileSize(st), elemBytes) * elemBytes;
       }
       poolBytes = std::max(poolBytes, bytes);
     } else if (auto t = dyn_cast<tt::TransOp>(op)) {
@@ -2466,7 +2478,11 @@ private:
     } else if (auto rs = dyn_cast<tt::ReshapeOp>(op)) {
       auto rt = cast<RankedTensorType>(rs.getResult().getType());
       Type e = rt.getElementType();
-      poolBytes = std::max(poolBytes, tileSize(rt) * (bitsOf(e) / 8));
+      int64_t elemBytes = bitsOf(e) / 8;
+      int64_t bytes = tileSize(rt) * elemBytes;
+      if (bytes > 32768)
+        bytes = reshapeBandElems(tileSize(rt), elemBytes) * elemBytes;
+      poolBytes = std::max(poolBytes, bytes);
     } else if (auto g = dyn_cast<tt::GatherOp>(op)) {
       auto st = cast<RankedTensorType>(g.getSrc().getType());
       Type e = st.getElementType();
@@ -2646,21 +2662,46 @@ private:
     auto &srcNames = names(src);
     int srcRc = regCount(src);
     int resRc = regCount(res);
+    int64_t elemBytes = bitsOf(resTy.getElementType()) / 8;
+    int64_t total = tileSize(resTy);
 
     std::string buf = fresh();
     os << ind() << "threadgroup " << sc << "* " << buf << " = "
        << poolRegion(0, sc) << ";\n";
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    for (int r = 0; r < srcRc; ++r)
-      os << ind() << buf << "[" << flatTileOffset(srcTy, r)
-         << "] = " << srcNames[r] << ";\n";
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    SmallVector<std::string> outs;
-    for (int r = 0; r < resRc; ++r) {
-      std::string id = fresh();
-      os << ind() << sc << " " << id << " = " << buf << "["
-         << flatTileOffset(resTy, r) << "];\n";
-      outs.push_back(id);
+
+    // A reshape is a flat-offset identity: result flat offset f reads the src
+    // element written at flat offset f. When the full fp tile exceeds the 32KB
+    // budget, stage it in flat-offset bands; each register belongs to exactly
+    // one band, so guarding write/read by band keeps the round-trip correct.
+    int64_t band = total * elemBytes > 32768
+                       ? reshapeBandElems(total, elemBytes)
+                       : total;
+
+    SmallVector<std::string> outs = declResultVars(res, StringRef());
+
+    for (int64_t lo = 0; lo < total; lo += band) {
+      int64_t hi = std::min(lo + band, total);
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int r = 0; r < srcRc; ++r) {
+        std::string off = flatTileOffset(srcTy, r);
+        const std::string &sv = srcNames[srcNames.size() == 1 ? 0 : r];
+        if (band == total)
+          os << ind() << buf << "[" << off << "] = " << sv << ";\n";
+        else
+          os << ind() << "{ int __f = " << off << "; if (__f >= " << lo
+             << " && __f < " << hi << ") " << buf << "[__f - " << lo
+             << "] = " << sv << "; }\n";
+      }
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int r = 0; r < resRc; ++r) {
+        std::string off = flatTileOffset(resTy, r);
+        if (band == total)
+          os << ind() << outs[r] << " = " << buf << "[" << off << "];\n";
+        else
+          os << ind() << "{ int __f = " << off << "; if (__f >= " << lo
+             << " && __f < " << hi << ") " << outs[r] << " = " << buf
+             << "[__f - " << lo << "]; }\n";
+      }
     }
     valMap[res] = outs;
     return success();
@@ -2838,6 +2879,42 @@ private:
           }
           os << ind() << "if (" << rowc << " >= " << r0 << " && " << rowc
              << " < " << r1 << ") " << ids[r] << " = " << rd << ";\n";
+        }
+      }
+      valMap[res] = ids;
+      return success();
+    }
+
+    // Over-budget tile with no bandable row dim (e.g. rank-1): band by flat
+    // offset. A convert_layout permutes the same logical tensor, so result
+    // register at flat offset f reads the src element written at flat offset f;
+    // guarding write/read by band keeps the round-trip correct at any rank.
+    if (tileBytes > 32768) {
+      int64_t total = tileSize(resTy);
+      int64_t band = reshapeBandElems(total, elemBytes);
+      SmallVector<std::string> ids(regCount(res));
+      for (int r = 0, n = regCount(res); r < n; ++r) {
+        ids[r] = fresh();
+        os << ind() << ptrTy << " " << ids[r] << ";\n";
+      }
+      for (int64_t lo = 0; lo < total; lo += band) {
+        int64_t hi = std::min(lo + band, total);
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        for (int r = 0, n = regCount(src); r < n; ++r) {
+          std::string sv = isPtr ? "(ulong)" + srcNames[r] : srcNames[r];
+          os << ind() << "{ int __f = " << flatTileOffset(srcTy, r)
+             << "; if (__f >= " << lo << " && __f < " << hi << ") " << buf
+             << "[__f - " << lo << "] = " << sv << "; }\n";
+        }
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        for (int r = 0, n = regCount(res); r < n; ++r) {
+          std::string rd = buf + std::string("[__f - ") + std::to_string(lo) +
+                           "]";
+          if (isPtr)
+            rd = "(" + ptrTy + ")" + rd;
+          os << ind() << "{ int __f = " << flatTileOffset(resTy, r)
+             << "; if (__f >= " << lo << " && __f < " << hi << ") " << ids[r]
+             << " = " << rd << "; }\n";
         }
       }
       valMap[res] = ids;

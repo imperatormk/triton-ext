@@ -6,7 +6,9 @@
 // from air.* intrinsics.
 
 #include "TritonAppleGPUToLLVM/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -339,6 +341,29 @@ private:
       return emitCmpF(c);
     if (auto s = dyn_cast<arith::SelectOp>(op))
       return emitSelect(s);
+    if (op->getDialect() ==
+        op->getContext()->getLoadedDialect<math::MathDialect>())
+      return emitMathUnary(op);
+    if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp,
+            arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp,
+            arith::TruncIOp>(op))
+      return emitCast(op);
+    if (isa<arith::BitcastOp, tt::BitcastOp>(op))
+      return emitBitcast(op);
+    if (auto f = dyn_cast<tt::FpToFpOp>(op))
+      return emitCast(op);
+    if (auto c = dyn_cast<tt::ClampFOp>(op))
+      return emitClamp(c);
+    if (isa<tt::AssertOp>(op)) {
+      for (Value r : op->getResults())
+        valMap[r] = SmallVector<std::string>{};
+      return success();
+    }
+    if (isa<tt::PrintOp>(op)) {
+      for (Value r : op->getResults())
+        valMap[r] = SmallVector<std::string>{};
+      return success();
+    }
     if (auto f = dyn_cast<scf::ForOp>(op))
       return emitFor(f);
     if (auto i = dyn_cast<scf::IfOp>(op))
@@ -579,6 +604,106 @@ private:
       const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
       os << ind() << sc << " " << id << " = " << fn.str() << "(" << a << ", "
          << b << ");\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  LogicalResult emitUnary(Operation *op, StringRef fn, StringRef sc) {
+    Value res = op->getResult(0);
+    auto &a = names(op->getOperand(0));
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      const std::string &v = a[a.size() == 1 ? 0 : r];
+      os << ind() << sc.str() << " " << id << " = " << fn.str() << "(" << v
+         << ");\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  LogicalResult emitMathUnary(Operation *op) {
+    std::string sc = mslScalarType(elementScalarType(op->getResult(0).getType()));
+    StringRef n = op->getName().getStringRef();
+    static const llvm::StringMap<const char *> fns = {
+        {"math.exp", "metal::exp"},     {"math.exp2", "metal::exp2"},
+        {"math.log", "metal::log"},     {"math.log2", "metal::log2"},
+        {"math.sin", "metal::sin"},     {"math.cos", "metal::cos"},
+        {"math.tan", "metal::tan"},     {"math.tanh", "metal::tanh"},
+        {"math.sqrt", "metal::sqrt"},   {"math.rsqrt", "metal::rsqrt"},
+        {"math.floor", "metal::floor"}, {"math.ceil", "metal::ceil"},
+        {"math.absf", "metal::abs"},    {"math.absi", "metal::abs"},
+        {"math.erf", "metal::erf"},     {"math.round", "metal::round"},
+        {"math.trunc", "metal::trunc"}, {"math.roundeven", "metal::rint"}};
+    auto it = fns.find(n);
+    if (it == fns.end()) {
+      op->emitError("EmitMSL: unhandled math op '" + n + "'");
+      return failure();
+    }
+    return emitUnary(op, it->second, sc);
+  }
+
+  LogicalResult emitCast(Operation *op) {
+    Value res = op->getResult(0);
+    std::string dst = mslScalarType(elementScalarType(res.getType()));
+    if (dst.empty()) {
+      op->emitError("EmitMSL: unhandled cast target type");
+      return failure();
+    }
+    auto &a = names(op->getOperand(0));
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      const std::string &v = a[a.size() == 1 ? 0 : r];
+      os << ind() << dst << " " << id << " = static_cast<" << dst << ">(" << v
+         << ");\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  LogicalResult emitBitcast(Operation *op) {
+    Value res = op->getResult(0);
+    std::string dst = mslScalarType(elementScalarType(res.getType()));
+    if (dst.empty()) {
+      op->emitError("EmitMSL: unhandled bitcast target type");
+      return failure();
+    }
+    auto &a = names(op->getOperand(0));
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      const std::string &v = a[a.size() == 1 ? 0 : r];
+      os << ind() << dst << " " << id << " = as_type<" << dst << ">(" << v
+         << ");\n";
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return success();
+  }
+
+  LogicalResult emitClamp(tt::ClampFOp op) {
+    Value res = op.getResult();
+    std::string sc = mslScalarType(elementScalarType(res.getType()));
+    auto &x = names(op.getX());
+    auto &lo = names(op.getMin());
+    auto &hi = names(op.getMax());
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      const std::string &xv = x[x.size() == 1 ? 0 : r];
+      const std::string &lv = lo[lo.size() == 1 ? 0 : r];
+      const std::string &hv = hi[hi.size() == 1 ? 0 : r];
+      os << ind() << sc << " " << id << " = metal::clamp(" << xv << ", " << lv
+         << ", " << hv << ");\n";
       ids.push_back(id);
     }
     valMap[res] = ids;

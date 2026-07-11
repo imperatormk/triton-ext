@@ -32,6 +32,8 @@ static std::string mslScalarType(Type t) {
     return "float";
   if (t.isF16())
     return "half";
+  if (t.isBF16())
+    return "bfloat";
   if (auto it = dyn_cast<IntegerType>(t)) {
     unsigned w = it.getWidth();
     if (w == 1)
@@ -863,13 +865,35 @@ private:
   // accumulator, stores it to threadgroup, and every thread reads its C result
   // registers back. Emits simdgroup_load / simdgroup_multiply_accumulate /
   // simdgroup_store only, never air.*.
+  static bool isDotOperandElem(Type t) {
+    return t.isF32() || t.isF16() || t.isBF16();
+  }
+  static std::string sgFragType(Type t) {
+    if (t.isF16())
+      return "simdgroup_half8x8";
+    if (t.isBF16())
+      return "simdgroup_bfloat8x8";
+    return "simdgroup_float8x8";
+  }
+  static std::string sgOperandScalar(Type t) {
+    if (t.isF16())
+      return "half";
+    if (t.isBF16())
+      return "bfloat";
+    return "float";
+  }
+
   LogicalResult emitDot(tt::DotOp op) {
     auto aTy = cast<RankedTensorType>(op.getA().getType());
     auto bTy = cast<RankedTensorType>(op.getB().getType());
     auto cTy = cast<RankedTensorType>(op.getResult().getType());
-    if (aTy.getRank() != 2 || !aTy.getElementType().isF32() ||
-        !bTy.getElementType().isF32() || !cTy.getElementType().isF32()) {
-      op.emitError("EmitMSL: only rank-2 f32 tt.dot supported");
+    Type aElem = aTy.getElementType();
+    Type bElem = bTy.getElementType();
+    Type cElem = cTy.getElementType();
+    if (aTy.getRank() != 2 || !isDotOperandElem(aElem) ||
+        !isDotOperandElem(bElem) || aElem != bElem ||
+        !(cElem.isF32() || cElem.isF16())) {
+      op.emitError("EmitMSL: unsupported tt.dot operand/accumulator types");
       return failure();
     }
     int64_t M = cTy.getShape()[0];
@@ -884,12 +908,20 @@ private:
     auto &bNames = names(op.getB());
     auto &cInit = names(op.getC());
 
+    std::string opScalar = sgOperandScalar(aElem);
+    std::string accScalar = mslScalarType(cElem);
+    std::string opFrag = sgFragType(aElem);
+    std::string accFrag = sgFragType(cElem);
+
     std::string tgA = "__dotA_" + std::to_string(tgScratchId++);
     std::string tgB = "__dotB_" + std::to_string(tgScratchId++);
     std::string tgC = "__dotC_" + std::to_string(tgScratchId++);
-    os << ind() << "threadgroup float " << tgA << "[" << M * K << "];\n";
-    os << ind() << "threadgroup float " << tgB << "[" << K * N << "];\n";
-    os << ind() << "threadgroup float " << tgC << "[" << M * N << "];\n";
+    os << ind() << "threadgroup " << opScalar << " " << tgA << "[" << M * K
+       << "];\n";
+    os << ind() << "threadgroup " << opScalar << " " << tgB << "[" << K * N
+       << "];\n";
+    os << ind() << "threadgroup " << accScalar << " " << tgC << "[" << M * N
+       << "];\n";
 
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     for (int r = 0, n = regCount(op.getA()); r < n; ++r)
@@ -906,14 +938,13 @@ private:
     for (int64_t mi = 0; mi < mT; ++mi)
       for (int64_t ni = 0; ni < nT; ++ni) {
         std::string acc = "acc_" + std::to_string(mi) + "_" + std::to_string(ni);
-        os << ind() << "simdgroup_float8x8 " << acc
-           << " = simdgroup_float8x8(0.0f);\n";
+        os << ind() << accFrag << " " << acc << " = " << accFrag << "(0.0f);\n";
         for (int64_t ki = 0; ki < kT; ++ki) {
           std::string fa = fresh(), fb = fresh();
-          os << ind() << "simdgroup_float8x8 " << fa << ";\n";
+          os << ind() << opFrag << " " << fa << ";\n";
           os << ind() << "simdgroup_load(" << fa << ", " << tgA << " + "
              << (mi * 8 * K + ki * 8) << ", " << K << ");\n";
-          os << ind() << "simdgroup_float8x8 " << fb << ";\n";
+          os << ind() << opFrag << " " << fb << ";\n";
           os << ind() << "simdgroup_load(" << fb << ", " << tgB << " + "
              << (ki * 8 * N + ni * 8) << ", " << N << ");\n";
           os << ind() << "simdgroup_multiply_accumulate(" << acc << ", " << fa
@@ -930,7 +961,7 @@ private:
     for (int r = 0, n = regCount(op.getResult()); r < n; ++r) {
       std::string id = fresh();
       std::string base = cInit[cInit.size() == 1 ? 0 : r];
-      os << ind() << "float " << id << " = " << tgC << "["
+      os << ind() << accScalar << " " << id << " = " << tgC << "["
          << flatTileOffset(cTy, r) << "] + " << base << ";\n";
       ids.push_back(id);
     }

@@ -1125,12 +1125,30 @@ private:
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 
     int64_t mT = M / 8, nT = N / 8, kT = K / 8;
-    os << ind() << "if (" << warpId << " == 0) {\n";
-    ++indent;
-    for (int64_t mi = 0; mi < mT; ++mi)
-      for (int64_t ni = 0; ni < nT; ++ni) {
+    tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
+    auto kWarpDim = StringAttr::get(op.getContext(), "warp");
+    int64_t numWarps = cLL.hasInDim(kWarpDim) ? cLL.getInDimSize(kWarpDim) : 1;
+    int64_t nFrag = mT * nT;
+    if (numWarps > nFrag)
+      numWarps = nFrag;
+
+    // Distribute the mTxnT output fragments round-robin across simdgroups: warp
+    // w owns fragments f with f % numWarps == w. Accumulators are declared for
+    // every fragment so a warp's owned registers stay live across the uniform
+    // barrier that separates the A/B-consuming compute phase from the C store
+    // phase (the store aliases the A region in the pool, so all A reads must
+    // finish first). The C readback below is layout-driven and warp-agnostic.
+    for (int64_t f = 0; f < nFrag; ++f) {
+      int64_t mi = f / nT, ni = f % nT;
+      std::string acc = "acc_" + std::to_string(mi) + "_" + std::to_string(ni);
+      os << ind() << accFrag << " " << acc << " = " << accFrag << "(0.0f);\n";
+    }
+    for (int64_t w = 0; w < numWarps; ++w) {
+      os << ind() << "if (" << warpId << " == " << w << ") {\n";
+      ++indent;
+      for (int64_t f = w; f < nFrag; f += numWarps) {
+        int64_t mi = f / nT, ni = f % nT;
         std::string acc = "acc_" + std::to_string(mi) + "_" + std::to_string(ni);
-        os << ind() << accFrag << " " << acc << " = " << accFrag << "(0.0f);\n";
         for (int64_t ki = 0; ki < kT; ++ki) {
           std::string fa = fresh(), fb = fresh();
           os << ind() << opFrag << " " << fa << ";\n";
@@ -1143,14 +1161,22 @@ private:
              << ", " << fb << ", " << acc << ");\n";
         }
       }
-    for (int64_t mi = 0; mi < mT; ++mi)
-      for (int64_t ni = 0; ni < nT; ++ni) {
+      --indent;
+      os << ind() << "}\n";
+    }
+    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    for (int64_t w = 0; w < numWarps; ++w) {
+      os << ind() << "if (" << warpId << " == " << w << ") {\n";
+      ++indent;
+      for (int64_t f = w; f < nFrag; f += numWarps) {
+        int64_t mi = f / nT, ni = f % nT;
         std::string acc = "acc_" + std::to_string(mi) + "_" + std::to_string(ni);
         os << ind() << "simdgroup_store(" << acc << ", " << tgC << " + "
            << (mi * 8 * N + ni * 8) << ", " << N << ");\n";
       }
-    --indent;
-    os << ind() << "}\n";
+      --indent;
+      os << ind() << "}\n";
+    }
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 
     SmallVector<std::string> ids;

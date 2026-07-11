@@ -448,6 +448,8 @@ private:
       return emitReduce(r);
     if (auto h = dyn_cast<tt::HistogramOp>(op))
       return emitHistogram(h);
+    if (auto m = dyn_cast<tt::MapElementwiseOp>(op))
+      return emitMapElementwise(m);
     if (auto s = dyn_cast<tt::ScanOp>(op))
       return emitScan(s);
     if (auto d = dyn_cast<tt::DotOp>(op))
@@ -1269,6 +1271,38 @@ private:
   // operand names, emit each region op via emitOp, and return the N terminator
   // result names. Region args are ordered a0,a1,...,aN-1,b0,b1,...,bN-1 per the
   // combiner ABI (all left operands, then all right operands).
+  LogicalResult emitMapElementwise(tt::MapElementwiseOp op) {
+    Region &region = op.getScalarOp();
+    Block &blk = region.front();
+    int nSrc = op.getNumOperands();
+    int nRes = op.getNumResults();
+    int pack = op.getPack();
+
+    SmallVector<SmallVector<std::string> *> srcNames(nSrc);
+    for (int s = 0; s < nSrc; ++s)
+      srcNames[s] = &names(op.getOperand(s));
+    int nReg = srcNames[0]->size();
+    int nGroup = nReg / pack;
+
+    SmallVector<SmallVector<std::string>> resIds(nRes);
+    for (int g = 0; g < nGroup; ++g) {
+      for (int s = 0; s < nSrc; ++s)
+        for (int p = 0; p < pack; ++p)
+          bindScalar(blk.getArgument(s * pack + p),
+                     (*srcNames[s])[g * pack + p]);
+      for (Operation &o : blk.without_terminator())
+        if (failed(emitOp(&o)))
+          return failure();
+      Operation *term = blk.getTerminator();
+      for (int k = 0; k < nRes; ++k)
+        for (int p = 0; p < pack; ++p)
+          resIds[k].push_back(names(term->getOperand(k * pack + p))[0]);
+    }
+    for (int k = 0; k < nRes; ++k)
+      valMap[op->getResult(k)] = resIds[k];
+    return success();
+  }
+
   LogicalResult emitCombineN(Region &region, ArrayRef<std::string> aVals,
                              ArrayRef<std::string> bVals,
                              SmallVectorImpl<std::string> &results) {

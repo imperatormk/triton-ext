@@ -236,17 +236,22 @@ def _signbit(x):
 
 @triton.jit
 def _isinf(x):
-    return (x == float('inf')) | (x == float('-inf'))
+    # Bit-level test: fast-math assumes no NaN/inf, so x==inf / x!=x fold away.
+    # Compare the exponent/mantissa bits directly to stay correct.
+    bits = x.to(tl.float32).to(tl.uint32, bitcast=True) & 0x7FFFFFFF
+    return bits == 0x7F800000
 
 
 @triton.jit
 def _isnan(x):
-    return x != x
+    bits = x.to(tl.float32).to(tl.uint32, bitcast=True) & 0x7FFFFFFF
+    return bits > 0x7F800000
 
 
 @triton.jit
 def _finitef(x):
-    return (x == x) & (x != float('inf')) & (x != float('-inf'))
+    bits = x.to(tl.float32).to(tl.uint32, bitcast=True) & 0x7F800000
+    return bits != 0x7F800000
 
 
 @triton.jit

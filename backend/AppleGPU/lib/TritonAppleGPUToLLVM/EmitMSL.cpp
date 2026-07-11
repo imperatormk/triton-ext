@@ -2108,7 +2108,16 @@ private:
     if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op)) {
       auto st = cast<RankedTensorType>(c.getSrc().getType());
       Type e = st.getElementType();
-      int64_t bytes = tileSize(st) * (bitsOf(e) / 8);
+      int64_t elemBytes = bitsOf(e) / 8;
+      int64_t bytes = tileSize(st) * elemBytes;
+      int rk = st.getRank();
+      if (bytes > 32768 && rk >= 2) {
+        int64_t N = st.getShape()[rk - 1];
+        int64_t bandRows = 32768 / (N * elemBytes);
+        if (bandRows < 1)
+          bandRows = 1;
+        bytes = bandRows * N * elemBytes;
+      }
       poolBytes = std::max(poolBytes, bytes);
     } else if (auto t = dyn_cast<tt::TransOp>(op)) {
       auto st = cast<RankedTensorType>(t.getSrc().getType());
@@ -2141,7 +2150,12 @@ private:
       if (!isa<IntegerType>(cE)) {
         int64_t accBytes = 4;
         int64_t cFull = M * N * accBytes;
-        if (ab + cFull <= 32768) {
+        int64_t elemBytes = bitsOf(aTy.getElementType()) / 8;
+        if (dotNeedsPanel(M, N, Kd, elemBytes, accBytes)) {
+          int64_t mp, np;
+          dotPanelDims(M, N, Kd, elemBytes, accBytes, mp, np);
+          need = mp * Kd * elemBytes + Kd * np * elemBytes + mp * np * accBytes;
+        } else if (ab + cFull <= 32768) {
           need = ab + cFull;
         } else {
           int64_t band = dotCBandRows(M, N, ab, accBytes);
@@ -2421,10 +2435,76 @@ private:
     std::string sc = isPtr ? "ulong" : ptrTy;
     auto &srcNames = names(src);
 
+    int64_t elemBytes = bitsOf(elemTy) / 8;
+    int64_t tileBytes = tileSize(resTy) * elemBytes;
+    int rank = resTy.getRank();
+    ArrayRef<int64_t> shape = resTy.getShape();
+
     std::string bufptr = fresh();
     os << ind() << "threadgroup " << sc << "* " << bufptr << " = "
        << poolRegion(0, sc) << ";\n";
     std::string buf = bufptr;
+
+    if (tileBytes > 32768 && rank >= 2) {
+      int64_t N = shape[rank - 1];
+      int64_t bandRows = 32768 / (N * elemBytes);
+      if (bandRows < 1)
+        bandRows = 1;
+      int64_t rowsTotal = shape[rank - 2];
+      tt::LinearLayout srcLL = ttg::toLinearLayout(srcTy);
+      auto srcOut = llvm::to_vector(srcLL.getOutDimNames());
+      StringAttr srcRowDim = srcOut[rank - 2];
+      tt::LinearLayout resLL = ttg::toLinearLayout(resTy);
+      auto resOut = llvm::to_vector(resLL.getOutDimNames());
+      StringAttr resRowDim = resOut[rank - 2];
+      SmallVector<std::string> ids(regCount(res));
+
+      auto bandOffset = [&](RankedTensorType rt, int reg, int64_t r0) {
+        auto outN = llvm::to_vector(ttg::toLinearLayout(rt).getOutDimNames());
+        std::string expr;
+        int64_t stride = 1;
+        for (int d = rank - 1; d >= 0; --d) {
+          std::string c = layoutCoordExpr(rt, reg, outN[d]);
+          if (d == rank - 2)
+            c = "(" + c + " - " + std::to_string(r0) + ")";
+          std::string term = stride == 1
+                                 ? c
+                                 : ("(" + c + " * " + std::to_string(stride) +
+                                    ")");
+          expr = expr.empty() ? term : ("(" + expr + " + " + term + ")");
+          stride *= (d == rank - 2) ? bandRows : shape[d];
+        }
+        return expr.empty() ? std::string("0") : expr;
+      };
+
+      for (int64_t r0 = 0; r0 < rowsTotal; r0 += bandRows) {
+        int64_t r1 = std::min<int64_t>(r0 + bandRows, rowsTotal);
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        for (int r = 0, n = regCount(src); r < n; ++r) {
+          std::string rowc = layoutCoordExpr(srcTy, r, srcRowDim);
+          std::string sv = isPtr ? "(ulong)" + srcNames[r] : srcNames[r];
+          os << ind() << "if (" << rowc << " >= " << r0 << " && " << rowc
+             << " < " << r1 << ") " << buf << "[" << bandOffset(srcTy, r, r0)
+             << "] = " << sv << ";\n";
+        }
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        for (int r = 0, n = regCount(res); r < n; ++r) {
+          std::string rowc = layoutCoordExpr(resTy, r, resRowDim);
+          std::string rd = buf + "[" + bandOffset(resTy, r, r0) + "]";
+          if (isPtr)
+            rd = "(" + ptrTy + ")" + rd;
+          if (ids[r].empty()) {
+            ids[r] = fresh();
+            os << ind() << ptrTy << " " << ids[r] << ";\n";
+          }
+          os << ind() << "if (" << rowc << " >= " << r0 << " && " << rowc
+             << " < " << r1 << ") " << ids[r] << " = " << rd << ";\n";
+        }
+      }
+      valMap[res] = ids;
+      return success();
+    }
+
     os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     for (int r = 0, n = regCount(src); r < n; ++r) {
       std::string sv =
@@ -2568,6 +2648,34 @@ private:
   // pool. The full MxN accumulator at acc width can dwarf A+B (e.g. float32
   // 128x128 C is 64KB vs 32KB A+B); banding the C round-trip over row groups
   // keeps a single reused region small enough to fit alongside A/B in 32KB.
+  // When full A+B+C staging exceeds the 32KB threadgroup budget, walk the
+  // output tile in (mp x np) panels (both multiples of 8) staging only
+  // A[mp x K] + B[K x np] + C[mp x np] at a time, so peak live TG stays under
+  // 32768. Picks the largest square-ish panel that fits.
+  static void dotPanelDims(int64_t M, int64_t N, int64_t K, int64_t elemBytes,
+                           int64_t accBytes, int64_t &mp, int64_t &np) {
+    mp = M;
+    np = N;
+    auto fits = [&](int64_t m, int64_t n) {
+      return m * K * elemBytes + K * n * elemBytes + m * n * accBytes <= 32768;
+    };
+    while (!fits(mp, np)) {
+      if (mp >= np && mp > 8)
+        mp -= 8;
+      else if (np > 8)
+        np -= 8;
+      else if (mp > 8)
+        mp -= 8;
+      else
+        break;
+    }
+  }
+
+  static bool dotNeedsPanel(int64_t M, int64_t N, int64_t K, int64_t elemBytes,
+                            int64_t accBytes) {
+    return M * K * elemBytes + K * N * elemBytes > 32768;
+  }
+
   static int64_t dotCBandRows(int64_t M, int64_t N, int64_t abBytes,
                               int64_t accBytes) {
     int64_t rowBytes = N * accBytes;
@@ -2664,6 +2772,127 @@ private:
 
     auto outNames = llvm::to_vector(cLL.getOutDimNames());
     StringAttr rowDim = outNames[rank - 2], colDim = outNames[rank - 1];
+
+    if (dotNeedsPanel(M, N, K, bitsOf(aElem) / 8, accBytes)) {
+      int64_t elemBytes = bitsOf(aElem) / 8;
+      int64_t mp, np;
+      dotPanelDims(M, N, K, elemBytes, accBytes, mp, np);
+      int64_t aPanelBytes = mp * K * elemBytes;
+      int64_t bPanelBytes = K * np * elemBytes;
+      tt::LinearLayout aLL = ttg::toLinearLayout(aTy);
+      auto aOut = llvm::to_vector(aLL.getOutDimNames());
+      StringAttr aRowDim = aOut[rank - 2], aColDim = aOut[rank - 1];
+      tt::LinearLayout bLL = ttg::toLinearLayout(bTy);
+      auto bOut = llvm::to_vector(bLL.getOutDimNames());
+      StringAttr bColDim = bOut[rank - 1], bRowDim = bOut[rank - 2];
+
+      std::string pA = fresh(), pB = fresh(), pC = fresh();
+      os << ind() << "threadgroup " << opScalar << "* " << pA << " = "
+         << poolRegion(0, opScalar) << ";\n";
+      os << ind() << "threadgroup " << opScalar << "* " << pB << " = "
+         << poolRegion(aPanelBytes, opScalar) << ";\n";
+      os << ind() << "threadgroup float* " << pC << " = "
+         << poolRegion(aPanelBytes + bPanelBytes, "float") << ";\n";
+
+      int nARegs = regCount(op.getA()), nBRegs = regCount(op.getB());
+      for (int64_t bi = 0; bi < B; ++bi) {
+        for (int64_t m0 = 0; m0 < M; m0 += mp) {
+          int64_t m1 = std::min<int64_t>(m0 + mp, M);
+          int64_t mpCur = m1 - m0;
+
+          os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          for (int r = 0; r < nARegs; ++r) {
+            std::string row = layoutCoordExpr(aTy, r, aRowDim);
+            std::string col = layoutCoordExpr(aTy, r, aColDim);
+            std::string guard = "(" + row + " >= " + std::to_string(m0) +
+                                " && " + row + " < " + std::to_string(m1) + ")";
+            if (rank == 3)
+              guard = "(" + batchCoordExpr(aTy, r) + " == " +
+                      std::to_string(bi) + " && " + guard + ")";
+            std::string off = "((" + row + " - " + std::to_string(m0) +
+                              ") * " + std::to_string(K) + " + " + col + ")";
+            os << ind() << "if " << guard << " " << pA << "[" << off
+               << "] = " << aNames[r] << ";\n";
+          }
+
+          for (int64_t n0 = 0; n0 < N; n0 += np) {
+            int64_t n1 = std::min<int64_t>(n0 + np, N);
+            int64_t npCur = n1 - n0;
+            int64_t pmT = mpCur / 8, pnT = npCur / 8;
+
+            os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+            for (int r = 0; r < nBRegs; ++r) {
+              std::string col = layoutCoordExpr(bTy, r, bColDim);
+              std::string row = layoutCoordExpr(bTy, r, bRowDim);
+              std::string guard = "(" + col + " >= " + std::to_string(n0) +
+                                  " && " + col + " < " + std::to_string(n1) +
+                                  ")";
+              if (rank == 3)
+                guard = "(" + batchCoordExpr(bTy, r) + " == " +
+                        std::to_string(bi) + " && " + guard + ")";
+              std::string off = "(" + row + " * " + std::to_string(npCur) +
+                                " + (" + col + " - " + std::to_string(n0) +
+                                "))";
+              os << ind() << "if " << guard << " " << pB << "[" << off
+                 << "] = " << bNames[r] << ";\n";
+            }
+            os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+            int64_t pnFrag = pmT * pnT;
+            int64_t pWarps = numWarps > pnFrag ? pnFrag : numWarps;
+            for (int64_t w = 0; w < pWarps; ++w) {
+              os << ind() << "if (" << warpId << " == " << w << ") {\n";
+              ++indent;
+              for (int64_t f = w; f < pnFrag; f += pWarps) {
+                int64_t mi = f / pnT, ni = f % pnT;
+                std::string acc = fresh();
+                os << ind() << accFrag << " " << acc << " = " << accFrag
+                   << "(0.0f);\n";
+                for (int64_t ki = 0; ki < kT; ++ki) {
+                  std::string fa = fresh(), fb = fresh();
+                  os << ind() << opFrag << " " << fa << ";\n";
+                  os << ind() << "simdgroup_load(" << fa << ", " << pA << " + "
+                     << (mi * 8 * K + ki * 8) << ", " << K << ");\n";
+                  os << ind() << opFrag << " " << fb << ";\n";
+                  os << ind() << "simdgroup_load(" << fb << ", " << pB << " + "
+                     << (ki * 8 * npCur + ni * 8) << ", " << npCur << ");\n";
+                  os << ind() << "simdgroup_multiply_accumulate(" << acc << ", "
+                     << fa << ", " << fb << ", " << acc << ");\n";
+                }
+                os << ind() << "simdgroup_store(" << acc << ", " << pC << " + "
+                   << (mi * 8 * npCur + ni * 8) << ", " << npCur << ");\n";
+              }
+              --indent;
+              os << ind() << "}\n";
+            }
+            os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+            for (int r = 0; r < nRes; ++r) {
+              std::string base = cInit[cInit.size() == 1 ? 0 : r];
+              std::string rowExpr = layoutCoordExpr(cTy, r, rowDim);
+              std::string colExpr = layoutCoordExpr(cTy, r, colDim);
+              std::string off = "((" + rowExpr + " - " + std::to_string(m0) +
+                                ") * " + std::to_string(npCur) + " + (" +
+                                colExpr + " - " + std::to_string(n0) + "))";
+              std::string guard = "(" + rowExpr + " >= " + std::to_string(m0) +
+                                  " && " + rowExpr + " < " + std::to_string(m1) +
+                                  " && " + colExpr +
+                                  " >= " + std::to_string(n0) + " && " +
+                                  colExpr + " < " + std::to_string(n1) + ")";
+              if (rank == 3)
+                guard = "(" + batchCoordExpr(cTy, r) + " == " +
+                        std::to_string(bi) + " && " + guard + ")";
+              os << ind() << "if " << guard << " " << ids[r] << " = " << pC
+                 << "[" << off << "] + " << base << ";\n";
+            }
+          }
+        }
+      }
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      valMap[op.getResult()] = ids;
+      return success();
+    }
+
     auto emitReadback = [&](int64_t bi, int64_t r0, int64_t r1) {
       for (int r = 0; r < nRes; ++r) {
         std::string base = cInit[cInit.size() == 1 ? 0 : r];
@@ -2730,7 +2959,7 @@ private:
         continue;
       }
 
-      std::string accBase = "acc_" + std::to_string(bi) + "_";
+      std::string accBase = fresh() + "_" + std::to_string(bi) + "_";
       for (int64_t f = 0; f < nFrag; ++f) {
         int64_t mi = f / nT, ni = f % nT;
         std::string acc =

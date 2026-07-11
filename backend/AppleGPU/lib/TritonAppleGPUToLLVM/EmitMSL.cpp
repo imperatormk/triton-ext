@@ -906,7 +906,12 @@ private:
 
   LogicalResult emitBitcast(Operation *op) {
     Value res = op->getResult(0);
-    std::string dst = mslScalarType(elementScalarType(res.getType()));
+    Type resElem = res.getType();
+    if (auto rt = dyn_cast<RankedTensorType>(resElem))
+      resElem = rt.getElementType();
+    bool isPtr = isa<tt::PointerType>(resElem);
+    std::string dst = isPtr ? mslStorageType(res.getType())
+                            : mslScalarType(elementScalarType(res.getType()));
     if (dst.empty()) {
       op->emitError("EmitMSL: unhandled bitcast target type");
       return failure();
@@ -917,8 +922,11 @@ private:
     for (int r = 0; r < rc; ++r) {
       std::string id = fresh();
       const std::string &v = a[a.size() == 1 ? 0 : r];
-      os << ind() << dst << " " << id << " = as_type<" << dst << ">(" << v
-         << ");\n";
+      if (isPtr)
+        os << ind() << dst << " " << id << " = (" << dst << ")" << v << ";\n";
+      else
+        os << ind() << dst << " " << id << " = as_type<" << dst << ">(" << v
+           << ");\n";
       ids.push_back(id);
     }
     valMap[res] = ids;

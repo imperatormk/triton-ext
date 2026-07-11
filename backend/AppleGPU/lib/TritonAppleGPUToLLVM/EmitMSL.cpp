@@ -973,11 +973,10 @@ private:
       os << ind() << accs[regOrder[i]] << " = " << comb << ";\n";
     }
 
-    std::string laneTotal = accs[regOrder[nReg - 1]];
-
     auto laneBits = axisBits(ll, kLane, outDim);
     std::string laneScan = fresh();
-    os << ind() << sc << " " << laneScan << " = " << laneTotal << ";\n";
+    os << ind() << sc << " " << laneScan << " = " << accs[regOrder[nReg - 1]]
+       << ";\n";
     for (auto &pr : laneBits) {
       unsigned delta = 1u << pr.first;
       std::string up = fresh();
@@ -992,20 +991,20 @@ private:
     }
     if (!laneBits.empty()) {
       std::string lanePrefix = fresh();
-      os << ind() << sc << " " << lanePrefix << " = " << laneScan << " - "
-         << laneTotal << ";\n";
+      os << ind() << sc << " " << lanePrefix << " = simd_shuffle_up(" << laneScan
+         << ", 1u);\n";
       for (int r = 0; r < nReg; ++r) {
         std::string comb = fresh();
         os << ind() << sc << " " << comb << ";\n";
         if (failed(emitCombine(region, comb, lanePrefix, accs[r], sc)))
           return failure();
-        os << ind() << accs[r] << " = " << comb << ";\n";
+        os << ind() << accs[r] << " = (" << laneId << " >= 1 ? " << comb << " : "
+           << accs[r] << ");\n";
       }
     }
 
     auto warpBits = axisBits(ll, kWarp, outDim);
     if (!warpBits.empty()) {
-      int numWarps = ll.getInDimSize(kWarp);
       std::string scratch = fresh();
       os << ind() << "threadgroup " << sc << "* " << scratch << " = "
          << poolRegion(0, sc) << ";\n";
@@ -1014,8 +1013,8 @@ private:
          << "] = " << laneScan << ";\n";
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       std::string carry = fresh();
-      os << ind() << sc << " " << carry << " = (" << sc << ")0;\n";
-      os << ind() << "for (int wp = 0; wp < " << warpId << "; ++wp) {\n";
+      os << ind() << sc << " " << carry << " = " << scratch << "[0];\n";
+      os << ind() << "for (int wp = 1; wp < " << warpId << "; ++wp) {\n";
       indent++;
       std::string wv = fresh();
       os << ind() << sc << " " << wv << " = " << scratch << "[wp];\n";

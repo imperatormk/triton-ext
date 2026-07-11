@@ -1727,6 +1727,11 @@ private:
     Type aElem = aTy.getElementType();
     Type bElem = bTy.getElementType();
     Type cElem = cTy.getElementType();
+    if (isa<IntegerType>(aElem) || isa<IntegerType>(bElem)) {
+      op.emitError("EmitMSL: integer tt.dot unsupported (simdgroup_matrix has "
+                   "no int path); needs a non-simdgroup fallback");
+      return failure();
+    }
     if (aTy.getRank() != 2 || !isDotOperandElem(aElem) ||
         !isDotOperandElem(bElem) || aElem != bElem ||
         !(cElem.isF32() || cElem.isF16())) {

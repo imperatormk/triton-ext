@@ -246,6 +246,8 @@ private:
       return emitFor(f);
     if (auto i = dyn_cast<scf::IfOp>(op))
       return emitIf(i);
+    if (auto r = dyn_cast<tt::ReduceOp>(op))
+      return emitReduce(r);
     if (isa<scf::YieldOp>(op))
       return success();
     if (isa<tt::ReturnOp>(op)) {
@@ -255,6 +257,14 @@ private:
     op->emitError("EmitMSL: unhandled op '" + op->getName().getStringRef() +
                   "'");
     return failure();
+  }
+
+  std::string floatLit(const APFloat &v) {
+    if (v.isInfinity())
+      return v.isNegative() ? "(-INFINITY)" : "INFINITY";
+    if (v.isNaN())
+      return "NAN";
+    return std::to_string(v.convertToDouble());
   }
 
   LogicalResult emitConstant(arith::ConstantOp op) {
@@ -272,7 +282,7 @@ private:
         std::string id = fresh();
         std::string lit;
         if (isa<FloatType>(rt.getElementType()))
-          lit = std::to_string(dense.getSplatValue<APFloat>().convertToDouble());
+          lit = floatLit(dense.getSplatValue<APFloat>());
         else
           lit = std::to_string(
               dense.getSplatValue<APInt>().getSExtValue());
@@ -286,7 +296,7 @@ private:
     std::string id = fresh();
     std::string lit;
     if (auto fa = dyn_cast<FloatAttr>(op.getValue()))
-      lit = std::to_string(fa.getValueAsDouble());
+      lit = floatLit(fa.getValue());
     else if (auto ia = dyn_cast<IntegerAttr>(op.getValue()))
       lit = std::to_string(ia.getInt());
     else {
@@ -546,6 +556,138 @@ private:
     os << "\n";
     for (auto [i, res] : llvm::enumerate(op.getResults()))
       valMap[res] = results[i];
+    return success();
+  }
+
+  // Emit the combiner region as an MSL statement writing `dst` from operands
+  // `a` and `b`, translating its single arith op. Reused for register, lane
+  // and warp combine steps.
+  LogicalResult emitCombine(Region &region, StringRef dst, StringRef a,
+                            StringRef b, StringRef sc) {
+    Block &blk = region.front();
+    Value lhs = blk.getArgument(0);
+    Value rhs = blk.getArgument(1);
+    bindScalar(lhs, a.str());
+    bindScalar(rhs, b.str());
+    std::string expr;
+    for (Operation &o : blk.without_terminator()) {
+      std::string id = fresh();
+      if (isa<arith::AddFOp>(o))
+        os << ind() << sc.str() << " " << id << " = (" << names(o.getOperand(0))[0]
+           << " + " << names(o.getOperand(1))[0] << ");\n";
+      else if (isa<arith::MulFOp>(o))
+        os << ind() << sc.str() << " " << id << " = (" << names(o.getOperand(0))[0]
+           << " * " << names(o.getOperand(1))[0] << ");\n";
+      else if (isa<arith::AddIOp>(o))
+        os << ind() << sc.str() << " " << id << " = (" << names(o.getOperand(0))[0]
+           << " + " << names(o.getOperand(1))[0] << ");\n";
+      else if (isa<arith::MulIOp>(o))
+        os << ind() << sc.str() << " " << id << " = (" << names(o.getOperand(0))[0]
+           << " * " << names(o.getOperand(1))[0] << ");\n";
+      else if (isa<arith::MaxNumFOp, arith::MaximumFOp>(o))
+        os << ind() << sc.str() << " " << id << " = max("
+           << names(o.getOperand(0))[0] << ", " << names(o.getOperand(1))[0]
+           << ");\n";
+      else if (isa<arith::MinNumFOp, arith::MinimumFOp>(o))
+        os << ind() << sc.str() << " " << id << " = min("
+           << names(o.getOperand(0))[0] << ", " << names(o.getOperand(1))[0]
+           << ");\n";
+      else if (isa<arith::MaxSIOp, arith::MaxUIOp>(o))
+        os << ind() << sc.str() << " " << id << " = max("
+           << names(o.getOperand(0))[0] << ", " << names(o.getOperand(1))[0]
+           << ");\n";
+      else if (isa<arith::MinSIOp, arith::MinUIOp>(o))
+        os << ind() << sc.str() << " " << id << " = min("
+           << names(o.getOperand(0))[0] << ", " << names(o.getOperand(1))[0]
+           << ");\n";
+      else {
+        o.emitError("EmitMSL: unsupported reduce combiner op");
+        return failure();
+      }
+      bindScalar(o.getResult(0), id);
+      expr = id;
+    }
+    os << ind() << dst.str() << " = " << expr << ";\n";
+    return success();
+  }
+
+  // Bitmask over lane (or warp) bits that reduce the given axis: a bit reduces
+  // if its LinearLayout basis maps to a nonzero coordinate on the reduced
+  // out-dim, i.e. distinct lanes/warps hold distinct axis elements.
+  unsigned reduceMask(const tt::LinearLayout &ll, StringAttr inDim,
+                      StringAttr outDim) {
+    unsigned mask = 0;
+    if (!ll.hasInDim(inDim))
+      return 0;
+    for (int b = 0, n = ll.getInDimSizeLog2(inDim); b < n; ++b)
+      if (ll.getBasis(inDim, b, outDim) != 0)
+        mask |= (1u << b);
+    return mask;
+  }
+
+  LogicalResult emitReduce(tt::ReduceOp op) {
+    if (op.getNumOperands() != 1) {
+      op.emitError("EmitMSL: only single-operand reduce supported");
+      return failure();
+    }
+    Value src = op.getOperand(0);
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    Value res = op.getResult()[0];
+    if (isa<RankedTensorType>(res.getType())) {
+      op.emitError("EmitMSL: only scalar-result reduce supported");
+      return failure();
+    }
+    std::string sc = mslScalarType(elementScalarType(res.getType()));
+    Region &region = op.getCombineOp();
+    auto &srcNames = names(src);
+
+    std::string acc = fresh();
+    os << ind() << sc << " " << acc << " = " << srcNames[0] << ";\n";
+    for (size_t r = 1; r < srcNames.size(); ++r)
+      if (failed(emitCombine(region, acc, acc, srcNames[r], sc)))
+        return failure();
+
+    MLIRContext *ctx = op.getContext();
+    tt::LinearLayout ll = ttg::toLinearLayout(srcTy);
+    auto kLane = StringAttr::get(ctx, "lane");
+    auto kWarp = StringAttr::get(ctx, "warp");
+    auto outDim = *ll.getOutDimNames().begin();
+
+    unsigned laneMask = reduceMask(ll, kLane, outDim);
+    for (int bit = 31; bit >= 0; --bit) {
+      unsigned m = 1u << bit;
+      if ((laneMask & m) == 0)
+        continue;
+      std::string other = fresh();
+      os << ind() << sc << " " << other << " = simd_shuffle_xor(" << acc << ", "
+         << m << "u);\n";
+      if (failed(emitCombine(region, acc, acc, other, sc)))
+        return failure();
+    }
+
+    unsigned warpMask = reduceMask(ll, kWarp, outDim);
+    if (warpMask != 0) {
+      auto kWarpDim = StringAttr::get(ctx, "warp");
+      int numWarps = ll.getInDimSize(kWarpDim);
+      std::string scratch = "__red_scratch_" + std::to_string(nextId++);
+      os << ind() << "threadgroup " << sc << " " << scratch << "[" << numWarps
+         << "];\n";
+      os << ind() << "if (" << laneId << " == 0) " << scratch << "[" << warpId
+         << "] = " << acc << ";\n";
+      os << ind()
+         << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      std::string wacc = fresh();
+      os << ind() << sc << " " << wacc << " = " << scratch << "[0];\n";
+      for (int w = 1; w < numWarps; ++w) {
+        std::string wv = fresh();
+        os << ind() << sc << " " << wv << " = " << scratch << "[" << w << "];\n";
+        if (failed(emitCombine(region, wacc, wacc, wv, sc)))
+          return failure();
+      }
+      acc = wacc;
+    }
+
+    bindScalar(res, acc);
     return success();
   }
 

@@ -328,6 +328,18 @@ def _cyl_bessel_i1(x):
 
 
 @triton.jit
+def _hypot(x, y):
+    return tl.sqrt(x * x + y * y)
+
+
+@triton.jit
+def _copysign(x, y):
+    ax = tl.abs(x)
+    neg = (y < 0.0) | (1.0 / y == float('-inf'))
+    return tl.where(neg, -ax, ax)
+
+
+@triton.jit
 def _j0(x):
     # Bessel J0, Abramowitz & Stegun 9.4.1 / 9.4.3 (Numerical Recipes form).
     # Even function. Small |x|<8: rational polynomial. Large: amplitude/phase
@@ -465,6 +477,8 @@ COMPOSITES = {
     'atan': _atan,
     'atan2': _atan2,
     'fmod': _fmod,
+    'hypot': _hypot,
+    'copysign': _copysign,
     'rint': _rint,
     'nearbyint': _rint,
     'llrint': _rint,

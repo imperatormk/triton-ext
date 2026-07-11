@@ -327,6 +327,8 @@ private:
       return emitIf(i);
     if (auto r = dyn_cast<tt::ReduceOp>(op))
       return emitReduce(r);
+    if (auto s = dyn_cast<tt::ScanOp>(op))
+      return emitScan(s);
     if (auto d = dyn_cast<tt::DotOp>(op))
       return emitDot(d);
     if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op))
@@ -860,6 +862,137 @@ private:
     return success();
   }
 
+  // Ordered (bit, axisStride) pairs for an inDim (lane/warp), only for bits that
+  // move along the scanned axis. Sorted by ascending axis stride.
+  SmallVector<std::pair<int, int32_t>> axisBits(const tt::LinearLayout &ll,
+                                                StringAttr inDim,
+                                                StringAttr outDim) {
+    SmallVector<std::pair<int, int32_t>> bits;
+    if (!ll.hasInDim(inDim))
+      return bits;
+    for (int b = 0, n = ll.getInDimSizeLog2(inDim); b < n; ++b) {
+      int32_t basis = ll.getBasis(inDim, b, outDim);
+      if (basis != 0)
+        bits.push_back({b, basis});
+    }
+    llvm::sort(bits, [](auto &a, auto &c) { return a.second < c.second; });
+    return bits;
+  }
+
+  LogicalResult emitScan(tt::ScanOp op) {
+    if (op.getNumOperands() != 1) {
+      op.emitError("EmitMSL: only single-operand scan supported");
+      return failure();
+    }
+    if (op.getReverse()) {
+      op.emitError("EmitMSL: reverse scan not supported");
+      return failure();
+    }
+    Value src = op.getOperand(0);
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    Value res = op.getResult()[0];
+    std::string sc = mslScalarType(elementScalarType(res.getType()));
+    Region &region = op.getRegion();
+    auto &srcNames = names(src);
+    int nReg = srcNames.size();
+
+    MLIRContext *ctx = op.getContext();
+    tt::LinearLayout ll = ttg::toLinearLayout(srcTy);
+    auto kLane = StringAttr::get(ctx, "lane");
+    auto kWarp = StringAttr::get(ctx, "warp");
+    auto outDim = *ll.getOutDimNames().begin();
+
+    SmallVector<int> regOrder(nReg);
+    for (int r = 0; r < nReg; ++r)
+      regOrder[r] = r;
+    llvm::sort(regOrder, [&](int a, int b) {
+      return registerCoords(srcTy, a)[0] < registerCoords(srcTy, b)[0];
+    });
+
+    SmallVector<std::string> accs(nReg);
+    for (int r = 0; r < nReg; ++r) {
+      accs[r] = fresh();
+      os << ind() << sc << " " << accs[r] << " = " << srcNames[r] << ";\n";
+    }
+    for (int i = 1; i < nReg; ++i) {
+      std::string comb = fresh();
+      os << ind() << sc << " " << comb << ";\n";
+      if (failed(emitCombine(region, comb, accs[regOrder[i - 1]],
+                             accs[regOrder[i]], sc)))
+        return failure();
+      os << ind() << accs[regOrder[i]] << " = " << comb << ";\n";
+    }
+
+    std::string laneTotal = accs[regOrder[nReg - 1]];
+
+    auto laneBits = axisBits(ll, kLane, outDim);
+    std::string laneScan = fresh();
+    os << ind() << sc << " " << laneScan << " = " << laneTotal << ";\n";
+    for (auto &pr : laneBits) {
+      unsigned delta = 1u << pr.first;
+      std::string up = fresh();
+      os << ind() << sc << " " << up << " = simd_shuffle_up(" << laneScan
+         << ", " << delta << "u);\n";
+      std::string comb = fresh();
+      os << ind() << sc << " " << comb << ";\n";
+      if (failed(emitCombine(region, comb, up, laneScan, sc)))
+        return failure();
+      os << ind() << laneScan << " = (" << laneId << " >= " << delta << " ? "
+         << comb << " : " << laneScan << ");\n";
+    }
+    if (!laneBits.empty()) {
+      std::string lanePrefix = fresh();
+      os << ind() << sc << " " << lanePrefix << " = " << laneScan << " - "
+         << laneTotal << ";\n";
+      for (int r = 0; r < nReg; ++r) {
+        std::string comb = fresh();
+        os << ind() << sc << " " << comb << ";\n";
+        if (failed(emitCombine(region, comb, lanePrefix, accs[r], sc)))
+          return failure();
+        os << ind() << accs[r] << " = " << comb << ";\n";
+      }
+    }
+
+    auto warpBits = axisBits(ll, kWarp, outDim);
+    if (!warpBits.empty()) {
+      int numWarps = ll.getInDimSize(kWarp);
+      std::string scratch = fresh();
+      os << ind() << "threadgroup " << sc << "* " << scratch << " = "
+         << poolRegion(0, sc) << ";\n";
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      os << ind() << "if (" << laneId << " == 31) " << scratch << "[" << warpId
+         << "] = " << laneScan << ";\n";
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      std::string carry = fresh();
+      os << ind() << sc << " " << carry << " = (" << sc << ")0;\n";
+      os << ind() << "for (int wp = 0; wp < " << warpId << "; ++wp) {\n";
+      indent++;
+      std::string wv = fresh();
+      os << ind() << sc << " " << wv << " = " << scratch << "[wp];\n";
+      std::string comb = fresh();
+      os << ind() << sc << " " << comb << ";\n";
+      if (failed(emitCombine(region, comb, carry, wv, sc)))
+        return failure();
+      os << ind() << carry << " = " << comb << ";\n";
+      indent--;
+      os << ind() << "}\n";
+      for (int r = 0; r < nReg; ++r) {
+        std::string comb = fresh();
+        os << ind() << sc << " " << comb << ";\n";
+        if (failed(emitCombine(region, comb, carry, accs[r], sc)))
+          return failure();
+        os << ind() << accs[r] << " = (" << warpId << " > 0 ? " << comb << " : "
+           << accs[r] << ");\n";
+      }
+    }
+
+    SmallVector<std::string> outNames(nReg);
+    for (int r = 0; r < nReg; ++r)
+      outNames[r] = accs[r];
+    valMap[res] = outNames;
+    return success();
+  }
+
   int tgScratchId = 0;
 
   // A single per-kernel threadgroup pool shared by every barrier-separated
@@ -912,6 +1045,16 @@ private:
       tt::LinearLayout ll = ttg::toLinearLayout(st);
       auto kWarp = StringAttr::get(op->getContext(), "warp");
       if (ll.hasInDim(kWarp)) {
+        int64_t nw = ll.getInDimSize(kWarp);
+        Type e = st.getElementType();
+        poolBytes = std::max(poolBytes, nw * (bitsOf(e) / 8));
+      }
+    } else if (auto s = dyn_cast<tt::ScanOp>(op)) {
+      auto st = cast<RankedTensorType>(s.getOperand(0).getType());
+      tt::LinearLayout ll = ttg::toLinearLayout(st);
+      auto kWarp = StringAttr::get(op->getContext(), "warp");
+      auto outDim = *ll.getOutDimNames().begin();
+      if (!axisBits(ll, kWarp, outDim).empty()) {
         int64_t nw = ll.getInDimSize(kWarp);
         Type e = st.getElementType();
         poolBytes = std::max(poolBytes, nw * (bitsOf(e) / 8));

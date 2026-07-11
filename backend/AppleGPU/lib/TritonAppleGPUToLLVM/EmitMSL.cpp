@@ -7,6 +7,7 @@
 
 #include "TritonAppleGPUToLLVM/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -255,22 +256,134 @@ private:
     os << ind() << "int " << warpId << " = (int)(" << tidId << ".x >> 5);\n";
 
     poolBytes = 0;
-    Block &body = func.getBody().front();
-    for (Operation &op : body)
-      scanPool(&op);
+    for (Block &blk : func.getBody())
+      for (Operation &op : blk)
+        scanPool(&op);
     if (poolBytes > 0) {
       poolBuf = "__pool";
       os << ind() << "threadgroup char " << poolBuf << "[" << poolBytes
          << "];\n";
     }
 
-
-    for (Operation &op : body) {
-      if (failed(emitOp(&op)))
+    Region &region = func.getBody();
+    if (region.hasOneBlock()) {
+      for (Operation &op : region.front())
+        if (failed(emitOp(&op)))
+          return failure();
+    } else {
+      if (failed(emitBlockCFG(region)))
         return failure();
     }
     os << "}\n";
     return success();
+  }
+
+  // Emit a multi-block region as a state-machine dispatch loop. MSL forbids
+  // goto/labels, so unstructured CFG is lowered to `while (true) { if (state ==
+  // N) { ... } }` with an integer state var per block. Block arguments become
+  // predeclared variables assigned on each branch edge (phi resolution) before
+  // the state transition.
+  LogicalResult emitBlockCFG(Region &region) {
+    blockLabel.clear();
+    int idx = 0;
+    for (Block &blk : region)
+      blockLabel[&blk] = std::to_string(idx++);
+
+    for (Block &blk : llvm::drop_begin(region))
+      for (BlockArgument arg : blk.getArguments()) {
+        if (isDatalessType(arg.getType())) {
+          valMap[arg] = SmallVector<std::string>{};
+          continue;
+        }
+        valMap[arg] = declResultVars(arg, StringRef());
+      }
+
+    // Each per-block `if` opens a C scope, so any SSA value used outside its
+    // defining block must live in a function-scope variable. Predeclare a
+    // hoisted var per crossing value; after the defining op emits, spill into
+    // it and rebind so cross-block uses read the hoisted name.
+    llvm::DenseMap<Value, SmallVector<std::string>> hoist;
+    for (Block &blk : region)
+      for (Operation &op : blk)
+        for (Value res : op.getResults()) {
+          if (isDatalessType(res.getType()))
+            continue;
+          bool crosses = llvm::any_of(res.getUsers(), [&](Operation *u) {
+            return u->getBlock() != &blk;
+          });
+          if (!crosses)
+            continue;
+          hoist[res] = declResultVars(res, StringRef());
+        }
+
+    std::string state = fresh();
+    os << ind() << "int " << state << " = 0;\n";
+    cfgState = state;
+    os << ind() << "while (true) {\n";
+    ++indent;
+    bool first = true;
+    for (Block &blk : region) {
+      os << ind() << (first ? "if" : "else if") << " (" << state << " == "
+         << blockLabel[&blk] << ") {\n";
+      first = false;
+      ++indent;
+      for (Operation &op : blk.without_terminator()) {
+        if (failed(emitOp(&op)))
+          return failure();
+        for (Value res : op.getResults()) {
+          auto it = hoist.find(res);
+          if (it == hoist.end())
+            continue;
+          auto &cur = names(res);
+          for (size_t r = 0; r < it->second.size(); ++r)
+            os << ind() << it->second[r] << " = "
+               << cur[cur.size() == 1 ? 0 : r] << ";\n";
+          valMap[res] = it->second;
+        }
+      }
+      if (failed(emitTerminator(blk.getTerminator())))
+        return failure();
+      --indent;
+      os << ind() << "}\n";
+    }
+    --indent;
+    os << ind() << "}\n";
+    cfgState.clear();
+    return success();
+  }
+
+  // Assign a successor block's argument variables from the branch's operands
+  // (phi resolution), transition the dispatch state, and re-enter the loop.
+  void emitBranchEdge(Block *succ, Operation::operand_range args) {
+    for (auto [i, operand] : llvm::enumerate(args)) {
+      auto &src = names(operand);
+      auto &dst = valMap[succ->getArgument(i)];
+      for (size_t r = 0; r < dst.size(); ++r)
+        os << ind() << dst[r] << " = " << src[src.size() == 1 ? 0 : r] << ";\n";
+    }
+    os << ind() << cfgState << " = " << blockLabel[succ] << ";\n";
+    os << ind() << "continue;\n";
+  }
+
+  LogicalResult emitTerminator(Operation *term) {
+    if (auto br = dyn_cast<cf::BranchOp>(term)) {
+      emitBranchEdge(br.getDest(), br.getDestOperands());
+      return success();
+    }
+    if (auto cbr = dyn_cast<cf::CondBranchOp>(term)) {
+      const std::string &c = names(cbr.getCondition())[0];
+      os << ind() << "if (" << c << ") {\n";
+      ++indent;
+      emitBranchEdge(cbr.getTrueDest(), cbr.getTrueDestOperands());
+      --indent;
+      os << ind() << "} else {\n";
+      ++indent;
+      emitBranchEdge(cbr.getFalseDest(), cbr.getFalseDestOperands());
+      --indent;
+      os << ind() << "}\n";
+      return success();
+    }
+    return emitOp(term);
   }
 
   std::string tgposId, tidId, numTgId, laneId, warpId;
@@ -2082,6 +2195,9 @@ private:
   // reinterpreted to the site's element type.
   std::string poolBuf;
   int64_t poolBytes = 0;
+
+  llvm::DenseMap<Block *, std::string> blockLabel;
+  std::string cfgState;
 
   static int64_t bitsOf(Type t) {
     return isa<tt::PointerType>(t) ? 64 : t.getIntOrFloatBitWidth();

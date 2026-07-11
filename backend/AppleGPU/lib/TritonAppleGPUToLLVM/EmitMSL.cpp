@@ -1714,6 +1714,7 @@ private:
       srcNames[s] = names(op.getOperand(s));
     int nReg = srcNames[0].size();
     int nGroup = nReg / pack;
+    bool multiBlock = !region.hasOneBlock();
 
     SmallVector<SmallVector<std::string>> resIds(nRes);
     for (int g = 0; g < nGroup; ++g) {
@@ -1721,6 +1722,22 @@ private:
         for (int p = 0; p < pack; ++p)
           bindScalar(blk.getArgument(s * pack + p),
                      srcNames[s][g * pack + p]);
+      if (multiBlock) {
+        SmallVector<std::string> capture(nRes * pack);
+        for (int i = 0; i < nRes * pack; ++i) {
+          capture[i] = fresh();
+          Value r = op->getResult(i / pack);
+          os << ind()
+             << mslScalarType(elementScalarType(r.getType())) << " "
+             << capture[i] << ";\n";
+        }
+        if (failed(emitMapCFG(region, capture)))
+          return failure();
+        for (int k = 0; k < nRes; ++k)
+          for (int p = 0; p < pack; ++p)
+            resIds[k].push_back(capture[k * pack + p]);
+        continue;
+      }
       for (Operation &o : blk.without_terminator())
         if (failed(emitOp(&o)))
           return failure();
@@ -1731,6 +1748,80 @@ private:
     }
     for (int k = 0; k < nRes; ++k)
       valMap[op->getResult(k)] = resIds[k];
+    return success();
+  }
+
+  // Run one group of a multi-block map_elementwise region as a state-machine
+  // dispatch loop (MSL forbids goto), spilling the map_elementwise.return
+  // operands into caller-provided capture vars and exiting the loop.
+  LogicalResult emitMapCFG(Region &region, ArrayRef<std::string> capture) {
+    blockLabel.clear();
+    int idx = 0;
+    for (Block &blk : region)
+      blockLabel[&blk] = std::to_string(idx++);
+
+    for (Block &blk : llvm::drop_begin(region))
+      for (BlockArgument arg : blk.getArguments()) {
+        if (isDatalessType(arg.getType())) {
+          valMap[arg] = SmallVector<std::string>{};
+          continue;
+        }
+        valMap[arg] = declResultVars(arg, StringRef());
+      }
+
+    llvm::DenseMap<Value, SmallVector<std::string>> hoist;
+    for (Block &blk : region)
+      for (Operation &op : blk)
+        for (Value res : op.getResults()) {
+          if (isDatalessType(res.getType()))
+            continue;
+          bool crosses = llvm::any_of(res.getUsers(), [&](Operation *u) {
+            return u->getBlock() != &blk;
+          });
+          if (!crosses)
+            continue;
+          hoist[res] = declResultVars(res, StringRef());
+        }
+
+    std::string state = fresh();
+    os << ind() << "int " << state << " = 0;\n";
+    cfgState = state;
+    os << ind() << "while (true) {\n";
+    ++indent;
+    bool first = true;
+    for (Block &blk : region) {
+      os << ind() << (first ? "if" : "else if") << " (" << state << " == "
+         << blockLabel[&blk] << ") {\n";
+      first = false;
+      ++indent;
+      for (Operation &op : blk.without_terminator()) {
+        if (failed(emitOp(&op)))
+          return failure();
+        for (Value res : op.getResults()) {
+          auto it = hoist.find(res);
+          if (it == hoist.end())
+            continue;
+          auto &cur = names(res);
+          for (size_t r = 0; r < it->second.size(); ++r)
+            os << ind() << it->second[r] << " = "
+               << cur[cur.size() == 1 ? 0 : r] << ";\n";
+          valMap[res] = it->second;
+        }
+      }
+      Operation *term = blk.getTerminator();
+      if (term->getName().getStringRef() == "tt.map_elementwise.return") {
+        for (auto [i, operand] : llvm::enumerate(term->getOperands()))
+          os << ind() << capture[i] << " = " << names(operand)[0] << ";\n";
+        os << ind() << "break;\n";
+      } else if (failed(emitTerminator(term))) {
+        return failure();
+      }
+      --indent;
+      os << ind() << "}\n";
+    }
+    --indent;
+    os << ind() << "}\n";
+    cfgState.clear();
     return success();
   }
 

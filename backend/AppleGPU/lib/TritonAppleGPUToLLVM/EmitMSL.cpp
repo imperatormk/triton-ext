@@ -1316,10 +1316,12 @@ private:
     int nRes = op.getNumResults();
     int pack = op.getPack();
 
-    SmallVector<SmallVector<std::string> *> srcNames(nSrc);
+    // Snapshot by value: bindScalar/emitOp below insert into valMap, which can
+    // rehash the DenseMap and dangle any reference held into it.
+    SmallVector<SmallVector<std::string>> srcNames(nSrc);
     for (int s = 0; s < nSrc; ++s)
-      srcNames[s] = &names(op.getOperand(s));
-    int nReg = srcNames[0]->size();
+      srcNames[s] = names(op.getOperand(s));
+    int nReg = srcNames[0].size();
     int nGroup = nReg / pack;
 
     SmallVector<SmallVector<std::string>> resIds(nRes);
@@ -1327,7 +1329,7 @@ private:
       for (int s = 0; s < nSrc; ++s)
         for (int p = 0; p < pack; ++p)
           bindScalar(blk.getArgument(s * pack + p),
-                     (*srcNames[s])[g * pack + p]);
+                     srcNames[s][g * pack + p]);
       for (Operation &o : blk.without_terminator())
         if (failed(emitOp(&o)))
           return failure();
@@ -1405,10 +1407,12 @@ private:
       scTys[k] = mslScalarType(elementScalarType(op.getResult()[k].getType()));
     Region &region = op.getCombineOp();
 
-    SmallVector<SmallVector<std::string> *> srcNames(nOp);
+    // Snapshot by value: emitCombineN below inserts into valMap, which can
+    // rehash the DenseMap and dangle any reference held into it.
+    SmallVector<SmallVector<std::string>> srcNames(nOp);
     for (int k = 0; k < nOp; ++k)
-      srcNames[k] = &names(op.getOperand(k));
-    int nReg = srcNames[0]->size();
+      srcNames[k] = names(op.getOperand(k));
+    int nReg = srcNames[0].size();
 
     MLIRContext *ctx = op.getContext();
     tt::LinearLayout ll = ttg::toLinearLayout(srcTy);
@@ -1450,12 +1454,12 @@ private:
       for (int k = 0; k < nOp; ++k) {
         accs[k] = fresh();
         os << ind() << scTys[k] << " " << accs[k] << " = "
-           << (*srcNames[k])[regs[0]] << ";\n";
+           << srcNames[k][regs[0]] << ";\n";
       }
       for (size_t i = 1; i < regs.size(); ++i) {
         SmallVector<std::string> bVals(nOp);
         for (int k = 0; k < nOp; ++k)
-          bVals[k] = (*srcNames[k])[regs[i]];
+          bVals[k] = srcNames[k][regs[i]];
         SmallVector<std::string> out;
         if (failed(emitCombineN(region, accs, bVals, out)))
           return failure();
@@ -1859,10 +1863,10 @@ private:
       scTys[k] = mslScalarType(elementScalarType(op.getResult()[k].getType()));
       byteWidths[k] = bitsOf(elementScalarType(op.getResult()[k].getType())) / 8;
     }
-    SmallVector<SmallVector<std::string> *> srcNames(nOp);
+    SmallVector<SmallVector<std::string>> srcNames(nOp);
     for (int k = 0; k < nOp; ++k)
-      srcNames[k] = &names(op.getOperand(k));
-    int nReg = srcNames[0]->size();
+      srcNames[k] = names(op.getOperand(k));
+    int nReg = srcNames[0].size();
 
     MLIRContext *ctx = op.getContext();
     tt::LinearLayout ll = ttg::toLinearLayout(srcTy);
@@ -1924,7 +1928,7 @@ private:
       for (int r = 0; r < nReg; ++r) {
         accs[k][r] = fresh();
         os << ind() << scTys[k] << " " << accs[k][r] << " = "
-           << (*srcNames[k])[r] << ";\n";
+           << srcNames[k][r] << ";\n";
       }
 
     const char *shuf = rev ? "simd_shuffle_down" : "simd_shuffle_up";

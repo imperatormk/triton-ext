@@ -419,7 +419,9 @@ private:
     if (auto c = dyn_cast<tt::ClampFOp>(op))
       return emitClamp(c);
     if (isa<tt::MulhiUIOp>(op))
-      return emitMinMax(op, "mulhi");
+      return emitMinMax(
+          op, "mulhi",
+          mslUnsignedType(elementScalarType(op->getResult(0).getType())));
     if (isa<tt::PreciseSqrtOp>(op))
       return emitUnary(
           op, "metal::sqrt",
@@ -507,7 +509,9 @@ private:
       return v.isNegative() ? "(-INFINITY)" : "INFINITY";
     if (v.isNaN())
       return "NAN";
-    return std::to_string(v.convertToDouble());
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.17g", v.convertToDouble());
+    return buf;
   }
 
   std::string floatLit(const APFloat &v, StringRef sc) {
@@ -818,9 +822,10 @@ private:
     return success();
   }
 
-  LogicalResult emitMinMax(Operation *op, StringRef fn) {
+  LogicalResult emitMinMax(Operation *op, StringRef fn, StringRef opCast = "") {
     Value res = op->getResult(0);
     std::string sc = mslScalarType(elementScalarType(res.getType()));
+    std::string pre = opCast.empty() ? "" : "(" + opCast.str() + ")";
     auto &lhs = names(op->getOperand(0));
     auto &rhs = names(op->getOperand(1));
     int rc = regCount(res);
@@ -829,8 +834,8 @@ private:
       std::string id = fresh();
       const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
       const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
-      os << ind() << sc << " " << id << " = " << fn.str() << "(" << a << ", "
-         << b << ");\n";
+      os << ind() << sc << " " << id << " = " << fn.str() << "(" << pre << a
+         << ", " << pre << b << ");\n";
       ids.push_back(id);
     }
     valMap[res] = ids;

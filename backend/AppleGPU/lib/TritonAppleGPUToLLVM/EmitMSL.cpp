@@ -481,6 +481,13 @@ private:
     return std::to_string(v.convertToDouble());
   }
 
+  std::string floatLit(const APFloat &v, StringRef sc) {
+    std::string lit = floatLit(v);
+    if (sc == "bfloat" || sc == "half")
+      return sc.str() + "(" + lit + ")";
+    return lit;
+  }
+
   LogicalResult emitConstant(arith::ConstantOp op) {
     Value res = op.getResult();
     if (auto rt = dyn_cast<RankedTensorType>(res.getType())) {
@@ -495,7 +502,7 @@ private:
       SmallVector<std::string> ids;
       if (dense.isSplat()) {
         std::string lit = isFloat
-                              ? floatLit(dense.getSplatValue<APFloat>())
+                              ? floatLit(dense.getSplatValue<APFloat>(), sc)
                               : std::to_string(
                                     dense.getSplatValue<APInt>().getSExtValue());
         for (int r = 0; r < rc; ++r) {
@@ -513,7 +520,7 @@ private:
       int64_t n = 0;
       if (isFloat) {
         for (const APFloat &v : dense.getValues<APFloat>())
-          os << (n++ ? ", " : "") << floatLit(v);
+          os << (n++ ? ", " : "") << floatLit(v, sc);
       } else {
         for (const APInt &v : dense.getValues<APInt>())
           os << (n++ ? ", " : "") << std::to_string(v.getSExtValue());
@@ -532,7 +539,7 @@ private:
     std::string id = fresh();
     std::string lit;
     if (auto fa = dyn_cast<FloatAttr>(op.getValue()))
-      lit = floatLit(fa.getValue());
+      lit = floatLit(fa.getValue(), sc);
     else if (auto ia = dyn_cast<IntegerAttr>(op.getValue()))
       lit = std::to_string(ia.getInt());
     else {

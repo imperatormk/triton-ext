@@ -1335,6 +1335,33 @@ private:
       op->emitError("EmitMSL: unhandled cast target type");
       return failure();
     }
+    {
+      Type srcElem = elementScalarType(op->getOperand(0).getType());
+      bool toHalf = dst == "half" || dst == "bfloat";
+      if (srcElem.isF32() && toHalf) {
+        bool rtz = false, handle = false;
+        if (auto f = dyn_cast<tt::FpToFpOp>(op)) {
+          if (auto rnd = f.getRounding()) {
+            handle = true;
+            rtz = *rnd == tt::RoundingMode::RTZ;
+          }
+        } else if (isa<arith::TruncFOp>(op)) {
+          handle = true;
+        }
+        if (handle) {
+          auto &a = names(op->getOperand(0));
+          int rc = regCount(res);
+          SmallVector<std::string> ids;
+          for (int r = 0; r < rc; ++r) {
+            const std::string &v = a[a.size() == 1 ? 0 : r];
+            ids.push_back(rtz ? emitTruncatedFloatValue(dst, v)
+                              : emitRoundedHalfValueFull(dst, v));
+          }
+          valMap[res] = ids;
+          return success();
+        }
+      }
+    }
     std::string srcCast;
     if (isa<arith::ExtUIOp, arith::UIToFPOp>(op))
       srcCast = mslUnsignedType(elementScalarType(op->getOperand(0).getType()));
@@ -3810,6 +3837,123 @@ private:
         os << ind() << "if (" << guard << ") *" << p << " = " << v << ";\n";
     }
     return success();
+  }
+
+  // IEEE round-to-nearest-even narrowing of an f32 `v` to half/bfloat, with
+  // correct NaN/Inf/overflow/subnormal handling (used by fp_to_fp rtne).
+  std::string emitRoundedHalfValueFull(const std::string &sc,
+                                       const std::string &v) {
+    std::string f = fresh(), u = fresh(), h = fresh(), bits = fresh();
+    os << ind() << "float " << f << " = (float)(" << v << ");\n";
+    os << ind() << "uint " << u << " = as_type<uint>(" << f << ");\n";
+    os << ind() << "ushort " << bits << ";\n";
+    std::string sgn = fresh(), e32 = fresh(), mant = fresh();
+    os << ind() << "uint " << sgn << " = (" << u << " >> 16) & 0x8000u;\n";
+    os << ind() << "int " << e32 << " = (int)((" << u << " >> 23) & 0xffu);\n";
+    os << ind() << "uint " << mant << " = " << u << " & 0x7fffffu;\n";
+    if (sc == "bfloat") {
+      std::string r = fresh();
+      os << ind() << "if (" << e32 << " == 0xff) {\n";
+      ++indent;
+      os << ind() << bits << " = (ushort)(((" << u << " >> 16) & 0xffffu) | ("
+         << mant << " ? 0x40u : 0u));\n";
+      --indent;
+      os << ind() << "} else {\n";
+      ++indent;
+      os << ind() << "uint " << r << " = (" << u << " >> 16) & 1u;\n";
+      os << ind() << "uint __t = (" << u << " + 0x7fffu + " << r << ");\n";
+      os << ind() << bits << " = (ushort)((__t >> 16) & 0xffffu);\n";
+      --indent;
+      os << ind() << "}\n";
+    } else {
+      std::string ex = fresh();
+      os << ind() << "int " << ex << " = " << e32 << " - 112;\n";
+      os << ind() << "if (" << e32 << " == 0xff) {\n";
+      ++indent;
+      os << ind() << bits << " = (ushort)(" << sgn << " | 0x7c00u | ("
+         << mant << " ? 0x200u : 0u));\n";
+      --indent;
+      os << ind() << "} else if (" << ex << " >= 31) {\n";
+      ++indent;
+      os << ind() << bits << " = (ushort)(" << sgn << " | 0x7c00u);\n";
+      --indent;
+      os << ind() << "} else if (" << ex << " <= 0) {\n";
+      ++indent;
+      os << ind() << "if (" << ex << " < -10) { " << bits << " = (ushort)"
+         << sgn << "; }\n";
+      os << ind() << "else {\n";
+      ++indent;
+      os << ind() << "uint __fm = " << mant << " | 0x800000u;\n";
+      os << ind() << "int __sh = 14 - " << ex << ";\n";
+      os << ind() << "uint __m = __fm >> __sh;\n";
+      os << ind() << "uint __rem = __fm & ((1u << __sh) - 1u);\n";
+      os << ind() << "uint __half = 1u << (__sh - 1);\n";
+      os << ind() << "if (__rem > __half || (__rem == __half && (__m & 1u))) "
+         << "__m += 1;\n";
+      os << ind() << bits << " = (ushort)(" << sgn << " | __m);\n";
+      --indent;
+      os << ind() << "}\n";
+      --indent;
+      os << ind() << "} else {\n";
+      ++indent;
+      std::string m = fresh(), rem = fresh();
+      os << ind() << "uint " << m << " = " << mant << " >> 13;\n";
+      os << ind() << "uint " << rem << " = " << mant << " & 0x1fffu;\n";
+      os << ind() << bits << " = (ushort)(" << sgn << " | ((uint)" << ex
+         << " << 10) | " << m << ");\n";
+      os << ind() << "if (" << rem << " > 0x1000u || (" << rem
+         << " == 0x1000u && (" << m << " & 1u))) " << bits << " += 1;\n";
+      --indent;
+      os << ind() << "}\n";
+    }
+    os << ind() << sc << " " << h << " = as_type<" << sc << ">(" << bits
+       << ");\n";
+    return h;
+  }
+
+  // Round-toward-zero (truncating) narrowing of an f32 `v` to half/bfloat.
+  // RTZ drops the low mantissa bits with no rounding increment.
+  std::string emitTruncatedFloatValue(const std::string &sc,
+                                      const std::string &v) {
+    std::string f = fresh(), u = fresh(), h = fresh(), bits = fresh();
+    os << ind() << "float " << f << " = (float)(" << v << ");\n";
+    os << ind() << "uint " << u << " = as_type<uint>(" << f << ");\n";
+    os << ind() << "ushort " << bits << ";\n";
+    if (sc == "bfloat") {
+      os << ind() << bits << " = (ushort)((" << u << " >> 16) & 0xffffu);\n";
+    } else {
+      std::string sgn = fresh(), ex = fresh(), mant = fresh();
+      os << ind() << "uint " << sgn << " = (" << u << " >> 16) & 0x8000u;\n";
+      os << ind() << "int " << ex << " = (int)((" << u
+         << " >> 23) & 0xffu) - 112;\n";
+      os << ind() << "uint " << mant << " = " << u << " & 0x7fffffu;\n";
+      os << ind() << "if (((" << u << " >> 23) & 0xffu) == 0xffu) {\n";
+      ++indent;
+      os << ind() << bits << " = (ushort)(" << sgn << " | 0x7c00u | ("
+         << mant << " ? 0x200u : 0u));\n";
+      --indent;
+      os << ind() << "} else if (" << ex << " >= 31) {\n";
+      ++indent;
+      os << ind() << bits << " = (ushort)(" << sgn << " | 0x7bffu);\n";
+      --indent;
+      os << ind() << "} else if (" << ex << " <= 0) {\n";
+      ++indent;
+      os << ind() << "if (" << ex << " < -10) { " << bits << " = (ushort)"
+         << sgn << "; }\n";
+      os << ind() << "else { uint __m = (" << mant
+         << " | 0x800000u) >> (14 - " << ex << "); " << bits
+         << " = (ushort)(" << sgn << " | __m); }\n";
+      --indent;
+      os << ind() << "} else {\n";
+      ++indent;
+      os << ind() << bits << " = (ushort)(" << sgn << " | ((uint)" << ex
+         << " << 10) | (" << mant << " >> 13));\n";
+      --indent;
+      os << ind() << "}\n";
+    }
+    os << ind() << sc << " " << h << " = as_type<" << sc << ">(" << bits
+       << ");\n";
+    return h;
   }
 
   // Integer RTNE narrowing of `v` to `sc`. Metal fast-math elides a plain

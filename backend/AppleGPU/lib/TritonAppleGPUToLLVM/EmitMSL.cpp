@@ -5101,6 +5101,11 @@ private:
     unsigned bw = scalarTy.getIntOrFloatBitWidth();
     tt::RMWOp kind = op.getAtomicRmwOp();
 
+    if (!isFloat && bw == 64) {
+      op.emitError("EmitMSL: 64-bit integer atomics are not supported on Metal");
+      return failure();
+    }
+
     bool floatNative = isFloat && bw == 32 &&
                        (kind == tt::RMWOp::ADD || kind == tt::RMWOp::FADD);
     bool floatEmulated = isFloat && !floatNative;

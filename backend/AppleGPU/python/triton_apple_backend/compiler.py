@@ -351,10 +351,14 @@ class MPSBackend(BaseBackend):
             f.write(msl.encode())
         air_path = src_path + '.air'
         lib_path = src_path + '.metallib'
-        # Default fast math; strict IEEE rounding is scoped to the kernels the
-        # emitter marks (rtne emulation reference relies on non-reassociated FP).
-        math_flags = (['-fmetal-math-mode=safe']
-                      if 'triton-mps: strict-fp' in msl else [])
+        # Safe math globally. Metal fast-math assumes no NaN/Inf and reassociates
+        # FP, which silently miscompiles any kernel that produces or consumes
+        # Inf/NaN (sort/argmax/reductions over NaN, div-by-zero, extremal muls)
+        # or relies on RTNE (the rtne downcast reference). Which kernels see
+        # Inf/NaN is a runtime property, not statically detectable, so scoping
+        # is unsound. Safe math is proven zero-cost on the simdgroup-matrix GEMM
+        # path (identical AIR); the only cost is precise transcendentals.
+        math_flags = ['-fmetal-math-mode=safe']
         try:
             subprocess.run(
                 ['xcrun', '-sdk', 'macosx', 'metal', *math_flags,

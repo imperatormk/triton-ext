@@ -3147,7 +3147,7 @@ private:
   // Peak byte footprint of a single transient scratch site.
   void scanPool(Operation *op) {
     if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op)) {
-      if (convertLayoutIsDeadDotStage(c))
+      if (convertLayoutIsDeadDotStage(c) || convertLayoutIsDeadDotStageSource(c))
         return;
       auto st = cast<RankedTensorType>(c.getSrc().getType());
       Type e = st.getElementType();
@@ -3551,7 +3551,8 @@ private:
   // then reads its destination registers back from the same offsets. Correct
   // for arbitrary distributed src/dst layouts (moves data across lanes/warps).
   LogicalResult emitConvertLayout(ttg::ConvertLayoutOp op) {
-    if (convertLayoutIsDeadDotStage(op)) {
+    if (convertLayoutIsDeadDotStage(op) ||
+        convertLayoutIsDeadDotStageSource(op)) {
       valMap[op.getResult()] = SmallVector<std::string>{};
       return success();
     }
@@ -3948,6 +3949,55 @@ private:
     return "(" + op.buf + " + " + op.baseOffset + ")";
   }
 
+  // A dot operand reached through a convert_layout of a rank-2 distributed
+  // tensor. The dot stages its operand into threadgroup memory by row-major
+  // (m,k) offset regardless of the operand's distributed layout, so it can read
+  // the CONVERT SOURCE registers at the source layout's row-major offsets and
+  // produce a bit-identical tile, making the convert_layout's own threadgroup
+  // round-trip dead weight. Returns the source value to stage, or null.
+  static Value dotOperandConvertSource(tt::DotOp d, Value operand) {
+    auto cvt = dyn_cast_or_null<ttg::ConvertLayoutOp>(operand.getDefiningOp());
+    if (!cvt)
+      return nullptr;
+    Value src = cvt.getSrc();
+    auto st = dyn_cast<RankedTensorType>(src.getType());
+    if (!st || st.getRank() != 2)
+      return nullptr;
+    if (dotOperandLocalLoad(operand, st.getShape()[0], st.getShape()[1]))
+      return nullptr;
+    auto aTy = cast<RankedTensorType>(d.getA().getType());
+    auto cTy = cast<RankedTensorType>(d.getResult().getType());
+    if (cTy.getRank() != 2)
+      return nullptr;
+    int64_t M = cTy.getShape()[0], N = cTy.getShape()[1];
+    int64_t K = aTy.getShape()[1];
+    int64_t elemBytes = bitsOf(aTy.getElementType()) / 8;
+    if (dotNeedsPanel(M, N, K, elemBytes, 4))
+      return nullptr;
+    return src;
+  }
+
+  // The convert_layout is dead when every use is a dot that will stage the
+  // convert source directly (dotOperandConvertSource matches). Emitting its
+  // round-trip is then pure waste.
+  static bool convertLayoutIsDeadDotStageSource(ttg::ConvertLayoutOp c) {
+    if (c.getResult().use_empty())
+      return false;
+    for (OpOperand &use : c.getResult().getUses()) {
+      auto d = dyn_cast<tt::DotOp>(use.getOwner());
+      if (!d)
+        return false;
+      if (use.get() != d.getA() && use.get() != d.getB())
+        return false;
+      auto cTy = cast<RankedTensorType>(d.getResult().getType());
+      if (cTy.getRank() != 2)
+        return false;
+      if (!dotOperandConvertSource(d, use.get()))
+        return false;
+    }
+    return true;
+  }
+
   // Lower tt.dot to MSL simdgroup_matrix 8x8 fragment MMA. A (MxK) and B (KxN)
   // per-thread registers are staged row-major into threadgroup memory; one
   // simdgroup cooperatively runs the 8x8 fragment MMA loop over K into an MxN
@@ -4043,8 +4093,6 @@ private:
       return failure();
     }
 
-    auto &aNames = names(op.getA());
-    auto &bNames = names(op.getB());
     auto &cInit = names(op.getC());
 
     std::string opScalar = sgOperandScalar(aElem);
@@ -4066,6 +4114,22 @@ private:
       aInPlace = dotOperandInPlaceBuf(op.getA(), M, K);
       bInPlace = dotOperandInPlaceBuf(op.getB(), K, N);
     }
+    // When an operand is a folded convert (its round-trip was skipped), stage
+    // the convert SOURCE registers at the source layout's row-major offsets:
+    // the tile content is layout-independent, so this reproduces the exact
+    // staged tile without the convert's threadgroup bounce.
+    Value aStage = op.getA(), bStage = op.getB();
+    if (!aInPlace)
+      if (Value s = dotOperandConvertSource(op, op.getA()))
+        aStage = s;
+    if (!bInPlace)
+      if (Value s = dotOperandConvertSource(op, op.getB()))
+        bStage = s;
+    auto aStageTy = cast<RankedTensorType>(aStage.getType());
+    auto bStageTy = cast<RankedTensorType>(bStage.getType());
+    auto &aNames = names(aStage);
+    auto &bNames = names(bStage);
+
     int64_t stagedA = aInPlace ? 0 : aBytes;
     int64_t stagedB = bInPlace ? 0 : bBytes;
     int64_t stagedAB = stagedA + stagedB;
@@ -4316,12 +4380,12 @@ private:
         if (stagesHere)
           os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
         if (!aInPlace)
-          for (int r = 0, n = regCount(op.getA()); r < n; ++r)
-            os << ind() << tgA << "[" << sliceFlatOffset(aTy, r) << "] = "
+          for (int r = 0, n = regCount(aStage); r < n; ++r)
+            os << ind() << tgA << "[" << sliceFlatOffset(aStageTy, r) << "] = "
                << aNames[r] << ";\n";
         if (!bInPlace)
-          for (int r = 0, n = regCount(op.getB()); r < n; ++r)
-            os << ind() << tgB << "[" << sliceFlatOffset(bTy, r) << "] = "
+          for (int r = 0, n = regCount(bStage); r < n; ++r)
+            os << ind() << tgB << "[" << sliceFlatOffset(bStageTy, r) << "] = "
                << bNames[r] << ";\n";
         os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
         // Slot j of warp w owns global fragment f = w + j*numWarps; its tile
@@ -4385,9 +4449,13 @@ private:
             os << ind() << "}\n";
           }
         }
-        // Fence the A/B reads before the pipeliner's prefetch overwrites the
-        // (possibly same) staging slot for the next slab.
-        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        // When this phase stages A/B into the pool, the next slab's leading
+        // stage barrier (and the post-loop readback's leading barrier) already
+        // fence these simdgroup_loads before any thread overwrites the pool, so
+        // no trailing fence is needed. Only the fully in-place path (no staging
+        // barrier next slab) needs an explicit fence here.
+        if (!stagesHere)
+          os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
         valMap[op.getResult()] = ids;
         return success();
       }
@@ -4446,13 +4514,13 @@ private:
     for (int64_t bi = 0; bi < B; ++bi) {
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       if (!aInPlace)
-        for (int r = 0, n = regCount(op.getA()); r < n; ++r)
-          os << ind() << batchGuard(aTy, r, bi) << tgA << "["
-             << sliceFlatOffset(aTy, r) << "] = " << aNames[r] << ";\n";
+        for (int r = 0, n = regCount(aStage); r < n; ++r)
+          os << ind() << batchGuard(aStageTy, r, bi) << tgA << "["
+             << sliceFlatOffset(aStageTy, r) << "] = " << aNames[r] << ";\n";
       if (!bInPlace)
-        for (int r = 0, n = regCount(op.getB()); r < n; ++r)
-          os << ind() << batchGuard(bTy, r, bi) << tgB << "["
-             << sliceFlatOffset(bTy, r) << "] = " << bNames[r] << ";\n";
+        for (int r = 0, n = regCount(bStage); r < n; ++r)
+          os << ind() << batchGuard(bStageTy, r, bi) << tgB << "["
+             << sliceFlatOffset(bStageTy, r) << "] = " << bNames[r] << ";\n";
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 
       auto emitFragMMA = [&](int64_t mi, int64_t ni, StringRef acc) {

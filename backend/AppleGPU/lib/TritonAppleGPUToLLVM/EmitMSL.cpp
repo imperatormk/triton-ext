@@ -665,6 +665,22 @@ private:
   std::string tgposId, tidId, numTgId, laneId, warpId;
   bool scalarSpinlock = false;
 
+  // Register-resident C GEMM fusion. When emitFor recognises an
+  // `acc = tl.dot(a, b, acc)` K-loop it drives the enclosed tt.dot through the
+  // three-phase path below: PhaseDecl declares persistent simdgroup fragments
+  // (once, pre-loop), PhaseMMA stages A/B and accumulates into them (each
+  // iteration, no tgC round-trip), PhaseReadback stores the fragments and
+  // gathers the #mma->scalar result (once, post-loop).
+  enum class FusedDotPhase { None, Decl, MMA, Readback };
+  struct FusedDotCtx {
+    FusedDotPhase phase = FusedDotPhase::None;
+    SmallVector<std::string> accNames;
+    SmallVector<std::string> ids;
+    SmallVector<std::string> baseNames;
+    std::string tgA, tgB, tgC;
+  };
+  FusedDotCtx fusedDot;
+
   static bool tracesToKernelArg(Value v) {
     while (v) {
       if (isa<BlockArgument>(v))
@@ -1675,7 +1691,95 @@ private:
     return isa<ttg::AsyncTokenType>(t);
   }
 
+  // Recognise the register-resident GEMM shape: a loop-carried #mma iter-arg
+  // that is the C operand of exactly one tt.dot in the body and whose only
+  // other use is being yielded back as that same iter-arg (the standard
+  // accumulating `acc = tl.dot(a, b, acc)` K-loop). Returns the dot and the
+  // iter-arg index, or nullopt.
+  std::optional<std::pair<tt::DotOp, unsigned>>
+  matchGemmDotLoop(scf::ForOp op) {
+    if (getenv("MSL_NO_FUSE"))
+      return std::nullopt;
+    Block *body = op.getBody();
+    auto yield = cast<scf::YieldOp>(body->getTerminator());
+    tt::DotOp found;
+    int nDots = 0;
+    for (Operation &o : body->without_terminator())
+      if (auto d = dyn_cast<tt::DotOp>(&o)) {
+        found = d;
+        ++nDots;
+      }
+    if (nDots != 1 || !found)
+      return std::nullopt;
+
+    auto cArg = dyn_cast<BlockArgument>(found.getC());
+    if (!cArg || cArg.getOwner() != body)
+      return std::nullopt;
+    unsigned idx = cArg.getArgNumber();
+    if (idx == 0)
+      return std::nullopt; // arg 0 is the induction var
+    unsigned iterIdx = idx - 1;
+    if (yield.getOperand(iterIdx) != found.getResult())
+      return std::nullopt;
+    // The iter-arg feeds the dot's C and nothing else; the dot result feeds the
+    // yield and nothing else. This keeps the accumulator purely register-carried.
+    for (Operation *u : cArg.getUsers())
+      if (u != found.getOperation())
+        return std::nullopt;
+    for (Operation *u : found.getResult().getUsers())
+      if (u != yield.getOperation())
+        return std::nullopt;
+
+    auto cTy = dyn_cast<RankedTensorType>(found.getResult().getType());
+    if (!cTy || cTy.getRank() != 2)
+      return std::nullopt;
+    Type aElem = cast<RankedTensorType>(found.getA().getType()).getElementType();
+    Type cElem = cTy.getElementType();
+    if (isa<IntegerType>(aElem) || !(cElem.isF32() || cElem.isF16()))
+      return std::nullopt;
+    int64_t M = cTy.getShape()[0], N = cTy.getShape()[1];
+    int64_t K = cast<RankedTensorType>(found.getA().getType()).getShape()[1];
+    if (M % 8 || N % 8 || K % 8)
+      return std::nullopt;
+
+    // Gate: the fused path only wins with a small warp-tile (<= 8
+    // simdgroup_float8x8 accumulators per warp) AND the disjoint staging path
+    // where staged A+B+C fits the pool (band == M, one readback). Anything
+    // larger falls back to the per-dot path. Staging bytes mirror emitDot: an
+    // operand already resident in a threadgroup buffer (in-place) stages 0.
+    int64_t aBytes = M * K * (bitsOf(aElem) / 8);
+    int64_t bBytes = N * K * (bitsOf(aElem) / 8);
+    int64_t cFull = M * N * 4;
+    bool wholeTileFits = aBytes + bBytes <= 32768;
+    // A/B that structurally resolve to a local_alloc buffer are loaded in place
+    // by emitDot (stage 0). The precise in-place base lives in memdescMap, which
+    // is only populated once the enclosing memdesc_index is emitted inside the
+    // loop; here (pre-loop) the structural walk is the reliable signal.
+    int64_t stagedA = aBytes, stagedB = bBytes;
+    if (wholeTileFits) {
+      if (dotOperandLocalLoad(found.getA(), M, K))
+        stagedA = 0;
+      if (dotOperandLocalLoad(found.getB(), K, N))
+        stagedB = 0;
+    }
+    if (stagedA + stagedB + cFull > poolBudget())
+      return std::nullopt;
+    tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
+    auto kWarpDim = StringAttr::get(op.getContext(), "warp");
+    int64_t numWarps = cLL.hasInDim(kWarpDim) ? cLL.getInDimSize(kWarpDim) : 1;
+    int64_t nFrag = (M / 8) * (N / 8);
+    if (numWarps > nFrag)
+      numWarps = nFrag;
+    int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
+    if (fragsPerWarp > 8)
+      return std::nullopt;
+
+    return std::make_pair(found, iterIdx);
+  }
+
   LogicalResult emitFor(scf::ForOp op) {
+    if (auto m = matchGemmDotLoop(op))
+      return emitFusedGemm(op, m->first, m->second);
     SmallVector<SmallVector<std::string>> carried;
     for (auto [i, init, res] :
          llvm::enumerate(op.getInitArgs(), op.getResults())) {
@@ -1712,6 +1816,84 @@ private:
     emitYieldAssign(op.getBody()->getTerminator(), carried);
     --indent;
     os << ind() << "}\n";
+    return success();
+  }
+
+  // Lower a recognised GEMM K-loop with the dot accumulator kept resident in
+  // simdgroup_matrix registers across the whole loop. The enclosed tt.dot is
+  // driven in three phases (see FusedDotCtx); every other carried value uses
+  // the normal scalar carry.
+  LogicalResult emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx) {
+    SmallVector<SmallVector<std::string>> carried;
+    SmallVector<std::string> initBase;
+    for (auto [i, init, res] :
+         llvm::enumerate(op.getInitArgs(), op.getResults())) {
+      if (isDatalessType(res.getType())) {
+        valMap[op.getRegionIterArg(i)] = SmallVector<std::string>{};
+        valMap[res] = SmallVector<std::string>{};
+        carried.push_back({});
+        continue;
+      }
+      auto &initNames = names(init);
+      if (i == iterIdx) {
+        // The accumulator carry is the persistent simdgroup fragments; its
+        // scalar registers are only produced once after the loop. Capture the
+        // init value as the readback base and give the iter-arg placeholder
+        // names (never read: its only use is the dot's C operand).
+        SmallVector<std::string> ids = declResultVars(res, StringRef());
+        initBase.assign(initNames.begin(), initNames.end());
+        fusedDot.ids = ids;
+        valMap[op.getRegionIterArg(i)] = ids;
+        valMap[res] = ids;
+        carried.push_back({});
+        continue;
+      }
+      SmallVector<std::string> vars = declResultVars(res, StringRef());
+      for (size_t r = 0; r < vars.size(); ++r)
+        os << ind() << vars[r] << " = "
+           << initNames[initNames.size() == 1 ? 0 : r] << ";\n";
+      valMap[op.getRegionIterArg(i)] = vars;
+      valMap[res] = vars;
+      carried.push_back(vars);
+    }
+
+    fusedDot.baseNames = initBase;
+    fusedDot.phase = FusedDotPhase::Decl;
+    if (failed(emitDot(dot)))
+      return failure();
+
+    std::string iv = fresh();
+    const std::string &lo = names(op.getLowerBound())[0];
+    const std::string &hi = names(op.getUpperBound())[0];
+    const std::string &st = names(op.getStep())[0];
+    bindScalar(op.getInductionVar(), iv);
+    std::string ivTy = mslScalarType(op.getInductionVar().getType());
+    if (ivTy.empty())
+      ivTy = "int";
+    os << ind() << "for (" << ivTy << " " << iv << " = " << lo << "; " << iv
+       << " < " << hi << "; " << iv << " += " << st << ") {\n";
+    ++indent;
+    fusedDot.phase = FusedDotPhase::MMA;
+    if (failed(emitRegionBody(op.getRegion())))
+      return failure();
+    fusedDot.phase = FusedDotPhase::None;
+    // Carry every value except the accumulator (its state lives in the frags).
+    auto *term = op.getBody()->getTerminator();
+    for (auto [i, operand] : llvm::enumerate(term->getOperands())) {
+      if (i == iterIdx || carried[i].empty())
+        continue;
+      auto &src = names(operand);
+      for (size_t r = 0; r < carried[i].size(); ++r)
+        os << ind() << carried[i][r] << " = "
+           << src[src.size() == 1 ? 0 : r] << ";\n";
+    }
+    --indent;
+    os << ind() << "}\n";
+
+    fusedDot.phase = FusedDotPhase::Readback;
+    if (failed(emitDot(dot)))
+      return failure();
+    fusedDot = FusedDotCtx{};
     return success();
   }
 
@@ -3640,21 +3822,31 @@ private:
     // the M×N store is banded to fit. DISJOINT when staged A+B+C fits the pool.
     bool disjointC = stagedAB + cFull <= poolBudget();
     int64_t bandRows = disjointC ? M : dotCBandRows(M, N, poolBudget(), accBytes);
+
+    // In the fused GEMM path the A/B in-place base is loop-variant, so its
+    // pointer decl must sit inside the loop (MMA phase); tgC is the static pool
+    // region. Decl declares only the persistent frags; Readback touches only tgC.
+    FusedDotPhase phase = fusedDot.phase;
+    bool needAB = phase == FusedDotPhase::None || phase == FusedDotPhase::MMA;
+    bool needC = phase != FusedDotPhase::Decl;
     std::string tgA = fresh(), tgB = fresh(), tgC = fresh();
-    if (aInPlace)
-      os << ind() << "threadgroup " << opScalar << "* " << tgA << " = "
-         << inPlaceBase(*aInPlace) << ";\n";
-    else
-      os << ind() << "threadgroup " << opScalar << "* " << tgA << " = "
-         << poolRegion(0, opScalar) << ";\n";
-    if (bInPlace)
-      os << ind() << "threadgroup " << opScalar << "* " << tgB << " = "
-         << inPlaceBase(*bInPlace) << ";\n";
-    else
-      os << ind() << "threadgroup " << opScalar << "* " << tgB << " = "
-         << poolRegion(stagedA, opScalar) << ";\n";
-    os << ind() << "threadgroup float* " << tgC << " = "
-       << poolRegion(disjointC ? stagedAB : 0, "float") << ";\n";
+    if (needAB) {
+      if (aInPlace)
+        os << ind() << "threadgroup " << opScalar << "* " << tgA << " = "
+           << inPlaceBase(*aInPlace) << ";\n";
+      else
+        os << ind() << "threadgroup " << opScalar << "* " << tgA << " = "
+           << poolRegion(0, opScalar) << ";\n";
+      if (bInPlace)
+        os << ind() << "threadgroup " << opScalar << "* " << tgB << " = "
+           << inPlaceBase(*bInPlace) << ";\n";
+      else
+        os << ind() << "threadgroup " << opScalar << "* " << tgB << " = "
+           << poolRegion(stagedA, opScalar) << ";\n";
+    }
+    if (needC)
+      os << ind() << "threadgroup float* " << tgC << " = "
+         << poolRegion(disjointC ? stagedAB : 0, "float") << ";\n";
 
     int64_t mT = M / 8, nT = N / 8, kT = K / 8;
     tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
@@ -3673,11 +3865,16 @@ private:
     };
 
     int nRes = regCount(op.getResult());
+    bool fused = phase != FusedDotPhase::None;
     SmallVector<std::string> ids(nRes);
-    for (int r = 0; r < nRes; ++r) {
-      ids[r] = fresh();
-      os << ind() << accScalar << " " << ids[r] << " = ("
-         << accScalar << ")0;\n";
+    if (fused) {
+      ids = fusedDot.ids;
+    } else {
+      for (int r = 0; r < nRes; ++r) {
+        ids[r] = fresh();
+        os << ind() << accScalar << " " << ids[r] << " = ("
+           << accScalar << ")0;\n";
+      }
     }
 
     auto outNames = llvm::to_vector(cLL.getOutDimNames());
@@ -3803,9 +4000,11 @@ private:
       return success();
     }
 
+    ArrayRef<std::string> rbBase = fused ? ArrayRef<std::string>(fusedDot.baseNames)
+                                         : ArrayRef<std::string>(cInit);
     auto emitReadback = [&](int64_t bi, int64_t r0, int64_t r1) {
       for (int r = 0; r < nRes; ++r) {
-        std::string base = cInit[cInit.size() == 1 ? 0 : r];
+        std::string base = rbBase[rbBase.size() == 1 ? 0 : r];
         std::string rowExpr = layoutCoordExpr(cTy, r, rowDim);
         std::string colExpr = layoutCoordExpr(cTy, r, colDim);
         std::string bandOff = "((" + rowExpr + " - " + std::to_string(r0) +
@@ -3820,6 +4019,92 @@ private:
            << bandOff << "] + " << base << ";\n";
       }
     };
+
+    auto emitFragMMAInto = [&](StringRef tgAn, StringRef tgBn, int64_t mi,
+                               int64_t ni, StringRef acc) {
+      for (int64_t ki = 0; ki < kT; ++ki) {
+        std::string fa = fresh(), fb = fresh();
+        os << ind() << opFrag << " " << fa << ";\n";
+        os << ind() << "simdgroup_load(" << fa << ", " << tgAn << " + "
+           << (mi * 8 * K + ki * 8) << ", " << K << ");\n";
+        os << ind() << opFrag << " " << fb << ";\n";
+        os << ind() << "simdgroup_load(" << fb << ", " << tgBn << " + "
+           << (ki * 8 * N + ni * 8) << ", " << N << ");\n";
+        os << ind() << "simdgroup_multiply_accumulate(" << acc << ", " << fa
+           << ", " << fb << ", " << acc << ");\n";
+      }
+    };
+
+    // Register-resident C fusion. The disjoint staging geometry is identical to
+    // the per-dot path below; only the accumulator lifetime changes: the frags
+    // are declared/zeroed once (Decl), accumulated each K-slab (MMA, no tgC
+    // round-trip), then stored + gathered once (Readback, the same emitReadback
+    // as the per-dot path, so the #mma->scalar extraction is bit-identical).
+    if (fused) {
+      // Frags are indexed by per-warp slot, not global tile: every warp shares
+      // the same `fragsPerWarp` accumulator vars (the winner's layout), so a
+      // thread holds only its own tiles' registers instead of all nFrag. Warp
+      // w's slot j is global tile f = w + j*numWarps, which the store maps back
+      // to the exact tgC offset the per-dot disjoint path uses (bit-exact
+      // readback). Warps run their slots inside `if (warp == w)`.
+      int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
+      if (fusedDot.phase == FusedDotPhase::Decl) {
+        fusedDot.accNames.assign(fragsPerWarp, "");
+        for (int64_t j = 0; j < fragsPerWarp; ++j) {
+          std::string acc = fresh();
+          fusedDot.accNames[j] = acc;
+          os << ind() << accFrag << " " << acc << " = " << accFrag
+             << "(0.0f);\n";
+        }
+        return success();
+      }
+      if (fusedDot.phase == FusedDotPhase::MMA) {
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        if (!aInPlace)
+          for (int r = 0, n = regCount(op.getA()); r < n; ++r)
+            os << ind() << tgA << "[" << sliceFlatOffset(aTy, r) << "] = "
+               << aNames[r] << ";\n";
+        if (!bInPlace)
+          for (int r = 0, n = regCount(op.getB()); r < n; ++r)
+            os << ind() << tgB << "[" << sliceFlatOffset(bTy, r) << "] = "
+               << bNames[r] << ";\n";
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        for (int64_t w = 0; w < numWarps; ++w) {
+          os << ind() << "if (" << warpId << " == " << w << ") {\n";
+          ++indent;
+          for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
+            int64_t mi = f / nT, ni = f % nT;
+            emitFragMMAInto(tgA, tgB, mi, ni, fusedDot.accNames[j]);
+          }
+          --indent;
+          os << ind() << "}\n";
+        }
+        // Fence the A/B reads before the pipeliner's prefetch overwrites the
+        // (possibly same) staging slot for the next slab.
+        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        valMap[op.getResult()] = ids;
+        return success();
+      }
+      // Readback: store the persistent frags once, then gather exactly as the
+      // per-dot disjoint path does.
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int64_t w = 0; w < numWarps; ++w) {
+        os << ind() << "if (" << warpId << " == " << w << ") {\n";
+        ++indent;
+        for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
+          int64_t mi = f / nT, ni = f % nT;
+          os << ind() << "simdgroup_store(" << fusedDot.accNames[j] << ", "
+             << tgC << " + " << (mi * 8 * N + ni * 8) << ", " << N << ");\n";
+        }
+        --indent;
+        os << ind() << "}\n";
+      }
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      emitReadback(0, 0, M);
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      valMap[op.getResult()] = ids;
+      return success();
+    }
 
     // Per batch slice: stage the M×K / K×N operand slice into one reused pool
     // region, run the 8×8 fragment MMA over K, then read the M×N accumulator

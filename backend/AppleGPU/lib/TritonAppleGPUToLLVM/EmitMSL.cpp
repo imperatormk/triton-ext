@@ -18,6 +18,7 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include <map>
 #include <set>
 #include "llvm/Support/raw_ostream.h"
@@ -163,12 +164,17 @@ public:
           "  return x >= 0.0f ? r : -r;\n"
           "}\n\n";
 
+    llvm::DenseSet<StringRef> callTargets;
+    mod.walk([&](tt::CallOp call) {
+      callTargets.insert(call.getCalleeAttr().getValue());
+    });
+
     SmallVector<tt::FuncOp> devFuncs, kernels;
     for (auto func : mod.getOps<tt::FuncOp>()) {
-      if (func.isPublic())
-        kernels.push_back(func);
-      else
+      if (callTargets.contains(func.getSymName()))
         devFuncs.push_back(func);
+      else
+        kernels.push_back(func);
     }
 
     // MSL forbids declaring threadgroup memory in a non-kernel function, so a

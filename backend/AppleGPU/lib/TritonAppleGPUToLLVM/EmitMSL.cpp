@@ -19,6 +19,7 @@
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseMap.h"
 #include <map>
+#include <set>
 #include "llvm/Support/raw_ostream.h"
 
 #include <string>
@@ -1952,9 +1953,18 @@ private:
           key += std::to_string(coords[d]) + ",";
       return key;
     };
+    auto fullKey = [&](int reg) {
+      SmallVector<int32_t> coords = registerCoords(srcTy, reg);
+      std::string key;
+      for (int32_t c : coords)
+        key += std::to_string(c) + ",";
+      return key;
+    };
     std::map<std::string, SmallVector<int>> groups;
+    std::set<std::string> seenFull;
     for (int r = 0; r < nReg; ++r)
-      groups[survKey(r)].push_back(r);
+      if (seenFull.insert(fullKey(r)).second)
+        groups[survKey(r)].push_back(r);
 
     unsigned laneMask = reduceMask(ll, kLane, redDim);
     unsigned warpMask = reduceMask(ll, kWarp, redDim);

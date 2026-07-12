@@ -4080,7 +4080,9 @@ private:
         return success();
       }
       if (fusedDot.phase == FusedDotPhase::MMA) {
-        os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        bool stagesHere = !aInPlace || !bInPlace;
+        if (stagesHere)
+          os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
         if (!aInPlace)
           for (int r = 0, n = regCount(op.getA()); r < n; ++r)
             os << ind() << tgA << "[" << sliceFlatOffset(aTy, r) << "] = "
@@ -4090,15 +4092,66 @@ private:
             os << ind() << tgB << "[" << sliceFlatOffset(bTy, r) << "] = "
                << bNames[r] << ";\n";
         os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-        for (int64_t w = 0; w < numWarps; ++w) {
-          os << ind() << "if (" << warpId << " == " << w << ") {\n";
-          ++indent;
-          for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
-            int64_t mi = f / nT, ni = f % nT;
-            emitFragMMAInto(tgA, tgB, mi, ni, fusedDot.accNames[j]);
+        // Slot j of warp w owns global fragment f = w + j*numWarps; its tile
+        // coords are mi=f/nT, ni=f%nT. When numWarps == nT (one warp per N
+        // column strip), mi=j is a per-slot compile-time constant and ni=warpId,
+        // so every warp runs identical branchless code with warpId-derived
+        // offsets. Otherwise fall back to the per-warp `if` ladder.
+        bool branchless = (numWarps == nT);
+        auto aOff = [&](int64_t mi, int64_t ki) {
+          return std::to_string(mi * 8 * K + ki * 8);
+        };
+        auto bOff = [&](const std::string &niExpr, int64_t ki) {
+          return "(" + std::to_string(ki * 8 * N) + " + " + niExpr + " * 8)";
+        };
+        auto emitSlots =
+            [&](ArrayRef<std::pair<int64_t, std::string>> slots) {
+              for (int64_t ki = 0; ki < kT; ++ki) {
+                DenseMap<int64_t, std::string> aFrag;
+                DenseMap<StringRef, std::string> bFrag;
+                for (auto &[mi, niExpr] : slots) {
+                  if (!aFrag.count(mi)) {
+                    std::string fa = fresh();
+                    aFrag[mi] = fa;
+                    os << ind() << opFrag << " " << fa << ";\n";
+                    os << ind() << "simdgroup_load(" << fa << ", " << tgA << " + "
+                       << aOff(mi, ki) << ", " << K << ");\n";
+                  }
+                  if (!bFrag.count(niExpr)) {
+                    std::string fb = fresh();
+                    bFrag[niExpr] = fb;
+                    os << ind() << opFrag << " " << fb << ";\n";
+                    os << ind() << "simdgroup_load(" << fb << ", " << tgB << " + "
+                       << bOff(niExpr, ki) << ", " << N << ");\n";
+                  }
+                }
+                for (auto [j, mn] : llvm::enumerate(slots)) {
+                  const std::string &acc = fusedDot.accNames[j];
+                  os << ind() << "simdgroup_multiply_accumulate(" << acc << ", "
+                     << aFrag[mn.first] << ", " << bFrag[mn.second] << ", " << acc
+                     << ");\n";
+                }
+              }
+            };
+        if (branchless) {
+          std::string niExpr = "(" + warpId + " % " + std::to_string(nT) + ")";
+          SmallVector<std::pair<int64_t, std::string>> slots;
+          for (int64_t j = 0; j * numWarps < nFrag; ++j) {
+            int64_t base = j * numWarps;
+            slots.push_back({base / nT, niExpr});
           }
-          --indent;
-          os << ind() << "}\n";
+          emitSlots(slots);
+        } else {
+          for (int64_t w = 0; w < numWarps; ++w) {
+            os << ind() << "if (" << warpId << " == " << w << ") {\n";
+            ++indent;
+            SmallVector<std::pair<int64_t, std::string>> slots;
+            for (int64_t f = w; f < nFrag; f += numWarps)
+              slots.push_back({f / nT, std::to_string(f % nT)});
+            emitSlots(slots);
+            --indent;
+            os << ind() << "}\n";
+          }
         }
         // Fence the A/B reads before the pipeliner's prefetch overwrites the
         // (possibly same) staging slot for the next slab.

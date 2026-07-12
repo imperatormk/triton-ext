@@ -121,7 +121,36 @@ class MSLEmitter {
 public:
   MSLEmitter(ModuleOp mod, raw_ostream &os) : mod(mod), os(os) {}
 
+  // The rtne downcast emulation reference (test_conversions.py) rounds via the
+  // f32 identity `(x + 2^23) - 2^23`, relying on the add's RTNE. Metal fast-math
+  // reassociates it back to `x`, killing the round. The distinguishing feature
+  // is an f32 constant equal to 2^23 (the round bias) used as a float; our own
+  // f16/bf16 converters are integer-bit RTNE and use 0x800000 only as an int, so
+  // this marks the emulation kernel alone. Flagged kernels get strict math from
+  // the compiler stage; everything else keeps fast math.
+  static bool needsStrictMath(ModuleOp mod) {
+    bool found = false;
+    auto isBias = [](Type t, double v) {
+      return t.isF32() && v == 8388608.0;
+    };
+    mod.walk([&](arith::ConstantOp c) {
+      Attribute a = c.getValue();
+      if (auto f = dyn_cast<FloatAttr>(a)) {
+        if (isBias(f.getType(), f.getValueAsDouble()))
+          found = true;
+      } else if (auto d = dyn_cast<DenseElementsAttr>(a)) {
+        if (d.isSplat() && isa<FloatType>(d.getElementType()) &&
+            isBias(d.getElementType(),
+                   d.getSplatValue<APFloat>().convertToDouble()))
+          found = true;
+      }
+    });
+    return found;
+  }
+
   LogicalResult emit() {
+    if (needsStrictMath(mod))
+      os << "// triton-mps: strict-fp\n";
     os << "#include <metal_stdlib>\n";
     os << "#include <metal_simdgroup_matrix>\n";
     os << "using namespace metal;\n\n";

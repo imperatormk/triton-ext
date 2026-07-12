@@ -338,9 +338,13 @@ class MPSBackend(BaseBackend):
             f.write(msl.encode())
         air_path = src_path + '.air'
         lib_path = src_path + '.metallib'
+        # Default fast math; strict IEEE rounding is scoped to the kernels the
+        # emitter marks (rtne emulation reference relies on non-reassociated FP).
+        math_flags = (['-fmetal-math-mode=safe']
+                      if 'triton-mps: strict-fp' in msl else [])
         try:
             subprocess.run(
-                ['xcrun', '-sdk', 'macosx', 'metal', '-fmetal-math-mode=safe',
+                ['xcrun', '-sdk', 'macosx', 'metal', *math_flags,
                  '-c', src_path, '-o', air_path],
                 check=True, capture_output=True)
             subprocess.run(

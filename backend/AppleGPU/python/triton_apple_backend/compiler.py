@@ -280,8 +280,12 @@ class MPSBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         # Software pipeliner: multi-buffer loads, lowered to
-        # air.simdgroup_async_copy_2d (hardware DMA).
-        if options.num_stages > 1:
+        # air.simdgroup_async_copy_2d (hardware DMA). The MSL path has no async
+        # copy (staging lowers to a synchronous threadgroup copy), so the
+        # multi-buffer pipeline only adds staging, barriers and slot rotation
+        # with no overlap benefit; skip it and stay single-buffered.
+        msl_path = bool(os.environ.get('TRITON_MPS_EMIT_MSL_MLIR'))
+        if options.num_stages > 1 and not msl_path:
             passes.ttgpuir.add_assign_latencies(pm, options.num_stages)
             passes.ttgpuir.add_schedule_loops(pm)
             passes.ttgpuir.add_pipeline(pm, options.num_stages, False)

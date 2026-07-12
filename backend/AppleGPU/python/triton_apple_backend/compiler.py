@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm
@@ -48,6 +49,13 @@ def _air_triple(os_major: int) -> str:
 
 # Libdevice patching: see _LibdevicePatchFinder in __init__.py
 _plugin = getattr(passes, 'plugin', None)
+
+# EmitMSL hands its output path to the C++ pass through the process-global
+# TRITON_MSL_OUT env var. Inductor autotuning precompiles choices on a thread
+# pool, so two concurrent make_msl calls would race that global and one would
+# read the other's path, leaving its own metallib empty ("no kernel void").
+# Serialize the env-var critical section.
+_msl_out_lock = threading.Lock()
 
 
 def _pmaybe_enable_debug(pm):
@@ -307,16 +315,17 @@ class MPSBackend(BaseBackend):
             msl_path = f.name
         pm = ir.pass_manager(mod.context)
         _pmaybe_enable_debug(pm)
-        old = os.environ.get('TRITON_MSL_OUT')
-        os.environ['TRITON_MSL_OUT'] = msl_path
-        try:
-            _plugin.add_emit_msl(pm)
-            pm.run(mod, 'make_msl')
-        finally:
-            if old is None:
-                os.environ.pop('TRITON_MSL_OUT', None)
-            else:
-                os.environ['TRITON_MSL_OUT'] = old
+        with _msl_out_lock:
+            old = os.environ.get('TRITON_MSL_OUT')
+            os.environ['TRITON_MSL_OUT'] = msl_path
+            try:
+                _plugin.add_emit_msl(pm)
+                pm.run(mod, 'make_msl')
+            finally:
+                if old is None:
+                    os.environ.pop('TRITON_MSL_OUT', None)
+                else:
+                    os.environ['TRITON_MSL_OUT'] = old
         with open(msl_path, 'r') as f:
             msl = f.read()
         os.unlink(msl_path)

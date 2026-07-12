@@ -2062,9 +2062,9 @@ private:
     }
 
     std::string iv = fresh();
-    const std::string &lo = names(op.getLowerBound())[0];
-    const std::string &hi = names(op.getUpperBound())[0];
-    const std::string &st = names(op.getStep())[0];
+    std::string lo = names(op.getLowerBound())[0];
+    std::string hi = names(op.getUpperBound())[0];
+    std::string st = names(op.getStep())[0];
     bindScalar(op.getInductionVar(), iv);
     std::string ivTy = mslScalarType(op.getInductionVar().getType());
     if (ivTy.empty())
@@ -2124,9 +2124,9 @@ private:
       return failure();
 
     std::string iv = fresh();
-    const std::string &lo = names(op.getLowerBound())[0];
-    const std::string &hi = names(op.getUpperBound())[0];
-    const std::string &st = names(op.getStep())[0];
+    std::string lo = names(op.getLowerBound())[0];
+    std::string hi = names(op.getUpperBound())[0];
+    std::string st = names(op.getStep())[0];
     bindScalar(op.getInductionVar(), iv);
     std::string ivTy = mslScalarType(op.getInductionVar().getType());
     if (ivTy.empty())

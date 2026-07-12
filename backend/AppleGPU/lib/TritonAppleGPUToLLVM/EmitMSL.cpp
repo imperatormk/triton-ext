@@ -5241,10 +5241,7 @@ private:
       if (!uniform && laneFree) {
         std::string src = "(uint)(" + laneId + " & " +
                           std::to_string(~laneFree & 31) + ")";
-        std::string bc = fresh();
-        os << ind() << sc << " " << bc << " = simd_shuffle(" << id << ", "
-           << src << ");\n";
-        id = bc;
+        id = emitShuffle("simd_shuffle", sc, id, src);
       }
       ids[r] = id;
     }

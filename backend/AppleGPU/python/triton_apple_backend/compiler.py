@@ -340,8 +340,9 @@ class MPSBackend(BaseBackend):
         lib_path = src_path + '.metallib'
         try:
             subprocess.run(
-                ['xcrun', '-sdk', 'macosx', 'metal', '-c', src_path, '-o',
-                 air_path], check=True, capture_output=True)
+                ['xcrun', '-sdk', 'macosx', 'metal', '-fmetal-math-mode=safe',
+                 '-c', src_path, '-o', air_path],
+                check=True, capture_output=True)
             subprocess.run(
                 ['xcrun', '-sdk', 'macosx', 'metallib', air_path, '-o',
                  lib_path], check=True, capture_output=True)

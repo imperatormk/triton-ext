@@ -179,6 +179,7 @@ class MPSOptions:
     allowed_dot_input_precisions: tuple = ("ieee", )
     default_dot_input_precision: str = "ieee"
     supported_fp8_dtypes: tuple = ()
+    extern_libs: tuple = ()
 
     def hash(self):
         return hashlib.md5(str(self.__dict__).encode()).hexdigest()

@@ -672,14 +672,33 @@ private:
   // iteration, no tgC round-trip), PhaseReadback stores the fragments and
   // gathers the #mma->scalar result (once, post-loop).
   enum class FusedDotPhase { None, Decl, MMA, Readback };
+  // When the fused GEMM accumulator flows only into a terminal row-major
+  // tt.store, the readback stores the accumulator fragments straight to device
+  // memory (skipping the threadgroup pool round-trip and the swizzled scalar
+  // gather). Populated when matchDirectStore succeeds; empty otherwise.
+  struct DirectStore {
+    tt::StoreOp store;
+    Value basePtr; // C matrix base pointer (scalar kernel arg)
+    Value ldc;     // row stride (scalar), col stride is 1 (row-major)
+    Value rowBase; // global row of the tile's top-left element (scalar)
+    Value colBase; // global col of the tile's top-left element (scalar)
+    Value boundM;  // store-mask row bound, or null when unmasked
+    Value boundN;  // store-mask col bound, or null when unmasked
+    std::string fullTileVar; // runtime "whole tile in bounds" predicate
+  };
   struct FusedDotCtx {
     FusedDotPhase phase = FusedDotPhase::None;
     SmallVector<std::string> accNames;
     SmallVector<std::string> ids;
     SmallVector<std::string> baseNames;
     std::string tgA, tgB, tgC;
+    std::optional<DirectStore> direct;
   };
   FusedDotCtx fusedDot;
+  // Terminal stores the fused readback already wrote directly to device (keyed
+  // by op), each with the runtime predicate under which it did so. emitStore
+  // guards the store on the negation to avoid a double write.
+  DenseMap<Operation *, std::string> directStoreHandled;
 
   static bool tracesToKernelArg(Value v) {
     while (v) {
@@ -701,6 +720,165 @@ private:
       return false;
     }
     return false;
+  }
+
+  static Value peelBroadcastExpand(Value v) {
+    while (v) {
+      Operation *def = v.getDefiningOp();
+      if (auto b = dyn_cast_or_null<tt::BroadcastOp>(def)) {
+        v = b.getSrc();
+        continue;
+      }
+      if (auto e = dyn_cast_or_null<tt::ExpandDimsOp>(def)) {
+        v = e.getSrc();
+        continue;
+      }
+      return v;
+    }
+    return v;
+  }
+
+  // A per-tile index `pidBase*TILE + iota` where iota is a 0-based make_range.
+  // Returns the scalar tile-base value (pidBase*TILE) or null.
+  static Value matchTileIndex(Value v) {
+    v = peelBroadcastExpand(v);
+    auto add = dyn_cast_or_null<arith::AddIOp>(v.getDefiningOp());
+    if (!add)
+      return Value();
+    Value a = peelBroadcastExpand(add.getLhs());
+    Value b = peelBroadcastExpand(add.getRhs());
+    auto isIota = [](Value x) {
+      auto sp = dyn_cast_or_null<tt::SplatOp>(x.getDefiningOp());
+      Value base = sp ? sp.getSrc() : x;
+      auto mr = dyn_cast_or_null<tt::MakeRangeOp>(
+          peelBroadcastExpand(base).getDefiningOp());
+      return mr && mr.getStart() == 0;
+    };
+    auto splatScalar = [](Value x) -> Value {
+      auto sp = dyn_cast_or_null<tt::SplatOp>(x.getDefiningOp());
+      return sp ? sp.getSrc() : Value();
+    };
+    if (isIota(b))
+      if (Value s = splatScalar(a))
+        return s;
+    if (isIota(a))
+      if (Value s = splatScalar(b))
+        return s;
+    return Value();
+  }
+
+  // Split an addptr offset `add(rowTerm, colTerm)` into (rowBase, ldc, colBase)
+  // where rowTerm = broadcast(rowIdx * splat(ldc)) and colTerm =
+  // broadcast(colIdx), each index a per-tile `base + iota`. ldc must be a
+  // scalar (loop-invariant); col stride is the implicit 1 of row-major.
+  bool matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
+                           Value &colBase) {
+    auto add = dyn_cast_or_null<arith::AddIOp>(off.getDefiningOp());
+    if (!add)
+      return false;
+    auto tryTerm = [&](Value rowT, Value colT) {
+      Value cb = matchTileIndex(colT);
+      if (!cb)
+        return false;
+      Value rowScaled = peelBroadcastExpand(rowT);
+      auto mul = dyn_cast_or_null<arith::MulIOp>(rowScaled.getDefiningOp());
+      if (!mul)
+        return false;
+      auto scalarSrc = [](Value x) -> Value {
+        auto sp = dyn_cast_or_null<tt::SplatOp>(
+            peelBroadcastExpand(x).getDefiningOp());
+        return sp ? sp.getSrc() : Value();
+      };
+      Value rIdxA = mul.getLhs(), rIdxB = mul.getRhs();
+      Value rb = matchTileIndex(rIdxA);
+      Value stride = scalarSrc(rIdxB);
+      if (!rb || !stride) {
+        rb = matchTileIndex(rIdxB);
+        stride = scalarSrc(rIdxA);
+      }
+      if (!rb || !stride)
+        return false;
+      rowBase = rb;
+      ldc = stride;
+      colBase = cb;
+      return true;
+    };
+    return tryTerm(add.getLhs(), add.getRhs()) ||
+           tryTerm(add.getRhs(), add.getLhs());
+  }
+
+  // The store boundary mask `(row < boundM) && (col < boundN)`, with row/col the
+  // same per-tile indices as the address. Extracts the two scalar bounds.
+  bool matchBoundaryMask(Value m, Value &boundM, Value &boundN) {
+    auto conj = dyn_cast_or_null<arith::AndIOp>(m.getDefiningOp());
+    if (!conj)
+      return false;
+    auto cmpBound = [&](Value side, bool wantRow) -> Value {
+      Value c = peelBroadcastExpand(side);
+      auto cmp = dyn_cast_or_null<arith::CmpIOp>(c.getDefiningOp());
+      if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt)
+        return Value();
+      if (!matchTileIndex(cmp.getLhs()))
+        return Value();
+      auto sp = dyn_cast_or_null<tt::SplatOp>(
+          peelBroadcastExpand(cmp.getRhs()).getDefiningOp());
+      return sp ? sp.getSrc() : Value();
+    };
+    if (Value bm = cmpBound(conj.getLhs(), true))
+      if (Value bn = cmpBound(conj.getRhs(), false)) {
+        boundM = bm;
+        boundN = bn;
+        return true;
+      }
+    if (Value bm = cmpBound(conj.getRhs(), true))
+      if (Value bn = cmpBound(conj.getLhs(), false)) {
+        boundM = bm;
+        boundN = bn;
+        return true;
+      }
+    return false;
+  }
+
+  // Recognise `acc(#mma) -> convert_layout -> tt.store(rowmajor)` as the sole
+  // consumer of the fused accumulator. Only an f32->f32 store through a single
+  // convert_layout is taken; anything else (dtype cast, reduction, second dot,
+  // extra users) falls back to the pool readback. Fills `ds` on success.
+  bool matchDirectStore(Value forResult, DirectStore &ds) {
+    if (getenv("MSL_NO_DIRECT_STORE"))
+      return false;
+    if (!forResult.hasOneUse())
+      return false;
+    auto cvt = dyn_cast<ttg::ConvertLayoutOp>(*forResult.user_begin());
+    if (!cvt || !cvt.getResult().hasOneUse())
+      return false;
+    auto store = dyn_cast<tt::StoreOp>(*cvt.getResult().user_begin());
+    if (!store || store.getValue() != cvt.getResult())
+      return false;
+    auto cTy = dyn_cast<RankedTensorType>(cvt.getResult().getType());
+    if (!cTy || !cTy.getElementType().isF32())
+      return false;
+    auto ptr = dyn_cast_or_null<tt::AddPtrOp>(store.getPtr().getDefiningOp());
+    if (!ptr)
+      return false;
+    auto splat = dyn_cast_or_null<tt::SplatOp>(ptr.getPtr().getDefiningOp());
+    if (!splat || !isa<BlockArgument>(splat.getSrc()))
+      return false;
+    Value rowBase, ldc, colBase;
+    if (!matchRowMajorOffset(ptr.getOffset(), rowBase, ldc, colBase))
+      return false;
+    Value boundM, boundN;
+    if (store.getMask()) {
+      if (!matchBoundaryMask(store.getMask(), boundM, boundN))
+        return false;
+    }
+    ds.store = store;
+    ds.basePtr = splat.getSrc();
+    ds.ldc = ldc;
+    ds.rowBase = rowBase;
+    ds.colBase = colBase;
+    ds.boundM = boundM;
+    ds.boundN = boundN;
+    return true;
   }
 
   // Build the MSL offset expression for register `reg` of a distributed 1-D
@@ -1889,6 +2067,23 @@ private:
     }
     --indent;
     os << ind() << "}\n";
+
+    DirectStore ds;
+    if (matchDirectStore(op.getResult(iterIdx), ds)) {
+      int64_t M = cast<RankedTensorType>(dot.getResult().getType()).getShape()[0];
+      int64_t N = cast<RankedTensorType>(dot.getResult().getType()).getShape()[1];
+      std::string ft = fresh();
+      ds.fullTileVar = ft;
+      std::string cond = "true";
+      if (ds.boundM) {
+        cond = "(" + names(ds.rowBase)[0] + " + " + std::to_string(M) +
+               " <= " + names(ds.boundM)[0] + " && " + names(ds.colBase)[0] +
+               " + " + std::to_string(N) + " <= " + names(ds.boundN)[0] + ")";
+      }
+      os << ind() << "bool " << ft << " = " << cond << ";\n";
+      fusedDot.direct = ds;
+      directStoreHandled[ds.store.getOperation()] = ft;
+    }
 
     fusedDot.phase = FusedDotPhase::Readback;
     if (failed(emitDot(dot)))
@@ -4159,8 +4354,32 @@ private:
         valMap[op.getResult()] = ids;
         return success();
       }
-      // Readback: store the persistent frags once, then gather exactly as the
-      // per-dot disjoint path does.
+      // Readback. When the accumulator flows only into a terminal row-major
+      // store and the whole tile is in bounds, scatter each fragment straight
+      // to device C (no pool, no swizzled gather). Otherwise (ragged tile, or
+      // no direct-store match) fall back to the pool store + gather.
+      if (fusedDot.direct) {
+        const DirectStore &d = *fusedDot.direct;
+        std::string base = names(d.basePtr)[0], ldc = names(d.ldc)[0];
+        std::string rowB = names(d.rowBase)[0], colB = names(d.colBase)[0];
+        os << ind() << "if (" << d.fullTileVar << ") {\n";
+        ++indent;
+        for (int64_t w = 0; w < numWarps; ++w) {
+          os << ind() << "if (" << warpId << " == " << w << ") {\n";
+          ++indent;
+          for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
+            int64_t mi = f / nT, ni = f % nT;
+            os << ind() << "simdgroup_store(" << fusedDot.accNames[j] << ", "
+               << base << " + (" << rowB << " + " << (mi * 8) << ") * " << ldc
+               << " + (" << colB << " + " << (ni * 8) << "), " << ldc << ");\n";
+          }
+          --indent;
+          os << ind() << "}\n";
+        }
+        --indent;
+        os << ind() << "} else {\n";
+        ++indent;
+      }
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       for (int64_t w = 0; w < numWarps; ++w) {
         os << ind() << "if (" << warpId << " == " << w << ") {\n";
@@ -4176,6 +4395,10 @@ private:
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       emitReadback(0, 0, M);
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      if (fusedDot.direct) {
+        --indent;
+        os << ind() << "}\n";
+      }
       valMap[op.getResult()] = ids;
       return success();
     }
@@ -4425,6 +4648,19 @@ private:
   }
 
   LogicalResult emitStore(tt::StoreOp op) {
+    auto handled = directStoreHandled.find(op.getOperation());
+    if (handled != directStoreHandled.end()) {
+      os << ind() << "if (!" << handled->second << ") {\n";
+      ++indent;
+      LogicalResult r = emitStoreBody(op);
+      --indent;
+      os << ind() << "}\n";
+      return r;
+    }
+    return emitStoreBody(op);
+  }
+
+  LogicalResult emitStoreBody(tt::StoreOp op) {
     auto &ptrs = names(op.getPtr());
     auto &vals = names(op.getValue());
     bool hasMask = op.getMask() != nullptr;

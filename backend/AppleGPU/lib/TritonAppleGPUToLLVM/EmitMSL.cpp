@@ -3965,14 +3965,8 @@ private:
       return nullptr;
     if (dotOperandLocalLoad(operand, st.getShape()[0], st.getShape()[1]))
       return nullptr;
-    auto aTy = cast<RankedTensorType>(d.getA().getType());
     auto cTy = cast<RankedTensorType>(d.getResult().getType());
     if (cTy.getRank() != 2)
-      return nullptr;
-    int64_t M = cTy.getShape()[0], N = cTy.getShape()[1];
-    int64_t K = aTy.getShape()[1];
-    int64_t elemBytes = bitsOf(aTy.getElementType()) / 8;
-    if (dotNeedsPanel(M, N, K, elemBytes, 4))
       return nullptr;
     return src;
   }
@@ -4203,10 +4197,10 @@ private:
       dotPanelDims(M, N, K, elemBytes, accBytes, mp, np);
       int64_t aPanelBytes = mp * K * elemBytes;
       int64_t bPanelBytes = K * np * elemBytes;
-      tt::LinearLayout aLL = ttg::toLinearLayout(aTy);
+      tt::LinearLayout aLL = ttg::toLinearLayout(aStageTy);
       auto aOut = llvm::to_vector(aLL.getOutDimNames());
       StringAttr aRowDim = aOut[rank - 2], aColDim = aOut[rank - 1];
-      tt::LinearLayout bLL = ttg::toLinearLayout(bTy);
+      tt::LinearLayout bLL = ttg::toLinearLayout(bStageTy);
       auto bOut = llvm::to_vector(bLL.getOutDimNames());
       StringAttr bColDim = bOut[rank - 1], bRowDim = bOut[rank - 2];
 
@@ -4218,7 +4212,7 @@ private:
       os << ind() << "threadgroup float* " << pC << " = "
          << poolRegion(aPanelBytes + bPanelBytes, "float") << ";\n";
 
-      int nARegs = regCount(op.getA()), nBRegs = regCount(op.getB());
+      int nARegs = regCount(aStage), nBRegs = regCount(bStage);
       for (int64_t bi = 0; bi < B; ++bi) {
         for (int64_t m0 = 0; m0 < M; m0 += mp) {
           int64_t m1 = std::min<int64_t>(m0 + mp, M);
@@ -4226,12 +4220,12 @@ private:
 
           os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
           for (int r = 0; r < nARegs; ++r) {
-            std::string row = layoutCoordExpr(aTy, r, aRowDim);
-            std::string col = layoutCoordExpr(aTy, r, aColDim);
+            std::string row = layoutCoordExpr(aStageTy, r, aRowDim);
+            std::string col = layoutCoordExpr(aStageTy, r, aColDim);
             std::string guard = "(" + row + " >= " + std::to_string(m0) +
                                 " && " + row + " < " + std::to_string(m1) + ")";
             if (rank == 3)
-              guard = "(" + batchCoordExpr(aTy, r) + " == " +
+              guard = "(" + batchCoordExpr(aStageTy, r) + " == " +
                       std::to_string(bi) + " && " + guard + ")";
             std::string off = "((" + row + " - " + std::to_string(m0) +
                               ") * " + std::to_string(K) + " + " + col + ")";
@@ -4246,13 +4240,13 @@ private:
 
             os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
             for (int r = 0; r < nBRegs; ++r) {
-              std::string col = layoutCoordExpr(bTy, r, bColDim);
-              std::string row = layoutCoordExpr(bTy, r, bRowDim);
+              std::string col = layoutCoordExpr(bStageTy, r, bColDim);
+              std::string row = layoutCoordExpr(bStageTy, r, bRowDim);
               std::string guard = "(" + col + " >= " + std::to_string(n0) +
                                   " && " + col + " < " + std::to_string(n1) +
                                   ")";
               if (rank == 3)
-                guard = "(" + batchCoordExpr(bTy, r) + " == " +
+                guard = "(" + batchCoordExpr(bStageTy, r) + " == " +
                         std::to_string(bi) + " && " + guard + ")";
               std::string off = "(" + row + " * " + std::to_string(npCur) +
                                 " + (" + col + " - " + std::to_string(n0) +

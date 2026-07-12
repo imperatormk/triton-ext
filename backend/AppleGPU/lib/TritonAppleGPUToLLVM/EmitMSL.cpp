@@ -178,6 +178,7 @@ private:
   struct MemDescInfo {
     std::string buf;
     std::string baseOffset;
+    SmallVector<int64_t> bufStrides;
   };
   llvm::DenseMap<Value, MemDescInfo> memdescMap;
 
@@ -824,6 +825,8 @@ private:
       return emitLocalAlloc(a);
     if (auto i = dyn_cast<ttg::MemDescIndexOp>(op))
       return emitMemDescIndex(i);
+    if (auto s = dyn_cast<ttg::MemDescSubsliceOp>(op))
+      return emitMemDescSubslice(s);
     if (auto c = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op))
       return emitAsyncCopy(c);
     if (auto l = dyn_cast<ttg::LocalStoreOp>(op))
@@ -3214,9 +3217,59 @@ private:
     return success();
   }
 
+  LogicalResult emitMemDescSubslice(ttg::MemDescSubsliceOp op) {
+    auto srcMt = cast<ttg::MemDescType>(op.getSrc().getType());
+    MemDescInfo parent = memdescMap[op.getSrc()];
+    ArrayRef<int64_t> srcShape = srcMt.getShape();
+    ArrayRef<int32_t> offsets = op.getOffsets();
+    if (offsets.size() != srcShape.size())
+      return op.emitError("EmitMSL: memdesc_subslice rank mismatch");
+
+    SmallVector<int64_t> strides(srcShape.size());
+    if (!parent.bufStrides.empty()) {
+      strides.assign(parent.bufStrides.begin(), parent.bufStrides.end());
+    } else {
+      int64_t s = 1;
+      for (int d = (int)srcShape.size() - 1; d >= 0; --d) {
+        strides[d] = s;
+        s *= srcShape[d];
+      }
+    }
+
+    int64_t constOff = 0;
+    for (int d = 0; d < (int)offsets.size(); ++d)
+      constOff += (int64_t)offsets[d] * strides[d];
+
+    std::string base;
+    if (parent.baseOffset == "0")
+      base = std::to_string(constOff);
+    else
+      base = constOff == 0 ? parent.baseOffset
+                           : ("(" + parent.baseOffset + " + " +
+                              std::to_string(constOff) + ")");
+
+    memdescMap[op.getResult()] = {parent.buf, base, strides};
+    return success();
+  }
+
   std::string memdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
                               int reg) {
-    std::string off = flatTileOffset(tileTy, reg);
+    std::string off;
+    if (info.bufStrides.empty()) {
+      off = flatTileOffset(tileTy, reg);
+    } else {
+      tt::LinearLayout ll = ttg::toLinearLayout(tileTy);
+      auto outNames = llvm::to_vector(ll.getOutDimNames());
+      for (int d = 0; d < (int)outNames.size(); ++d) {
+        std::string c = layoutCoordExpr(tileTy, reg, outNames[d]);
+        int64_t s = info.bufStrides[d];
+        std::string term =
+            s == 1 ? c : ("(" + c + " * " + std::to_string(s) + ")");
+        off = off.empty() ? term : ("(" + off + " + " + term + ")");
+      }
+      if (off.empty())
+        off = "0";
+    }
     if (info.baseOffset == "0")
       return off;
     return "(" + info.baseOffset + " + " + off + ")";

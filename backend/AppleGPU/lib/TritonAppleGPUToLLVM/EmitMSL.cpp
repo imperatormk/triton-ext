@@ -2605,7 +2605,10 @@ private:
   std::string cfgState;
 
   static int64_t bitsOf(Type t) {
-    return isa<tt::PointerType>(t) ? 64 : t.getIntOrFloatBitWidth();
+    if (isa<tt::PointerType>(t))
+      return 64;
+    int64_t bits = t.getIntOrFloatBitWidth();
+    return bits == 1 ? 8 : bits;
   }
 
   std::string poolRegion(int64_t byteOffset, StringRef sc) {

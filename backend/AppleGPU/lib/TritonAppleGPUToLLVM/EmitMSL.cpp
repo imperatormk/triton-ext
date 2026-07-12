@@ -3599,6 +3599,10 @@ private:
   }
 
   LogicalResult emitLocalLoad(ttg::LocalLoadOp op) {
+    if (localLoadIsDeadDotStage(op)) {
+      valMap[op.getResult()] = SmallVector<std::string>{};
+      return success();
+    }
     auto resTy = cast<RankedTensorType>(op.getResult().getType());
     MemDescInfo src = memdescMap[op.getSrc()];
     std::string sc = mslScalarType(resTy.getElementType());
@@ -3673,6 +3677,23 @@ private:
     for (OpOperand &use : c.getResult().getUses()) {
       auto d = dyn_cast<tt::DotOp>(use.getOwner());
       if (!d || !dotReadsOperandInPlace(d, c.getResult()))
+        return false;
+    }
+    return true;
+  }
+
+  static bool localLoadIsDeadDotStage(ttg::LocalLoadOp ll) {
+    if (ll.getResult().use_empty())
+      return false;
+    for (OpOperand &use : ll.getResult().getUses()) {
+      Operation *owner = use.getOwner();
+      if (auto c = dyn_cast<ttg::ConvertLayoutOp>(owner)) {
+        if (!convertLayoutIsDeadDotStage(c))
+          return false;
+        continue;
+      }
+      auto d = dyn_cast<tt::DotOp>(owner);
+      if (!d || !dotReadsOperandInPlace(d, ll.getResult()))
         return false;
     }
     return true;

@@ -148,6 +148,12 @@ public:
     globalPoolBytes = 0;
     for (auto func : mod.getOps<tt::FuncOp>()) {
       poolBytes = 0;
+      liveTgBytes = 0;
+      func.walk([&](ttg::LocalAllocOp la) {
+        auto mt = cast<ttg::MemDescType>(la.getResult().getType());
+        liveTgBytes += memdescFlatSize(mt) *
+                       (bitsOf(mt.getElementType()) / 8);
+      });
       for (Block &blk : func.getBody())
         for (Operation &op : blk)
           scanPool(&op);
@@ -310,6 +316,11 @@ private:
     });
 
     poolBytes = 0;
+    liveTgBytes = 0;
+    func.walk([&](ttg::LocalAllocOp la) {
+      auto mt = cast<ttg::MemDescType>(la.getResult().getType());
+      liveTgBytes += memdescFlatSize(mt) * (bitsOf(mt.getElementType()) / 8);
+    });
     for (Block &blk : func.getBody())
       for (Operation &op : blk)
         scanPool(&op);
@@ -2643,7 +2654,15 @@ private:
   std::string poolBuf;
   int64_t poolBytes = 0;
   int64_t globalPoolBytes = 0;
+  int64_t liveTgBytes = 0;
   bool moduleHasDevFuncs = false;
+
+  // Threadgroup budget left for the reused pool after the always-live
+  // local_alloc buffers, which coexist with the pool in kernel scope.
+  int64_t poolBudget() const {
+    int64_t b = 32768 - liveTgBytes;
+    return b < 0 ? 0 : b;
+  }
 
   llvm::DenseMap<Block *, std::string> blockLabel;
   std::string cfgState;
@@ -2665,8 +2684,9 @@ private:
 
   // Elements per band for a threadgroup-staged reshape whose full tile exceeds
   // the 32KB budget: the largest chunk of flat offsets that fits.
-  static int64_t reshapeBandElems(int64_t totalElems, int64_t elemBytes) {
-    int64_t cap = 32768 / elemBytes;
+  static int64_t reshapeBandElems(int64_t totalElems, int64_t elemBytes,
+                                  int64_t budget = 32768) {
+    int64_t cap = budget / elemBytes;
     if (cap < 1)
       cap = 1;
     int64_t nBands = (totalElems + cap - 1) / cap;
@@ -2684,19 +2704,22 @@ private:
   // Peak byte footprint of a single transient scratch site.
   void scanPool(Operation *op) {
     if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+      if (convertLayoutIsDeadDotStage(c))
+        return;
       auto st = cast<RankedTensorType>(c.getSrc().getType());
       Type e = st.getElementType();
       int64_t elemBytes = bitsOf(e) / 8;
       int64_t bytes = tileSize(st) * elemBytes;
       int rk = st.getRank();
-      if (bytes > 32768 && rk >= 2) {
+      int64_t cap = poolBudget();
+      if (bytes > cap && rk >= 2) {
         int64_t N = st.getShape()[rk - 1];
-        int64_t bandRows = 32768 / (N * elemBytes);
+        int64_t bandRows = cap / (N * elemBytes);
         if (bandRows < 1)
           bandRows = 1;
         bytes = bandRows * N * elemBytes;
-      } else if (bytes > 32768) {
-        bytes = reshapeBandElems(tileSize(st), elemBytes) * elemBytes;
+      } else if (bytes > cap) {
+        bytes = reshapeBandElems(tileSize(st), elemBytes, cap) * elemBytes;
       }
       poolBytes = std::max(poolBytes, bytes);
     } else if (auto t = dyn_cast<tt::TransOp>(op)) {
@@ -2731,23 +2754,33 @@ private:
       int64_t M = cTy.getShape()[rk - 2];
       int64_t N = cTy.getShape()[rk - 1];
       int64_t Kd = aTy.getShape()[rk - 1];
-      int64_t ab = M * Kd * (bitsOf(aTy.getElementType()) / 8) +
-                   Kd * N * (bitsOf(bTy.getElementType()) / 8);
+      int64_t aBy = M * Kd * (bitsOf(aTy.getElementType()) / 8);
+      int64_t bBy = Kd * N * (bitsOf(bTy.getElementType()) / 8);
       Type cE = cTy.getElementType();
-      int64_t need = ab;
-      if (!isa<IntegerType>(cE)) {
+      int64_t need;
+      if (isa<IntegerType>(cE)) {
+        need = aBy + bBy;
+      } else {
         int64_t accBytes = 4;
-        int64_t cFull = M * N * accBytes;
         int64_t elemBytes = bitsOf(aTy.getElementType()) / 8;
-        if (dotNeedsPanel(M, N, Kd, elemBytes, accBytes)) {
+        int64_t stagedA = aBy, stagedB = bBy;
+        if (rk == 2 && aBy + bBy <= 32768) {
+          if (dotOperandLocalLoad(d.getA(), M, Kd))
+            stagedA = 0;
+          if (dotOperandLocalLoad(d.getB(), Kd, N))
+            stagedB = 0;
+        }
+        int64_t stagedAB = stagedA + stagedB;
+        int64_t cFull = M * N * accBytes;
+        if (stagedAB == aBy + bBy && dotNeedsPanel(M, N, Kd, elemBytes, accBytes)) {
           int64_t mp, np;
           dotPanelDims(M, N, Kd, elemBytes, accBytes, mp, np);
           need = mp * Kd * elemBytes + Kd * np * elemBytes + mp * np * accBytes;
-        } else if (ab + cFull <= 32768) {
-          need = ab + cFull;
+        } else if (stagedAB + cFull <= poolBudget()) {
+          need = stagedAB + cFull;
         } else {
-          int64_t band = dotCBandRows(M, N, ab, accBytes);
-          need = std::max(ab, band * N * accBytes);
+          int64_t band = dotCBandRows(M, N, poolBudget(), accBytes);
+          need = std::max(stagedAB, band * N * accBytes);
         }
       }
       poolBytes = std::max(poolBytes, need);
@@ -3075,6 +3108,10 @@ private:
   // then reads its destination registers back from the same offsets. Correct
   // for arbitrary distributed src/dst layouts (moves data across lanes/warps).
   LogicalResult emitConvertLayout(ttg::ConvertLayoutOp op) {
+    if (convertLayoutIsDeadDotStage(op)) {
+      valMap[op.getResult()] = SmallVector<std::string>{};
+      return success();
+    }
     Value src = op.getSrc();
     Value res = op.getResult();
     auto srcTy = cast<RankedTensorType>(src.getType());
@@ -3095,9 +3132,10 @@ private:
        << poolRegion(0, sc) << ";\n";
     std::string buf = bufptr;
 
-    if (tileBytes > 32768 && rank >= 2) {
+    int64_t convCap = poolBudget();
+    if (tileBytes > convCap && rank >= 2) {
       int64_t N = shape[rank - 1];
-      int64_t bandRows = 32768 / (N * elemBytes);
+      int64_t bandRows = convCap / (N * elemBytes);
       if (bandRows < 1)
         bandRows = 1;
       int64_t rowsTotal = shape[rank - 2];
@@ -3159,9 +3197,9 @@ private:
     // offset. A convert_layout permutes the same logical tensor, so result
     // register at flat offset f reads the src element written at flat offset f;
     // guarding write/read by band keeps the round-trip correct at any rank.
-    if (tileBytes > 32768) {
+    if (tileBytes > convCap) {
       int64_t total = tileSize(resTy);
-      int64_t band = reshapeBandElems(total, elemBytes);
+      int64_t band = reshapeBandElems(total, elemBytes, convCap);
       SmallVector<std::string> ids(regCount(res));
       for (int r = 0, n = regCount(res); r < n; ++r) {
         ids[r] = fresh();
@@ -3364,6 +3402,88 @@ private:
     return success();
   }
 
+  struct InPlaceOperand {
+    std::string buf;
+    std::string baseOffset;
+  };
+
+  // A local_load of a contiguous row-major [rows][cols] threadgroup buffer
+  // (local_alloc, optionally memdesc_index'd, never subsliced) reached through
+  // convert_layouts, or null.
+  static ttg::LocalLoadOp dotOperandLocalLoad(Value operand, int64_t rows,
+                                              int64_t cols) {
+    Value v = operand;
+    while (auto cvt = dyn_cast_or_null<ttg::ConvertLayoutOp>(v.getDefiningOp()))
+      v = cvt.getSrc();
+    auto ll = dyn_cast_or_null<ttg::LocalLoadOp>(v.getDefiningOp());
+    if (!ll)
+      return nullptr;
+    auto mt = cast<ttg::MemDescType>(ll.getSrc().getType());
+    if (mt.getRank() != 2 || mt.getShape()[0] != rows ||
+        mt.getShape()[1] != cols)
+      return nullptr;
+    Value src = ll.getSrc();
+    while (Operation *def = src.getDefiningOp()) {
+      if (auto mi = dyn_cast<ttg::MemDescIndexOp>(def)) {
+        src = mi.getSrc();
+        continue;
+      }
+      if (isa<ttg::LocalAllocOp>(def))
+        return ll;
+      return nullptr;
+    }
+    return nullptr;
+  }
+
+  static bool dotReadsOperandInPlace(tt::DotOp d, Value operand) {
+    auto cTy = cast<RankedTensorType>(d.getResult().getType());
+    if (cTy.getRank() != 2)
+      return false;
+    int64_t M = cTy.getShape()[0], N = cTy.getShape()[1];
+    int64_t Kd = cast<RankedTensorType>(d.getA().getType()).getShape()[1];
+    int64_t aBy = M * Kd * (bitsOf(cast<RankedTensorType>(d.getA().getType())
+                                       .getElementType()) /
+                            8);
+    int64_t bBy = Kd * N * (bitsOf(cast<RankedTensorType>(d.getB().getType())
+                                       .getElementType()) /
+                            8);
+    if (aBy + bBy > 32768)
+      return false;
+    if (operand == d.getA())
+      return dotOperandLocalLoad(operand, M, Kd);
+    if (operand == d.getB())
+      return dotOperandLocalLoad(operand, Kd, N);
+    return false;
+  }
+
+  static bool convertLayoutIsDeadDotStage(ttg::ConvertLayoutOp c) {
+    if (c.getResult().use_empty())
+      return false;
+    for (OpOperand &use : c.getResult().getUses()) {
+      auto d = dyn_cast<tt::DotOp>(use.getOwner());
+      if (!d || !dotReadsOperandInPlace(d, c.getResult()))
+        return false;
+    }
+    return true;
+  }
+
+  std::optional<InPlaceOperand>
+  dotOperandInPlaceBuf(Value operand, int64_t rows, int64_t cols) {
+    ttg::LocalLoadOp ll = dotOperandLocalLoad(operand, rows, cols);
+    if (!ll)
+      return std::nullopt;
+    auto it = memdescMap.find(ll.getSrc());
+    if (it == memdescMap.end() || !it->second.bufStrides.empty())
+      return std::nullopt;
+    return InPlaceOperand{it->second.buf, it->second.baseOffset};
+  }
+
+  static std::string inPlaceBase(const InPlaceOperand &op) {
+    if (op.baseOffset == "0")
+      return op.buf;
+    return "(" + op.buf + " + " + op.baseOffset + ")";
+  }
+
   // Lower tt.dot to MSL simdgroup_matrix 8x8 fragment MMA. A (MxK) and B (KxN)
   // per-thread registers are staged row-major into threadgroup memory; one
   // simdgroup cooperatively runs the 8x8 fragment MMA loop over K into an MxN
@@ -3421,10 +3541,10 @@ private:
     return M * K * elemBytes + K * N * elemBytes > 32768;
   }
 
-  static int64_t dotCBandRows(int64_t M, int64_t N, int64_t abBytes,
+  static int64_t dotCBandRows(int64_t M, int64_t N, int64_t cBudget,
                               int64_t accBytes) {
     int64_t rowBytes = N * accBytes;
-    int64_t band = abBytes / rowBytes;
+    int64_t band = cBudget / rowBytes;
     band -= band % 8;
     if (band < 8)
       band = 8;
@@ -3469,27 +3589,43 @@ private:
     std::string accFrag = "simdgroup_float8x8";
 
     int64_t aBytes = M * K * (bitsOf(aElem) / 8);
+    int64_t bBytes = N * K * (bitsOf(bElem) / 8);
     int64_t accBytes = 4;
-    int64_t abBytes = aBytes + N * K * (bitsOf(bElem) / 8);
     int64_t cFull = M * N * accBytes;
 
-    // Two staging modes. DISJOINT: C gets its own pool region past A/B, so a
-    // warp computes and stores each fragment back-to-back with no intervening
-    // barrier; only one accumulator is live at a time, keeping register
-    // pressure (and thus the PSO's max threadgroup size) low. ALIASED: C reuses
-    // the A/B region and the M×N store is banded over row groups to fit; a
-    // uniform barrier separates A/B reads from C stores, so every fragment
-    // accumulator stays live at once. DISJOINT is preferred whenever A+B+C fits
-    // the 32KB threadgroup budget.
-    bool disjointC = abBytes + cFull <= 32768;
-    int64_t bandRows = disjointC ? M : dotCBandRows(M, N, abBytes, accBytes);
+    // When an operand already sits in a row-major threadgroup buffer (the
+    // pipeliner's local_alloc), load fragments straight from it. Only the
+    // whole-tile rank-2 path indexes a buffer simdgroup_load can address.
+    std::optional<InPlaceOperand> aInPlace, bInPlace;
+    bool wholeTileFits = M * K * (bitsOf(aElem) / 8) + bBytes <= 32768;
+    if (rank == 2 && wholeTileFits) {
+      aInPlace = dotOperandInPlaceBuf(op.getA(), M, K);
+      bInPlace = dotOperandInPlaceBuf(op.getB(), K, N);
+    }
+    int64_t stagedA = aInPlace ? 0 : aBytes;
+    int64_t stagedB = bInPlace ? 0 : bBytes;
+    int64_t stagedAB = stagedA + stagedB;
+
+    // DISJOINT: C gets its own pool region past staged A/B; one accumulator is
+    // live at a time (low register pressure). ALIASED: C reuses the pool and
+    // the M×N store is banded to fit. DISJOINT when staged A+B+C fits the pool.
+    bool disjointC = stagedAB + cFull <= poolBudget();
+    int64_t bandRows = disjointC ? M : dotCBandRows(M, N, poolBudget(), accBytes);
     std::string tgA = fresh(), tgB = fresh(), tgC = fresh();
-    os << ind() << "threadgroup " << opScalar << "* " << tgA << " = "
-       << poolRegion(0, opScalar) << ";\n";
-    os << ind() << "threadgroup " << opScalar << "* " << tgB << " = "
-       << poolRegion(aBytes, opScalar) << ";\n";
+    if (aInPlace)
+      os << ind() << "threadgroup " << opScalar << "* " << tgA << " = "
+         << inPlaceBase(*aInPlace) << ";\n";
+    else
+      os << ind() << "threadgroup " << opScalar << "* " << tgA << " = "
+         << poolRegion(0, opScalar) << ";\n";
+    if (bInPlace)
+      os << ind() << "threadgroup " << opScalar << "* " << tgB << " = "
+         << inPlaceBase(*bInPlace) << ";\n";
+    else
+      os << ind() << "threadgroup " << opScalar << "* " << tgB << " = "
+         << poolRegion(stagedA, opScalar) << ";\n";
     os << ind() << "threadgroup float* " << tgC << " = "
-       << poolRegion(disjointC ? abBytes : 0, "float") << ";\n";
+       << poolRegion(disjointC ? stagedAB : 0, "float") << ";\n";
 
     int64_t mT = M / 8, nT = N / 8, kT = K / 8;
     tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
@@ -3661,12 +3797,14 @@ private:
     // back. Slices are barrier-separated and reuse the same pool.
     for (int64_t bi = 0; bi < B; ++bi) {
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-      for (int r = 0, n = regCount(op.getA()); r < n; ++r)
-        os << ind() << batchGuard(aTy, r, bi) << tgA << "["
-           << sliceFlatOffset(aTy, r) << "] = " << aNames[r] << ";\n";
-      for (int r = 0, n = regCount(op.getB()); r < n; ++r)
-        os << ind() << batchGuard(bTy, r, bi) << tgB << "["
-           << sliceFlatOffset(bTy, r) << "] = " << bNames[r] << ";\n";
+      if (!aInPlace)
+        for (int r = 0, n = regCount(op.getA()); r < n; ++r)
+          os << ind() << batchGuard(aTy, r, bi) << tgA << "["
+             << sliceFlatOffset(aTy, r) << "] = " << aNames[r] << ";\n";
+      if (!bInPlace)
+        for (int r = 0, n = regCount(op.getB()); r < n; ++r)
+          os << ind() << batchGuard(bTy, r, bi) << tgB << "["
+             << sliceFlatOffset(bTy, r) << "] = " << bNames[r] << ";\n";
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 
       auto emitFragMMA = [&](int64_t mi, int64_t ni, StringRef acc) {

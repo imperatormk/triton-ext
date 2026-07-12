@@ -3186,6 +3186,15 @@ private:
     os << ind() << "threadgroup " << sc << " " << buf << "["
        << memdescFlatSize(mt) << "];\n";
     memdescMap[op.getResult()] = {buf, "0"};
+    if (Value init = op.getSrc()) {
+      auto srcTy = cast<RankedTensorType>(init.getType());
+      auto &vals = names(init);
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      for (int r = 0, n = regCount(init); r < n; ++r)
+        os << ind() << buf << "[" << flatTileOffset(srcTy, r)
+           << "] = " << vals[r] << ";\n";
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    }
     return success();
   }
 

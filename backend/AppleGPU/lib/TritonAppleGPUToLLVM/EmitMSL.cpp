@@ -1136,7 +1136,7 @@ private:
     if (auto l = dyn_cast<ttg::LocalLoadOp>(op))
       return emitLocalLoad(l);
     if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op)) {
-      emitBarrier(/*device=*/true);
+      emitBarrier(/*device=*/false);
       for (Value r : op->getResults())
         valMap[r] = SmallVector<std::string>{};
       return success();

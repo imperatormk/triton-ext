@@ -222,6 +222,32 @@ private:
 
   std::string ind() const { return std::string(indent * 4, ' '); }
 
+  // Barrier peephole: a barrier is held pending rather than written immediately,
+  // so two barriers emitted back-to-back with no intervening statement collapse
+  // into one (keeping the stronger memory scope). flushBarrier() must run before
+  // any non-barrier output and at every scope boundary so a pending barrier is
+  // never lost or reordered past a real memory operation.
+  bool barrierPending = false;
+  bool barrierPendingDevice = false;
+
+  void emitBarrier(bool device) {
+    barrierPending = true;
+    barrierPendingDevice = barrierPendingDevice || device;
+  }
+
+  void flushBarrier() {
+    if (!barrierPending)
+      return;
+    barrierPending = false;
+    bool device = barrierPendingDevice;
+    barrierPendingDevice = false;
+    if (device)
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup | "
+                     "mem_flags::mem_device);\n";
+    else
+      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  }
+
   // Number of per-thread registers (unrolled elements) for a value.
   int regCount(Value v) {
     auto rt = dyn_cast<RankedTensorType>(v.getType());
@@ -369,6 +395,7 @@ private:
       if (failed(emitBlockCFG(region)))
         return failure();
     }
+    flushBarrier();
     os << "}\n";
     return success();
   }
@@ -475,6 +502,7 @@ private:
       if (failed(emitBlockCFG(region)))
         return failure();
     }
+    flushBarrier();
     curDevFunc = nullptr;
     os << "}\n";
     return success();
@@ -617,6 +645,7 @@ private:
           valMap[res] = it->second;
         }
       }
+      flushBarrier();
       if (failed(emitTerminator(blk.getTerminator())))
         return failure();
       --indent;
@@ -936,7 +965,14 @@ private:
     return expr;
   }
 
+  static bool isPureBarrierOp(Operation *op) {
+    return isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp, ttg::BarrierOp,
+               mlir::gpu::BarrierOp>(op);
+  }
+
   LogicalResult emitOp(Operation *op) {
+    if (!isPureBarrierOp(op))
+      flushBarrier();
     if (auto c = dyn_cast<arith::ConstantOp>(op))
       return emitConstant(c);
     if (auto p = dyn_cast<tt::GetProgramIdOp>(op))
@@ -1100,20 +1136,20 @@ private:
     if (auto l = dyn_cast<ttg::LocalLoadOp>(op))
       return emitLocalLoad(l);
     if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op)) {
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup | "
-                     "mem_flags::mem_device);\n";
+      emitBarrier(/*device=*/true);
       for (Value r : op->getResults())
         valMap[r] = SmallVector<std::string>{};
       return success();
     }
     if (auto b = dyn_cast<ttg::BarrierOp>(op)) {
-      os << ind() << "threadgroup_barrier(" << barrierMemFlags(b.getAddrSpace())
-         << ");\n";
+      uint32_t bits = static_cast<uint32_t>(b.getAddrSpace());
+      bool device = bits & (static_cast<uint32_t>(ttg::AddrSpace::GlobalRead) |
+                            static_cast<uint32_t>(ttg::AddrSpace::GlobalWrite));
+      emitBarrier(device);
       return success();
     }
     if (isa<mlir::gpu::BarrierOp>(op)) {
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup | "
-                     "mem_flags::mem_device);\n";
+      emitBarrier(/*device=*/true);
       return success();
     }
     if (isa<ttg::LocalDeallocOp>(op))
@@ -1829,6 +1865,7 @@ private:
     for (Operation &op : blk.without_terminator())
       if (failed(emitOp(&op)))
         return failure();
+    flushBarrier();
     return success();
   }
 
@@ -3777,7 +3814,7 @@ private:
         os << ind() << addr << " = " << load << ";\n";
       }
     }
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    emitBarrier(/*device=*/false);
     valMap[op.getResult()] = SmallVector<std::string>{};
     return success();
   }
@@ -3789,7 +3826,7 @@ private:
     for (int r = 0, n = regCount(op.getSrc()); r < n; ++r)
       os << ind() << dst.buf << "[" << memdescElemAddr(dst, srcTy, r)
          << "] = " << vals[r] << ";\n";
-    os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    emitBarrier(/*device=*/false);
     return success();
   }
 

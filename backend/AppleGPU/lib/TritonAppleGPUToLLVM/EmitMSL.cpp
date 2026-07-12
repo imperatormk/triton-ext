@@ -122,33 +122,6 @@ class MSLEmitter {
 public:
   MSLEmitter(ModuleOp mod, raw_ostream &os) : mod(mod), os(os) {}
 
-  // The rtne downcast emulation reference (test_conversions.py) rounds via the
-  // f32 identity `(x + 2^23) - 2^23`, relying on the add's RTNE. Metal fast-math
-  // reassociates it back to `x`, killing the round. The distinguishing feature
-  // is an f32 constant equal to 2^23 (the round bias) used as a float; our own
-  // f16/bf16 converters are integer-bit RTNE and use 0x800000 only as an int, so
-  // this marks the emulation kernel alone. Flagged kernels get strict math from
-  // the compiler stage; everything else keeps fast math.
-  static bool needsStrictMath(ModuleOp mod) {
-    bool found = false;
-    auto isBias = [](Type t, double v) {
-      return t.isF32() && v == 8388608.0;
-    };
-    mod.walk([&](arith::ConstantOp c) {
-      Attribute a = c.getValue();
-      if (auto f = dyn_cast<FloatAttr>(a)) {
-        if (isBias(f.getType(), f.getValueAsDouble()))
-          found = true;
-      } else if (auto d = dyn_cast<DenseElementsAttr>(a)) {
-        if (d.isSplat() && isa<FloatType>(d.getElementType()) &&
-            isBias(d.getElementType(),
-                   d.getSplatValue<APFloat>().convertToDouble()))
-          found = true;
-      }
-    });
-    return found;
-  }
-
   // Metal has no double type; f64 anywhere means a genuine hardware limit. Emit
   // a clear error instead of narrowing f64 to float and returning wrong values.
   LogicalResult rejectF64() {
@@ -190,8 +163,6 @@ public:
   LogicalResult emit() {
     if (failed(rejectF64()))
       return failure();
-    if (needsStrictMath(mod))
-      os << "// triton-mps: strict-fp\n";
     os << "#include <metal_stdlib>\n";
     os << "#include <metal_simdgroup_matrix>\n";
     os << "using namespace metal;\n\n";
@@ -1618,26 +1589,41 @@ private:
   LogicalResult emitMathUnary(Operation *op) {
     std::string sc = mslScalarType(elementScalarType(op->getResult(0).getType()));
     StringRef n = op->getName().getStringRef();
+    // metal:: trig/exp/log/sqrt lower to air.fast_* (approximate) even under
+    // -fmetal-math-mode=safe; the math mode never controls transcendental
+    // accuracy, only the namespace does. Inductor checks against aten's accurate
+    // transcendentals at fp32 tolerance (rel ~1e-6), which the fast_* variants
+    // miss (e.g. tan via sin/cos, pow via exp2/log2). Use metal::precise:: for
+    // the accuracy-sensitive functions; exact ops (floor/ceil/round/abs) keep
+    // the plain form.
     static const llvm::StringMap<const char *> unary = {
-        {"math.exp", "metal::exp"},       {"math.exp2", "metal::exp2"},
-        {"math.log", "metal::log"},       {"math.log2", "metal::log2"},
-        {"math.log10", "metal::log10"},   {"math.sin", "metal::sin"},
-        {"math.cos", "metal::cos"},       {"math.tan", "metal::tan"},
-        {"math.tanh", "metal::tanh"},     {"math.sinh", "metal::sinh"},
-        {"math.cosh", "metal::cosh"},     {"math.asin", "metal::asin"},
-        {"math.acos", "metal::acos"},     {"math.atan", "metal::atan"},
-        {"math.sqrt", "metal::sqrt"},     {"math.rsqrt", "metal::rsqrt"},
-        {"math.cbrt", "metal::cbrt"},     {"math.floor", "metal::floor"},
-        {"math.ceil", "metal::ceil"},     {"math.absf", "metal::fabs"},
-        {"math.absi", "metal::abs"},      {"math.erf", "tt_erf"},
-        {"math.round", "metal::round"},   {"math.trunc", "metal::trunc"},
-        {"math.roundeven", "metal::rint"}};
+        {"math.exp", "metal::precise::exp"},
+        {"math.exp2", "metal::precise::exp2"},
+        {"math.log", "metal::precise::log"},
+        {"math.log2", "metal::precise::log2"},
+        {"math.log10", "metal::precise::log10"},
+        {"math.sin", "metal::precise::sin"},
+        {"math.cos", "metal::precise::cos"},
+        {"math.tan", "metal::precise::tan"},
+        {"math.tanh", "metal::precise::tanh"},
+        {"math.sinh", "metal::precise::sinh"},
+        {"math.cosh", "metal::precise::cosh"},
+        {"math.asin", "metal::precise::asin"},
+        {"math.acos", "metal::precise::acos"},
+        {"math.atan", "metal::precise::atan"},
+        {"math.sqrt", "metal::precise::sqrt"},
+        {"math.rsqrt", "metal::precise::rsqrt"},
+        {"math.cbrt", "metal::precise::cbrt"},
+        {"math.floor", "metal::floor"},   {"math.ceil", "metal::ceil"},
+        {"math.absf", "metal::fabs"},     {"math.absi", "metal::abs"},
+        {"math.erf", "tt_erf"},           {"math.round", "metal::round"},
+        {"math.trunc", "metal::trunc"},   {"math.roundeven", "metal::rint"}};
     if (auto it = unary.find(n); it != unary.end())
       return emitUnary(op, it->second, sc);
     static const llvm::StringMap<const char *> binary = {
-        {"math.atan2", "metal::atan2"},
-        {"math.powf", "metal::pow"},
-        {"math.fpowi", "metal::pow"},
+        {"math.atan2", "metal::precise::atan2"},
+        {"math.powf", "metal::precise::pow"},
+        {"math.fpowi", "metal::precise::pow"},
         {"math.copysign", "metal::copysign"}};
     if (auto it = binary.find(n); it != binary.end())
       return emitMinMax(op, it->second);
@@ -1650,8 +1636,8 @@ private:
       SmallVector<std::string> ids;
       for (int r = 0; r < rc; ++r) {
         std::string id = fresh();
-        os << ind() << sc << " " << id << " = metal::pow((" << sc << ")10, "
-           << a[a.size() == 1 ? 0 : r] << ");\n";
+        os << ind() << sc << " " << id << " = metal::precise::pow((" << sc
+           << ")10, " << a[a.size() == 1 ? 0 : r] << ");\n";
         ids.push_back(id);
       }
       valMap[res] = ids;

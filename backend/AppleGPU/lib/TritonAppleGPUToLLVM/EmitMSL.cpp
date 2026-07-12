@@ -301,6 +301,14 @@ private:
     os << ind() << "int " << laneId << " = (int)(" << tidId << ".x & 31u);\n";
     os << ind() << "int " << warpId << " = (int)(" << tidId << ".x >> 5);\n";
 
+    scalarSpinlock = false;
+    func.walk([&](tt::AtomicCASOp cas) {
+      if (isa<RankedTensorType>(cas.getPtr().getType()))
+        return;
+      if (tracesToKernelArg(cas.getPtr()))
+        scalarSpinlock = true;
+    });
+
     poolBytes = 0;
     for (Block &blk : func.getBody())
       for (Operation &op : blk)
@@ -615,6 +623,29 @@ private:
   }
 
   std::string tgposId, tidId, numTgId, laneId, warpId;
+  bool scalarSpinlock = false;
+
+  static bool tracesToKernelArg(Value v) {
+    while (v) {
+      if (isa<BlockArgument>(v))
+        return true;
+      Operation *def = v.getDefiningOp();
+      if (auto ap = dyn_cast_or_null<tt::AddPtrOp>(def)) {
+        v = ap.getPtr();
+        continue;
+      }
+      if (auto sp = dyn_cast_or_null<tt::SplatOp>(def)) {
+        v = sp.getSrc();
+        continue;
+      }
+      if (auto bc = dyn_cast_or_null<tt::BitcastOp>(def)) {
+        v = bc.getSrc();
+        continue;
+      }
+      return false;
+    }
+    return false;
+  }
 
   // Build the MSL offset expression for register `reg` of a distributed 1-D
   // tensor value, using its TritonGPU LinearLayout. block/lane/warp are runtime
@@ -3852,11 +3883,14 @@ private:
       std::string init =
           other ? (*other)[other->size() == 1 ? 0 : r] : std::string("0");
       os << ind() << sc << " " << id << " = " << init << ";\n";
+      std::string deref = scalarSpinlock ? ("*(device coherent(device) " + sc +
+                                            "*)" + p)
+                                         : ("*" + p);
       if (hasMask) {
         const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
-        os << ind() << "if (" << m << ") " << id << " = *" << p << ";\n";
+        os << ind() << "if (" << m << ") " << id << " = " << deref << ";\n";
       } else {
-        os << ind() << id << " = *" << p << ";\n";
+        os << ind() << id << " = " << deref << ";\n";
       }
       ids.push_back(id);
     }
@@ -3898,18 +3932,22 @@ private:
       }
     }
 
+    std::string sc = mslScalarType(elementScalarType(op.getValue().getType()));
     for (int r = 0; r < rc; ++r) {
       const std::string &p = ptrs[r];
       const std::string &v = vals[vals.size() == 1 ? 0 : r];
+      std::string lhs = scalarSpinlock
+                            ? ("*(device coherent(device) " + sc + "*)" + p)
+                            : ("*" + p);
       std::string guard = threadPred;
       if (hasMask) {
         const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
         guard = guard.empty() ? m : guard + " && " + m;
       }
       if (guard.empty())
-        os << ind() << "*" << p << " = " << v << ";\n";
+        os << ind() << lhs << " = " << v << ";\n";
       else
-        os << ind() << "if (" << guard << ") *" << p << " = " << v << ";\n";
+        os << ind() << "if (" << guard << ") " << lhs << " = " << v << ";\n";
     }
     return success();
   }
@@ -4235,15 +4273,7 @@ private:
       threadPred = threadPred.empty() ? wp : threadPred + " && " + wp;
     }
 
-    // Device atomics are relaxed-only on Metal; a release/acq_rel RMW (e.g. a
-    // spinlock unlock via atomic_xchg) needs an explicit device release fence
-    // so the critical-section stores are visible before the lock is dropped.
     tt::MemSemantic sem = op.getSem();
-    if (sem == tt::MemSemantic::RELEASE ||
-        sem == tt::MemSemantic::ACQUIRE_RELEASE)
-      os << ind()
-         << "atomic_thread_fence(mem_flags::mem_device, "
-            "memory_order_release);\n";
 
     SmallVector<std::string> ids(rc);
     for (int r = 0; r < rc; ++r) {
@@ -4281,8 +4311,25 @@ private:
           emitFloat32CASLoop(p, cur, newExpr, id);
         }
       } else {
+        std::string order = "memory_order_relaxed";
+        std::string tail;
+        switch (sem) {
+        case tt::MemSemantic::ACQUIRE:
+          order = "memory_order_acquire";
+          break;
+        case tt::MemSemantic::RELEASE:
+          order = "memory_order_release";
+          break;
+        case tt::MemSemantic::ACQUIRE_RELEASE:
+          order = "memory_order_acq_rel";
+          break;
+        default:
+          break;
+        }
+        if (order != "memory_order_relaxed")
+          tail = ", mem_flags::mem_device";
         std::string call = std::string(fn) + "((device " + atomicTy + "*)" + p +
-                           ", " + v + ", memory_order_relaxed)";
+                           ", " + v + ", " + order + tail + ")";
         os << ind() << id << " = " << call << ";\n";
       }
       if (guarded) {
@@ -4360,10 +4407,12 @@ private:
     }
   }
 
-  // Metal device atomics accept ONLY memory_order_relaxed (the toolchain
-  // rejects acquire/release/acq_rel on a thread_scope_device atomic). All
-  // cross-threadgroup ordering therefore comes from explicit device fences
-  // (atomic_thread_fence(mem_device, ...)), not from the atomic op's order.
+  // A bare Metal device atomic accepts only memory_order_relaxed, but the
+  // mem_flags overload (…, order, order, mem_flags::mem_device) does take
+  // acquire/release. A scalar spinlock therefore CAS-acquires and xchg-releases
+  // the lock word directly; the lock-guarded foreign buffer is accessed through
+  // `device coherent(device)` so the acquire/release pair actually flushes it to
+  // the next holder (else the AGX per-threadgroup cache silently drops updates).
   LogicalResult emitAtomicCAS(tt::AtomicCASOp op) {
     Value res = op.getResult();
     Type scalarTy = elementScalarType(res.getType());
@@ -4435,7 +4484,8 @@ private:
     std::string call = "atomic_compare_exchange_weak_explicit((device "
                        "atomic_int *)" +
                        p + ", &" + exp + ", " + v +
-                       ", memory_order_relaxed, memory_order_relaxed)";
+                       ", memory_order_acquire, memory_order_relaxed, "
+                       "mem_flags::mem_device)";
     os << ind() << "while (" << exp << " == " << c << " && !(" << call
        << ")) {}\n";
     os << ind() << (declare ? sc + " " : "") << id << " = " << exp << ";\n";

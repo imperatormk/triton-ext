@@ -148,17 +148,8 @@ public:
       : mod(mod), fwd(&realOut), os(fwd) {}
 
   LogicalResult emit() {
-    os << "#include <metal_stdlib>\n";
-    os << "#include <metal_simdgroup_matrix>\n";
-    os << "using namespace metal;\n\n";
-    os << "static inline float tt_erf(float x){\n"
-          "  float t = 1.0f/(1.0f+0.5f*metal::fabs(x));\n"
-          "  float y = t*metal::exp(-x*x-1.26551223f+t*(1.00002368f+t*(0.37409196f"
-          "+t*(0.09678418f+t*(-0.18628806f+t*(0.27886807f+t*(-1.13520398f"
-          "+t*(1.48851587f+t*(-0.82215223f+t*0.17087277f)))))))));\n"
-          "  float r = 1.0f - y;\n"
-          "  return x >= 0.0f ? r : -r;\n"
-          "}\n\n";
+    msl::MSLPrinter preamblePrinter(os);
+    preamblePrinter.printPreamble();
 
     llvm::DenseSet<StringRef> callTargets;
     mod.walk([&](tt::CallOp call) {
@@ -380,6 +371,7 @@ private:
   // Helpers below mint fresh names over a raw id counter passed by reference
   // (seeded from nextId by the caller) so they never mutate nextId directly.
   llvm::SmallVector<msl::Stmt *, 2> laneWarpDecls(int &id, StringRef tid);
+  llvm::SmallVector<msl::Stmt *, 2> laneWarpProlog();
   llvm::SmallVector<msl::Param, 8> deviceParams(tt::FuncOp func, int &id,
                                                 bool bind);
   bool astElemwiseDecls(Operation *op, msl::Type *declTy, int &id,
@@ -519,30 +511,25 @@ private:
 
   LogicalResult emitFunc(tt::FuncOp func) {
     auto fnTy = func.getFunctionType();
-    // Pin the threadgroup size the runtime always dispatches (num_warps*32).
-    // Without it the Metal compiler picks an occupancy-driven ceiling that can
-    // fall below the requested size (register/threadgroup pressure), so a valid
-    // launch is rejected as OutOfResources; the attribute makes the compiler
-    // budget for exactly this size (spilling if needed) instead.
-    if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps")) {
-      int64_t threads = nw.getInt() * 32;
-      os << "[[max_total_threads_per_threadgroup(" << threads << ")]]\n";
-    }
-    os << "kernel void " << mslKernelName(func.getName()) << "(\n";
+    // Pin the threadgroup size the runtime always dispatches (num_warps*32) so
+    // the Metal compiler budgets for exactly this size instead of an
+    // occupancy-driven ceiling that could reject a valid launch.
+    msl::Attr *maxThreads = nullptr;
+    if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+      maxThreads = ctx.maxThreadsAttr(nw.getInt() * 32);
 
-    // Match the runtime ABI (driver.py): pointer args first, each in its own
-    // buffer; then all scalar args packed with natural alignment into a single
-    // trailing buffer. Scalars are read back by reinterpreting a byte offset.
+    // Params + prologue mint real fresh() names IN ORDER (before the body walk)
+    // so body register names stay in lockstep with the string ABI numbering.
     unsigned buffer = 0;
-    SmallVector<std::string> argLines;
+    llvm::SmallVector<msl::Param, 8> params;
     SmallVector<BlockArgument> scalarArgs;
     for (auto [i, argTy] : llvm::enumerate(fnTy.getInputs())) {
       BlockArgument arg = func.getArgument(i);
       if (auto pt = dyn_cast<tt::PointerType>(argTy)) {
         std::string id = fresh();
-        std::string sc = mslScalarType(pt.getPointeeType());
-        argLines.push_back("    device " + sc + "* " + id + " [[buffer(" +
-                           std::to_string(buffer++) + ")]]");
+        params.push_back(ctx.param(
+            ctx.ptr(astScalarType(pt.getPointeeType()), msl::AddrSpace::Device),
+            id, ctx.bufferAttr(buffer++)));
         bindScalar(arg, id);
       } else if (isa<IntegerType, FloatType>(argTy)) {
         scalarArgs.push_back(arg);
@@ -551,44 +538,45 @@ private:
         return failure();
       }
     }
-
     std::string argbufId;
     if (!scalarArgs.empty()) {
       argbufId = fresh();
-      argLines.push_back("    constant char* " + argbufId + " [[buffer(" +
-                         std::to_string(buffer++) + ")]]");
+      params.push_back(ctx.param(
+          ctx.ptr(ctx.scalar(msl::Scalar::I8), msl::AddrSpace::Constant),
+          argbufId, ctx.bufferAttr(buffer++)));
     }
-
+    msl::Type *u3 = ctx.vector(msl::Scalar::U32, 3);
     tgposId = fresh();
     tidId = fresh();
     numTgId = fresh();
-    argLines.push_back("    uint3 " + tgposId +
-                       " [[threadgroup_position_in_grid]]");
-    argLines.push_back("    uint3 " + tidId +
-                       " [[thread_position_in_threadgroup]]");
-    argLines.push_back("    uint3 " + numTgId +
-                       " [[threadgroups_per_grid]]");
-    os << llvm::join(argLines, ",\n") << ") {\n";
+    params.push_back(ctx.param(u3, tgposId, ctx.tgPosAttr()));
+    params.push_back(ctx.param(u3, tidId, ctx.threadPosAttr()));
+    params.push_back(ctx.param(u3, numTgId, ctx.tgsPerGridAttr()));
 
+    msl::Block prologue;
     int off = 0;
     for (BlockArgument arg : scalarArgs) {
       Type ty = arg.getType();
       unsigned bits = ty.getIntOrFloatBitWidth();
       int size = bits == 1 ? 1 : (int)(bits / 8);
       off = (off + size - 1) / size * size;
-      std::string sc = mslScalarType(ty);
+      msl::Type *sc = astScalarType(ty);
       std::string id = fresh();
-      os << ind() << sc << " " << id << " = *(constant " << sc << "*)("
-         << argbufId << " + " << off << ");\n";
+      // *(constant sc*)(argbuf + off)
+      msl::Expr *addr = ctx.paren(
+          ctx.binary(msl::BinOp::Add, ctx.var(argbufId),
+                     ctx.lit(std::to_string(off))));
+      prologue.push_back(ctx.declStmt(
+          sc, id,
+          ctx.deref(ctx.cast(msl::Cast::Style::CStyle,
+                             ctx.ptr(sc, msl::AddrSpace::Constant), addr))));
       bindScalar(arg, id);
       off += size;
     }
-
-    // lane = tid.x & (warpSize-1); warp = tid.x >> log2(warpSize)
     laneId = fresh();
     warpId = fresh();
-    os << ind() << "int " << laneId << " = (int)(" << tidId << ".x & 31u);\n";
-    os << ind() << "int " << warpId << " = (int)(" << tidId << ".x >> 5);\n";
+    for (msl::Stmt *s : laneWarpProlog())
+      prologue.push_back(s);
 
     scalarSpinlock = false;
     func.walk([&](tt::AtomicCASOp cas) {
@@ -610,8 +598,8 @@ private:
     int64_t kernelPool = moduleHasDevFuncs ? globalPoolBytes : poolBytes;
     if (kernelPool > 0) {
       poolBuf = "__pool";
-      os << ind() << "threadgroup char " << poolBuf << "[" << kernelPool
-         << "];\n";
+      prologue.push_back(ctx.arrayDeclStmt(ctx.named("threadgroup char"),
+                                           poolBuf, kernelPool));
     }
 
     Region &region = func.getBody();
@@ -619,9 +607,12 @@ private:
                                            : astEmitBlockCFG(region);
     if (emitFailed)
       return failure();
+    for (msl::Stmt *s : body)
+      prologue.push_back(s);
+    msl::KernelFn *fn = ctx.kernelFn(maxThreads, mslKernelName(func.getName()),
+                                     params, std::move(prologue));
     msl::MSLPrinter printer(os);
-    printer.printBlockAt(body, indent);
-    os << "}\n";
+    printer.print(fn);
     return success();
   }
 
@@ -639,32 +630,17 @@ private:
 
   LogicalResult declRetStruct(tt::FuncOp func) {
     auto results = func.getFunctionType().getResults();
-    if (isTensorResult(results)) {
-      std::string name = mslDeviceFuncName(func.getName()) + "_ret";
-      devRetStruct[func] = name;
-      std::string sc =
-          mslScalarType(cast<RankedTensorType>(results[0]).getElementType());
-      Value res = func.getBody().front().getTerminator()->getOperand(0);
-      int rc = regCount(res);
-      os << "struct " << name << " {\n";
-      for (int i = 0; i < rc; ++i)
-        os << "  " << sc << " f" << i << ";\n";
-      os << "};\n";
+    if (!isTensorResult(results) && results.size() <= 1)
       return success();
-    }
-    if (results.size() <= 1)
-      return success();
-    std::string name = mslDeviceFuncName(func.getName()) + "_ret";
-    devRetStruct[func] = name;
-    os << "struct " << name << " {\n";
-    for (auto [i, ty] : llvm::enumerate(results)) {
-      if (!isa<IntegerType, FloatType>(ty)) {
+    for (Type ty : results)
+      if (!isTensorResult(results) && !isa<IntegerType, FloatType>(ty)) {
         func.emitError("EmitMSL: unsupported device function result type");
         return failure();
       }
-      os << "  " << mslScalarType(ty) << " f" << i << ";\n";
-    }
-    os << "};\n";
+    devRetStruct[func] = mslDeviceFuncName(func.getName()) + "_ret";
+    msl::MSLPrinter printer(os);
+    printer.print(astRetStructDecl(func));
+    os << "\n";
     return success();
   }
 
@@ -723,21 +699,46 @@ private:
   LogicalResult emitDeviceFuncProto(tt::FuncOp func, bool asDecl) {
     if (failed(declRetStruct(func)))
       return failure();
-    if (failed(emitDeviceSignature(func, /*bindArgs=*/false)))
-      return failure();
-    os << ";\n";
+    msl::MSLPrinter printer(os);
+    printer.printProto(astDeviceProto(func));
     return success();
   }
 
   LogicalResult emitDeviceFunc(tt::FuncOp func) {
-    if (failed(emitDeviceSignature(func, /*bindArgs=*/true)))
-      return failure();
-    os << " {\n";
+    auto fnTy = func.getFunctionType();
+    llvm::SmallVector<msl::Param, 8> params;
+    for (auto [i, argTy] : llvm::enumerate(fnTy.getInputs())) {
+      std::string id = fresh();
+      if (auto pt = dyn_cast<tt::PointerType>(argTy))
+        params.push_back(ctx.param(
+            ctx.ptr(astScalarType(pt.getPointeeType()), msl::AddrSpace::Device),
+            id));
+      else if (isa<IntegerType, FloatType>(argTy))
+        params.push_back(ctx.param(astScalarType(argTy), id));
+      else {
+        func.emitError("EmitMSL: unsupported device function argument type");
+        return failure();
+      }
+      bindScalar(func.getArgument(i), id);
+    }
+    msl::Type *u3 = ctx.vector(msl::Scalar::U32, 3);
+    tgposId = fresh();
+    tidId = fresh();
+    numTgId = fresh();
+    params.push_back(ctx.param(u3, tgposId));
+    params.push_back(ctx.param(u3, tidId));
+    params.push_back(ctx.param(u3, numTgId));
+    devPoolPtr.clear();
+    if (globalPoolBytes > 0) {
+      devPoolPtr = fresh();
+      params.push_back(ctx.param(
+          ctx.ptr(ctx.scalar(msl::Scalar::I8), msl::AddrSpace::Threadgroup),
+          devPoolPtr));
+    }
 
     laneId = fresh();
     warpId = fresh();
-    os << ind() << "int " << laneId << " = (int)(" << tidId << ".x & 31u);\n";
-    os << ind() << "int " << warpId << " = (int)(" << tidId << ".x >> 5);\n";
+    msl::Block prologue = laneWarpProlog();
 
     poolBuf = devPoolPtr;
     curDevFunc = func;
@@ -746,10 +747,14 @@ private:
                                            : astEmitBlockCFG(region);
     if (emitFailed)
       return failure();
-    msl::MSLPrinter printer(os);
-    printer.printBlockAt(body, indent);
     curDevFunc = nullptr;
-    os << "}\n";
+    for (msl::Stmt *s : body)
+      prologue.push_back(s);
+    msl::DeviceFn *fn = ctx.deviceFn(astDeviceRetType(func),
+                                     mslDeviceFuncName(func.getName()), params,
+                                     std::move(prologue));
+    msl::MSLPrinter printer(os);
+    printer.print(fn);
     return success();
   }
 

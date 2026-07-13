@@ -163,6 +163,21 @@ msl::KernelFn *MSLEmitter::astKernelFn(tt::FuncOp func, msl::Block body) {
                       std::move(prologue));
 }
 
+// `int lane = (int)(tid.x & 31u); int warp = (int)(tid.x >> 5);` using the
+// already-minted laneId/warpId/tidId members (kernel + device-fn prologues).
+llvm::SmallVector<msl::Stmt *, 2> MSLEmitter::laneWarpProlog() {
+  msl::Type *i32 = ctx.scalar(msl::Scalar::I32);
+  msl::Expr *lane = ctx.cast(
+      CS::CStyle, i32,
+      ctx.paren(ctx.binary(B::And, ctx.member(ctx.var(tidId), "x"),
+                           ctx.lit("31u"))));
+  msl::Expr *warp = ctx.cast(
+      CS::CStyle, i32,
+      ctx.paren(ctx.binary(B::Shr, ctx.member(ctx.var(tidId), "x"),
+                           ctx.lit("5"))));
+  return {ctx.declStmt(i32, laneId, lane), ctx.declStmt(i32, warpId, warp)};
+}
+
 // `int lane = (int)(tid.x & 31u); int warp = (int)(tid.x >> 5);` - shared by
 // kernel + device-fn prologues.
 llvm::SmallVector<msl::Stmt *, 2> MSLEmitter::laneWarpDecls(int &id,
@@ -949,8 +964,6 @@ msl::Block MSLEmitter::astWalkBlock(Block &blk, unsigned depth) {
     if (astEmitOp(&op, body))
       continue;
     Operation *opp = &op;
-    if (getenv("MSL_LOG_CAPTURE"))
-      llvm::errs() << "CAPTURE: " << op.getName().getStringRef() << "\n";
     msl::Stmt *raw = captureRaw([&] {
       if (failed(emitOp(opp)))
         emitFailed = true;

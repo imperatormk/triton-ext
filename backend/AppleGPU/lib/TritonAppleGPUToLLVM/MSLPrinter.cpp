@@ -451,8 +451,7 @@ void MSLPrinter::printStmt(const Stmt *s) {
       os << "    ";
       printParam(p);
       if (i + 1 < fn->params.size())
-        os << ",";
-      os << "\n";
+        os << ",\n";
     }
     os << ") {\n";
     ++indent;

@@ -48,13 +48,6 @@ msl::Expr *MSLEmitter::astFloatLit(const APFloat &v, StringRef sc) {
 // Integer / float binary, shift, elementwise
 //===----------------------------------------------------------------------===//
 
-
-
-
-
-
-
-
 //===----------------------------------------------------------------------===//
 // AST sub-expression builders (binary / minmax / unary / ternary)
 //===----------------------------------------------------------------------===//
@@ -147,9 +140,6 @@ msl::Expr *MSLEmitter::astTernaryCallExpr(StringRef fn, StringRef a,
 // Casts / bitcast
 //===----------------------------------------------------------------------===//
 
-
-
-
 // General arith cast RHS: static_cast<dst>(src). The fp32->half/bfloat
 // narrowing path (rtz/round-to-nearest) stays on the string route (bespoke
 // bit-twiddling, a Raw escape hatch); this builds the common static_cast form.
@@ -188,10 +178,6 @@ msl::Expr *MSLEmitter::astBitcastExpr(Operation *op, StringRef v) {
 // Clamp / compare / select
 //===----------------------------------------------------------------------===//
 
-
-
-
-
 msl::Expr *MSLEmitter::astClampExpr(tt::ClampFOp op, StringRef x, StringRef lo,
                                     StringRef hi) {
   msl::Expr *clamped = ctx.call(msl::builtin::math::Clamp,
@@ -210,7 +196,6 @@ msl::Expr *MSLEmitter::astSelectExpr(StringRef c, StringRef t, StringRef f) {
 //===----------------------------------------------------------------------===//
 // Cross-lane shuffle
 //===----------------------------------------------------------------------===//
-
 
 // Statement form of the shuffle: emit the same temp decls emitShuffle writes
 // into `body` and return the fresh result name (used by reduce/scan where the

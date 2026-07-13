@@ -303,7 +303,7 @@ void MSLPrinter::printStmtInline(const Stmt *s) {
   }
   if (auto *a = llvm::dyn_cast<AssignStmt>(s)) {
     printExpr(a->lhs);
-    os << " = ";
+    os << (a->compound == AssignStmt::Compound::Add ? " += " : " = ");
     printExpr(a->rhs);
     return;
   }
@@ -357,7 +357,7 @@ void MSLPrinter::printStmt(const Stmt *s) {
     auto *a = llvm::cast<AssignStmt>(s);
     ind();
     printExpr(a->lhs);
-    os << " = ";
+    os << (a->compound == AssignStmt::Compound::Add ? " += " : " = ");
     printExpr(a->rhs);
     os << ";\n";
     return;

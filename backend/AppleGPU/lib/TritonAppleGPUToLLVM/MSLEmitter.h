@@ -392,6 +392,7 @@ private:
   // false when the op has no whole-op sibling yet (flip layer 7b fills these).
   bool astEmitOp(Operation *op, msl::Block &body);
   msl::Block astWalkBlock(Block &blk, unsigned depth);
+  SmallVector<std::string> astDeclResultVars(Value v, msl::Block &body);
   bool emitFailed = false;
 
   std::string fresh() { return "v" + std::to_string(nextId++); }

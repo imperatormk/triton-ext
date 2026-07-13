@@ -228,7 +228,10 @@ struct ArrayDeclStmt : Stmt {
 struct AssignStmt : Stmt {
   Expr *lhs;
   Expr *rhs;
-  AssignStmt(Expr *l, Expr *r) : Stmt(Kind::Assign), lhs(l), rhs(r) {}
+  // compound != None renders `lhs op= rhs` (e.g. the for-step `iv += st`).
+  enum class Compound { None, Add } compound;
+  AssignStmt(Expr *l, Expr *r, Compound c)
+      : Stmt(Kind::Assign), lhs(l), rhs(r), compound(c) {}
   static bool classof(const Stmt *s) { return s->kind == Kind::Assign; }
 };
 
@@ -447,7 +450,12 @@ public:
                                llvm::ArrayRef<Expr *> init = {}) {
     return make<ArrayDeclStmt>(e, save(n), cnt, init);
   }
-  AssignStmt *assignStmt(Expr *l, Expr *r) { return make<AssignStmt>(l, r); }
+  AssignStmt *assignStmt(Expr *l, Expr *r) {
+    return make<AssignStmt>(l, r, AssignStmt::Compound::None);
+  }
+  AssignStmt *addAssignStmt(Expr *l, Expr *r) {
+    return make<AssignStmt>(l, r, AssignStmt::Compound::Add);
+  }
   ExprStmt *exprStmt(Expr *e) { return make<ExprStmt>(e); }
   ReturnStmt *returnStmt(Expr *v = nullptr,
                          llvm::ArrayRef<Expr *> fields = {}) {

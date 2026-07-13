@@ -261,8 +261,7 @@ msl::ForScope *MSLEmitter::astForScope(scf::ForOp op, msl::Block body,
   msl::Type *ty = ctx.named(ivTy);
   msl::Stmt *init = ctx.declStmt(ty, iv, ctx.var(lo));
   msl::Expr *cond = ctx.binary(B::Lt, ctx.var(iv), ctx.var(hi));
-  msl::Stmt *step = ctx.assignStmt(
-      ctx.var(iv), ctx.binary(B::Add, ctx.var(iv), ctx.var(st)));
+  msl::Stmt *step = ctx.addAssignStmt(ctx.var(iv), ctx.var(st));
   return ctx.forScope(init, cond, step, std::move(body));
 }
 
@@ -386,6 +385,26 @@ bool MSLEmitter::astElemwiseDecls(
   for (int r = 0; r < rc; ++r)
     body.push_back(ctx.declStmt(declTy, g.fresh(), mk(r)));
   return true;
+}
+
+// Predeclare a value's per-register result variables (`sc id;`) with no init,
+// mirroring declResultVars; returns the minted names (caller binds valMap).
+SmallVector<std::string>
+MSLEmitter::astDeclResultVars(Value v, msl::Block &body) {
+  Type elem = v.getType();
+  if (auto rt = dyn_cast<RankedTensorType>(elem))
+    elem = rt.getElementType();
+  msl::Type *sc = isa<tt::PointerType>(elem)
+                      ? astStorageType(v.getType())
+                      : astScalarType(elementScalarType(v.getType()));
+  int rc = regCount(v);
+  SmallVector<std::string> ids;
+  for (int r = 0; r < rc; ++r) {
+    std::string id = fresh();
+    body.push_back(ctx.declStmt(sc, id, nullptr));
+    ids.push_back(id);
+  }
+  return ids;
 }
 
 // Flip-aware per-register decls: mints real fresh() names (advancing nextId so
@@ -818,6 +837,78 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
         return ctx.call(bi::precise::Pow, {ten, ctx.var(opnd(op->getOperand(0), r))});
       });
     return false; // unhandled math op: let string path emit the error
+  }
+
+  // scf.if: predeclare result vars, then IfScope with then/else sub-blocks.
+  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    SmallVector<SmallVector<std::string>> results;
+    for (Value res : ifOp.getResults())
+      results.push_back(astDeclResultVars(res, body));
+
+    unsigned d = (unsigned)indent + 1;
+    msl::Block thenB = astWalkBlock(ifOp.getThenRegion().front(), d);
+    if (!results.empty())
+      for (msl::Stmt *s :
+           astYieldAssign(ifOp.thenBlock()->getTerminator(), results))
+        thenB.push_back(s);
+    if (ifOp.getElseRegion().empty()) {
+      body.push_back(ctx.ifScope(ctx.var(names(ifOp.getCondition())[0]),
+                                 std::move(thenB)));
+    } else {
+      msl::Block elseB = astWalkBlock(ifOp.getElseRegion().front(), d);
+      if (!results.empty())
+        for (msl::Stmt *s :
+             astYieldAssign(ifOp.elseBlock()->getTerminator(), results))
+          elseB.push_back(s);
+      body.push_back(ctx.ifElseScope(ctx.var(names(ifOp.getCondition())[0]),
+                                     std::move(thenB), std::move(elseB)));
+    }
+    for (auto [i, res] : llvm::enumerate(ifOp.getResults()))
+      valMap[res] = results[i];
+    return true;
+  }
+
+  // scf.for (non-fused, non-wide-IV). Fused GEMM K-loops and i64-IV loops keep
+  // the string path (captured) for now.
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    if (matchGemmDotLoop(forOp))
+      return false;
+    Type ivType = forOp.getInductionVar().getType();
+    if (ivType.isInteger(64))
+      return false;
+
+    SmallVector<SmallVector<std::string>> carried;
+    for (auto [i, init, res] :
+         llvm::enumerate(forOp.getInitArgs(), forOp.getResults())) {
+      if (isDatalessType(res.getType())) {
+        valMap[forOp.getRegionIterArg(i)] = SmallVector<std::string>{};
+        valMap[res] = SmallVector<std::string>{};
+        carried.push_back({});
+        continue;
+      }
+      auto &initNames = names(init);
+      SmallVector<std::string> vars = astDeclResultVars(res, body);
+      for (size_t r = 0; r < vars.size(); ++r)
+        body.push_back(ctx.assignStmt(
+            ctx.var(vars[r]),
+            ctx.var(initNames[initNames.size() == 1 ? 0 : r])));
+      valMap[forOp.getRegionIterArg(i)] = vars;
+      valMap[res] = vars;
+      carried.push_back(vars);
+    }
+
+    std::string iv = fresh();
+    bindScalar(forOp.getInductionVar(), iv);
+    std::string ivTy = mslScalarType(ivType);
+    if (ivTy.empty())
+      ivTy = "int";
+
+    msl::Block loopBody = astWalkBlock(forOp.getRegion().front(), (unsigned)indent + 1);
+    for (msl::Stmt *s :
+         astYieldAssign(forOp.getBody()->getTerminator(), carried))
+      loopBody.push_back(s);
+    body.push_back(astForScope(forOp, std::move(loopBody), iv, ivTy));
+    return true;
   }
 
   // --- Flipped families slot in above this line; unflipped ops fall through to

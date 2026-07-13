@@ -44,9 +44,7 @@ int main() {
     Stmt *initDecl =
         ctx.declStmt(ctx.scalar(Scalar::I32), "v0", ctx.lit("0"));
     Expr *cond = ctx.binary(BinOp::Lt, ctx.var("v0"), ctx.lit("4"));
-    Stmt *step =
-        ctx.assignStmt(ctx.var("v0"),
-                       ctx.binary(BinOp::Add, ctx.var("v0"), ctx.lit("1")));
+    Stmt *step = ctx.addAssignStmt(ctx.var("v0"), ctx.lit("1"));
     body.push_back(ctx.forScope(initDecl, cond, step, std::move(forBody)));
   }
 
@@ -135,7 +133,7 @@ int main() {
       "    device float* x [[buffer(0)]],\n"
       "    uint3 tid [[thread_position_in_threadgroup]]\n"
       ") {\n"
-      "    for (int v0 = 0; v0 < 4; v0 = v0 + 1) {\n"
+      "    for (int v0 = 0; v0 < 4; v0 += 1) {\n"
       "        float v1 = x[v0];\n"
       "        acc = acc + v1;\n"
       "        threadgroup_barrier(mem_flags::mem_threadgroup | "

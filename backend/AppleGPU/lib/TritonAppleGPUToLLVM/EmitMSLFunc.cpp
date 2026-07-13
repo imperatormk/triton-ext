@@ -467,8 +467,75 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
-  (void)resElem;
-  (void)opnd;
+
+  // Float binaries: `sc id = (a o b);`
+  if (isa<arith::AddFOp, arith::MulFOp, arith::SubFOp, arith::DivFOp,
+          tt::PreciseDivFOp>(op))
+    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+      return astElementwiseExpr(
+          isa<arith::AddFOp>(op)   ? B::Add
+          : isa<arith::SubFOp>(op) ? B::Sub
+          : isa<arith::MulFOp>(op) ? B::Mul
+                                   : B::Div,
+          nullptr, opnd(op->getOperand(0), r), opnd(op->getOperand(1), r));
+    });
+
+  // Integer add/sub/mul/div/rem (astIntBinaryExpr handles the i1 and unsigned
+  // paths; the decl type must match the string path's unsigned promotion).
+  if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp, arith::DivSIOp,
+          arith::DivUIOp, arith::RemSIOp, arith::RemUIOp>(op)) {
+    msl::Type *declTy = astScalarType(resElem);
+    if (auto it = dyn_cast<IntegerType>(resElem); it && it.getWidth() == 1)
+      declTy = ctx.scalar(msl::Scalar::I1);
+    else if (isa<arith::DivUIOp, arith::RemUIOp>(op))
+      declTy = astUnsignedType(resElem);
+    return astDeclBind(op, declTy, body, [&](int r) {
+      return astIntBinaryExpr(op, opnd(op->getOperand(0), r),
+                              opnd(op->getOperand(1), r));
+    });
+  }
+
+  // Bitwise/logical and/or/xor.
+  if (isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op)) {
+    B bo = isa<arith::AndIOp>(op) ? B::And
+           : isa<arith::OrIOp>(op) ? B::Or
+                                   : B::Xor;
+    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+      return astElementwiseExpr(bo, nullptr, opnd(op->getOperand(0), r),
+                                opnd(op->getOperand(1), r));
+    });
+  }
+
+  // Shifts.
+  if (isa<arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp>(op))
+    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+      return astShiftExpr(op, opnd(op->getOperand(0), r),
+                          opnd(op->getOperand(1), r));
+    });
+
+  // Program-id / num-programs: `int id = (int)(builtin.comp);`
+  if (auto p = dyn_cast<tt::GetProgramIdOp>(op)) {
+    const char *comp = p.getAxis() == tt::ProgramIDDim::X   ? "x"
+                       : p.getAxis() == tt::ProgramIDDim::Y ? "y"
+                                                            : "z";
+    msl::Expr *e = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::I32),
+                            ctx.paren(ctx.member(ctx.var(tgposId), comp)));
+    std::string id = fresh();
+    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), id, e));
+    bindScalar(op->getResult(0), id);
+    return true;
+  }
+  if (auto n = dyn_cast<tt::GetNumProgramsOp>(op)) {
+    const char *comp = n.getAxis() == tt::ProgramIDDim::X   ? "x"
+                       : n.getAxis() == tt::ProgramIDDim::Y ? "y"
+                                                            : "z";
+    msl::Expr *e = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::I32),
+                            ctx.paren(ctx.member(ctx.var(numTgId), comp)));
+    std::string id = fresh();
+    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), id, e));
+    bindScalar(op->getResult(0), id);
+    return true;
+  }
 
   // --- Flipped families slot in above this line; unflipped ops fall through to
   // the string capture in astWalkBlock. ---

@@ -227,8 +227,8 @@ msl::Expr *MSLEmitter::astIntBinaryExpr(Operation *op, StringRef a,
   if (auto it = dyn_cast<IntegerType>(resElem); it && it.getWidth() == 1) {
     // (bool)((((int)a) o ((int)b)) & 1)
     msl::Type *i32 = ctx.scalar(msl::Scalar::I32);
-    msl::Expr *ca = ctx.cast(msl::Cast::Style::CStyle, i32, ctx.var(a));
-    msl::Expr *cb = ctx.cast(msl::Cast::Style::CStyle, i32, ctx.var(b));
+    msl::Expr *ca = ctx.paren(ctx.cast(msl::Cast::Style::CStyle, i32, ctx.var(a)));
+    msl::Expr *cb = ctx.paren(ctx.cast(msl::Cast::Style::CStyle, i32, ctx.var(b)));
     msl::Expr *inner = ctx.paren(ctx.binary(o, ca, cb));
     msl::Expr *masked =
         ctx.paren(ctx.binary(msl::BinOp::And, inner, ctx.lit("1")));
@@ -246,8 +246,13 @@ msl::Expr *MSLEmitter::astShiftExpr(Operation *op, StringRef a, StringRef b) {
   msl::BinOp o = isa<arith::ShLIOp>(op) ? msl::BinOp::Shl : msl::BinOp::Shr;
   bool logical = isa<arith::ShLIOp, arith::ShRUIOp>(op);
   msl::Expr *lhs = ctx.var(a);
-  if (logical)
-    lhs = ctx.cast(msl::Cast::Style::CStyle, astUnsignedType(resElem), lhs);
+  if (logical) {
+    // Functional-style cast `usc(a)` (matches emitShift's string form).
+    std::string usc = mslUnsignedType(resElem);
+    if (usc.empty())
+      usc = "u" + mslScalarType(resElem);
+    lhs = ctx.call(usc, {ctx.var(a)});
+  }
   return ctx.paren(ctx.binary(o, lhs, ctx.var(b)));
 }
 

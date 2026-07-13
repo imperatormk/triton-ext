@@ -103,9 +103,7 @@ inline constexpr llvm::StringRef Threadgroup = "mem_flags::mem_threadgroup";
 // memory_order_* orderings.
 namespace order {
 inline constexpr llvm::StringRef Relaxed = "memory_order_relaxed";
-inline constexpr llvm::StringRef Acquire = "memory_order_acquire";
-inline constexpr llvm::StringRef Release = "memory_order_release";
-inline constexpr llvm::StringRef AcqRel = "memory_order_acq_rel";
+inline constexpr llvm::StringRef SeqCst = "memory_order_seq_cst";
 } // namespace order
 
 } // namespace builtin

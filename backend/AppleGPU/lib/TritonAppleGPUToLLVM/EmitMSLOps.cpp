@@ -1503,17 +1503,13 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
         }));
         indent = savedInd;
       } else {
-        std::string order = "memory_order_relaxed";
-        switch (sem) {
-        case tt::MemSemantic::ACQUIRE: order = "memory_order_acquire"; break;
-        case tt::MemSemantic::RELEASE: order = "memory_order_release"; break;
-        case tt::MemSemantic::ACQUIRE_RELEASE: order = "memory_order_acq_rel"; break;
-        default: break;
-        }
-        bool memFlags = order != "memory_order_relaxed";
+        // Metal device atomics are relaxed-only; acquire/release/acq_rel are
+        // not valid MSL memory orders (the acq_rel form fails to compile).
+        (void)sem;
         inner.push_back(ctx.assignStmt(
             ctx.var(id),
-            astAtomicRmwCall(fn, atomicTy, p, v, order, memFlags)));
+            astAtomicRmwCall(fn, atomicTy, p, v, "memory_order_relaxed",
+                             /*memFlags=*/false)));
       }
       if (guard)
         body.push_back(ctx.ifScope(guard, std::move(inner)));

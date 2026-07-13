@@ -70,11 +70,12 @@ msl::Block MSLEmitter::astPacked16Base(StringRef p, std::string &wordPtrOut,
       ctx.lit("0u"));
 
   msl::Block block;
-  block.push_back(
-      ctx.declStmt(ucptr, bytePtr, ctx.paren(ctx.var(p))));
+  block.push_back(ctx.declStmt(
+      ucptr, bytePtr, ctx.cast(CS::CStyle, ucptr, ctx.paren(ctx.var(p)))));
   block.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::SizeT), wordAddr, addr));
   block.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), isHigh, hi));
-  block.push_back(ctx.declStmt(auptr, wordPtr, ctx.var(wordAddr)));
+  block.push_back(ctx.declStmt(
+      auptr, wordPtr, ctx.cast(CS::CStyle, auptr, ctx.var(wordAddr))));
   wordPtrOut = wordPtr;
   isHighOut = isHigh;
   return block;
@@ -117,7 +118,7 @@ msl::Block MSLEmitter::astFloat32CASLoop(StringRef p, StringRef curId,
 
   msl::Type *auptr = ctx.ptr(ctx.named(ba::Uint), msl::AddrSpace::Device);
   msl::Stmt *wpDecl = ctx.declStmt(
-      auptr, wordPtr, ctx.paren(ctx.var(p)));
+      auptr, wordPtr, ctx.cast(CS::CStyle, auptr, ctx.paren(ctx.var(p))));
   msl::Stmt *wDecl = ctx.declStmt(
       ctx.scalar(msl::Scalar::U32), word,
       ctx.call(ba::Load, {ctx.var(wordPtr), ctx.lit(border::Relaxed)}));
@@ -222,9 +223,10 @@ msl::Block MSLEmitter::astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
 
 // sc exp = c;
 // while (exp == c && !(atomic_compare_exchange_weak_explicit(
-//          (device atomic_int *)p, &exp, v, memory_order_acquire,
-//          memory_order_relaxed, mem_flags::mem_device))) {}
+//          (device atomic_int *)p, &exp, v, memory_order_relaxed,
+//          memory_order_relaxed))) {}
 // [sc ]id = exp;
+// Metal device atomics are relaxed-only; acquire/release orders are invalid MSL.
 msl::Block MSLEmitter::astInt32CAS(StringRef p, StringRef c, StringRef v,
                                    StringRef sc, StringRef id, bool declare) {
   LocalGen g{nextId};
@@ -235,8 +237,7 @@ msl::Block MSLEmitter::astInt32CAS(StringRef p, StringRef c, StringRef v,
   msl::Expr *cas = ctx.call(
       ba::CompareExchangeWeak,
       {ctx.cast(CS::CStyle, aiptr, ctx.var(p)), ctx.addrOf(ctx.var(exp)),
-       ctx.var(v), ctx.lit(border::Acquire), ctx.lit(border::Relaxed),
-       ctx.lit(bmem::Device)});
+       ctx.var(v), ctx.lit(border::Relaxed), ctx.lit(border::Relaxed)});
   msl::Expr *cond =
       ctx.binary(B::LAnd, ctx.binary(B::Eq, ctx.var(exp), ctx.var(c)),
                  ctx.unary(msl::UnOp::LNot, ctx.paren(cas)));
@@ -363,10 +364,12 @@ msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
   return outer;
 }
 
-// atomic_thread_fence(mem_flags::mem_device, memory_order_acquire);
+// atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
+// Metal fences accept only relaxed or seq_cst; seq_cst is the valid
+// stronger-than-acquire order.
 msl::Stmt *MSLEmitter::astAcquireFence() {
   return ctx.exprStmt(ctx.call(
-      ba::ThreadFence, {ctx.lit(bmem::Device), ctx.lit(border::Acquire)}));
+      ba::ThreadFence, {ctx.lit(bmem::Device), ctx.lit(border::SeqCst)}));
 }
 
 //===----------------------------------------------------------------------===//
@@ -386,7 +389,7 @@ msl::Expr *MSLEmitter::astPoll64Load(StringRef p, StringRef wordPtr,
                                      msl::Stmt *&out) {
   msl::Type *vptr = ctx.ptr(ctx.scalar(msl::Scalar::U64), msl::AddrSpace::Device,
                             /*coherent=*/false, /*vol=*/true);
-  out = ctx.declStmt(vptr, wordPtr, ctx.paren(ctx.var(p)));
+  out = ctx.declStmt(vptr, wordPtr, ctx.cast(CS::CStyle, vptr, ctx.paren(ctx.var(p))));
   return ctx.paren(ctx.deref(ctx.var(wordPtr)));
 }
 

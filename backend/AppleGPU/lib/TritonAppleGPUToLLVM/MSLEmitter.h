@@ -395,6 +395,12 @@ private:
   SmallVector<std::string> astDeclResultVars(Value v, msl::Block &body);
   msl::Expr *astDerefPtr(Value ptr, StringRef name, StringRef scName);
   void astStoreBody(tt::StoreOp op, msl::Block &body);
+  void astBandRoundTrip(msl::Block &body, StringRef buf, int64_t total,
+                        int64_t band, int srcRc, int resRc,
+                        ArrayRef<std::string> outs,
+                        llvm::function_ref<msl::Expr *(int)> srcOff,
+                        llvm::function_ref<msl::Expr *(int)> srcVal,
+                        llvm::function_ref<msl::Expr *(int)> resOff);
   bool emitFailed = false;
 
   std::string fresh() { return "v" + std::to_string(nextId++); }

@@ -351,9 +351,10 @@ bool MSLEmitter::astScanWarpCarry(
     byteOff += (int64_t)numWarps * 32 * byteWidths[k];
   }
   body.push_back(ctx.hardBarrier(false));
-  std::string topGuard = axisTopLane == StringRef(laneId)
-                             ? std::string("true")
-                             : (laneId + " == " + axisTopLane.str());
+  msl::Expr *topGuard =
+      axisTopLane == StringRef(laneId)
+          ? static_cast<msl::Expr *>(ctx.lit("true"))
+          : ctx.binary(B::Eq, ctx.var(laneId), ctx.var(axisTopLane));
   for (int k = 0; k < nOp; ++k) {
     // scratch[k][warp * 32 + lane] = laneScan[k];
     msl::Expr *idx = ctx.binary(
@@ -361,12 +362,16 @@ bool MSLEmitter::astScanWarpCarry(
         ctx.var(laneId));
     msl::Stmt *asn = ctx.assignStmt(ctx.subscript(ctx.var(scratch[k]), idx),
                                     ctx.var(laneScan[k]));
-    body.push_back(ctx.compactIf(ctx.raw(topGuard), asn));
+    body.push_back(ctx.compactIf(topGuard, asn));
   }
   body.push_back(ctx.hardBarrier(false));
 
-  std::string base = "((" + warpId + " & " + std::to_string(~axisWarpMask) +
-                     ") * 32 + " + axisTopLane.str() + ")";
+  // ((warpId & ~axisWarpMask) * 32 + axisTopLane)
+  msl::Expr *base = ctx.paren(ctx.add(
+      ctx.mul(ctx.paren(ctx.binary(B::And, ctx.var(warpId),
+                                   ctx.i32lit(~axisWarpMask))),
+              ctx.lit("32")),
+      ctx.var(axisTopLane)));
 
   SmallVector<int> maskBits;
   for (size_t r = 0; r < warpBits.size(); ++r)
@@ -382,15 +387,22 @@ bool MSLEmitter::astScanWarpCarry(
 
   std::string myPart = fresh();
   {
-    SmallVector<std::string> posTerms;
+    // posTerms[r] = ((((warpId >> maskBits[r]) & 1) << r))
+    SmallVector<msl::Expr *> posTerms;
     for (size_t r = 0; r < maskBits.size(); ++r)
-      posTerms.push_back("((((" + warpId + " >> " + std::to_string(maskBits[r]) +
-                         ") & 1) << " + std::to_string(r) + "))");
-    std::string warpPos = posTerms[0];
+      posTerms.push_back(ctx.paren(ctx.paren(ctx.binary(
+          B::Shl,
+          ctx.paren(ctx.binary(
+              B::And,
+              ctx.paren(ctx.binary(B::Shr, ctx.var(warpId),
+                                   ctx.i32lit(maskBits[r]))),
+              ctx.i32lit(1))),
+          ctx.i32lit(r)))));
+    msl::Expr *warpPos = posTerms[0];
     for (size_t i = 1; i < posTerms.size(); ++i)
-      warpPos = "(" + warpPos + " | " + posTerms[i] + ")";
-    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), myPart,
-                                ctx.raw(warpPos)));
+      warpPos = ctx.paren(ctx.binary(B::Or, warpPos, posTerms[i]));
+    body.push_back(
+        ctx.declStmt(ctx.scalar(msl::Scalar::I32), myPart, warpPos));
   }
 
   SmallVector<int> order;
@@ -399,7 +411,7 @@ bool MSLEmitter::astScanWarpCarry(
 
   auto slot = [&](int k, int part) -> msl::Expr * {
     return ctx.subscript(ctx.var(scratch[k]),
-                         ctx.binary(B::Add, ctx.raw(base),
+                         ctx.binary(B::Add, base,
                                     ctx.lit(std::to_string(partWarp(part) * 32))));
   };
 

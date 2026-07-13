@@ -385,6 +385,8 @@ private:
   bool astEmitOp(Operation *op, msl::Block &body);
   msl::Block astWalkBlock(Block &blk, unsigned depth);
   msl::Block astEmitBlockCFG(Region &region);
+  void astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
+                     msl::Block &body);
   msl::Block astWalkBlock2(Block &blk,
                            llvm::DenseMap<Value, SmallVector<std::string>> &hoist);
   msl::Block astTerminatorEdge(Operation *term, StringRef state);

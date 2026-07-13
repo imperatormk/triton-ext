@@ -411,13 +411,9 @@ bool MSLEmitter::astCombineN(Region &region, ArrayRef<std::string> aVals,
   for (Operation &o : blk.without_terminator()) {
     if (astEmitOp(&o, body))
       continue;
-    Operation *opp = &o;
-    msl::Stmt *raw = captureRaw([&] {
-      if (failed(emitOp(opp)))
-        emitFailed = true;
-    });
-    if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
-      body.push_back(raw);
+    o.emitError("EmitMSL: unhandled combiner op '" +
+                o.getName().getStringRef() + "'");
+    emitFailed = true;
     if (barrierPending) {
       body.push_back(ctx.barrier(barrierPendingDevice));
       barrierPending = false;
@@ -589,6 +585,55 @@ bool MSLEmitter::astScanWarpCarry(
   return true;
 }
 
+// Multi-block map_elementwise region -> state machine. Like astEmitBlockCFG but
+// the map_elementwise.return terminator spills operands into caller `capture`
+// slots then breaks. Appends the predeclarations + state machine to `body`.
+void MSLEmitter::astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
+                              msl::Block &body) {
+  blockLabel.clear();
+  int idx = 0;
+  for (Block &blk : region)
+    blockLabel[&blk] = std::to_string(idx++);
+  for (Block &blk : llvm::drop_begin(region))
+    for (BlockArgument arg : blk.getArguments()) {
+      if (isDatalessType(arg.getType())) {
+        valMap[arg] = SmallVector<std::string>{};
+        continue;
+      }
+      valMap[arg] = astDeclResultVars(arg, body);
+    }
+  llvm::DenseMap<Value, SmallVector<std::string>> hoist;
+  for (Block &blk : region)
+    for (Operation &op : blk)
+      for (Value res : op.getResults()) {
+        if (isDatalessType(res.getType()))
+          continue;
+        bool crosses = llvm::any_of(res.getUsers(), [&](Operation *u) {
+          return u->getBlock() != &blk;
+        });
+        if (crosses)
+          hoist[res] = astDeclResultVars(res, body);
+      }
+  std::string state = fresh();
+  cfgState = state;
+  llvm::SmallVector<std::pair<std::string, msl::Block>> cases;
+  for (Block &blk : region) {
+    msl::Block caseBody = astWalkBlock2(blk, hoist);
+    Operation *term = blk.getTerminator();
+    if (term->getName().getStringRef() == "tt.map_elementwise.return") {
+      for (auto [i, operand] : llvm::enumerate(term->getOperands()))
+        caseBody.push_back(astMapReturnSpill(capture[i], names(operand)[0]));
+      caseBody.push_back(ctx.breakStmt());
+    } else {
+      for (msl::Stmt *s : astTerminatorEdge(term, state))
+        caseBody.push_back(s);
+    }
+    cases.push_back({blockLabel[&blk], std::move(caseBody)});
+  }
+  cfgState.clear();
+  body.push_back(astMapCFGStateMachine(state, cases));
+}
+
 // Multi-block region -> state-machine dispatch Block. Predeclares block-arg vars
 // + cross-block hoisted vars, then a StateMachineScope with per-block cases
 // (walked ops + hoist spills + terminator edge). Mirrors emitBlockCFG.
@@ -646,18 +691,14 @@ MSLEmitter::astWalkBlock2(Block &blk,
   ++indent;
   for (Operation &op : blk.without_terminator()) {
     if (!astEmitOp(&op, body)) {
-      Operation *opp = &op;
-      msl::Stmt *raw = captureRaw([&] {
-        if (failed(emitOp(opp)))
-          emitFailed = true;
-      });
-      if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
-        body.push_back(raw);
-      if (barrierPending) {
-        body.push_back(ctx.barrier(barrierPendingDevice));
-        barrierPending = false;
-        barrierPendingDevice = false;
-      }
+      op.emitError("EmitMSL: unhandled CFG op '" +
+                   op.getName().getStringRef() + "'");
+      emitFailed = true;
+    }
+    if (barrierPending) {
+      body.push_back(ctx.barrier(barrierPendingDevice));
+      barrierPending = false;
+      barrierPendingDevice = false;
     }
     for (Value res : op.getResults()) {
       auto it = hoist.find(res);
@@ -692,15 +733,11 @@ msl::Block MSLEmitter::astTerminatorEdge(Operation *term, StringRef state) {
                                 std::move(elseB)));
     return out;
   }
-  // return / other terminator through astEmitOp (or capture).
+  // return / other terminator through astEmitOp.
   if (!astEmitOp(term, out)) {
-    Operation *tp = term;
-    msl::Stmt *raw = captureRaw([&] {
-      if (failed(emitOp(tp)))
-        emitFailed = true;
-    });
-    if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
-      out.push_back(raw);
+    term->emitError("EmitMSL: unhandled CFG terminator '" +
+                    term->getName().getStringRef() + "'");
+    emitFailed = true;
   }
   return out;
 }
@@ -964,10 +1001,12 @@ msl::Block MSLEmitter::astWalkBlock(Block &blk, unsigned depth) {
     if (astEmitOp(&op, body))
       continue;
     Operation *opp = &op;
-    msl::Stmt *raw = captureRaw([&] {
-      if (failed(emitOp(opp)))
-        emitFailed = true;
-    });
+    (void)opp;
+    // No real-kernel op family falls through: astEmitOp is exhaustive. An
+    // unhandled op is a hard error.
+    op.emitError("EmitMSL: unhandled op '" + op.getName().getStringRef() + "'");
+    emitFailed = true;
+    msl::Stmt *raw = ctx.rawVerbatim("");
     // An alias/dataless op (splat/reshape/broadcast/...) rebinds valMap but emits
     // no text; drop its empty RawStmt so no node lingers for it.
     if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
@@ -1731,23 +1770,34 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     int nReg = srcNames[0].size();
     int nGroup = nReg / pack;
     bool multiBlock = !region.hasOneBlock();
-    if (multiBlock)
-      return false; // string state-machine path (captured)
 
     SmallVector<SmallVector<std::string>> resIds(nRes);
     for (int g = 0; g < nGroup; ++g) {
       for (int s = 0; s < nSrc; ++s)
         for (int p = 0; p < pack; ++p)
           bindScalar(blk.getArgument(s * pack + p), srcNames[s][g * pack + p]);
+      if (multiBlock) {
+        SmallVector<std::string> capture(nRes * pack);
+        for (int i = 0; i < nRes * pack; ++i) {
+          capture[i] = fresh();
+          Value r = mp->getResult(i / pack);
+          body.push_back(astMapCaptureDecl(
+              mslScalarType(elementScalarType(r.getType())), capture[i]));
+        }
+        astEmitMapCFG(region, capture, body);
+        if (emitFailed)
+          return false;
+        for (int k = 0; k < nRes; ++k)
+          for (int p = 0; p < pack; ++p)
+            resIds[k].push_back(capture[k * pack + p]);
+        continue;
+      }
       for (Operation &o : blk.without_terminator()) {
-        if (astEmitOp(&o, body))
-          continue;
-        Operation *opp = &o;
-        msl::Stmt *raw = captureRaw([&] {
-          if (failed(emitOp(opp))) emitFailed = true;
-        });
-        if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
-          body.push_back(raw);
+        if (!astEmitOp(&o, body)) {
+          o.emitError("EmitMSL: unhandled map op '" +
+                      o.getName().getStringRef() + "'");
+          emitFailed = true;
+        }
       }
       if (emitFailed)
         return false;

@@ -902,6 +902,79 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
 
   bool noCF = getenv("MSL_AST_NO_CF");
 
+  // tt.trans: round-trip through a threadgroup buffer keyed by row-major offset.
+  if (auto tr = dyn_cast<tt::TransOp>(op)) {
+    if (!isa<RankedTensorType>(tr.getResult().getType()))
+      return false;
+    Value src = tr.getSrc();
+    Value res = tr.getResult();
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    auto perm = tr.getOrder();
+    msl::Type *scTy = astScalarType(resTy.getElementType());
+    std::string sc = mslScalarType(resTy.getElementType());
+    auto &srcNames = names(src);
+    int srcRc = regCount(src);
+    int resRc = regCount(res);
+    int64_t elemBytes = bitsOf(resTy.getElementType()) / 8;
+    int64_t total = tileSize(resTy);
+
+    std::string buf = fresh();
+    body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
+                                astPoolRegion(0, sc)));
+    int64_t band = total * elemBytes > 32768
+                       ? reshapeBandElems(total, elemBytes)
+                       : total;
+    SmallVector<std::string> ids = astDeclResultVars(res, body);
+
+    for (int64_t lo = 0; lo < total; lo += band) {
+      int64_t hi = std::min(lo + band, total);
+      body.push_back(ctx.barrier(false));
+      for (int r = 0; r < srcRc; ++r) {
+        msl::Expr *off = astTransFlatOffset(srcTy, perm, resTy.getShape(), r);
+        msl::Expr *sv = ctx.var(srcNames[srcNames.size() == 1 ? 0 : r]);
+        if (band == total) {
+          body.push_back(ctx.assignStmt(ctx.subscript(ctx.var(buf), off), sv));
+        } else {
+          msl::Block b;
+          b.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), "__f", off));
+          msl::Expr *cond = ctx.binary(
+              B::LAnd,
+              ctx.binary(B::Ge, ctx.var("__f"), ctx.lit(std::to_string(lo))),
+              ctx.binary(B::Lt, ctx.var("__f"), ctx.lit(std::to_string(hi))));
+          msl::Expr *idx =
+              ctx.binary(B::Sub, ctx.var("__f"), ctx.lit(std::to_string(lo)));
+          b.push_back(ctx.compactIf(
+              cond, ctx.assignStmt(ctx.subscript(ctx.var(buf), idx), sv)));
+          body.push_back(ctx.plainScope(std::move(b)));
+        }
+      }
+      body.push_back(ctx.barrier(false));
+      for (int r = 0; r < resRc; ++r) {
+        msl::Expr *off = astFlatTileOffset(resTy, r);
+        if (band == total) {
+          body.push_back(ctx.assignStmt(
+              ctx.var(ids[r]), ctx.subscript(ctx.var(buf), off)));
+        } else {
+          msl::Block b;
+          b.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), "__f", off));
+          msl::Expr *cond = ctx.binary(
+              B::LAnd,
+              ctx.binary(B::Ge, ctx.var("__f"), ctx.lit(std::to_string(lo))),
+              ctx.binary(B::Lt, ctx.var("__f"), ctx.lit(std::to_string(hi))));
+          msl::Expr *idx =
+              ctx.binary(B::Sub, ctx.var("__f"), ctx.lit(std::to_string(lo)));
+          b.push_back(ctx.compactIf(
+              cond, ctx.assignStmt(ctx.var(ids[r]),
+                                   ctx.subscript(ctx.var(buf), idx))));
+          body.push_back(ctx.plainScope(std::move(b)));
+        }
+      }
+    }
+    valMap[res] = ids;
+    return true;
+  }
+
   // tt.return
   if (auto ret = dyn_cast<tt::ReturnOp>(op)) {
     body.push_back(astReturn(ret));

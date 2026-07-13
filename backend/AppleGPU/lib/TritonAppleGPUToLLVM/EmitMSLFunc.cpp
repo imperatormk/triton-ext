@@ -1485,6 +1485,51 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  // tt.map_elementwise: per-group inline of the scalar region. Single-block
+  // groups AST-walk the region; multi-block groups use the string state machine
+  // (captured), as they are rare and self-contained.
+  if (auto mp = dyn_cast<tt::MapElementwiseOp>(op)) {
+    Region &region = mp.getScalarOp();
+    Block &blk = region.front();
+    int nSrc = mp.getNumOperands();
+    int nRes = mp.getNumResults();
+    int pack = mp.getPack();
+    SmallVector<SmallVector<std::string>> srcNames(nSrc);
+    for (int s = 0; s < nSrc; ++s)
+      srcNames[s] = names(mp.getOperand(s));
+    int nReg = srcNames[0].size();
+    int nGroup = nReg / pack;
+    bool multiBlock = !region.hasOneBlock();
+    if (multiBlock)
+      return false; // string state-machine path (captured)
+
+    SmallVector<SmallVector<std::string>> resIds(nRes);
+    for (int g = 0; g < nGroup; ++g) {
+      for (int s = 0; s < nSrc; ++s)
+        for (int p = 0; p < pack; ++p)
+          bindScalar(blk.getArgument(s * pack + p), srcNames[s][g * pack + p]);
+      for (Operation &o : blk.without_terminator()) {
+        if (astEmitOp(&o, body))
+          continue;
+        Operation *opp = &o;
+        msl::Stmt *raw = captureRaw([&] {
+          if (failed(emitOp(opp))) emitFailed = true;
+        });
+        if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
+          body.push_back(raw);
+      }
+      if (emitFailed)
+        return false;
+      Operation *term = blk.getTerminator();
+      for (int k = 0; k < nRes; ++k)
+        for (int p = 0; p < pack; ++p)
+          resIds[k].push_back(names(term->getOperand(k * pack + p))[0]);
+    }
+    for (int k = 0; k < nRes; ++k)
+      valMap[mp->getResult(k)] = resIds[k];
+    return true;
+  }
+
   // tt.histogram: zero-init threadgroup bins, per-register guarded fetch_add,
   // barrier, then per-result-register atomic_load.
   if (auto hg = dyn_cast<tt::HistogramOp>(op)) {

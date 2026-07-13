@@ -902,6 +902,32 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
 
   bool noCF = getenv("MSL_AST_NO_CF");
 
+  // tt.return
+  if (auto ret = dyn_cast<tt::ReturnOp>(op)) {
+    body.push_back(astReturn(ret));
+    return true;
+  }
+
+  // ub.poison: `sc id = nullptr;` (ptr) or `sc id = (sc)0;`
+  if (op->getName().getStringRef() == "ub.poison") {
+    Value res = op->getResult(0);
+    Type elem = res.getType();
+    if (auto rt = dyn_cast<RankedTensorType>(elem))
+      elem = rt.getElementType();
+    bool isPtr = isa<tt::PointerType>(elem);
+    msl::Type *sc = isPtr ? astStorageType(res.getType())
+                          : astScalarType(elementScalarType(res.getType()));
+    std::string scName = isPtr ? mslStorageType(res.getType())
+                               : mslScalarType(elementScalarType(res.getType()));
+    if (scName.empty())
+      return false;
+    return astDeclBind(op, sc, body, [&](int) -> msl::Expr * {
+      if (isPtr)
+        return ctx.lit("nullptr");
+      return ctx.cast(CS::CStyle, sc, ctx.lit("0"));
+    });
+  }
+
   // addptr: `device sc* id = b + o;`
   if (auto ap = dyn_cast<tt::AddPtrOp>(op)) {
     msl::Type *sc = ctx.ptr(astScalarType(elementScalarType(op->getResult(0).getType())),

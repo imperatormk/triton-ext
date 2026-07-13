@@ -2097,12 +2097,24 @@ private:
     std::string hi = names(op.getUpperBound())[0];
     std::string st = names(op.getStep())[0];
     bindScalar(op.getInductionVar(), iv);
-    std::string ivTy = mslScalarType(op.getInductionVar().getType());
+    Type ivType = op.getInductionVar().getType();
+    std::string ivTy = mslScalarType(ivType);
     if (ivTy.empty())
       ivTy = "int";
-    os << ind() << "for (" << ivTy << " " << iv << " = " << lo << "; " << iv
-       << " < " << hi << "; " << iv << " += " << st << ") {\n";
-    ++indent;
+    bool wideIv = ivType.isInteger(64);
+    if (wideIv) {
+      std::string tc = fresh();
+      os << ind() << "for (" << ivTy << " " << tc << " = 0; ; " << tc
+         << " += 1) {\n";
+      ++indent;
+      os << ind() << ivTy << " " << iv << " = " << lo << " + " << tc << " * "
+         << st << ";\n";
+      os << ind() << "if (!(" << iv << " < " << hi << ")) break;\n";
+    } else {
+      os << ind() << "for (" << ivTy << " " << iv << " = " << lo << "; " << iv
+         << " < " << hi << "; " << iv << " += " << st << ") {\n";
+      ++indent;
+    }
     if (failed(emitRegionBody(op.getRegion())))
       return failure();
     emitYieldAssign(op.getBody()->getTerminator(), carried);

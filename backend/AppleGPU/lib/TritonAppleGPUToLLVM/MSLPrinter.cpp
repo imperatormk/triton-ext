@@ -397,6 +397,15 @@ void MSLPrinter::printStmt(const Stmt *s) {
     barrierPendingDevice =
         barrierPendingDevice || llvm::cast<BarrierStmt>(s)->device;
     return;
+  case Stmt::Kind::CompactIf: {
+    auto *c = llvm::cast<CompactIfStmt>(s);
+    ind() << "if (";
+    printExpr(c->cond);
+    os << ") ";
+    printStmtInline(c->then);
+    os << ";\n";
+    return;
+  }
   case Stmt::Kind::Raw: {
     auto *r = llvm::cast<RawStmt>(s);
     if (r->verbatim)

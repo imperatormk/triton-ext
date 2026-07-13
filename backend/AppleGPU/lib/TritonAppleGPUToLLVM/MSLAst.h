@@ -194,7 +194,8 @@ struct Raw : Expr {
 
 struct Stmt {
   enum class Kind {
-    Decl, ArrayDecl, Assign, Expr, Return, Break, Continue, Barrier, Raw,
+    Decl, ArrayDecl, Assign, Expr, Return, Break, Continue, Barrier, CompactIf,
+    Raw,
     // scopes
     KernelFn, DeviceFn, ForScope, TripCountForScope, IfScope, WhileScope,
     StateMachineScope, PlainScope
@@ -263,6 +264,14 @@ struct BarrierStmt : Stmt {
   bool device;
   explicit BarrierStmt(bool d) : Stmt(Kind::Barrier), device(d) {}
   static bool classof(const Stmt *s) { return s->kind == Kind::Barrier; }
+};
+
+// `if (cond) <stmt>` on one line, no braces (load mask, store guard, etc.).
+struct CompactIfStmt : Stmt {
+  Expr *cond;
+  Stmt *then;
+  CompactIfStmt(Expr *c, Stmt *t) : Stmt(Kind::CompactIf), cond(c), then(t) {}
+  static bool classof(const Stmt *s) { return s->kind == Kind::CompactIf; }
 };
 
 struct RawStmt : Stmt {
@@ -467,6 +476,9 @@ public:
   BreakStmt *breakStmt() { return make<BreakStmt>(); }
   ContinueStmt *continueStmt() { return make<ContinueStmt>(); }
   BarrierStmt *barrier(bool device) { return make<BarrierStmt>(device); }
+  CompactIfStmt *compactIf(Expr *c, Stmt *t) {
+    return make<CompactIfStmt>(c, t);
+  }
   RawStmt *rawStmt(llvm::StringRef t) { return make<RawStmt>(save(t), false); }
   RawStmt *rawVerbatim(llvm::StringRef t) {
     return make<RawStmt>(save(t), true);

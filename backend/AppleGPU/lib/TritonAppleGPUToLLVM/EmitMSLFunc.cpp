@@ -414,6 +414,75 @@ bool MSLEmitter::astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
   return true;
 }
 
+// `*p`, or the coherent-cast deref `*(device coherent(device) sc*)p` when a
+// scalar spinlock forces a coherent access (mirrors emitLoad/emitStoreBody).
+msl::Expr *MSLEmitter::astDerefPtr(Value, StringRef name, StringRef scName) {
+  if (scalarSpinlock) {
+    // Exact `device coherent(device) sc*` cast form used by emitLoad/StoreBody
+    // (the printer's plain coherent-ptr form omits the leading `device`).
+    msl::Type *cp = ctx.named("device coherent(device) " + scName.str() + "*");
+    return ctx.deref(ctx.cast(CS::CStyle, cp, ctx.var(name)));
+  }
+  return ctx.deref(ctx.var(name));
+}
+
+// Per-register store: `[if (guard)] *p = v;` mirroring emitStoreBody's thread
+// predicate + mask guard.
+void MSLEmitter::astStoreBody(tt::StoreOp op, msl::Block &body) {
+  auto &ptrs = names(op.getPtr());
+  auto &vals = names(op.getValue());
+  bool hasMask = op.getMask() != nullptr;
+  SmallVector<std::string> *mask = hasMask ? &names(op.getMask()) : nullptr;
+  bool uniform = !isa<RankedTensorType>(op.getPtr().getType());
+  int rc = ptrs.size();
+
+  unsigned laneFree = 0, warpFree = 0;
+  if (!uniform) {
+    auto ptrTy = cast<RankedTensorType>(op.getPtr().getType());
+    tt::LinearLayout ll = ttg::toLinearLayout(ptrTy);
+    MLIRContext *c = op.getContext();
+    auto masks = ll.getFreeVariableMasks();
+    laneFree = masks.lookup(StringAttr::get(c, "lane"));
+    warpFree = masks.lookup(StringAttr::get(c, "warp"));
+  }
+  // Thread predicate as an Expr (built to print identically to emitStoreBody).
+  msl::Expr *threadPred = nullptr;
+  if (uniform) {
+    threadPred = ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0"));
+  } else {
+    if (laneFree)
+      threadPred = ctx.paren(ctx.binary(
+          B::Eq,
+          ctx.paren(ctx.binary(B::And, ctx.var(laneId),
+                               ctx.lit(std::to_string(laneFree)))),
+          ctx.lit("0")));
+    if (warpFree) {
+      msl::Expr *wp = ctx.paren(ctx.binary(
+          B::Eq,
+          ctx.paren(ctx.binary(B::And, ctx.var(warpId),
+                               ctx.lit(std::to_string(warpFree)))),
+          ctx.lit("0")));
+      threadPred = threadPred ? ctx.binary(B::LAnd, threadPred, wp) : wp;
+    }
+  }
+
+  std::string scName = mslScalarType(elementScalarType(op.getValue().getType()));
+  for (int r = 0; r < rc; ++r) {
+    msl::Expr *lhs = astDerefPtr(op.getPtr(), ptrs[r], scName);
+    msl::Expr *v = ctx.var(vals[vals.size() == 1 ? 0 : r]);
+    msl::Stmt *assign = ctx.assignStmt(lhs, v);
+    msl::Expr *guard = threadPred;
+    if (hasMask) {
+      msl::Expr *m = ctx.var((*mask)[mask->size() == 1 ? 0 : r]);
+      guard = guard ? ctx.binary(B::LAnd, guard, m) : m;
+    }
+    if (guard)
+      body.push_back(ctx.compactIf(guard, assign));
+    else
+      body.push_back(assign);
+  }
+}
+
 // Walk a single-block region's ops into a Block: each op goes through astEmitOp,
 // falling back to a verbatim capture of the string emitOp for not-yet-flipped
 // families. `depth` is the printer nesting the Block prints at, so a captured op
@@ -832,6 +901,65 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   }
 
   bool noCF = getenv("MSL_AST_NO_CF");
+
+  // addptr: `device sc* id = b + o;`
+  if (auto ap = dyn_cast<tt::AddPtrOp>(op)) {
+    msl::Type *sc = ctx.ptr(astScalarType(elementScalarType(op->getResult(0).getType())),
+                            msl::AddrSpace::Device);
+    auto &base = names(ap.getPtr());
+    auto &offs = names(ap.getOffset());
+    return astDeclBind(op, sc, body, [&](int r) {
+      return ctx.binary(B::Add, ctx.var(base[base.size() == 1 ? 0 : r]),
+                        ctx.var(offs[offs.size() == 1 ? 0 : r]));
+    });
+  }
+
+  // load: `sc id = init; [if (m)] id = *p;`
+  if (auto ld = dyn_cast<tt::LoadOp>(op)) {
+    Value res = ld.getResult();
+    msl::Type *sc = astScalarType(elementScalarType(res.getType()));
+    std::string scName = mslScalarType(elementScalarType(res.getType()));
+    auto &ptrs = names(ld.getPtr());
+    bool hasMask = ld.getMask() != nullptr;
+    SmallVector<std::string> *mask = hasMask ? &names(ld.getMask()) : nullptr;
+    SmallVector<std::string> *other = ld.getOther() ? &names(ld.getOther()) : nullptr;
+    int rc = regCount(res);
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      std::string id = fresh();
+      msl::Expr *init =
+          other ? static_cast<msl::Expr *>(
+                      ctx.var((*other)[other->size() == 1 ? 0 : r]))
+                : static_cast<msl::Expr *>(ctx.lit("0"));
+      body.push_back(ctx.declStmt(sc, id, init));
+      msl::Expr *deref = astDerefPtr(ld.getPtr(), ptrs[r], scName);
+      msl::Stmt *assign = ctx.assignStmt(ctx.var(id), deref);
+      if (hasMask)
+        body.push_back(ctx.compactIf(
+            ctx.var((*mask)[mask->size() == 1 ? 0 : r]), assign));
+      else
+        body.push_back(assign);
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return true;
+  }
+
+  // store: `[if (guard)] *p = v;` (optionally wrapped by a directStore guard).
+  if (auto st = dyn_cast<tt::StoreOp>(op)) {
+    auto handled = directStoreHandled.find(st.getOperation());
+    if (handled != directStoreHandled.end()) {
+      msl::Block inner;
+      astStoreBody(st, inner);
+      // if (!<fullTile>) { <store body> }
+      body.push_back(ctx.ifScope(
+          ctx.unary(msl::UnOp::LNot, ctx.var(handled->second)),
+          std::move(inner)));
+      return true;
+    }
+    astStoreBody(st, body);
+    return true;
+  }
 
   // scf.if: predeclare result vars, then IfScope with then/else sub-blocks.
   if (auto ifOp = dyn_cast<scf::IfOp>(op)) {

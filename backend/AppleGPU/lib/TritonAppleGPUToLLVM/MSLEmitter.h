@@ -393,6 +393,8 @@ private:
   bool astEmitOp(Operation *op, msl::Block &body);
   msl::Block astWalkBlock(Block &blk, unsigned depth);
   SmallVector<std::string> astDeclResultVars(Value v, msl::Block &body);
+  msl::Expr *astDerefPtr(Value ptr, StringRef name, StringRef scName);
+  void astStoreBody(tt::StoreOp op, msl::Block &body);
   bool emitFailed = false;
 
   std::string fresh() { return "v" + std::to_string(nextId++); }

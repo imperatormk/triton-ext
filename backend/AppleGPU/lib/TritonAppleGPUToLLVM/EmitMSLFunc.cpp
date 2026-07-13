@@ -1722,20 +1722,29 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     };
     scanFree(kLane, 0);
     scanFree(kWarp, 5);
-    std::string ownerGuard =
-        freeMask == 0 ? ""
-                      : "(" + tidId + ".x & " + std::to_string(freeMask) +
-                            "u) == 0u";
+    // (tidId.x & freeMask u) == 0u
+    msl::Expr *ownerGuard =
+        freeMask == 0
+            ? nullptr
+            : ctx.binary(B::Eq,
+                         ctx.paren(ctx.binary(
+                             B::And, ctx.member(ctx.var(tidId), "x"),
+                             ctx.u32lit(freeMask))),
+                         ctx.lit("0u"));
     for (int r = 0; r < (int)srcVals.size(); ++r) {
       const std::string &v = srcVals[r];
-      std::string guard =
-          "(" + srcU + ")" + v + " < " + std::to_string(nBins) + "u";
-      if (!ownerGuard.empty())
-        guard = ownerGuard + " && (" + guard + ")";
+      // (srcU)v < nBins u
+      msl::Expr *guard =
+          ctx.binary(B::Lt, ctx.cast(CS::CStyle, ctx.named(srcU), ctx.var(v)),
+                     ctx.u32lit(nBins));
+      if (ownerGuard)
+        guard = ctx.binary(B::LAnd, ownerGuard, ctx.paren(guard));
       if (maskVals)
-        guard = "(" + (*maskVals)[maskVals->size() == 1 ? 0 : r] + ") && (" +
-                guard + ")";
-      body.push_back(astHistFetchAdd(ctx.raw(guard), bins, v));
+        guard = ctx.binary(
+            B::LAnd,
+            ctx.paren(ctx.var((*maskVals)[maskVals->size() == 1 ? 0 : r])),
+            ctx.paren(guard));
+      body.push_back(astHistFetchAdd(guard, bins, v));
     }
     body.push_back(ctx.hardBarrier(false));
 
@@ -1833,19 +1842,23 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       const std::string &v = vals[vals.size() == 1 ? 0 : r];
       std::string id = fresh();
       body.push_back(ctx.declStmt(scTy, id, astInit0(sc)));
-      std::string guard;
-      if (uniform) guard = tidId + ".x == 0";
-      else if (!threadPred.empty()) guard = threadPred;
+      msl::Expr *guard = nullptr;
+      if (uniform)
+        guard = ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0"));
+      else if (!threadPred.empty())
+        guard = ctx.var(threadPred);
       if (hasMask) {
         const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
-        guard = guard.empty() ? m : guard + " && " + m;
+        guard = guard ? static_cast<msl::Expr *>(ctx.binary(B::LAnd, guard,
+                                                            ctx.var(m)))
+                      : ctx.var(m);
       }
       msl::Block inner;
       if (floatEmulated) {
         // Self-contained emulated CAS loop: captured verbatim (advances nextId).
         // Bake indentation for the guard-body depth (inner nests inside ifScope).
         int savedInd = indent;
-        if (!guard.empty())
+        if (guard)
           ++indent;
         inner.push_back(captureRaw([&] {
           std::string cur = fresh();
@@ -1873,8 +1886,8 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
             ctx.var(id),
             astAtomicRmwCall(fn, atomicTy, p, v, order, memFlags)));
       }
-      if (!guard.empty())
-        body.push_back(ctx.ifScope(ctx.raw(guard), std::move(inner)));
+      if (guard)
+        body.push_back(ctx.ifScope(guard, std::move(inner)));
       else
         for (msl::Stmt *s : inner)
           body.push_back(s);

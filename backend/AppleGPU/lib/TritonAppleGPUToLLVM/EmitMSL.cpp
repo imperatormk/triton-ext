@@ -421,8 +421,29 @@ private:
 
   // Multi-result callees return a small struct; declare it and remember the
   // name so callers can bind each field.
+  // A single tensor result is returned as a struct of its per-thread registers,
+  // reusing the same struct mechanism as a multi-scalar result. Callee and
+  // caller share the tensor's layout (Triton inserts convert_layout at the
+  // boundary), so register index i maps directly to caller register i.
+  static bool isTensorResult(ArrayRef<Type> results) {
+    return results.size() == 1 && isa<RankedTensorType>(results[0]);
+  }
+
   LogicalResult declRetStruct(tt::FuncOp func) {
     auto results = func.getFunctionType().getResults();
+    if (isTensorResult(results)) {
+      std::string name = mslDeviceFuncName(func.getName()) + "_ret";
+      devRetStruct[func] = name;
+      std::string sc =
+          mslScalarType(cast<RankedTensorType>(results[0]).getElementType());
+      Value res = func.getBody().front().getTerminator()->getOperand(0);
+      int rc = regCount(res);
+      os << "struct " << name << " {\n";
+      for (int i = 0; i < rc; ++i)
+        os << "  " << sc << " f" << i << ";\n";
+      os << "};\n";
+      return success();
+    }
     if (results.size() <= 1)
       return success();
     std::string name = mslDeviceFuncName(func.getName()) + "_ret";
@@ -443,6 +464,8 @@ private:
     auto results = func.getFunctionType().getResults();
     if (results.empty())
       return "void";
+    if (isTensorResult(results))
+      return devRetStruct[func];
     if (results.size() == 1)
       return mslScalarType(results[0]);
     return devRetStruct[func];
@@ -534,9 +557,14 @@ private:
       os << ind() << "return;\n";
       return success();
     }
-    if (n == 1) {
+    if (n == 1 && !isa<RankedTensorType>(op.getOperand(0).getType())) {
       auto &nm = names(op.getOperand(0));
       os << ind() << "return " << nm[0] << ";\n";
+      return success();
+    }
+    if (n == 1) {
+      auto &nm = names(op.getOperand(0));
+      os << ind() << "return { " << llvm::join(nm, ", ") << " };\n";
       return success();
     }
     std::string st = curDevFunc ? devRetStruct.lookup(curDevFunc) : "";
@@ -574,6 +602,23 @@ private:
                        llvm::join(argExprs, ", ") + ")";
 
     unsigned nRes = op.getNumResults();
+    if (nRes == 1 && isa<RankedTensorType>(op.getResult(0).getType())) {
+      Value res = op.getResult(0);
+      std::string sc =
+          mslScalarType(cast<RankedTensorType>(res.getType()).getElementType());
+      std::string tmp = fresh();
+      os << ind() << deviceRetType(callee) << " " << tmp << " = " << call
+         << ";\n";
+      int rc = regCount(res);
+      SmallVector<std::string> ids;
+      for (int i = 0; i < rc; ++i) {
+        std::string id = fresh();
+        os << ind() << sc << " " << id << " = " << tmp << ".f" << i << ";\n";
+        ids.push_back(id);
+      }
+      valMap[res] = ids;
+      return success();
+    }
     if (nRes == 0) {
       os << ind() << call << ";\n";
     } else if (nRes == 1) {

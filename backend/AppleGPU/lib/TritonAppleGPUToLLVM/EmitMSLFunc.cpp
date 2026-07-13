@@ -603,6 +603,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  // A/B harness: force every value-producing family to the string capture path
+  // (the always-safe no-ops above still flow through AST). Lets any flipped op be
+  // diffed against its string emitter. Transitional; unset in normal builds.
+  if (getenv("MSL_AST_NO_FLIP"))
+    return false;
+
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
@@ -1030,6 +1036,99 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
         [&](int r) { return static_cast<msl::Expr *>(
                          ctx.var(srcNames[srcNames.size() == 1 ? 0 : r])); },
         [&](int r) { return astFlatTileOffset(resTy, r); });
+    valMap[res] = outs;
+    return true;
+  }
+
+  // tt.cat: scatter both halves (rhs shifted past lhs flat size), gather result.
+  if (auto ct = dyn_cast<tt::CatOp>(op)) {
+    Value lhs = ct.getLhs(), rhs = ct.getRhs(), res = ct.getResult();
+    auto lhsTy = cast<RankedTensorType>(lhs.getType());
+    auto rhsTy = cast<RankedTensorType>(rhs.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    msl::Type *scTy = astScalarType(resTy.getElementType());
+    std::string sc = mslScalarType(resTy.getElementType());
+    auto &lhsNames = names(lhs);
+    auto &rhsNames = names(rhs);
+    int64_t lhsFlat = tileSize(lhsTy);
+
+    std::string buf = fresh();
+    body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
+                                astPoolRegion(0, sc)));
+    body.push_back(ctx.barrier(false));
+    for (int r = 0, n = regCount(lhs); r < n; ++r)
+      body.push_back(ctx.assignStmt(
+          ctx.subscript(ctx.var(buf), astFlatTileOffset(lhsTy, r)),
+          ctx.var(lhsNames[r])));
+    for (int r = 0, n = regCount(rhs); r < n; ++r) {
+      msl::Expr *off = ctx.binary(B::Add, astFlatTileOffset(rhsTy, r),
+                                  ctx.lit(std::to_string(lhsFlat)));
+      body.push_back(ctx.assignStmt(ctx.subscript(ctx.var(buf), off),
+                                    ctx.var(rhsNames[r])));
+    }
+    body.push_back(ctx.barrier(false));
+    SmallVector<std::string> ids;
+    for (int r = 0, n = regCount(res); r < n; ++r) {
+      std::string id = fresh();
+      body.push_back(ctx.declStmt(
+          scTy, id, ctx.subscript(ctx.var(buf), astFlatTileOffset(resTy, r))));
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return true;
+  }
+
+  // tt.gather: stage src tile, then read each result register at the
+  // index-selected source offset (row-major fold, dim `axis` uses idx).
+  if (auto ga = dyn_cast<tt::GatherOp>(op)) {
+    Value src = ga.getSrc(), idx = ga.getIndices(), res = ga.getResult();
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    int axis = ga.getAxis();
+    msl::Type *scTy = astScalarType(elementScalarType(resTy));
+    std::string sc = mslScalarType(elementScalarType(resTy));
+    auto &srcNames = names(src);
+    auto &idxNames = names(idx);
+    int srcRc = regCount(src);
+    int resRc = regCount(res);
+    auto srcShape = srcTy.getShape();
+    tt::LinearLayout resLL = ttg::toLinearLayout(resTy);
+    auto resOut = llvm::to_vector(resLL.getOutDimNames());
+
+    std::string buf = fresh();
+    body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
+                                astPoolRegion(0, sc)));
+    body.push_back(ctx.barrier(false));
+    for (int r = 0; r < srcRc; ++r)
+      body.push_back(ctx.assignStmt(
+          ctx.subscript(ctx.var(buf), astFlatTileOffset(srcTy, r)),
+          ctx.var(srcNames[srcNames.size() == 1 ? 0 : r])));
+    body.push_back(ctx.barrier(false));
+
+    SmallVector<std::string> outs;
+    for (int r = 0; r < resRc; ++r) {
+      msl::Expr *off = nullptr;
+      int64_t stride = 1;
+      for (int d = (int)srcShape.size() - 1; d >= 0; --d) {
+        msl::Expr *c =
+            (d == axis)
+                ? static_cast<msl::Expr *>(ctx.cast(
+                      CS::CStyle, ctx.scalar(msl::Scalar::I32),
+                      ctx.paren(ctx.var(idxNames[idxNames.size() == 1 ? 0 : r]))))
+                : astLayoutCoordExpr(resTy, r, resOut[d]);
+        msl::Expr *term =
+            stride == 1
+                ? c
+                : ctx.paren(ctx.binary(B::Mul, c, ctx.lit(std::to_string(stride))));
+        off = off ? ctx.paren(ctx.binary(B::Add, off, term)) : term;
+        stride *= srcShape[d];
+      }
+      if (!off)
+        off = ctx.lit("0");
+      std::string id = fresh();
+      body.push_back(ctx.declStmt(scTy, id, ctx.subscript(ctx.var(buf), off)));
+      outs.push_back(id);
+    }
     valMap[res] = outs;
     return true;
   }

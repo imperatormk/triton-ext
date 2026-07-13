@@ -262,7 +262,12 @@ struct ContinueStmt : Stmt {
 
 struct BarrierStmt : Stmt {
   bool device;
-  explicit BarrierStmt(bool d) : Stmt(Kind::Barrier), device(d) {}
+  // hard barriers are emitted verbatim (they flush any pending soft barrier
+  // first) and never collapse with an adjacent barrier - mirroring the string
+  // paths that spelled `threadgroup_barrier(...)` literally (dot/trans/reduce/
+  // convert/...). Soft barriers go through the peephole (async/local_store).
+  bool hard;
+  BarrierStmt(bool d, bool hard) : Stmt(Kind::Barrier), device(d), hard(hard) {}
   static bool classof(const Stmt *s) { return s->kind == Kind::Barrier; }
 };
 
@@ -483,7 +488,12 @@ public:
   }
   BreakStmt *breakStmt() { return make<BreakStmt>(); }
   ContinueStmt *continueStmt() { return make<ContinueStmt>(); }
-  BarrierStmt *barrier(bool device) { return make<BarrierStmt>(device); }
+  BarrierStmt *barrier(bool device) {
+    return make<BarrierStmt>(device, false);
+  }
+  BarrierStmt *hardBarrier(bool device) {
+    return make<BarrierStmt>(device, true);
+  }
   CompactIfStmt *compactIf(Expr *c, Stmt *t) {
     return make<CompactIfStmt>(c, t, true);
   }

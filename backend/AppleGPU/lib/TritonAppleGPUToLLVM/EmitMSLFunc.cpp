@@ -450,7 +450,7 @@ bool MSLEmitter::astScanWarpCarry(
         astPoolRegion(byteOff, scTys[k])));
     byteOff += (int64_t)numWarps * 32 * byteWidths[k];
   }
-  body.push_back(ctx.barrier(false));
+  body.push_back(ctx.hardBarrier(false));
   std::string topGuard = axisTopLane == StringRef(laneId)
                              ? std::string("true")
                              : (laneId + " == " + axisTopLane.str());
@@ -463,7 +463,7 @@ bool MSLEmitter::astScanWarpCarry(
                                     ctx.var(laneScan[k]));
     body.push_back(ctx.compactIf(ctx.raw(topGuard), asn));
   }
-  body.push_back(ctx.barrier(false));
+  body.push_back(ctx.hardBarrier(false));
 
   std::string base = "((" + warpId + " & " + std::to_string(~axisWarpMask) +
                      ") * 32 + " + axisTopLane.str() + ")";
@@ -570,7 +570,103 @@ bool MSLEmitter::astScanWarpCarry(
           ctx.paren(ctx.ternary(ctx.var(init), ctx.var(out[k]),
                                 ctx.var(accs[k][r])))));
   }
-  body.push_back(ctx.barrier(false));
+  body.push_back(ctx.hardBarrier(false));
+  return true;
+}
+
+// Fused GEMM K-loop: carry iter-args, run the dot Decl phase, the K-loop with
+// the MMA-phase dot in its body, the non-acc carry, direct-store setup, then the
+// Readback-phase dot. Mirrors emitFusedGemm with AST nodes.
+bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
+                                  msl::Block &body) {
+  SmallVector<SmallVector<std::string>> carried;
+  SmallVector<std::string> initBase;
+  for (auto [i, init, res] :
+       llvm::enumerate(op.getInitArgs(), op.getResults())) {
+    if (isDatalessType(res.getType())) {
+      valMap[op.getRegionIterArg(i)] = SmallVector<std::string>{};
+      valMap[res] = SmallVector<std::string>{};
+      carried.push_back({});
+      continue;
+    }
+    auto &initNames = names(init);
+    if (i == iterIdx) {
+      SmallVector<std::string> ids = astDeclResultVars(res, body);
+      initBase.assign(initNames.begin(), initNames.end());
+      fusedDot.ids = ids;
+      valMap[op.getRegionIterArg(i)] = ids;
+      valMap[res] = ids;
+      carried.push_back({});
+      continue;
+    }
+    SmallVector<std::string> vars = astDeclResultVars(res, body);
+    for (size_t r = 0; r < vars.size(); ++r)
+      body.push_back(ctx.assignStmt(
+          ctx.var(vars[r]), ctx.var(initNames[initNames.size() == 1 ? 0 : r])));
+    valMap[op.getRegionIterArg(i)] = vars;
+    valMap[res] = vars;
+    carried.push_back(vars);
+  }
+
+  fusedDot.baseNames = initBase;
+  fusedDot.phase = FusedDotPhase::Decl;
+  if (!astEmitDot(dot, body))
+    return false;
+
+  std::string iv = fresh();
+  bindScalar(op.getInductionVar(), iv);
+  std::string ivTy = mslScalarType(op.getInductionVar().getType());
+  if (ivTy.empty())
+    ivTy = "int";
+
+  // Loop body: MMA-phase dot (walked) + non-acc carry.
+  fusedDot.phase = FusedDotPhase::MMA;
+  msl::Block loopBody = astWalkBlock(op.getRegion().front(), (unsigned)indent + 1);
+  if (emitFailed)
+    return false;
+  fusedDot.phase = FusedDotPhase::None;
+  auto *term = op.getBody()->getTerminator();
+  for (auto [i, operand] : llvm::enumerate(term->getOperands())) {
+    if (i == iterIdx || carried[i].empty())
+      continue;
+    auto &src = names(operand);
+    for (size_t r = 0; r < carried[i].size(); ++r)
+      loopBody.push_back(ctx.assignStmt(
+          ctx.var(carried[i][r]), ctx.var(src[src.size() == 1 ? 0 : r])));
+  }
+  body.push_back(astForScope(op, std::move(loopBody), iv, ivTy));
+
+  DirectStore ds;
+  if (matchDirectStore(op.getResult(iterIdx), ds)) {
+    int64_t M = cast<RankedTensorType>(dot.getResult().getType()).getShape()[0];
+    int64_t N = cast<RankedTensorType>(dot.getResult().getType()).getShape()[1];
+    std::string ft = fresh();
+    ds.fullTileVar = ft;
+    msl::Expr *cond;
+    if (ds.boundM) {
+      // (rowBase + M <= boundM && colBase + N <= boundN)
+      cond = ctx.paren(ctx.binary(
+          B::LAnd,
+          ctx.binary(B::Le,
+                     ctx.binary(B::Add, ctx.var(names(ds.rowBase)[0]),
+                                ctx.lit(std::to_string(M))),
+                     ctx.var(names(ds.boundM)[0])),
+          ctx.binary(B::Le,
+                     ctx.binary(B::Add, ctx.var(names(ds.colBase)[0]),
+                                ctx.lit(std::to_string(N))),
+                     ctx.var(names(ds.boundN)[0]))));
+    } else {
+      cond = ctx.lit("true");
+    }
+    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), ft, cond));
+    fusedDot.direct = ds;
+    directStoreHandled[ds.store.getOperation()] = ft;
+  }
+
+  fusedDot.phase = FusedDotPhase::Readback;
+  if (!astEmitDot(dot, body))
+    return false;
+  fusedDot = FusedDotCtx{};
   return true;
 }
 
@@ -646,7 +742,7 @@ void MSLEmitter::astBandRoundTrip(
   };
   for (int64_t lo = 0; lo < total; lo += band) {
     int64_t hi = std::min(lo + band, total);
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
     for (int r = 0; r < srcRc; ++r) {
       msl::Expr *off = srcOff(r);
       msl::Expr *sv = srcVal(r);
@@ -655,7 +751,7 @@ void MSLEmitter::astBandRoundTrip(
       else
         body.push_back(banded(off, lo, hi, /*toBuf=*/true, sv));
     }
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
     for (int r = 0; r < resRc; ++r) {
       msl::Expr *off = resOff(r);
       if (band == total)
@@ -1253,12 +1349,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     if (Value init = la.getSrc()) {
       auto srcTy = cast<RankedTensorType>(init.getType());
       auto &vals = names(init);
-      body.push_back(ctx.barrier(false));
+      body.push_back(ctx.hardBarrier(false));
       for (int r = 0, n = regCount(init); r < n; ++r)
         body.push_back(ctx.assignStmt(
             ctx.subscript(ctx.var(buf), astFlatTileOffset(srcTy, r)),
             ctx.var(vals[r])));
-      body.push_back(ctx.barrier(false));
+      body.push_back(ctx.hardBarrier(false));
     }
     return true;
   }
@@ -1387,7 +1483,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       };
       for (int64_t r0 = 0; r0 < rowsTotal; r0 += bandRows) {
         int64_t r1 = std::min<int64_t>(r0 + bandRows, rowsTotal);
-        body.push_back(ctx.barrier(false));
+        body.push_back(ctx.hardBarrier(false));
         for (int r = 0, n = regCount(src); r < n; ++r) {
           msl::Expr *rowc = astLayoutCoordExpr(srcTy, r, srcRowDim);
           msl::Expr *cond = ctx.binary(
@@ -1399,7 +1495,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
                         ctx.subscript(ctx.var(buf), bandOffset(srcTy, r, r0)),
                         scatterVal(srcNames[r]))));
         }
-        body.push_back(ctx.barrier(false));
+        body.push_back(ctx.hardBarrier(false));
         for (int r = 0, n = regCount(res); r < n; ++r) {
           if (ids[r].empty()) {
             ids[r] = fresh();
@@ -1430,7 +1526,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       }
       for (int64_t lo = 0; lo < total; lo += band) {
         int64_t hi = std::min(lo + band, total);
-        body.push_back(ctx.barrier(false));
+        body.push_back(ctx.hardBarrier(false));
         for (int r = 0, n = regCount(src); r < n; ++r) {
           msl::Block b;
           b.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), "__f",
@@ -1446,7 +1542,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
                                    scatterVal(srcNames[r]))));
           body.push_back(ctx.plainScope(std::move(b)));
         }
-        body.push_back(ctx.barrier(false));
+        body.push_back(ctx.hardBarrier(false));
         for (int r = 0, n = regCount(res); r < n; ++r) {
           msl::Block b;
           b.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), "__f",
@@ -1467,12 +1563,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       return true;
     }
 
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
     for (int r = 0, n = regCount(src); r < n; ++r)
       body.push_back(ctx.assignStmt(
           ctx.subscript(ctx.var(buf), astFlatTileOffset(srcTy, r)),
           scatterVal(srcNames[r])));
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
     SmallVector<std::string> ids;
     for (int r = 0, n = regCount(res); r < n; ++r) {
       std::string id = fresh();
@@ -1548,7 +1644,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     body.push_back(astHistBinsDecl(bins));
     std::string zi = fresh();
     body.push_back(astHistZeroInit(bins, zi, nBins, threads));
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
 
     auto &srcVals = names(hg.getSrc());
     SmallVector<std::string> *maskVals = hg.getMask() ? &names(hg.getMask()) : nullptr;
@@ -1586,7 +1682,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
                 guard + ")";
       body.push_back(astHistFetchAdd(ctx.raw(guard), bins, v));
     }
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
 
     auto outDims = llvm::to_vector(ttg::toLinearLayout(resTy).getOutDimNames());
     msl::Type *resScTy = astScalarType(resTy.getElementType());
@@ -1744,7 +1840,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       std::string bcbuf = fresh();
       body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup),
                                   bcbuf, astPoolRegion(0, sc)));
-      body.push_back(ctx.barrier(false));
+      body.push_back(ctx.hardBarrier(false));
       std::string wcanon =
           "((" + warpId + " & " + std::to_string(warpFree) + ") == 0)";
       std::string warpKey =
@@ -1761,7 +1857,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
             ctx.assignStmt(ctx.subscript(ctx.var(bcbuf), slotFor(r)),
                            ctx.var(ids[r]))));
       }
-      body.push_back(ctx.barrier(false));
+      body.push_back(ctx.hardBarrier(false));
       for (int r = 0; r < rc; ++r) {
         int srcr = regFree ? (r & ~regFree) : r;
         std::string bc = fresh();
@@ -1913,10 +2009,10 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
             ctx.assignStmt(ctx.subscript(ctx.var(bcast), ctx.lit("0")),
                            ctx.var(id))));
         body.push_back(astAcquireFence());
-        body.push_back(ctx.barrier(false));
+        body.push_back(ctx.hardBarrier(false));
         body.push_back(ctx.assignStmt(
             ctx.var(id), ctx.subscript(ctx.var(bcast), ctx.lit("0"))));
-        body.push_back(ctx.barrier(false));
+        body.push_back(ctx.hardBarrier(false));
       } else {
         for (msl::Stmt *s : casBody)
           body.push_back(s);
@@ -2214,7 +2310,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
                      std::max<int64_t>(1, bitsOf(elementScalarType(
                                               rd.getResult()[k].getType())) / 8);
         }
-        body.push_back(ctx.barrier(false));
+        body.push_back(ctx.hardBarrier(false));
         // scratch[k][warp * 32 + lane] = accs[k];
         for (int k = 0; k < nOp; ++k) {
           msl::Expr *idx = ctx.binary(
@@ -2223,7 +2319,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
           body.push_back(ctx.assignStmt(
               ctx.subscript(ctx.var(scratch[k]), idx), ctx.var(accs[k])));
         }
-        body.push_back(ctx.barrier(false));
+        body.push_back(ctx.hardBarrier(false));
         SmallVector<int> redVals = subsetsOf(warpMask, numWarps);
         // base = ((warp & ~warpMask) * 32 + lane)
         msl::Expr *base = ctx.paren(ctx.binary(
@@ -2297,7 +2393,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     std::string buf = fresh();
     body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
                                 astPoolRegion(0, sc)));
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
     for (int r = 0, n = regCount(lhs); r < n; ++r)
       body.push_back(ctx.assignStmt(
           ctx.subscript(ctx.var(buf), astFlatTileOffset(lhsTy, r)),
@@ -2308,7 +2404,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       body.push_back(ctx.assignStmt(ctx.subscript(ctx.var(buf), off),
                                     ctx.var(rhsNames[r])));
     }
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
     SmallVector<std::string> ids;
     for (int r = 0, n = regCount(res); r < n; ++r) {
       std::string id = fresh();
@@ -2340,12 +2436,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     std::string buf = fresh();
     body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
                                 astPoolRegion(0, sc)));
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
     for (int r = 0; r < srcRc; ++r)
       body.push_back(ctx.assignStmt(
           ctx.subscript(ctx.var(buf), astFlatTileOffset(srcTy, r)),
           ctx.var(srcNames[srcNames.size() == 1 ? 0 : r])));
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
 
     SmallVector<std::string> outs;
     for (int r = 0; r < resRc; ++r) {
@@ -2495,8 +2591,8 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   if (auto forOp = dyn_cast<scf::ForOp>(op)) {
     if (noCF)
       return false;
-    if (matchGemmDotLoop(forOp))
-      return false;
+    if (auto m = matchGemmDotLoop(forOp))
+      return astEmitFusedGemm(forOp, m->first, m->second, body);
     Type ivType = forOp.getInductionVar().getType();
     bool wideIv = ivType.isInteger(64);
 

@@ -403,6 +403,8 @@ private:
     std::string baseOffset;
   };
   bool astEmitDot(tt::DotOp op, msl::Block &body);
+  bool astEmitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
+                        msl::Block &body);
   bool astEmitDotScalar(tt::DotOp op, msl::Block &body);
   bool astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
                        Value bStage, ArrayRef<std::string> aNames,

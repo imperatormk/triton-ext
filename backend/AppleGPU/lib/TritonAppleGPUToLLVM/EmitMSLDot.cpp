@@ -96,7 +96,7 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
   auto tgPtr = [&](StringRef scalar) {
     return ctx.named(("threadgroup " + scalar.str() + "*"));
   };
-  auto barrier = [&] { body.push_back(ctx.barrier(false)); };
+  auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
 
   std::string tgA = fresh(), tgB = fresh(), tgC = fresh();
   if (needAB) {
@@ -299,7 +299,7 @@ bool MSLEmitter::astEmitDotFused(
   auto bStageTy = cast<RankedTensorType>(bStage.getType());
   auto cTy = cast<RankedTensorType>(op.getResult().getType());
   int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
-  auto barrier = [&] { body.push_back(ctx.barrier(false)); };
+  auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
 
   if (fusedDot.phase == FusedDotPhase::Decl) {
     fusedDot.accNames.assign(fragsPerWarp, "");
@@ -416,7 +416,7 @@ bool MSLEmitter::astEmitDotFused(
     // Build pool store + gather into elseBody:
     {
       msl::Block &tgt = elseBody;
-      tgt.push_back(ctx.barrier(false));
+      tgt.push_back(ctx.hardBarrier(false));
       for (int64_t w = 0; w < numWarps; ++w) {
         msl::Block inner;
         for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
@@ -428,9 +428,9 @@ bool MSLEmitter::astEmitDotFused(
             ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
             std::move(inner)));
       }
-      tgt.push_back(ctx.barrier(false));
+      tgt.push_back(ctx.hardBarrier(false));
       readbackInto(tgt, 0, 0, M);
-      tgt.push_back(ctx.barrier(false));
+      tgt.push_back(ctx.hardBarrier(false));
     }
     body.push_back(ctx.ifElseScope(ctx.var(d.fullTileVar), std::move(ifBody),
                                    std::move(elseBody)));
@@ -488,7 +488,7 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
   body.push_back(ctx.declStmt(tgPtr("float"), pC,
                               astPoolRegion(aPanelBytes + bPanelBytes, "float")));
   int nARegs = regCount(aStage), nBRegs = regCount(bStage);
-  auto barrier = [&] { body.push_back(ctx.barrier(false)); };
+  auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
 
   for (int64_t bi = 0; bi < Bd; ++bi) {
     for (int64_t m0 = 0; m0 < M; m0 += mp) {
@@ -576,7 +576,7 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
       }
     }
   }
-  body.push_back(ctx.barrier(false));
+  body.push_back(ctx.hardBarrier(false));
   return true;
 }
 
@@ -635,7 +635,7 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
   }
 
   for (int64_t bi = 0; bi < Bd; ++bi) {
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
     for (int r = 0, n = regCount(aStage); r < n; ++r) {
       msl::Stmt *asn = ctx.assignStmt(
           ctx.subscript(ctx.var(tgA), astSliceFlatOffset(aStageTy, r)),
@@ -650,7 +650,7 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
       body.push_back(rank == 3 ? ctx.compactIf(batchCond(bStageTy, r, bi), asn)
                                : asn);
     }
-    body.push_back(ctx.barrier(false));
+    body.push_back(ctx.hardBarrier(false));
 
     for (int r = 0; r < nRes; ++r) {
       std::string mrow = fresh(), ncol = fresh(), acc = fresh(), kv = fresh();
@@ -681,7 +681,7 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
                                : accum);
     }
   }
-  body.push_back(ctx.barrier(false));
+  body.push_back(ctx.hardBarrier(false));
   valMap[op.getResult()] = ids;
   return true;
 }

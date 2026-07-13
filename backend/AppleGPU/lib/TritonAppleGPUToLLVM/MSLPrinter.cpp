@@ -322,6 +322,17 @@ void MSLPrinter::printStmtInline(const Stmt *s) {
 void MSLPrinter::printBlock(const Block &b) {
   for (const Stmt *s : b) {
     if (auto *bar = llvm::dyn_cast<BarrierStmt>(s)) {
+      if (bar->hard) {
+        // Flush any pending soft barrier, then emit this one verbatim; it never
+        // collapses with an adjacent barrier.
+        flushBarrier();
+        if (bar->device)
+          ind() << "threadgroup_barrier(mem_flags::mem_threadgroup | "
+                   "mem_flags::mem_device);\n";
+        else
+          ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        continue;
+      }
       barrierPending = true;
       barrierPendingDevice = barrierPendingDevice || bar->device;
       continue;

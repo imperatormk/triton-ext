@@ -4657,8 +4657,17 @@ private:
     std::string bScalar = mslScalarType(bElem);
     std::string accScalar = mslScalarType(cElem);
 
-    auto &aNames = names(op.getA());
-    auto &bNames = names(op.getB());
+    Value aStage = op.getA(), bStage = op.getB();
+    if (rank == 2) {
+      if (Value s = dotOperandConvertSource(op, op.getA()))
+        aStage = s;
+      if (Value s = dotOperandConvertSource(op, op.getB()))
+        bStage = s;
+    }
+    auto aStageTy = cast<RankedTensorType>(aStage.getType());
+    auto bStageTy = cast<RankedTensorType>(bStage.getType());
+    auto &aNames = names(aStage);
+    auto &bNames = names(bStage);
     auto &cInit = names(op.getC());
 
     int64_t aBytes = M * K * (bitsOf(aElem) / 8);
@@ -4690,12 +4699,12 @@ private:
 
     for (int64_t bi = 0; bi < B; ++bi) {
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-      for (int r = 0, n = regCount(op.getA()); r < n; ++r)
-        os << ind() << batchGuard(aTy, r, bi) << tgA << "["
-           << sliceFlatOffset(aTy, r) << "] = " << aNames[r] << ";\n";
-      for (int r = 0, n = regCount(op.getB()); r < n; ++r)
-        os << ind() << batchGuard(bTy, r, bi) << tgB << "["
-           << sliceFlatOffset(bTy, r) << "] = " << bNames[r] << ";\n";
+      for (int r = 0, n = regCount(aStage); r < n; ++r)
+        os << ind() << batchGuard(aStageTy, r, bi) << tgA << "["
+           << sliceFlatOffset(aStageTy, r) << "] = " << aNames[r] << ";\n";
+      for (int r = 0, n = regCount(bStage); r < n; ++r)
+        os << ind() << batchGuard(bStageTy, r, bi) << tgB << "["
+           << sliceFlatOffset(bStageTy, r) << "] = " << bNames[r] << ";\n";
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 
       for (int r = 0; r < nRes; ++r) {

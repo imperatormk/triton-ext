@@ -5,6 +5,7 @@
 // address spaces come from the MLIR types and TritonGPU LinearLayout, never
 // from air.* intrinsics.
 
+#include "MSLConstants.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -1101,7 +1102,7 @@ private:
           mslUnsignedType(elementScalarType(op->getResult(0).getType())));
     if (isa<tt::PreciseSqrtOp>(op))
       return emitUnary(
-          op, "metal::precise::sqrt",
+          op, msl::builtin::precise::Sqrt,
           mslScalarType(elementScalarType(op->getResult(0).getType())));
     if (isa<tt::PreciseDivFOp>(op))
       return emitFloatBinary(op);
@@ -1601,39 +1602,40 @@ private:
     // miss (e.g. tan via sin/cos, pow via exp2/log2). Use metal::precise:: for
     // the accuracy-sensitive functions; exact ops (floor/ceil/round/abs) keep
     // the plain form.
-    static const llvm::StringMap<const char *> unary = {
-        {"math.exp", "metal::precise::exp"},
-        {"math.exp2", "metal::precise::exp2"},
-        {"math.log", "metal::precise::log"},
-        {"math.log2", "metal::precise::log2"},
-        {"math.log10", "metal::precise::log10"},
-        {"math.sin", "metal::precise::sin"},
-        {"math.cos", "metal::precise::cos"},
-        {"math.tan", "metal::precise::tan"},
-        {"math.tanh", "metal::precise::tanh"},
-        {"math.sinh", "metal::precise::sinh"},
-        {"math.cosh", "metal::precise::cosh"},
-        {"math.asin", "metal::precise::asin"},
-        {"math.acos", "metal::precise::acos"},
-        {"math.atan", "metal::precise::atan"},
-        {"math.sqrt", "metal::precise::sqrt"},
-        {"math.rsqrt", "metal::precise::rsqrt"},
-        {"math.cbrt", "metal::precise::cbrt"},
-        {"math.floor", "metal::floor"},   {"math.ceil", "metal::ceil"},
-        {"math.absf", "metal::fabs"},     {"math.absi", "metal::abs"},
-        {"math.erf", "tt_erf"},           {"math.round", "metal::round"},
-        {"math.trunc", "metal::trunc"},   {"math.roundeven", "metal::rint"}};
+    namespace bi = msl::builtin;
+    static const llvm::StringMap<StringRef> unary = {
+        {"math.exp", bi::precise::Exp},
+        {"math.exp2", bi::precise::Exp2},
+        {"math.log", bi::precise::Log},
+        {"math.log2", bi::precise::Log2},
+        {"math.log10", bi::precise::Log10},
+        {"math.sin", bi::precise::Sin},
+        {"math.cos", bi::precise::Cos},
+        {"math.tan", bi::precise::Tan},
+        {"math.tanh", bi::precise::Tanh},
+        {"math.sinh", bi::precise::Sinh},
+        {"math.cosh", bi::precise::Cosh},
+        {"math.asin", bi::precise::Asin},
+        {"math.acos", bi::precise::Acos},
+        {"math.atan", bi::precise::Atan},
+        {"math.sqrt", bi::precise::Sqrt},
+        {"math.rsqrt", bi::precise::Rsqrt},
+        {"math.cbrt", bi::precise::Cbrt},
+        {"math.floor", bi::math::Floor}, {"math.ceil", bi::math::Ceil},
+        {"math.absf", bi::math::Fabs},   {"math.absi", bi::math::Abs},
+        {"math.erf", "tt_erf"},          {"math.round", bi::math::Round},
+        {"math.trunc", bi::math::Trunc}, {"math.roundeven", bi::math::Rint}};
     if (auto it = unary.find(n); it != unary.end())
       return emitUnary(op, it->second, sc);
-    static const llvm::StringMap<const char *> binary = {
-        {"math.atan2", "metal::precise::atan2"},
-        {"math.powf", "metal::precise::pow"},
-        {"math.fpowi", "metal::precise::pow"},
-        {"math.copysign", "metal::copysign"}};
+    static const llvm::StringMap<StringRef> binary = {
+        {"math.atan2", bi::precise::Atan2},
+        {"math.powf", bi::precise::Pow},
+        {"math.fpowi", bi::precise::Pow},
+        {"math.copysign", bi::math::Copysign}};
     if (auto it = binary.find(n); it != binary.end())
       return emitMinMax(op, it->second);
     if (n == "math.fma")
-      return emitTernary(op, "metal::fma", sc);
+      return emitTernary(op, msl::builtin::math::Fma, sc);
     if (n == "math.exp10") {
       Value res = op->getResult(0);
       auto &a = names(op->getOperand(0));
@@ -1641,8 +1643,8 @@ private:
       SmallVector<std::string> ids;
       for (int r = 0; r < rc; ++r) {
         std::string id = fresh();
-        os << ind() << sc << " " << id << " = metal::precise::pow((" << sc
-           << ")10, " << a[a.size() == 1 ? 0 : r] << ");\n";
+        os << ind() << sc << " " << id << " = " << msl::builtin::precise::Pow
+           << "((" << sc << ")10, " << a[a.size() == 1 ? 0 : r] << ");\n";
         ids.push_back(id);
       }
       valMap[res] = ids;

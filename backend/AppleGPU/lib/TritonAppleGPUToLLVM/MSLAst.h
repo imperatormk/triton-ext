@@ -453,13 +453,15 @@ public:
   // operands in ctx.paren() wherever the source string had literal parens.
   Binary *add(Expr *l, Expr *r) { return binary(BinOp::Add, l, r); }
   Binary *mul(Expr *l, Expr *r) { return binary(BinOp::Mul, l, r); }
-  // Left-fold add: {a,b,c} -> ((a + b) + c), matching a flat `a + b + c` string.
-  Expr *addChain(llvm::ArrayRef<Expr *> xs) {
+  // Left-fold over `op`: {a,b,c} -> ((a op b) op c), matching a flat
+  // `a op b op c` string (the printer adds no inner parens).
+  Expr *chain(BinOp op, llvm::ArrayRef<Expr *> xs) {
     Expr *acc = xs.front();
     for (Expr *x : xs.drop_front())
-      acc = add(acc, x);
+      acc = binary(op, acc, x);
     return acc;
   }
+  Expr *addChain(llvm::ArrayRef<Expr *> xs) { return chain(BinOp::Add, xs); }
   Unary *unary(UnOp op, Expr *x) { return make<Unary>(op, x); }
   Cast *cast(Cast::Style s, Type *to, Expr *x) { return make<Cast>(s, to, x); }
   Call *call(llvm::StringRef c, llvm::ArrayRef<Type *> ta,

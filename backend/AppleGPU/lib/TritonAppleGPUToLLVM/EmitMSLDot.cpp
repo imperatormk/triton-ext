@@ -509,38 +509,54 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
       int64_t m1 = std::min<int64_t>(m0 + mp, M), mpCur = m1 - m0;
       barrier();
       for (int r = 0; r < nARegs; ++r) {
-        std::string row = layoutCoordExpr(aStageTy, r, aRowDim);
-        std::string col = layoutCoordExpr(aStageTy, r, aColDim);
-        std::string guard = "(" + row + " >= " + std::to_string(m0) + " && " +
-                            row + " < " + std::to_string(m1) + ")";
+        // (row >= m0 && row < m1)
+        msl::Expr *guard = ctx.paren(ctx.binary(
+            B::LAnd,
+            ctx.binary(B::Ge, astLayoutCoordExpr(aStageTy, r, aRowDim),
+                       ctx.i32lit(m0)),
+            ctx.binary(B::Lt, astLayoutCoordExpr(aStageTy, r, aRowDim),
+                       ctx.i32lit(m1))));
         if (rank == 3)
-          guard = "(" + batchCoordExpr(aStageTy, r) + " == " + std::to_string(bi) +
-                  " && " + guard + ")";
-        std::string off = "((" + row + " - " + std::to_string(m0) + ") * " +
-                          std::to_string(K) + " + " + col + ")";
+          guard = ctx.paren(ctx.binary(
+              B::LAnd,
+              ctx.binary(B::Eq, astBatchCoordExpr(aStageTy, r), ctx.i32lit(bi)),
+              guard));
+        // ((row - m0) * K + col)
+        msl::Expr *off = ctx.paren(ctx.add(
+            ctx.mul(ctx.paren(ctx.binary(B::Sub,
+                                         astLayoutCoordExpr(aStageTy, r, aRowDim),
+                                         ctx.i32lit(m0))),
+                    ctx.i32lit(K)),
+            astLayoutCoordExpr(aStageTy, r, aColDim)));
         body.push_back(ctx.compactIfBare(
-            ctx.raw(guard),
-            ctx.assignStmt(ctx.subscript(ctx.var(pA), ctx.raw(off)),
-                           ctx.var(aNames[r]))));
+            guard, ctx.assignStmt(ctx.subscript(ctx.var(pA), off),
+                                  ctx.var(aNames[r]))));
       }
       for (int64_t n0 = 0; n0 < N; n0 += np) {
         int64_t n1 = std::min<int64_t>(n0 + np, N), npCur = n1 - n0;
         int64_t pmT = mpCur / 8, pnT = npCur / 8;
         barrier();
         for (int r = 0; r < nBRegs; ++r) {
-          std::string col = layoutCoordExpr(bStageTy, r, bColDim);
-          std::string row = layoutCoordExpr(bStageTy, r, bRowDim);
-          std::string guard = "(" + col + " >= " + std::to_string(n0) + " && " +
-                              col + " < " + std::to_string(n1) + ")";
+          // (col >= n0 && col < n1)
+          msl::Expr *guard = ctx.paren(ctx.binary(
+              B::LAnd,
+              ctx.binary(B::Ge, astLayoutCoordExpr(bStageTy, r, bColDim),
+                         ctx.i32lit(n0)),
+              ctx.binary(B::Lt, astLayoutCoordExpr(bStageTy, r, bColDim),
+                         ctx.i32lit(n1))));
           if (rank == 3)
-            guard = "(" + batchCoordExpr(bStageTy, r) + " == " + std::to_string(bi) +
-                    " && " + guard + ")";
-          std::string off = "(" + row + " * " + std::to_string(npCur) + " + (" +
-                            col + " - " + std::to_string(n0) + "))";
+            guard = ctx.paren(ctx.binary(
+                B::LAnd,
+                ctx.binary(B::Eq, astBatchCoordExpr(bStageTy, r), ctx.i32lit(bi)),
+                guard));
+          // (row * npCur + (col - n0))
+          msl::Expr *off = ctx.paren(ctx.add(
+              ctx.mul(astLayoutCoordExpr(bStageTy, r, bRowDim), ctx.i32lit(npCur)),
+              ctx.paren(ctx.binary(B::Sub, astLayoutCoordExpr(bStageTy, r, bColDim),
+                                   ctx.i32lit(n0)))));
           body.push_back(ctx.compactIfBare(
-              ctx.raw(guard),
-              ctx.assignStmt(ctx.subscript(ctx.var(pB), ctx.raw(off)),
-                             ctx.var(bNames[r]))));
+              guard, ctx.assignStmt(ctx.subscript(ctx.var(pB), off),
+                                    ctx.var(bNames[r]))));
         }
         barrier();
         int64_t pnFrag = pmT * pnT;
@@ -568,24 +584,35 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
         barrier();
         for (int r = 0; r < nRes; ++r) {
           std::string base = cInit[cInit.size() == 1 ? 0 : r];
-          std::string rowExpr = layoutCoordExpr(cTy, r, rowDim);
-          std::string colExpr = layoutCoordExpr(cTy, r, colDim);
-          std::string off = "((" + rowExpr + " - " + std::to_string(m0) + ") * " +
-                            std::to_string(npCur) + " + (" + colExpr + " - " +
-                            std::to_string(n0) + "))";
-          std::string guard = "(" + rowExpr + " >= " + std::to_string(m0) +
-                              " && " + rowExpr + " < " + std::to_string(m1) +
-                              " && " + colExpr + " >= " + std::to_string(n0) +
-                              " && " + colExpr + " < " + std::to_string(n1) + ")";
+          // ((rowExpr - m0) * npCur + (colExpr - n0))
+          msl::Expr *off = ctx.paren(ctx.add(
+              ctx.mul(ctx.paren(ctx.binary(B::Sub,
+                                           astLayoutCoordExpr(cTy, r, rowDim),
+                                           ctx.i32lit(m0))),
+                      ctx.i32lit(npCur)),
+              ctx.paren(ctx.binary(B::Sub, astLayoutCoordExpr(cTy, r, colDim),
+                                   ctx.i32lit(n0)))));
+          // (rowExpr >= m0 && rowExpr < m1 && colExpr >= n0 && colExpr < n1)
+          msl::Expr *guard = ctx.paren(ctx.chain(
+              B::LAnd,
+              {ctx.binary(B::Ge, astLayoutCoordExpr(cTy, r, rowDim),
+                          ctx.i32lit(m0)),
+               ctx.binary(B::Lt, astLayoutCoordExpr(cTy, r, rowDim),
+                          ctx.i32lit(m1)),
+               ctx.binary(B::Ge, astLayoutCoordExpr(cTy, r, colDim),
+                          ctx.i32lit(n0)),
+               ctx.binary(B::Lt, astLayoutCoordExpr(cTy, r, colDim),
+                          ctx.i32lit(n1))}));
           if (rank == 3)
-            guard = "(" + batchCoordExpr(cTy, r) + " == " + std::to_string(bi) +
-                    " && " + guard + ")";
+            guard = ctx.paren(ctx.binary(
+                B::LAnd,
+                ctx.binary(B::Eq, astBatchCoordExpr(cTy, r), ctx.i32lit(bi)),
+                guard));
           body.push_back(ctx.compactIfBare(
-              ctx.raw(guard),
-              ctx.assignStmt(ctx.var(ids[r]),
-                             ctx.binary(B::Add,
-                                        ctx.subscript(ctx.var(pC), ctx.raw(off)),
-                                        ctx.var(base)))));
+              guard, ctx.assignStmt(
+                         ctx.var(ids[r]),
+                         ctx.binary(B::Add, ctx.subscript(ctx.var(pC), off),
+                                    ctx.var(base)))));
         }
       }
     }
@@ -669,9 +696,9 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
     for (int r = 0; r < nRes; ++r) {
       std::string mrow = fresh(), ncol = fresh(), acc = fresh(), kv = fresh();
       body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), mrow,
-                                  ctx.raw(layoutCoordExpr(cTy, r, dRow))));
+                                  astLayoutCoordExpr(cTy, r, dRow)));
       body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), ncol,
-                                  ctx.raw(layoutCoordExpr(cTy, r, dCol))));
+                                  astLayoutCoordExpr(cTy, r, dCol)));
       body.push_back(ctx.declStmt(accTy, acc,
                                   ctx.cast(CS::CStyle, accTy, ctx.lit("0"))));
       // for (int kv = 0; kv < K; ++kv) { acc += (acc)tgA[mrow*K+kv] * (acc)tgB[kv*N+ncol]; }
@@ -680,12 +707,14 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
       msl::Stmt *step = ctx.exprStmt(ctx.raw("++" + kv));
       msl::Expr *aElemE = ctx.cast(
           CS::CStyle, accTy,
-          ctx.subscript(ctx.var(tgA), ctx.raw(mrow + " * " + std::to_string(K) +
-                                              " + " + kv)));
+          ctx.subscript(ctx.var(tgA),
+                        ctx.add(ctx.mul(ctx.var(mrow), ctx.i32lit(K)),
+                                ctx.var(kv))));
       msl::Expr *bElemE = ctx.cast(
           CS::CStyle, accTy,
-          ctx.subscript(ctx.var(tgB), ctx.raw(kv + " * " + std::to_string(N) +
-                                              " + " + ncol)));
+          ctx.subscript(ctx.var(tgB),
+                        ctx.add(ctx.mul(ctx.var(kv), ctx.i32lit(N)),
+                                ctx.var(ncol))));
       msl::Block loop;
       loop.push_back(ctx.addAssignStmt(ctx.var(acc),
                                        ctx.binary(B::Mul, aElemE, bElemE)));

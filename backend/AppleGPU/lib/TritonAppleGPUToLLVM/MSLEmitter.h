@@ -223,6 +223,26 @@ private:
   msl::Expr *astMemdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
                                 int reg);
 
+  // AST siblings of the dot/GEMM simdgroup-matrix emission (defs in
+  // EmitMSLDot.cpp). Not driving emission this layer; mirror the string parens.
+  msl::MatrixType *astSgFragType(Type t);
+  msl::Expr *astFragAddr(StringRef base, int64_t off);
+  msl::Stmt *astFragDecl(msl::MatrixType *frag, StringRef name);
+  msl::Stmt *astAccFragDecl(msl::MatrixType *frag, StringRef name);
+  msl::Stmt *astSgLoad(StringRef frag, StringRef base, int64_t off, int64_t ld);
+  msl::Stmt *astSgStore(StringRef acc, StringRef base, int64_t off, int64_t ld);
+  msl::Stmt *astSgMultiplyAccumulate(StringRef acc, StringRef a, StringRef b);
+  msl::Expr *astReadbackValue(StringRef buf, msl::Expr *off, StringRef base);
+
+  // fp-narrowing siblings. The bit-twiddling body is the design-sanctioned Raw
+  // escape hatch; only the outer `sc h = as_type<sc>(bits);` decl is real nodes.
+  msl::Stmt *astRoundedHalfValueFull(const std::string &sc, const std::string &v,
+                                     std::string &outName);
+  msl::Stmt *astTruncatedFloatValue(const std::string &sc, const std::string &v,
+                                    std::string &outName);
+  msl::Stmt *astRoundedHalfValue(const std::string &sc, const std::string &v,
+                                 std::string &outName);
+
   std::string fresh() { return "v" + std::to_string(nextId++); }
 
   std::string ind() const { return std::string(indent * 4, ' '); }

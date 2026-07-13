@@ -1060,9 +1060,8 @@ struct AtomicPollOpAppleConversion
 
     Type expTy = op.getExpected().getType();
     unsigned bw = expTy.getIntOrFloatBitWidth();
-    if (bw != 16 && bw != 32) {
-      op.emitError("atomic_poll supports only 16/32-bit expected values: "
-                   "the Apple GPU backend has no 64-bit device atomics");
+    if (bw != 16 && bw != 32 && bw != 64) {
+      op.emitError("atomic_poll supports only 16/32/64-bit expected values");
       return failure();
     }
 

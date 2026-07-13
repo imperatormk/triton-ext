@@ -1,5 +1,6 @@
 #include "ConvertCommon.h"
 #include "Dialect/TritonAppleGPU/IR/AppleMmaFragment.h"
+#include "llvm/ADT/SmallSet.h"
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "TritonAppleGPUToLLVM/Passes.h"
 #include "TritonAppleGPUToLLVM/TargetInfo.h"
@@ -446,6 +447,19 @@ struct ConvertLayoutOpAppleConversion
       srcCoords.push_back({off[rd], off[cd]});
     for (auto &off : dstOffsets)
       dstCoords.push_back({off[rd], off[cd]});
+
+    // Match convertType's struct, which collapses register replicas on the same
+    // (row,col) when sizePerThread exceeds a size-1 tensor dim.
+    auto dedupCoords = [](SmallVector<std::pair<int64_t, int64_t>> &coords) {
+      SmallVector<std::pair<int64_t, int64_t>> uniq;
+      llvm::SmallSet<std::pair<int64_t, int64_t>, 16> seen;
+      for (auto &c : coords)
+        if (seen.insert(c).second)
+          uniq.push_back(c);
+      coords = std::move(uniq);
+    };
+    dedupCoords(srcCoords);
+    dedupCoords(dstCoords);
 
     Value src = adaptor.getSrc();
     SmallVector<Value> srcElems;

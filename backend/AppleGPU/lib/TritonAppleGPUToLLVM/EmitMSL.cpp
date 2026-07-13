@@ -3345,7 +3345,10 @@ private:
           int64_t eb = std::max<int64_t>(
               1, bitsOf(elementScalarType(ar.getResult().getType())) / 8);
           int64_t rc = ll.getInDimSize(StringAttr::get(c, "register"));
-          poolBytes = std::max<int64_t>(poolBytes, rc * 32 * eb);
+          int64_t nw = ll.hasInDim(StringAttr::get(c, "warp"))
+                           ? ll.getInDimSize(StringAttr::get(c, "warp"))
+                           : 1;
+          poolBytes = std::max<int64_t>(poolBytes, rc * 32 * nw * eb);
         }
       }
     } else if (auto s = dyn_cast<tt::ScanOp>(op)) {
@@ -5318,31 +5321,39 @@ private:
     // memory keyed by (register, canonical-lane) so every warp reads the true
     // pre-op value for its logical element.
     if (!uniform && warpFree) {
+      auto ptrTy = cast<RankedTensorType>(op.getPtr().getType());
+      tt::LinearLayout ll = ttg::toLinearLayout(ptrTy);
+      MLIRContext *c = op.getContext();
+      int64_t numWarps = ll.hasInDim(StringAttr::get(c, "warp"))
+                             ? ll.getInDimSize(StringAttr::get(c, "warp"))
+                             : 1;
       std::string bcbuf = fresh();
       os << ind() << "threadgroup " << sc << "* " << bcbuf << " = "
          << poolRegion(0, sc) << ";\n";
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       std::string wcanon =
           "((" + warpId + " & " + std::to_string(warpFree) + ") == 0)";
+      // A replica warp shares its canonical source's non-free warp bits, so key
+      // the staging slot on those bits to keep distinct canonical warps apart.
+      std::string warpKey =
+          "(" + warpId + " & " + std::to_string(~warpFree & (numWarps - 1)) +
+          ")";
+      auto slotFor = [&](int reg) {
+        return "((" + warpKey + " * " + std::to_string(rc * 32) + ") + " +
+               std::to_string(reg) + " * 32 + (" + laneId + " & " +
+               std::to_string(~laneFree & 31) + "))";
+      };
       for (int r = 0; r < rc; ++r) {
         if (regFree && (r & regFree) != 0)
           continue;
-        std::string laneKey =
-            "(" + laneId + " & " + std::to_string(~laneFree & 31) + ")";
-        std::string slot =
-            "(" + std::to_string(r) + " * 32 + " + laneKey + ")";
-        os << ind() << "if (" << wcanon << ") " << bcbuf << "[" << slot
+        os << ind() << "if (" << wcanon << ") " << bcbuf << "[" << slotFor(r)
            << "] = " << ids[r] << ";\n";
       }
       os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       for (int r = 0; r < rc; ++r) {
         int src = regFree ? (r & ~regFree) : r;
-        std::string laneKey =
-            "(" + laneId + " & " + std::to_string(~laneFree & 31) + ")";
-        std::string slot =
-            "(" + std::to_string(src) + " * 32 + " + laneKey + ")";
         std::string bc = fresh();
-        os << ind() << sc << " " << bc << " = " << bcbuf << "[" << slot
+        os << ind() << sc << " " << bc << " = " << bcbuf << "[" << slotFor(src)
            << "];\n";
         ids[r] = bc;
       }
@@ -5504,9 +5515,8 @@ private:
   LogicalResult emitAtomicPoll(tt::AtomicPollOp op) {
     Type expTy = op.getExpected().getType();
     unsigned bw = expTy.getIntOrFloatBitWidth();
-    if (bw != 16 && bw != 32) {
-      op.emitError("EmitMSL: atomic_poll supports only 16/32-bit; this target "
-                   "lacks 64-bit device atomics");
+    if (bw != 16 && bw != 32 && bw != 64) {
+      op.emitError("EmitMSL: atomic_poll supports only 16/32/64-bit values");
       return failure();
     }
     bool acquire = op.getSem() == tt::MemSemantic::ACQUIRE;
@@ -5536,6 +5546,10 @@ private:
                    wordPtr + ", memory_order_relaxed) >> 16) : " +
                    "(atomic_load_explicit(" + wordPtr +
                    ", memory_order_relaxed) & 0xffffu))";
+      } else if (bw == 64) {
+        os << ind() << "volatile device ulong *" << wordPtr
+           << " = (volatile device ulong *)(" << p << ");\n";
+        loadExpr = "(*" + wordPtr + ")";
       } else {
         os << ind() << "device atomic_uint *" << wordPtr
            << " = (device atomic_uint *)(" << p << ");\n";
@@ -5544,7 +5558,7 @@ private:
       }
       return wordPtr;
     };
-    std::string wordTy = bw == 16 ? "ushort" : "uint";
+    std::string wordTy = bw == 16 ? "ushort" : (bw == 64 ? "ulong" : "uint");
 
     if (!op.getTimeout()) {
       // Without a timeout the poll can only complete on a match, so every

@@ -408,9 +408,15 @@ void MSLPrinter::printStmt(const Stmt *s) {
     return;
   case Stmt::Kind::CompactIf: {
     auto *c = llvm::cast<CompactIfStmt>(s);
-    ind() << "if (";
-    printExpr(c->cond);
-    os << ") ";
+    if (c->parenCond) {
+      ind() << "if (";
+      printExpr(c->cond);
+      os << ") ";
+    } else {
+      ind() << "if ";
+      printExpr(c->cond);
+      os << " ";
+    }
     printStmtInline(c->then);
     os << ";\n";
     return;

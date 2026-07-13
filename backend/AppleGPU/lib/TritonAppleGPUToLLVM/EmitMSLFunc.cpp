@@ -1485,6 +1485,10 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  // tt.dot: simdgroup-matrix / scalar GEMM (all staging + fusion phases).
+  if (auto dt = dyn_cast<tt::DotOp>(op))
+    return astEmitDot(dt, body);
+
   // tt.map_elementwise: per-group inline of the scalar region. Single-block
   // groups AST-walk the region; multi-block groups use the string state machine
   // (captured), as they are rare and self-contained.

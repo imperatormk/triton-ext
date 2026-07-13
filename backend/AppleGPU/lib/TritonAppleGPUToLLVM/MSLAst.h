@@ -267,10 +267,15 @@ struct BarrierStmt : Stmt {
 };
 
 // `if (cond) <stmt>` on one line, no braces (load mask, store guard, etc.).
+// parenCond=false renders `if <cond> <stmt>` (cond already carries its parens);
+// used by the dot guards whose string form is `if (...) ...` with the parens
+// baked into the raw guard expression.
 struct CompactIfStmt : Stmt {
   Expr *cond;
   Stmt *then;
-  CompactIfStmt(Expr *c, Stmt *t) : Stmt(Kind::CompactIf), cond(c), then(t) {}
+  bool parenCond;
+  CompactIfStmt(Expr *c, Stmt *t, bool paren)
+      : Stmt(Kind::CompactIf), cond(c), then(t), parenCond(paren) {}
   static bool classof(const Stmt *s) { return s->kind == Kind::CompactIf; }
 };
 
@@ -480,7 +485,11 @@ public:
   ContinueStmt *continueStmt() { return make<ContinueStmt>(); }
   BarrierStmt *barrier(bool device) { return make<BarrierStmt>(device); }
   CompactIfStmt *compactIf(Expr *c, Stmt *t) {
-    return make<CompactIfStmt>(c, t);
+    return make<CompactIfStmt>(c, t, true);
+  }
+  // `if <cond> <stmt>` - cond already carries its own parentheses.
+  CompactIfStmt *compactIfBare(Expr *c, Stmt *t) {
+    return make<CompactIfStmt>(c, t, false);
   }
   RawStmt *rawStmt(llvm::StringRef t) { return make<RawStmt>(save(t), false); }
   RawStmt *rawVerbatim(llvm::StringRef t) {

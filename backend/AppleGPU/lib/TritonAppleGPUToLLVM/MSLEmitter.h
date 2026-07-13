@@ -398,6 +398,29 @@ private:
   bool astCombineN(Region &region, ArrayRef<std::string> aVals,
                    ArrayRef<std::string> bVals, msl::Block &body,
                    SmallVectorImpl<std::string> &results);
+  struct InPlaceOperand {
+    std::string buf;
+    std::string baseOffset;
+  };
+  bool astEmitDot(tt::DotOp op, msl::Block &body);
+  bool astEmitDotScalar(tt::DotOp op, msl::Block &body);
+  bool astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
+                       Value bStage, ArrayRef<std::string> aNames,
+                       ArrayRef<std::string> bNames, ArrayRef<std::string> cInit,
+                       ArrayRef<std::string> ids, int64_t M, int64_t N, int64_t K,
+                       int64_t Bd, int rank, msl::MatrixType *opFrag,
+                       StringRef opScalar, int64_t numWarps, StringAttr rowDim,
+                       StringAttr colDim);
+  bool astEmitDotFused(
+      tt::DotOp op, msl::Block &body, Value aStage, Value bStage,
+      ArrayRef<std::string> aNames, ArrayRef<std::string> bNames, StringRef tgA,
+      StringRef tgB, StringRef tgC, ArrayRef<std::string> ids, int64_t M,
+      int64_t N, int64_t K, int64_t mT, int64_t nT, int64_t kT, int64_t nFrag,
+      int64_t numWarps, std::optional<InPlaceOperand> aInPlace,
+      std::optional<InPlaceOperand> bInPlace, msl::MatrixType *opFrag,
+      msl::MatrixType *accFragTy,
+      llvm::function_ref<void(msl::Block &, int64_t, int64_t, int64_t)>
+          readbackInto);
   std::string astShuffle(StringRef op, StringRef sc, StringRef val,
                          StringRef arg, msl::Block &body);
   bool astScanWarpCarry(Region &region, int nOp, ArrayRef<std::string> scTys,
@@ -3750,10 +3773,6 @@ private:
     return success();
   }
 
-  struct InPlaceOperand {
-    std::string buf;
-    std::string baseOffset;
-  };
 
   // A local_load of a contiguous row-major [rows][cols] threadgroup buffer
   // (local_alloc, optionally memdesc_index'd, never subsliced) reached through

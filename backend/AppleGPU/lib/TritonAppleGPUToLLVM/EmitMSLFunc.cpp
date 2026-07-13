@@ -41,6 +41,15 @@ struct LocalGen {
 using B = msl::BinOp;
 using CS = msl::Cast::Style;
 
+static msl::BinOp cmpBinOp(llvm::StringRef o) {
+  if (o == "<") return B::Lt;
+  if (o == "<=") return B::Le;
+  if (o == ">") return B::Gt;
+  if (o == ">=") return B::Ge;
+  if (o == "==") return B::Eq;
+  return B::Ne;
+}
+
 //===----------------------------------------------------------------------===//
 // Return-struct type + device return type
 //===----------------------------------------------------------------------===//
@@ -536,6 +545,132 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     bindScalar(op->getResult(0), id);
     return true;
   }
+
+  // Integer compare: `bool id = (casta o castb);`
+  if (auto ci = dyn_cast<arith::CmpIOp>(op)) {
+    const char *o;
+    bool uns = false;
+    switch (ci.getPredicate()) {
+    case arith::CmpIPredicate::ult: uns = true; [[fallthrough]];
+    case arith::CmpIPredicate::slt: o = "<"; break;
+    case arith::CmpIPredicate::ule: uns = true; [[fallthrough]];
+    case arith::CmpIPredicate::sle: o = "<="; break;
+    case arith::CmpIPredicate::ugt: uns = true; [[fallthrough]];
+    case arith::CmpIPredicate::sgt: o = ">"; break;
+    case arith::CmpIPredicate::uge: uns = true; [[fallthrough]];
+    case arith::CmpIPredicate::sge: o = ">="; break;
+    case arith::CmpIPredicate::eq: o = "=="; break;
+    case arith::CmpIPredicate::ne: o = "!="; break;
+    }
+    msl::BinOp bo = cmpBinOp(o);
+    msl::Type *opCast =
+        uns ? astUnsignedType(elementScalarType(ci.getLhs().getType())) : nullptr;
+    return astDeclBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
+      return astElementwiseExpr(bo, opCast, opnd(op->getOperand(0), r),
+                                opnd(op->getOperand(1), r));
+    });
+  }
+  if (auto cf = dyn_cast<arith::CmpFOp>(op)) {
+    const char *o;
+    switch (cf.getPredicate()) {
+    case arith::CmpFPredicate::OLT:
+    case arith::CmpFPredicate::ULT: o = "<"; break;
+    case arith::CmpFPredicate::OLE:
+    case arith::CmpFPredicate::ULE: o = "<="; break;
+    case arith::CmpFPredicate::OGT:
+    case arith::CmpFPredicate::UGT: o = ">"; break;
+    case arith::CmpFPredicate::OGE:
+    case arith::CmpFPredicate::UGE: o = ">="; break;
+    case arith::CmpFPredicate::OEQ:
+    case arith::CmpFPredicate::UEQ: o = "=="; break;
+    case arith::CmpFPredicate::ONE:
+    case arith::CmpFPredicate::UNE: o = "!="; break;
+    default: return false; // unsupported predicate: let string path error
+    }
+    msl::BinOp bo = cmpBinOp(o);
+    return astDeclBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
+      return astElementwiseExpr(bo, nullptr, opnd(op->getOperand(0), r),
+                                opnd(op->getOperand(1), r));
+    });
+  }
+
+  // Select: `sc id = c ? t : f;`
+  if (auto s = dyn_cast<arith::SelectOp>(op)) {
+    Type re = op->getResult(0).getType();
+    if (auto rt = dyn_cast<RankedTensorType>(re))
+      re = rt.getElementType();
+    msl::Type *declTy = isa<tt::PointerType>(re)
+                            ? astStorageType(op->getResult(0).getType())
+                            : astScalarType(elementScalarType(re));
+    return astDeclBind(op, declTy, body, [&](int r) {
+      return astSelectExpr(opnd(s.getCondition(), r), opnd(s.getTrueValue(), r),
+                           opnd(s.getFalseValue(), r));
+    });
+  }
+
+  // Clamp.
+  if (auto c = dyn_cast<tt::ClampFOp>(op))
+    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+      return astClampExpr(c, opnd(c.getX(), r), opnd(c.getMin(), r),
+                          opnd(c.getMax(), r));
+    });
+
+  // Casts (non fp-narrowing) / bitcast / ptr<->int.
+  if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp,
+          arith::ExtFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(op))
+    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+      return astCastExpr(op, opnd(op->getOperand(0), r));
+    });
+  if (isa<arith::BitcastOp, tt::BitcastOp>(op))
+    return astDeclBind(op, astStorageType(op->getResult(0).getType()), body,
+                       [&](int r) {
+                         return astBitcastExpr(op, opnd(op->getOperand(0), r));
+                       });
+  if (isa<tt::IntToPtrOp, tt::PtrToIntOp>(op))
+    return astDeclBind(op, astStorageType(op->getResult(0).getType()), body,
+                       [&](int r) {
+                         return astPtrIntCastExpr(op, opnd(op->getOperand(0), r));
+                       });
+
+  // negf: `sc id = -a;`
+  if (isa<arith::NegFOp>(op))
+    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+      return ctx.unary(msl::UnOp::Neg, ctx.var(opnd(op->getOperand(0), r)));
+    });
+
+  // min/max family (decl type is always the signed scalar; opCast/propagateNan
+  // per the string emitMinMax). Covers arith min/max, mulhi, remf(fmod).
+  {
+    StringRef fn;
+    msl::Type *opCast = nullptr;
+    bool propagateNan = false;
+    bool isMinMax = true;
+    if (isa<arith::MaximumFOp>(op)) { fn = "max"; propagateNan = true; }
+    else if (isa<arith::MinimumFOp>(op)) { fn = "min"; propagateNan = true; }
+    else if (isa<arith::MaxUIOp>(op)) {
+      fn = "max"; opCast = astUnsignedType(resElem);
+    } else if (isa<arith::MinUIOp>(op)) {
+      fn = "min"; opCast = astUnsignedType(resElem);
+    } else if (isa<arith::MaxNumFOp, arith::MaxSIOp>(op)) fn = "max";
+    else if (isa<arith::MinNumFOp, arith::MinSIOp>(op)) fn = "min";
+    else if (isa<arith::RemFOp>(op)) fn = "metal::fmod";
+    else if (isa<tt::MulhiUIOp>(op)) {
+      fn = "mulhi"; opCast = astUnsignedType(resElem);
+    } else isMinMax = false;
+    if (isMinMax)
+      return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+        return astMinMaxExpr(fn, opCast, propagateNan,
+                             opnd(op->getOperand(0), r),
+                             opnd(op->getOperand(1), r));
+      });
+  }
+
+  // precise_sqrt: `sc id = (sc)metal::precise::sqrt(a);`
+  if (isa<tt::PreciseSqrtOp>(op))
+    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+      return astUnaryExpr(msl::builtin::precise::Sqrt, astScalarType(resElem),
+                          opnd(op->getOperand(0), r));
+    });
 
   // --- Flipped families slot in above this line; unflipped ops fall through to
   // the string capture in astWalkBlock. ---

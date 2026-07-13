@@ -1896,19 +1896,27 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup),
                                   bcbuf, astPoolRegion(0, sc)));
       body.push_back(ctx.hardBarrier(false));
-      std::string wcanon =
-          "((" + warpId + " & " + std::to_string(warpFree) + ") == 0)";
-      std::string warpKey =
-          "(" + warpId + " & " + std::to_string(~warpFree & (numWarps - 1)) + ")";
+      // ((warpId & warpFree) == 0)
+      msl::Expr *wcanon = ctx.paren(ctx.binary(
+          B::Eq,
+          ctx.paren(ctx.binary(B::And, ctx.var(warpId), ctx.i32lit(warpFree))),
+          ctx.i32lit(0)));
+      // (warpId & (~warpFree & (numWarps-1)))
+      msl::Expr *warpKey = ctx.paren(ctx.binary(
+          B::And, ctx.var(warpId),
+          ctx.i32lit(~warpFree & (numWarps - 1))));
+      // ((warpKey * rc*32) + reg*32 + (laneId & (~laneFree & 31)))
       auto slotFor = [&](int reg) -> msl::Expr * {
-        return ctx.raw("((" + warpKey + " * " + std::to_string(rc * 32) +
-                       ") + " + std::to_string(reg) + " * 32 + (" + laneId +
-                       " & " + std::to_string(~laneFree & 31) + "))");
+        return ctx.paren(ctx.addChain(
+            {ctx.paren(ctx.mul(warpKey, ctx.i32lit(rc * 32))),
+             ctx.mul(ctx.i32lit(reg), ctx.i32lit(32)),
+             ctx.paren(ctx.binary(B::And, ctx.var(laneId),
+                                  ctx.i32lit(~laneFree & 31)))}));
       };
       for (int r = 0; r < rc; ++r) {
         if (regFree && (r & regFree) != 0) continue;
         body.push_back(ctx.compactIf(
-            ctx.raw(wcanon),
+            wcanon,
             ctx.assignStmt(ctx.subscript(ctx.var(bcbuf), slotFor(r)),
                            ctx.var(ids[r]))));
       }
@@ -2206,15 +2214,16 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
                                std::to_string(delta) + "u", body);
           SmallVector<std::string> out;
           if (!astCombineN(region, nb, laneScan, body, out)) return false;
-          std::string local =
-              "(" + laneId + " & " + std::to_string(axisLaneMask) + ")";
-          std::string guard =
-              rev ? (local + " <= " + std::to_string(axisLaneMask - delta))
-                  : (local + " >= " + std::to_string(delta));
+          // (laneId & axisLaneMask) [<= mask-delta | >= delta]
+          msl::Expr *local = ctx.paren(
+              ctx.binary(B::And, ctx.var(laneId), ctx.i32lit(axisLaneMask)));
+          msl::Expr *guard =
+              rev ? ctx.binary(B::Le, local, ctx.i32lit(axisLaneMask - delta))
+                  : ctx.binary(B::Ge, local, ctx.i32lit(delta));
           for (int k = 0; k < nOp; ++k)
             body.push_back(ctx.assignStmt(
                 ctx.var(laneScan[k]),
-                ctx.paren(ctx.ternary(ctx.raw(guard), ctx.var(out[k]),
+                ctx.paren(ctx.ternary(guard, ctx.var(out[k]),
                                       ctx.var(laneScan[k])))));
         }
         if (!laneBits.empty()) {
@@ -2222,11 +2231,13 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
           for (int k = 0; k < nOp; ++k)
             lanePrefix[k] = astShuffle(shuf, scTys[k], laneScan[k],
                                        std::to_string(axisLaneLow) + "u", body);
-          std::string local =
-              "(" + laneId + " & " + std::to_string(axisLaneMask) + ")";
-          std::string guard =
-              rev ? (local + " <= " + std::to_string(axisLaneMask - axisLaneLow))
-                  : (local + " >= " + std::to_string(axisLaneLow));
+          // (laneId & axisLaneMask) [<= mask-low | >= low]
+          msl::Expr *local = ctx.paren(
+              ctx.binary(B::And, ctx.var(laneId), ctx.i32lit(axisLaneMask)));
+          msl::Expr *guard =
+              rev ? ctx.binary(B::Le, local,
+                               ctx.i32lit(axisLaneMask - axisLaneLow))
+                  : ctx.binary(B::Ge, local, ctx.i32lit(axisLaneLow));
           for (int r : regs) {
             SmallVector<std::string> out, ar(nOp);
             for (int k = 0; k < nOp; ++k) ar[k] = accs[k][r];
@@ -2234,7 +2245,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
             for (int k = 0; k < nOp; ++k)
               body.push_back(ctx.assignStmt(
                   ctx.var(accs[k][r]),
-                  ctx.paren(ctx.ternary(ctx.raw(guard), ctx.var(out[k]),
+                  ctx.paren(ctx.ternary(guard, ctx.var(out[k]),
                                         ctx.var(accs[k][r])))));
           }
         }

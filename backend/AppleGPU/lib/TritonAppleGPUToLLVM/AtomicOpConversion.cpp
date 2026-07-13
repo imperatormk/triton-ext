@@ -1047,6 +1047,145 @@ struct AtomicCASOpAppleConversion
   }
 };
 
+struct AtomicPollOpAppleConversion
+    : public ConvertOpToLLVMPattern<triton::AtomicPollOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::AtomicPollOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    auto mod = op->getParentOfType<ModuleOp>();
+
+    Type expTy = op.getExpected().getType();
+    unsigned bw = expTy.getIntOrFloatBitWidth();
+    if (bw != 16 && bw != 32) {
+      op.emitError("atomic_poll supports only 16/32-bit expected values: "
+                   "the Apple GPU backend has no 64-bit device atomics");
+      return failure();
+    }
+
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto intTy = cast<IntegerType>(expTy);
+    Value llPtr = adaptor.getPtr();
+    Value llExp = adaptor.getExpected();
+
+    auto arrI32x3Ty = LLVMArrayType::get(i32Ty, 3);
+    auto tidFnTy = LLVMFunctionType::get(arrI32x3Ty, {}, false);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(mod.getBody());
+      if (!mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup"))
+        LLVMFuncOp::create(rewriter, mod.getLoc(),
+                           "air.thread_position_in_threadgroup", tidFnTy,
+                           Linkage::External);
+    }
+    auto tidFn =
+        mod.lookupSymbol<LLVMFuncOp>("air.thread_position_in_threadgroup");
+
+    auto voidTy = LLVMVoidType::get(ctx);
+    auto barrFnTy = LLVMFunctionType::get(voidTy, {i32Ty, i32Ty}, false);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(mod.getBody());
+      if (!mod.lookupSymbol<LLVMFuncOp>("air.wg.barrier"))
+        LLVMFuncOp::create(rewriter, mod.getLoc(), "air.wg.barrier", barrFnTy,
+                           Linkage::External);
+    }
+    auto barrFn = mod.lookupSymbol<LLVMFuncOp>("air.wg.barrier");
+
+    bool acquire = op.getSem() == triton::MemSemantic::ACQUIRE;
+    bool hasTimeout = (bool)op.getTimeout();
+
+    Value tidStruct =
+        LLVM::CallOp::create(rewriter, loc, tidFn, ValueRange{}).getResult();
+    Value tid0 = LLVM::ExtractValueOp::create(rewriter, loc, i32Ty, tidStruct,
+                                              ArrayRef<int64_t>{0});
+    Value zero = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+    Value isThread0 = LLVM::ICmpOp::create(
+        rewriter, loc, LLVM::ICmpPredicate::eq, tid0, zero);
+
+    Value tgFlagPtr;
+    if (hasTimeout) {
+      auto tgPtrTy = LLVMPointerType::get(ctx, 3);
+      std::string tgName = "__tg_poll_bcast";
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(mod.getBody());
+        if (!mod.lookupSymbol<LLVM::GlobalOp>(tgName)) {
+          auto arrTy = LLVMArrayType::get(i32Ty, 1);
+          LLVM::GlobalOp::create(rewriter, mod.getLoc(), arrTy, false,
+                                 Linkage::Internal, tgName, Attribute(), 4, 3u);
+        }
+      }
+      auto tgGlobal = mod.lookupSymbol<LLVM::GlobalOp>(tgName);
+      tgFlagPtr =
+          LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy, tgGlobal.getName());
+    }
+
+    auto *currentBlock = rewriter.getInsertionBlock();
+    auto *afterBlock =
+        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    auto *pollBlock = rewriter.createBlock(afterBlock);
+
+    rewriter.setInsertionPointToEnd(currentBlock);
+    LLVM::CondBrOp::create(rewriter, loc, isThread0, pollBlock, afterBlock);
+
+    rewriter.setInsertionPointToStart(pollBlock);
+    if (!hasTimeout) {
+      Value cur = LLVM::LoadOp::create(rewriter, loc, intTy, llPtr,
+                                       /*alignment=*/0, /*isVolatile=*/true);
+      Value matched = LLVM::ICmpOp::create(rewriter, loc,
+                                           LLVM::ICmpPredicate::eq, cur, llExp);
+      LLVM::CondBrOp::create(rewriter, loc, matched, afterBlock, pollBlock);
+    } else {
+      Value cur = LLVM::LoadOp::create(rewriter, loc, intTy, llPtr,
+                                       /*alignment=*/0, /*isVolatile=*/true);
+      Value matched = LLVM::ICmpOp::create(rewriter, loc,
+                                           LLVM::ICmpPredicate::eq, cur, llExp);
+      Value matchedI32 =
+          LLVM::ZExtOp::create(rewriter, loc, i32Ty, matched);
+      LLVM::StoreOp::create(rewriter, loc, matchedI32, tgFlagPtr);
+      LLVM::BrOp::create(rewriter, loc, afterBlock);
+    }
+
+    rewriter.setInsertionPointToStart(afterBlock);
+    if (acquire) {
+      auto fenceFnTy =
+          LLVMFunctionType::get(voidTy, {i32Ty, i32Ty, i32Ty}, false);
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(mod.getBody());
+        if (!mod.lookupSymbol<LLVMFuncOp>("air.atomic.fence"))
+          LLVMFuncOp::create(rewriter, mod.getLoc(), "air.atomic.fence",
+                             fenceFnTy, Linkage::External);
+      }
+      auto fenceFn = mod.lookupSymbol<LLVMFuncOp>("air.atomic.fence");
+      Value memDev = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+      Value acqOrd = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+      Value devScope = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+      LLVM::CallOp::create(rewriter, loc, fenceFn,
+                           ValueRange{memDev, acqOrd, devScope});
+    }
+
+    Value flagTG = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+    Value scope1 = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+    LLVM::CallOp::create(rewriter, loc, barrFn, ValueRange{flagTG, scope1});
+
+    Value result;
+    if (!hasTimeout) {
+      result = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+    } else {
+      Value loaded = LLVM::LoadOp::create(rewriter, loc, i32Ty, tgFlagPtr);
+      result = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::ne,
+                                    loaded, zero);
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 } // anonymous namespace
 
 void populateAtomicOpPatterns(LLVMTypeConverter &typeConverter,
@@ -1055,6 +1194,8 @@ void populateAtomicOpPatterns(LLVMTypeConverter &typeConverter,
                                            patternBenefitDefault + 10);
   patterns.add<AtomicCASOpAppleConversion>(typeConverter,
                                            patternBenefitDefault + 10);
+  patterns.add<AtomicPollOpAppleConversion>(typeConverter,
+                                            patternBenefitDefault + 10);
 }
 
 } // namespace mlir::triton::applegpu

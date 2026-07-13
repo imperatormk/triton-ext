@@ -243,6 +243,35 @@ private:
   msl::Stmt *astRoundedHalfValue(const std::string &sc, const std::string &v,
                                  std::string &outName);
 
+  // atomic siblings (EmitMSLAtomic.cpp). Multi-statement builders return a
+  // msl::Block so the caller splices them at its own indent (no stray braces);
+  // single-node builders return Stmt*/Expr*.
+  msl::Expr *astInit0(StringRef sc);
+  msl::Expr *astDeviceAtomicPtr(StringRef atomicTy, StringRef p);
+  msl::Block astPacked16Base(StringRef p, std::string &wordPtrOut,
+                             std::string &isHighOut);
+  msl::Expr *astAtomicRmwCall(StringRef fn, StringRef atomicTy, StringRef p,
+                              StringRef v, StringRef order, bool memFlags);
+  msl::Block astFloat32CASLoop(StringRef p, StringRef curId,
+                               msl::Expr *newFloatExpr, StringRef id);
+  msl::Block astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
+                                StringRef sc, StringRef curId,
+                                msl::Expr *newHalfExpr, StringRef id);
+  msl::Block astInt32CAS(StringRef p, StringRef c, StringRef v, StringRef sc,
+                         StringRef id, bool declare);
+  msl::Block astFloat32CAS(StringRef p, StringRef c, StringRef v, StringRef id,
+                           bool declare);
+  msl::Block astPacked16CAS(StringRef wordPtr, StringRef isHigh, StringRef c,
+                            StringRef v, StringRef sc, StringRef id,
+                            bool declare);
+  msl::Stmt *astAcquireFence();
+  msl::Stmt *astPollSpin(msl::Expr *loadExpr, StringRef want);
+  msl::Expr *astPoll64Load(StringRef p, StringRef wordPtr, msl::Stmt *&out);
+  msl::Stmt *astHistBinsDecl(StringRef bins);
+  msl::Stmt *astHistZeroInit(StringRef bins, StringRef zi, int64_t nBins,
+                             int64_t threads);
+  msl::Stmt *astHistFetchAdd(msl::Expr *guard, StringRef bins, StringRef v);
+
   std::string fresh() { return "v" + std::to_string(nextId++); }
 
   std::string ind() const { return std::string(indent * 4, ' '); }

@@ -397,9 +397,14 @@ void MSLPrinter::printStmt(const Stmt *s) {
     barrierPendingDevice =
         barrierPendingDevice || llvm::cast<BarrierStmt>(s)->device;
     return;
-  case Stmt::Kind::Raw:
-    ind() << llvm::cast<RawStmt>(s)->text << "\n";
+  case Stmt::Kind::Raw: {
+    auto *r = llvm::cast<RawStmt>(s);
+    if (r->verbatim)
+      os << r->text;
+    else
+      ind() << r->text << "\n";
     return;
+  }
   case Stmt::Kind::KernelFn: {
     auto *fn = llvm::cast<KernelFn>(s);
     if (fn->maxThreads) {

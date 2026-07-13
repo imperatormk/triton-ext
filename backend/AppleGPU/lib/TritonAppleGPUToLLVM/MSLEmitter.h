@@ -8,6 +8,7 @@
 
 #include "MSLAst.h"
 #include "MSLConstants.h"
+#include "MSLPrinter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -116,11 +117,35 @@ inline Type elementScalarType(Type t) {
   return t;
 }
 
+// Forwarding stream: `os` writes here, and the sink can be retargeted so a
+// still-string op family can be captured into a buffer (hybrid RawStmt path).
+class ForwardOStream : public llvm::raw_ostream {
+public:
+  explicit ForwardOStream(llvm::raw_ostream *sink) : sink(sink) {
+    SetUnbuffered();
+  }
+  ~ForwardOStream() override { flush(); }
+  llvm::raw_ostream *swap(llvm::raw_ostream *s) {
+    flush();
+    llvm::raw_ostream *prev = sink;
+    sink = s;
+    return prev;
+  }
+
+private:
+  void write_impl(const char *ptr, size_t size) override {
+    sink->write(ptr, size);
+  }
+  uint64_t current_pos() const override { return sink->tell(); }
+  llvm::raw_ostream *sink;
+};
+
 // Per-value symbol table: maps an SSA Value to its MSL identifier. For tensor
 // values we store one identifier per register (per-thread element).
 class MSLEmitter {
 public:
-  MSLEmitter(ModuleOp mod, raw_ostream &os) : mod(mod), os(os) {}
+  MSLEmitter(ModuleOp mod, raw_ostream &realOut)
+      : mod(mod), fwd(&realOut), os(fwd) {}
 
   LogicalResult emit() {
     os << "#include <metal_stdlib>\n";
@@ -183,7 +208,21 @@ public:
 
 private:
   ModuleOp mod;
+  ForwardOStream fwd;
   raw_ostream &os;
+
+  // Capture the string output of `fn` (which writes to `os`) into a verbatim
+  // RawStmt. Transitional: lets a not-yet-flipped op family print byte-identical
+  // while the surrounding function is AST-driven. Removed once all families flip.
+  template <typename Fn> msl::Stmt *captureRaw(Fn &&fn) {
+    std::string buf;
+    llvm::raw_string_ostream ss(buf);
+    llvm::raw_ostream *prev = fwd.swap(&ss);
+    fn();
+    ss.flush();
+    fwd.swap(prev);
+    return ctx.rawVerbatim(buf);
+  }
   // AST arena. Unused by emission yet; later layers build nodes into it and the
   // printer renders them, replacing the string emission below.
   msl::MSLContext ctx;
@@ -346,10 +385,14 @@ private:
   bool astElemwiseDecls(Operation *op, msl::Type *declTy, int &id,
                         msl::Block &body,
                         llvm::function_ref<msl::Expr *(int)> mk);
+  bool astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
+                   llvm::function_ref<msl::Expr *(int)> mk);
   // Dispatch spine: appends the sibling nodes for `op` to `body`. Returns true
   // when the op is wired (nodes appended, or nothing for alias/dataless ops);
   // false when the op has no whole-op sibling yet (flip layer 7b fills these).
   bool astEmitOp(Operation *op, msl::Block &body);
+  msl::Block astWalkBlock(Block &blk, unsigned depth);
+  bool emitFailed = false;
 
   std::string fresh() { return "v" + std::to_string(nextId++); }
 
@@ -521,14 +564,16 @@ private:
 
     Region &region = func.getBody();
     if (region.hasOneBlock()) {
-      for (Operation &op : region.front())
-        if (failed(emitOp(&op)))
-          return failure();
+      msl::Block body = astWalkBlock(region.front(), indent);
+      if (emitFailed)
+        return failure();
+      msl::MSLPrinter printer(os);
+      printer.printBlockAt(body, indent);
     } else {
       if (failed(emitBlockCFG(region)))
         return failure();
+      flushBarrier();
     }
-    flushBarrier();
     os << "}\n";
     return success();
   }
@@ -651,14 +696,16 @@ private:
     curDevFunc = func;
     Region &region = func.getBody();
     if (region.hasOneBlock()) {
-      for (Operation &op : region.front())
-        if (failed(emitOp(&op)))
-          return failure();
+      msl::Block body = astWalkBlock(region.front(), indent);
+      if (emitFailed)
+        return failure();
+      msl::MSLPrinter printer(os);
+      printer.printBlockAt(body, indent);
     } else {
       if (failed(emitBlockCFG(region)))
         return failure();
+      flushBarrier();
     }
-    flushBarrier();
     curDevFunc = nullptr;
     os << "}\n";
     return success();

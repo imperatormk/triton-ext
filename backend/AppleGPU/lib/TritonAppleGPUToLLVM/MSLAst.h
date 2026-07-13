@@ -264,7 +264,11 @@ struct BarrierStmt : Stmt {
 
 struct RawStmt : Stmt {
   llvm::StringRef text;
-  explicit RawStmt(llvm::StringRef t) : Stmt(Kind::Raw), text(t) {}
+  // verbatim => print text exactly (no indent, no trailing newline); used by the
+  // transitional capture path where `text` already carries indentation+newlines.
+  bool verbatim;
+  RawStmt(llvm::StringRef t, bool verbatim)
+      : Stmt(Kind::Raw), text(t), verbatim(verbatim) {}
   static bool classof(const Stmt *s) { return s->kind == Kind::Raw; }
 };
 
@@ -452,7 +456,10 @@ public:
   BreakStmt *breakStmt() { return make<BreakStmt>(); }
   ContinueStmt *continueStmt() { return make<ContinueStmt>(); }
   BarrierStmt *barrier(bool device) { return make<BarrierStmt>(device); }
-  RawStmt *rawStmt(llvm::StringRef t) { return make<RawStmt>(save(t)); }
+  RawStmt *rawStmt(llvm::StringRef t) { return make<RawStmt>(save(t), false); }
+  RawStmt *rawVerbatim(llvm::StringRef t) {
+    return make<RawStmt>(save(t), true);
+  }
 
   // --- Attrs / Params ---
   Attr *bufferAttr(unsigned n) { return make<Attr>(Attr::Kind::Buffer, n); }

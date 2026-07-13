@@ -379,13 +379,56 @@ bool MSLEmitter::astElemwiseDecls(
   return true;
 }
 
+// Flip-aware per-register decls: mints real fresh() names (advancing nextId so
+// downstream captured/flipped ops stay in lockstep) and binds valMap[result].
+bool MSLEmitter::astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
+                             llvm::function_ref<msl::Expr *(int)> mk) {
+  int rc = regCount(op->getResult(0));
+  SmallVector<std::string> ids;
+  for (int r = 0; r < rc; ++r) {
+    std::string id = fresh();
+    body.push_back(ctx.declStmt(declTy, id, mk(r)));
+    ids.push_back(id);
+  }
+  valMap[op->getResult(0)] = ids;
+  return true;
+}
+
+// Walk a single-block region's ops into a Block: each op goes through astEmitOp,
+// falling back to a verbatim capture of the string emitOp for not-yet-flipped
+// families. `depth` is the printer nesting the Block prints at, so a captured op
+// bakes matching indentation. Terminators (yield/return/branch) are walked too;
+// astEmitOp handles the dataless ones and captures the rest.
+msl::Block MSLEmitter::astWalkBlock(Block &blk, unsigned depth) {
+  msl::Block body;
+  int savedIndent = indent;
+  indent = depth;
+  for (Operation &op : blk) {
+    if (astEmitOp(&op, body))
+      continue;
+    Operation *opp = &op;
+    body.push_back(captureRaw([&] {
+      if (failed(emitOp(opp)))
+        emitFailed = true;
+    }));
+    // A captured op may leave a pending string-path barrier (it flushes only at
+    // scope boundaries). Translate it to a BarrierStmt so the printer peephole
+    // still collapses it with an adjacent barrier uniformly.
+    if (barrierPending) {
+      body.push_back(ctx.barrier(barrierPendingDevice));
+      barrierPending = false;
+      barrierPendingDevice = false;
+    }
+  }
+  indent = savedIndent;
+  return body;
+}
+
 // Route `op` to its sibling-builder(s), appending nodes to `body`. Returns true
 // when handled (including alias/dataless ops that append nothing). Ops whose
 // full lowering is not yet expressible from existing siblings return false -
 // the flip layer (7b) wires those; see the report for the exact list.
 bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
-  int id = nextId;
-  LocalGen g{id};
   auto opnd = [&](Value v, int r) -> StringRef {
     auto &nm = names(v);
     return nm[nm.size() == 1 ? 0 : r];
@@ -405,105 +448,30 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   }
   if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op)) {
     body.push_back(ctx.barrier(/*device=*/false));
+    for (Value r : op->getResults())
+      valMap[r] = SmallVector<std::string>{};
     return true;
   }
 
-  // Alias / dataless / no-op: rebind only, emit nothing.
-  if (isa<tt::UnsplatOp, tt::SplatOp, tt::ExpandDimsOp, tt::BroadcastOp,
-          tt::JoinOp, tt::SplitOp, tt::CatOp, tt::TransOp, tt::ReshapeOp,
-          tt::AssertOp, tt::PrintOp, ttg::LocalDeallocOp, scf::YieldOp>(op))
+  // Structural no-ops that neither emit text nor bind a named value.
+  if (isa<ttg::LocalDeallocOp, scf::YieldOp>(op))
     return true;
   if (op->getName().getStringRef() == "llvm.intr.assume")
     return true;
+  if (isa<tt::AssertOp, tt::PrintOp>(op)) {
+    for (Value r : op->getResults())
+      valMap[r] = SmallVector<std::string>{};
+    return true;
+  }
 
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
+  (void)resElem;
+  (void)opnd;
 
-  // Integer / float / shift / min-max / logical binaries.
-  if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp, arith::DivSIOp,
-          arith::DivUIOp, arith::RemSIOp, arith::RemUIOp>(op))
-    return astElemwiseDecls(op, astScalarType(resElem), id, body, [&](int r) {
-      return astIntBinaryExpr(op, opnd(op->getOperand(0), r),
-                              opnd(op->getOperand(1), r));
-    });
-  if (isa<arith::AddFOp, arith::MulFOp, arith::SubFOp, arith::DivFOp,
-          tt::PreciseDivFOp>(op))
-    return astElemwiseDecls(op, astScalarType(resElem), id, body, [&](int r) {
-      return astElementwiseExpr(
-          isa<arith::AddFOp>(op)   ? B::Add
-          : isa<arith::SubFOp>(op) ? B::Sub
-          : isa<arith::MulFOp>(op) ? B::Mul
-                                   : B::Div,
-          nullptr, opnd(op->getOperand(0), r), opnd(op->getOperand(1), r));
-    });
-  if (isa<arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp>(op))
-    return astElemwiseDecls(op, astScalarType(resElem), id, body, [&](int r) {
-      return astShiftExpr(op, opnd(op->getOperand(0), r),
-                          opnd(op->getOperand(1), r));
-    });
-  if (isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op)) {
-    B bo = isa<arith::AndIOp>(op) ? B::And
-           : isa<arith::OrIOp>(op) ? B::Or
-                                   : B::Xor;
-    return astElemwiseDecls(op, astScalarType(resElem), id, body, [&](int r) {
-      return astElementwiseExpr(bo, nullptr, opnd(op->getOperand(0), r),
-                                opnd(op->getOperand(1), r));
-    });
-  }
-
-  // Casts (non fp-narrowing path) / bitcast / ptr<->int.
-  if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp,
-          arith::ExtFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(op))
-    return astElemwiseDecls(op, astScalarType(resElem), id, body, [&](int r) {
-      return astCastExpr(op, opnd(op->getOperand(0), r));
-    });
-  if (isa<arith::BitcastOp, tt::BitcastOp>(op))
-    return astElemwiseDecls(op, astStorageType(op->getResult(0).getType()), id,
-                            body, [&](int r) {
-                              return astBitcastExpr(op, opnd(op->getOperand(0), r));
-                            });
-  if (isa<tt::IntToPtrOp, tt::PtrToIntOp>(op))
-    return astElemwiseDecls(op, astStorageType(op->getResult(0).getType()), id,
-                            body, [&](int r) {
-                              return astPtrIntCastExpr(op,
-                                                       opnd(op->getOperand(0), r));
-                            });
-  if (auto c = dyn_cast<tt::ClampFOp>(op))
-    return astElemwiseDecls(op, astScalarType(resElem), id, body, [&](int r) {
-      return astClampExpr(c, opnd(c.getX(), r), opnd(c.getMin(), r),
-                          opnd(c.getMax(), r));
-    });
-  if (auto s = dyn_cast<arith::SelectOp>(op))
-    return astElemwiseDecls(op, astScalarType(resElem), id, body, [&](int r) {
-      return astSelectExpr(opnd(s.getCondition(), r), opnd(s.getTrueValue(), r),
-                           opnd(s.getFalseValue(), r));
-    });
-
-  // Program-id / num-programs: single scalar decl reading the uint3 builtin.
-  if (auto p = dyn_cast<tt::GetProgramIdOp>(op)) {
-    const char *comp = p.getAxis() == tt::ProgramIDDim::X   ? "x"
-                       : p.getAxis() == tt::ProgramIDDim::Y ? "y"
-                                                            : "z";
-    msl::Expr *e = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::I32),
-                            ctx.paren(ctx.member(ctx.var(tgposId), comp)));
-    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), g.fresh(), e));
-    return true;
-  }
-  if (auto n = dyn_cast<tt::GetNumProgramsOp>(op)) {
-    const char *comp = n.getAxis() == tt::ProgramIDDim::X   ? "x"
-                       : n.getAxis() == tt::ProgramIDDim::Y ? "y"
-                                                            : "z";
-    msl::Expr *e = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::I32),
-                            ctx.paren(ctx.member(ctx.var(numTgId), comp)));
-    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), g.fresh(), e));
-    return true;
-  }
-
-  // Everything else (constant, make_range, load/store, atomics, dot, reduce,
-  // scan, histogram, map, convert_layout, gather, local_*, memdesc_*,
-  // async_copy, fp-narrowing casts, math unary, cmp, poison, call, return,
-  // scf.for/if/while) still needs a whole-op body-builder the flip layer wires.
+  // --- Flipped families slot in above this line; unflipped ops fall through to
+  // the string capture in astWalkBlock. ---
   return false;
 }
 

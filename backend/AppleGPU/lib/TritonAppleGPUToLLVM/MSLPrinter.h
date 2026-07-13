@@ -19,6 +19,14 @@ public:
   void printExpr(const Expr *e);
   void printStmt(const Stmt *s);
   void printBlock(const Block &b);
+  // Print a block at a given nesting indent, flushing any trailing barrier.
+  // Used by the hybrid emitter to render a function body Block into the same
+  // stream the string signature/prologue already wrote to.
+  void printBlockAt(const Block &b, unsigned startIndent) {
+    indent = startIndent;
+    printBlock(b);
+    flushBarrier();
+  }
   void printParam(const Param &p);
   void printAttr(const Attr *a);
 

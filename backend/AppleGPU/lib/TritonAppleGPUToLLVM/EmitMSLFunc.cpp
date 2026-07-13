@@ -672,6 +672,57 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
                           opnd(op->getOperand(0), r));
     });
 
+  // math.* dialect: unary/binary transcendentals, fma, exp10.
+  if (op->getDialect() ==
+      op->getContext()->getLoadedDialect<math::MathDialect>()) {
+    msl::Type *sc = astScalarType(resElem);
+    StringRef n = op->getName().getStringRef();
+    namespace bi = msl::builtin;
+    static const llvm::StringMap<StringRef> unary = {
+        {"math.exp", bi::precise::Exp},   {"math.exp2", bi::precise::Exp2},
+        {"math.log", bi::precise::Log},   {"math.log2", bi::precise::Log2},
+        {"math.log10", bi::precise::Log10}, {"math.sin", bi::precise::Sin},
+        {"math.cos", bi::precise::Cos},   {"math.tan", bi::precise::Tan},
+        {"math.tanh", bi::precise::Tanh}, {"math.sinh", bi::precise::Sinh},
+        {"math.cosh", bi::precise::Cosh}, {"math.asin", bi::precise::Asin},
+        {"math.acos", bi::precise::Acos}, {"math.atan", bi::precise::Atan},
+        {"math.sqrt", bi::precise::Sqrt}, {"math.rsqrt", bi::precise::Rsqrt},
+        {"math.cbrt", bi::precise::Cbrt}, {"math.floor", bi::math::Floor},
+        {"math.ceil", bi::math::Ceil},    {"math.absf", bi::math::Fabs},
+        {"math.absi", bi::math::Abs},     {"math.erf", "tt_erf"},
+        {"math.round", bi::math::Round},  {"math.trunc", bi::math::Trunc},
+        {"math.roundeven", bi::math::Rint}};
+    if (auto it = unary.find(n); it != unary.end()) {
+      StringRef fn = it->second;
+      return astDeclBind(op, sc, body, [&](int r) {
+        return astUnaryExpr(fn, sc, opnd(op->getOperand(0), r));
+      });
+    }
+    static const llvm::StringMap<StringRef> binary = {
+        {"math.atan2", bi::precise::Atan2}, {"math.powf", bi::precise::Pow},
+        {"math.fpowi", bi::precise::Pow}, {"math.copysign", bi::math::Copysign}};
+    if (auto it = binary.find(n); it != binary.end()) {
+      StringRef fn = it->second;
+      return astDeclBind(op, sc, body, [&](int r) {
+        return astMinMaxExpr(fn, nullptr, false, opnd(op->getOperand(0), r),
+                             opnd(op->getOperand(1), r));
+      });
+    }
+    if (n == "math.fma")
+      return astDeclBind(op, sc, body, [&](int r) {
+        return astTernaryCallExpr(bi::math::Fma, opnd(op->getOperand(0), r),
+                                  opnd(op->getOperand(1), r),
+                                  opnd(op->getOperand(2), r));
+      });
+    if (n == "math.exp10")
+      return astDeclBind(op, sc, body, [&](int r) {
+        // pow((sc)10, a)
+        msl::Expr *ten = ctx.cast(CS::CStyle, sc, ctx.lit("10"));
+        return ctx.call(bi::precise::Pow, {ten, ctx.var(opnd(op->getOperand(0), r))});
+      });
+    return false; // unhandled math op: let string path emit the error
+  }
+
   // --- Flipped families slot in above this line; unflipped ops fall through to
   // the string capture in astWalkBlock. ---
   return false;

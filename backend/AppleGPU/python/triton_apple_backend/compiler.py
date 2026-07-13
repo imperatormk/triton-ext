@@ -345,6 +345,33 @@ class MPSBackend(BaseBackend):
         metadata["shared"] = 0
         return mod
 
+    def make_msl_llir(self, mod, metadata, options):
+        # The MSL path lowers TTGIR straight to MSL source, so it produces no
+        # LLVM IR. Tests that inspect asm["llir"] (licm.disable markers, poison
+        # propagation) still need one, so we run the AIR path's TTGIR->LLVM
+        # lowering purely to expose that IR. EmitMSL is read-only, so the module
+        # it saw is intact here; make_llir mutates it to the LLVM dialect, which
+        # is fine because make_msl already stashed the MSL source in metadata and
+        # make_msl_metallib ignores its module argument.
+        name = metadata.get("name")
+        shared = metadata.get("shared")
+        old_opt = os.environ.get('METAL_LLVM_OPT_LEVEL')
+        os.environ['METAL_LLVM_OPT_LEVEL'] = '0'
+        try:
+            llvm_mod = self.make_llir(mod, metadata, options)
+        finally:
+            if old_opt is None:
+                os.environ.pop('METAL_LLVM_OPT_LEVEL', None)
+            else:
+                os.environ['METAL_LLVM_OPT_LEVEL'] = old_opt
+        metadata.pop("_llvm_ir", None)
+        metadata.pop("_dynamic_smem_bytes", None)
+        if name is not None:
+            metadata["name"] = name
+        if shared is not None:
+            metadata["shared"] = shared
+        return llvm_mod
+
     def make_msl_metallib(self, mod, metadata, options):
         msl = metadata.pop("_msl_src")
         with tempfile.NamedTemporaryFile(suffix='.metal', delete=False) as f:
@@ -552,6 +579,8 @@ class MPSBackend(BaseBackend):
                 src, meta, options)
         if os.environ.get('TRITON_MPS_EMIT_MSL_MLIR'):
             stages["msl"] = lambda src, meta: self.make_msl(src, meta, options)
+            stages["llir"] = lambda src, meta: self.make_msl_llir(
+                src, meta, options)
             stages["metallib"] = lambda src, meta: self.make_msl_metallib(
                 src, meta, options)
         else:

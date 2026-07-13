@@ -150,19 +150,25 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
   auto readbackInto = [&](msl::Block &tgt, int64_t bi, int64_t r0, int64_t r1) {
     for (int r = 0; r < nRes; ++r) {
       std::string base = rbBase[rbBase.size() == 1 ? 0 : r];
-      std::string rowExpr = layoutCoordExpr(cTy, r, rowDim);
-      std::string colExpr = layoutCoordExpr(cTy, r, colDim);
-      std::string bandOff = "((" + rowExpr + " - " + std::to_string(r0) +
-                            ") * " + std::to_string(N) + " + " + colExpr + ")";
-      std::string guard = "(" + rowExpr + " >= " + std::to_string(r0) + " && " +
-                          rowExpr + " < " + std::to_string(r1) + ")";
+      // ((rowExpr - r0) * N + colExpr)
+      msl::Expr *bandOff = ctx.paren(ctx.add(
+          ctx.mul(ctx.paren(ctx.binary(B::Sub, astLayoutCoordExpr(cTy, r, rowDim),
+                                       ctx.i32lit(r0))),
+                  ctx.i32lit(N)),
+          astLayoutCoordExpr(cTy, r, colDim)));
+      // (rowExpr >= r0 && rowExpr < r1)
+      msl::Expr *guard = ctx.paren(ctx.binary(
+          B::LAnd,
+          ctx.binary(B::Ge, astLayoutCoordExpr(cTy, r, rowDim), ctx.i32lit(r0)),
+          ctx.binary(B::Lt, astLayoutCoordExpr(cTy, r, rowDim), ctx.i32lit(r1))));
       if (rank == 3)
-        guard = "(" + batchCoordExpr(cTy, r) + " == " + std::to_string(bi) +
-                " && " + guard + ")";
+        guard = ctx.paren(ctx.binary(
+            B::LAnd,
+            ctx.binary(B::Eq, astBatchCoordExpr(cTy, r), ctx.i32lit(bi)),
+            guard));
       tgt.push_back(ctx.compactIfBare(
-          ctx.raw(guard),
-          ctx.assignStmt(ctx.var(ids[r]),
-                         astReadbackValue(tgC, ctx.raw(bandOff), base))));
+          guard, ctx.assignStmt(ctx.var(ids[r]),
+                                astReadbackValue(tgC, bandOff, base))));
     }
   };
   auto readback = [&](int64_t bi, int64_t r0, int64_t r1) {
@@ -327,54 +333,60 @@ bool MSLEmitter::astEmitDotFused(
             ctx.var(bNames[r])));
     barrier();
     bool branchless = (numWarps == nT);
-    // slots: (mi, niExpr) pairs; niExpr is a string.
-    auto emitSlots = [&](ArrayRef<std::pair<int64_t, std::string>> slots,
-                         msl::Block &into) {
+    // slots: (mi, niKey, niExpr); niKey dedups bFrag, niExpr is the typed index.
+    struct Slot {
+      int64_t mi;
+      std::string niKey;
+      msl::Expr *niExpr;
+    };
+    auto emitSlots = [&](ArrayRef<Slot> slots, msl::Block &into) {
       for (int64_t ki = 0; ki < kT; ++ki) {
         DenseMap<int64_t, std::string> aFrag;
         std::map<std::string, std::string> bFrag;
         for (auto &pr : slots) {
-          int64_t mi = pr.first;
-          const std::string &niExpr = pr.second;
+          int64_t mi = pr.mi;
+          const std::string &niKey = pr.niKey;
           if (!aFrag.count(mi)) {
             std::string fa = fresh();
             aFrag[mi] = fa;
             into.push_back(astFragDecl(opFrag, fa));
             into.push_back(astSgLoad(fa, tgA, mi * 8 * K + ki * 8, K));
           }
-          if (!bFrag.count(niExpr)) {
+          if (!bFrag.count(niKey)) {
             std::string fb = fresh();
-            bFrag[niExpr] = fb;
+            bFrag[niKey] = fb;
             into.push_back(astFragDecl(opFrag, fb));
             // simdgroup_load(fb, tgB + (ki*8*N + niExpr * 8), N);
-            std::string off = "(" + std::to_string(ki * 8 * N) + " + " + niExpr +
-                              " * 8)";
+            msl::Expr *off = ctx.paren(ctx.add(
+                ctx.i32lit(ki * 8 * N), ctx.mul(pr.niExpr, ctx.i32lit(8))));
             into.push_back(ctx.exprStmt(ctx.call(
                 msl::builtin::sg::Load,
-                {ctx.var(fb),
-                 ctx.binary(B::Add, ctx.var(tgB), ctx.raw(off)),
-                 ctx.lit(std::to_string(N))})));
+                {ctx.var(fb), ctx.binary(B::Add, ctx.var(tgB), off),
+                 ctx.i32lit(N)})));
           }
         }
         for (auto [j, mn] : llvm::enumerate(slots)) {
           const std::string &acc = fusedDot.accNames[j];
           into.push_back(
-              astSgMultiplyAccumulate(acc, aFrag[mn.first], bFrag[mn.second]));
+              astSgMultiplyAccumulate(acc, aFrag[mn.mi], bFrag[mn.niKey]));
         }
       }
     };
     if (branchless) {
-      std::string niExpr = "(" + warpId + " % " + std::to_string(nT) + ")";
-      SmallVector<std::pair<int64_t, std::string>> slots;
+      std::string niKey = "(" + warpId + " % " + std::to_string(nT) + ")";
+      msl::Expr *niExpr = ctx.paren(ctx.binary(B::Rem, ctx.var(warpId),
+                                               ctx.i32lit(nT)));
+      SmallVector<Slot> slots;
       for (int64_t j = 0; j * numWarps < nFrag; ++j)
-        slots.push_back({(j * numWarps) / nT, niExpr});
+        slots.push_back({(j * numWarps) / nT, niKey, niExpr});
       emitSlots(slots, body);
     } else {
       for (int64_t w = 0; w < numWarps; ++w) {
         msl::Block inner;
-        SmallVector<std::pair<int64_t, std::string>> slots;
+        SmallVector<Slot> slots;
         for (int64_t f = w; f < nFrag; f += numWarps)
-          slots.push_back({f / nT, std::to_string(f % nT)});
+          slots.push_back(
+              {f / nT, std::to_string(f % nT), ctx.i32lit(f % nT)});
         emitSlots(slots, inner);
         body.push_back(ctx.ifScope(
             ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
@@ -398,12 +410,14 @@ bool MSLEmitter::astEmitDotFused(
       for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
         int64_t mi = f / nT, ni = f % nT;
         // simdgroup_store(acc, base + (rowB + mi*8)*ldc + (colB + ni*8), ldc);
-        std::string off = base + " + (" + rowB + " + " + std::to_string(mi * 8) +
-                          ") * " + ldc + " + (" + colB + " + " +
-                          std::to_string(ni * 8) + ")";
+        msl::Expr *off = ctx.addChain(
+            {ctx.var(base),
+             ctx.mul(ctx.paren(ctx.add(ctx.var(rowB), ctx.i32lit(mi * 8))),
+                     ctx.var(ldc)),
+             ctx.paren(ctx.add(ctx.var(colB), ctx.i32lit(ni * 8)))});
         inner.push_back(ctx.exprStmt(ctx.call(
             msl::builtin::sg::Store,
-            {ctx.var(fusedDot.accNames[j]), ctx.raw(off),
+            {ctx.var(fusedDot.accNames[j]), off,
              ctx.var(ldc)})));
       }
       ifBody.push_back(ctx.ifScope(

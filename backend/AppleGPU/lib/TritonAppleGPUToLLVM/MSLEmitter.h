@@ -400,6 +400,15 @@ private:
                    SmallVectorImpl<std::string> &results);
   std::string astShuffle(StringRef op, StringRef sc, StringRef val,
                          StringRef arg, msl::Block &body);
+  bool astScanWarpCarry(Region &region, int nOp, ArrayRef<std::string> scTys,
+                        ArrayRef<int64_t> byteWidths,
+                        ArrayRef<std::pair<int, int32_t>> warpBits,
+                        ArrayRef<int> regs,
+                        SmallVector<SmallVector<std::string>> &accs,
+                        ArrayRef<std::string> laneScan, StringRef axisTopLane,
+                        unsigned axisWarpMask, int numWarps, bool rev,
+                        SmallVectorImpl<std::string> &runTotalOut,
+                        msl::Block &body);
   void astBandRoundTrip(msl::Block &body, StringRef buf, int64_t total,
                         int64_t band, int srcRc, int resRc,
                         ArrayRef<std::string> outs,

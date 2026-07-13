@@ -418,6 +418,162 @@ bool MSLEmitter::astCombineN(Region &region, ArrayRef<std::string> aVals,
   return true;
 }
 
+// AST form of emitScanWarpCarry: the cross-warp inclusive-carry for one register
+// group. Mirrors the string emitter node-for-node (compound guard/index exprs
+// are ctx.raw leaves, matching the string's spelling exactly).
+bool MSLEmitter::astScanWarpCarry(
+    Region &region, int nOp, ArrayRef<std::string> scTys,
+    ArrayRef<int64_t> byteWidths, ArrayRef<std::pair<int, int32_t>> warpBits,
+    ArrayRef<int> regs, SmallVector<SmallVector<std::string>> &accs,
+    ArrayRef<std::string> laneScan, StringRef axisTopLane, unsigned axisWarpMask,
+    int numWarps, bool rev, SmallVectorImpl<std::string> &runTotalOut,
+    msl::Block &body) {
+  SmallVector<msl::Type *> scT(nOp);
+  for (int k = 0; k < nOp; ++k)
+    scT[k] = ctx.named(scTys[k]);
+
+  if (warpBits.empty()) {
+    for (int k = 0; k < nOp; ++k) {
+      std::string s =
+          astShuffle("simd_shuffle", scTys[k], laneScan[k], axisTopLane, body);
+      body.push_back(ctx.assignStmt(ctx.var(runTotalOut[k]), ctx.var(s)));
+    }
+    return true;
+  }
+
+  SmallVector<std::string> scratch(nOp);
+  int64_t byteOff = 0;
+  for (int k = 0; k < nOp; ++k) {
+    scratch[k] = fresh();
+    body.push_back(ctx.declStmt(
+        ctx.ptr(scT[k], msl::AddrSpace::Threadgroup), scratch[k],
+        astPoolRegion(byteOff, scTys[k])));
+    byteOff += (int64_t)numWarps * 32 * byteWidths[k];
+  }
+  body.push_back(ctx.barrier(false));
+  std::string topGuard = axisTopLane == StringRef(laneId)
+                             ? std::string("true")
+                             : (laneId + " == " + axisTopLane.str());
+  for (int k = 0; k < nOp; ++k) {
+    // scratch[k][warp * 32 + lane] = laneScan[k];
+    msl::Expr *idx = ctx.binary(
+        B::Add, ctx.binary(B::Mul, ctx.var(warpId), ctx.lit("32")),
+        ctx.var(laneId));
+    msl::Stmt *asn = ctx.assignStmt(ctx.subscript(ctx.var(scratch[k]), idx),
+                                    ctx.var(laneScan[k]));
+    body.push_back(ctx.compactIf(ctx.raw(topGuard), asn));
+  }
+  body.push_back(ctx.barrier(false));
+
+  std::string base = "((" + warpId + " & " + std::to_string(~axisWarpMask) +
+                     ") * 32 + " + axisTopLane.str() + ")";
+
+  SmallVector<int> maskBits;
+  for (size_t r = 0; r < warpBits.size(); ++r)
+    maskBits.push_back(warpBits[r].first);
+  int nParts = 1 << warpBits.size();
+  auto partWarp = [&](int part) {
+    int w = 0;
+    for (size_t b = 0; b < maskBits.size(); ++b)
+      if (part & (1 << b))
+        w |= (1 << maskBits[b]);
+    return w;
+  };
+
+  std::string myPart = fresh();
+  {
+    SmallVector<std::string> posTerms;
+    for (size_t r = 0; r < maskBits.size(); ++r)
+      posTerms.push_back("((((" + warpId + " >> " + std::to_string(maskBits[r]) +
+                         ") & 1) << " + std::to_string(r) + "))");
+    std::string warpPos = posTerms[0];
+    for (size_t i = 1; i < posTerms.size(); ++i)
+      warpPos = "(" + warpPos + " | " + posTerms[i] + ")";
+    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), myPart,
+                                ctx.raw(warpPos)));
+  }
+
+  SmallVector<int> order;
+  for (int p = 0; p < nParts; ++p)
+    order.push_back(rev ? nParts - 1 - p : p);
+
+  auto slot = [&](int k, int part) -> msl::Expr * {
+    return ctx.subscript(ctx.var(scratch[k]),
+                         ctx.binary(B::Add, ctx.raw(base),
+                                    ctx.lit(std::to_string(partWarp(part) * 32))));
+  };
+
+  SmallVector<std::string> grand(nOp);
+  for (int k = 0; k < nOp; ++k) {
+    grand[k] = fresh();
+    body.push_back(ctx.declStmt(scT[k], grand[k], slot(k, order[0])));
+  }
+  for (int idx = 1; idx < nParts; ++idx) {
+    SmallVector<std::string> pv(nOp);
+    for (int k = 0; k < nOp; ++k) {
+      pv[k] = fresh();
+      body.push_back(ctx.declStmt(scT[k], pv[k], slot(k, order[idx])));
+    }
+    SmallVector<std::string> out;
+    if (!astCombineN(region, grand, pv, body, out))
+      return false;
+    for (int k = 0; k < nOp; ++k)
+      body.push_back(ctx.assignStmt(ctx.var(grand[k]), ctx.var(out[k])));
+  }
+  for (int k = 0; k < nOp; ++k)
+    body.push_back(ctx.assignStmt(ctx.var(runTotalOut[k]), ctx.var(grand[k])));
+
+  SmallVector<std::string> carry(nOp);
+  for (int k = 0; k < nOp; ++k) {
+    carry[k] = fresh();
+    body.push_back(ctx.declStmt(scT[k], carry[k], ctx.var(grand[k])));
+  }
+  std::string init = fresh();
+  body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), init, ctx.lit("false")));
+  for (int idx = 0; idx < nParts; ++idx) {
+    int p = order[idx];
+    msl::Expr *cond = ctx.binary(rev ? B::Lt : B::Gt, ctx.var(myPart),
+                                 ctx.lit(std::to_string(p)));
+    msl::Block ifBody;
+    SmallVector<std::string> pv(nOp);
+    for (int k = 0; k < nOp; ++k) {
+      pv[k] = fresh();
+      ifBody.push_back(ctx.declStmt(scT[k], pv[k], slot(k, p)));
+    }
+    // if (init) { carry = combine(carry, pv); } else { carry = pv; init = true; }
+    msl::Block thenB, elseB;
+    {
+      SmallVector<std::string> out;
+      if (!astCombineN(region, carry, pv, thenB, out))
+        return false;
+      for (int k = 0; k < nOp; ++k)
+        thenB.push_back(ctx.assignStmt(ctx.var(carry[k]), ctx.var(out[k])));
+    }
+    for (int k = 0; k < nOp; ++k)
+      elseB.push_back(ctx.assignStmt(ctx.var(carry[k]), ctx.var(pv[k])));
+    elseB.push_back(ctx.assignStmt(ctx.var(init), ctx.lit("true")));
+    ifBody.push_back(ctx.ifElseScope(ctx.var(init), std::move(thenB),
+                                     std::move(elseB)));
+    body.push_back(ctx.ifScope(cond, std::move(ifBody)));
+  }
+  for (int r : regs) {
+    SmallVector<std::string> ar(nOp);
+    for (int k = 0; k < nOp; ++k)
+      ar[k] = accs[k][r];
+    SmallVector<std::string> out;
+    if (!astCombineN(region, carry, ar, body, out))
+      return false;
+    for (int k = 0; k < nOp; ++k)
+      // accs[k][r] = (init ? out[k] : accs[k][r]);
+      body.push_back(ctx.assignStmt(
+          ctx.var(accs[k][r]),
+          ctx.paren(ctx.ternary(ctx.var(init), ctx.var(out[k]),
+                                ctx.var(accs[k][r])))));
+  }
+  body.push_back(ctx.barrier(false));
+  return true;
+}
+
 // Predeclare a value's per-register result variables (`sc id;`) with no init,
 // mirroring declResultVars; returns the minted names (caller binds valMap).
 SmallVector<std::string>
@@ -1326,6 +1482,201 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       ids.push_back(id);
     }
     valMap[res] = ids;
+    return true;
+  }
+
+  // tt.scan: per-run register fold + lane shuffle prefix + cross-warp carry +
+  // cross-run carry. Mirrors emitScan with AST nodes.
+  if (auto sn = dyn_cast<tt::ScanOp>(op)) {
+    bool rev = sn.getReverse();
+    int nOp = sn.getNumOperands();
+    auto srcTy = cast<RankedTensorType>(sn.getOperand(0).getType());
+    int axis = sn.getAxis();
+    Region &region = sn.getRegion();
+    SmallVector<std::string> scTys(nOp);
+    SmallVector<msl::Type *> scTypes(nOp);
+    SmallVector<int64_t> byteWidths(nOp);
+    for (int k = 0; k < nOp; ++k) {
+      scTys[k] = mslScalarType(elementScalarType(sn.getResult()[k].getType()));
+      scTypes[k] = astScalarType(elementScalarType(sn.getResult()[k].getType()));
+      byteWidths[k] = bitsOf(elementScalarType(sn.getResult()[k].getType())) / 8;
+    }
+    SmallVector<SmallVector<std::string>> srcNames(nOp);
+    for (int k = 0; k < nOp; ++k)
+      srcNames[k] = names(sn.getOperand(k));
+    int nReg = srcNames[0].size();
+
+    MLIRContext *mctx = sn.getContext();
+    tt::LinearLayout ll = ttg::toLinearLayout(srcTy);
+    auto kLane = StringAttr::get(mctx, "lane");
+    auto kWarp = StringAttr::get(mctx, "warp");
+    auto outDims = llvm::to_vector(ll.getOutDimNames());
+    auto outDim = outDims[axis];
+    auto laneBits = axisBits(ll, kLane, outDim);
+    auto warpBits = axisBits(ll, kWarp, outDim);
+
+    unsigned axisLaneMask = 0;
+    for (auto &pr : laneBits) axisLaneMask |= (1u << pr.first);
+    unsigned axisLaneLow = axisLaneMask & (~axisLaneMask + 1);
+    unsigned normMask = axisLaneMask / (axisLaneLow ? axisLaneLow : 1);
+    if (axisLaneMask && (normMask & (normMask + 1)))
+      return false; // unsupported lane layout: let string path error
+    unsigned axisWarpMask = 0;
+    for (auto &pr : warpBits) axisWarpMask |= (1u << pr.first);
+    int numWarps = ll.hasInDim(kWarp) ? ll.getInDimSize(kWarp) : 1;
+
+    int32_t laneWarpReach = 0;
+    for (auto &pr : laneBits) laneWarpReach = std::max(laneWarpReach, pr.second);
+    for (auto &pr : warpBits) laneWarpReach = std::max(laneWarpReach, pr.second);
+
+    auto keyOf = [&](int reg) {
+      SmallVector<int32_t> coords = registerCoords(srcTy, reg);
+      std::string key;
+      for (int d = 0; d < (int)coords.size(); ++d)
+        if (d != axis) key += std::to_string(coords[d]) + ",";
+      return key;
+    };
+    SmallVector<int> runId(nReg, 0);
+    for (int r = 0; r < nReg; ++r) {
+      int32_t c = registerCoords(srcTy, r)[axis];
+      runId[r] = laneWarpReach ? (c / (2 * laneWarpReach)) : 0;
+    }
+
+    SmallVector<SmallVector<std::string>> accs(nOp, SmallVector<std::string>(nReg));
+    for (int k = 0; k < nOp; ++k)
+      for (int r = 0; r < nReg; ++r) {
+        accs[k][r] = fresh();
+        body.push_back(ctx.declStmt(scTypes[k], accs[k][r],
+                                    ctx.var(srcNames[k][r])));
+      }
+
+    const char *shuf = rev ? "simd_shuffle_down" : "simd_shuffle_up";
+    std::string axisTopLane =
+        axisLaneMask == 0
+            ? laneId
+            : ("((" + laneId + " & " + std::to_string(~axisLaneMask) + ") | " +
+               (rev ? "0" : std::to_string(axisLaneMask)) + ")");
+
+    std::map<std::string, SmallVector<int>> keys;
+    SmallVector<std::string> keyOrder;
+    for (int r = 0; r < nReg; ++r) {
+      std::string k = keyOf(r);
+      if (keys.find(k) == keys.end()) keyOrder.push_back(k);
+      keys[k].push_back(r);
+    }
+
+    for (std::string &key : keyOrder) {
+      SmallVector<int> &keyRegs = keys[key];
+      SmallVector<int> runOrder;
+      for (int r : keyRegs)
+        if (llvm::find(runOrder, runId[r]) == runOrder.end())
+          runOrder.push_back(runId[r]);
+      llvm::sort(runOrder, [&](int a, int b) { return rev ? a > b : a < b; });
+      SmallVector<SmallVector<std::string>> runTotals(
+          runOrder.size(), SmallVector<std::string>(nOp));
+
+      for (size_t ri = 0; ri < runOrder.size(); ++ri) {
+        int run = runOrder[ri];
+        SmallVector<int> regs;
+        for (int r : keyRegs)
+          if (runId[r] == run) regs.push_back(r);
+        llvm::sort(regs, [&](int a, int b) {
+          int32_t ca = registerCoords(srcTy, a)[axis];
+          int32_t cb = registerCoords(srcTy, b)[axis];
+          return rev ? ca > cb : ca < cb;
+        });
+
+        for (size_t i = 1; i < regs.size(); ++i) {
+          SmallVector<std::string> a(nOp), b(nOp);
+          for (int k = 0; k < nOp; ++k) {
+            a[k] = accs[k][regs[i - 1]];
+            b[k] = accs[k][regs[i]];
+          }
+          SmallVector<std::string> out;
+          if (!astCombineN(region, a, b, body, out)) return false;
+          for (int k = 0; k < nOp; ++k)
+            body.push_back(ctx.assignStmt(ctx.var(accs[k][regs[i]]),
+                                          ctx.var(out[k])));
+        }
+
+        SmallVector<std::string> laneScan(nOp);
+        for (int k = 0; k < nOp; ++k) {
+          laneScan[k] = fresh();
+          body.push_back(ctx.declStmt(scTypes[k], laneScan[k],
+                                      ctx.var(accs[k][regs.back()])));
+        }
+        for (auto &pr : laneBits) {
+          unsigned delta = 1u << pr.first;
+          SmallVector<std::string> nb(nOp);
+          for (int k = 0; k < nOp; ++k)
+            nb[k] = astShuffle(shuf, scTys[k], laneScan[k],
+                               std::to_string(delta) + "u", body);
+          SmallVector<std::string> out;
+          if (!astCombineN(region, nb, laneScan, body, out)) return false;
+          std::string local =
+              "(" + laneId + " & " + std::to_string(axisLaneMask) + ")";
+          std::string guard =
+              rev ? (local + " <= " + std::to_string(axisLaneMask - delta))
+                  : (local + " >= " + std::to_string(delta));
+          for (int k = 0; k < nOp; ++k)
+            body.push_back(ctx.assignStmt(
+                ctx.var(laneScan[k]),
+                ctx.paren(ctx.ternary(ctx.raw(guard), ctx.var(out[k]),
+                                      ctx.var(laneScan[k])))));
+        }
+        if (!laneBits.empty()) {
+          SmallVector<std::string> lanePrefix(nOp);
+          for (int k = 0; k < nOp; ++k)
+            lanePrefix[k] = astShuffle(shuf, scTys[k], laneScan[k],
+                                       std::to_string(axisLaneLow) + "u", body);
+          std::string local =
+              "(" + laneId + " & " + std::to_string(axisLaneMask) + ")";
+          std::string guard =
+              rev ? (local + " <= " + std::to_string(axisLaneMask - axisLaneLow))
+                  : (local + " >= " + std::to_string(axisLaneLow));
+          for (int r : regs) {
+            SmallVector<std::string> out, ar(nOp);
+            for (int k = 0; k < nOp; ++k) ar[k] = accs[k][r];
+            if (!astCombineN(region, lanePrefix, ar, body, out)) return false;
+            for (int k = 0; k < nOp; ++k)
+              body.push_back(ctx.assignStmt(
+                  ctx.var(accs[k][r]),
+                  ctx.paren(ctx.ternary(ctx.raw(guard), ctx.var(out[k]),
+                                        ctx.var(accs[k][r])))));
+          }
+        }
+
+        for (int k = 0; k < nOp; ++k) {
+          runTotals[ri][k] = fresh();
+          body.push_back(ctx.declStmt(scTypes[k], runTotals[ri][k], nullptr));
+        }
+        if (!astScanWarpCarry(region, nOp, scTys, byteWidths, warpBits, regs,
+                              accs, laneScan, axisTopLane, axisWarpMask, numWarps,
+                              rev, runTotals[ri], body))
+          return false;
+      }
+
+      for (size_t ri = 1; ri < runOrder.size(); ++ri) {
+        SmallVector<std::string> carry = runTotals[0];
+        for (size_t j = 1; j < ri; ++j) {
+          SmallVector<std::string> out;
+          if (!astCombineN(region, carry, runTotals[j], body, out)) return false;
+          carry = out;
+        }
+        int run = runOrder[ri];
+        for (int r : keyRegs) {
+          if (runId[r] != run) continue;
+          SmallVector<std::string> ar(nOp);
+          for (int k = 0; k < nOp; ++k) ar[k] = accs[k][r];
+          SmallVector<std::string> out;
+          if (!astCombineN(region, carry, ar, body, out)) return false;
+          for (int k = 0; k < nOp; ++k)
+            body.push_back(ctx.assignStmt(ctx.var(accs[k][r]), ctx.var(out[k])));
+        }
+      }
+    }
+    for (int k = 0; k < nOp; ++k)
+      valMap[sn.getResult()[k]] = accs[k];
     return true;
   }
 

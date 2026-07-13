@@ -12,6 +12,7 @@
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
 #include <cstring>
+#include <string>
 #include <utility>
 
 namespace mlir::triton::applegpu::msl {
@@ -445,7 +446,20 @@ public:
   // --- Exprs ---
   VarRef *var(llvm::StringRef n) { return make<VarRef>(save(n)); }
   Literal *lit(llvm::StringRef t) { return make<Literal>(save(t)); }
+  Literal *i32lit(long long n) { return lit(std::to_string(n)); }
+  Literal *u32lit(unsigned n) { return lit(std::to_string(n) + "u"); }
   Binary *binary(BinOp op, Expr *l, Expr *r) { return make<Binary>(op, l, r); }
+  // Binary shorthands. No implicit parens - the printer is dumb, so wrap
+  // operands in ctx.paren() wherever the source string had literal parens.
+  Binary *add(Expr *l, Expr *r) { return binary(BinOp::Add, l, r); }
+  Binary *mul(Expr *l, Expr *r) { return binary(BinOp::Mul, l, r); }
+  // Left-fold add: {a,b,c} -> ((a + b) + c), matching a flat `a + b + c` string.
+  Expr *addChain(llvm::ArrayRef<Expr *> xs) {
+    Expr *acc = xs.front();
+    for (Expr *x : xs.drop_front())
+      acc = add(acc, x);
+    return acc;
+  }
   Unary *unary(UnOp op, Expr *x) { return make<Unary>(op, x); }
   Cast *cast(Cast::Style s, Type *to, Expr *x) { return make<Cast>(s, to, x); }
   Call *call(llvm::StringRef c, llvm::ArrayRef<Type *> ta,

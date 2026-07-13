@@ -311,6 +311,46 @@ private:
       StringRef state,
       ArrayRef<std::pair<std::string, msl::Block>> cases);
 
+  // function / scope / control-flow sibling builders (EmitMSLFunc.cpp). Each
+  // takes a pre-built body Block and returns the scope node; they never emit,
+  // so the flip layer (7b) walks the ops into the body then wraps it here.
+  msl::KernelFn *astKernelFn(tt::FuncOp func, msl::Block body);
+  msl::DeviceFn *astDeviceFn(tt::FuncOp func, msl::Block body);
+  msl::DeviceFn *astDeviceProto(tt::FuncOp func);
+  msl::NamedType *astRetStructType(tt::FuncOp func);
+  msl::Stmt *astRetStructDecl(tt::FuncOp func); // ArrayDecl-less; RawStmt struct
+  msl::Type *astDeviceRetType(tt::FuncOp func);
+  msl::Stmt *astReturn(tt::ReturnOp op);
+  msl::ForScope *astForScope(scf::ForOp op, msl::Block body, StringRef iv,
+                             StringRef ivTy);
+  msl::TripCountForScope *astTripCountForScope(scf::ForOp op, msl::Block body,
+                                               StringRef counter, StringRef iv,
+                                               StringRef ivTy);
+  msl::Stmt *astForNode(scf::ForOp op, msl::Block body, StringRef iv,
+                        StringRef tc, StringRef ivTy, bool wideIv);
+  msl::IfScope *astIfScope(scf::IfOp op, msl::Block thenB, msl::Block elseB);
+  msl::WhileScope *astWhileScope(scf::WhileOp op, msl::Block body);
+  msl::StateMachineScope *astBlockCFG(
+      Region &region, StringRef state,
+      ArrayRef<std::pair<std::string, msl::Block>> cases);
+  msl::Block astBranchEdge(Block *succ, Operation::operand_range args,
+                           StringRef state);
+  msl::Stmt *astCondBranch(Value cond, msl::Block thenB, msl::Block elseB);
+  msl::Block astYieldAssign(Operation *term,
+                            ArrayRef<SmallVector<std::string>> dsts);
+  // Helpers below mint fresh names over a raw id counter passed by reference
+  // (seeded from nextId by the caller) so they never mutate nextId directly.
+  llvm::SmallVector<msl::Stmt *, 2> laneWarpDecls(int &id, StringRef tid);
+  llvm::SmallVector<msl::Param, 8> deviceParams(tt::FuncOp func, int &id,
+                                                bool bind);
+  bool astElemwiseDecls(Operation *op, msl::Type *declTy, int &id,
+                        msl::Block &body,
+                        llvm::function_ref<msl::Expr *(int)> mk);
+  // Dispatch spine: appends the sibling nodes for `op` to `body`. Returns true
+  // when the op is wired (nodes appended, or nothing for alias/dataless ops);
+  // false when the op has no whole-op sibling yet (flip layer 7b fills these).
+  bool astEmitOp(Operation *op, msl::Block &body);
+
   std::string fresh() { return "v" + std::to_string(nextId++); }
 
   std::string ind() const { return std::string(indent * 4, ' '); }

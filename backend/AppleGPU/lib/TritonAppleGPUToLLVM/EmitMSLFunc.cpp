@@ -621,6 +621,44 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
       return astCastExpr(op, opnd(op->getOperand(0), r));
     });
+  // TruncF / FpToFp: f32->half/bfloat narrowing emits a self-contained multi-line
+  // block (RTZ or RTNE); other float casts are a plain static_cast. The narrowing
+  // block is captured verbatim (imperative multi-stmt, no expr sibling) but still
+  // advances the real nextId + binds valMap via the string helper.
+  if (isa<arith::TruncFOp, tt::FpToFpOp>(op)) {
+    std::string dst = mslScalarType(elementScalarType(op->getResult(0).getType()));
+    Type srcElem = elementScalarType(op->getOperand(0).getType());
+    bool toHalf = dst == "half" || dst == "bfloat";
+    bool rtz = false, narrow = false;
+    if (auto f = dyn_cast<tt::FpToFpOp>(op)) {
+      if (auto rnd = f.getRounding()) {
+        narrow = srcElem.isF32() && toHalf;
+        rtz = *rnd == tt::RoundingMode::RTZ;
+      }
+    } else if (srcElem.isF32() && toHalf) {
+      narrow = true;
+    }
+    if (narrow) {
+      auto &a = names(op->getOperand(0));
+      int rc = regCount(op->getResult(0));
+      SmallVector<std::string> ids;
+      for (int r = 0; r < rc; ++r) {
+        const std::string &v = a[a.size() == 1 ? 0 : r];
+        std::string out;
+        body.push_back(captureRaw([&] {
+          out = rtz ? emitTruncatedFloatValue(dst, v)
+                    : emitRoundedHalfValueFull(dst, v);
+        }));
+        ids.push_back(out);
+      }
+      valMap[op->getResult(0)] = ids;
+      return true;
+    }
+    // Non-narrowing float cast: static_cast<dst>(v).
+    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+      return astCastExpr(op, opnd(op->getOperand(0), r));
+    });
+  }
   if (isa<arith::BitcastOp, tt::BitcastOp>(op))
     return astDeclBind(op, astStorageType(op->getResult(0).getType()), body,
                        [&](int r) {

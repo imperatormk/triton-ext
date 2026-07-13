@@ -1485,6 +1485,324 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  // tt.atomic_rmw: native fetch_* (AST) or fp-emulated CAS loop (captured), with
+  // redundant-thread guard + lane/warp replica broadcast.
+  if (auto ar = dyn_cast<tt::AtomicRMWOp>(op)) {
+    Value res = ar.getResult();
+    Type scalarTy = elementScalarType(res.getType());
+    std::string sc = mslScalarType(scalarTy);
+    msl::Type *scTy = astScalarType(scalarTy);
+    bool isFloat = isa<FloatType>(scalarTy);
+    unsigned bw = scalarTy.getIntOrFloatBitWidth();
+    tt::RMWOp kind = ar.getAtomicRmwOp();
+    if (!isFloat && bw == 64)
+      return false;
+    bool floatNative = isFloat && bw == 32 &&
+                       (kind == tt::RMWOp::ADD || kind == tt::RMWOp::FADD);
+    bool floatEmulated = isFloat && !floatNative;
+    if (floatEmulated && bw != 16 && bw != 32)
+      return false;
+    std::string atomicTy = isFloat ? "atomic_float"
+                           : (kind == tt::RMWOp::UMAX || kind == tt::RMWOp::UMIN)
+                               ? "atomic_uint"
+                               : (bw == 64 ? "atomic_long" : "atomic_int");
+    const char *fn = nullptr;
+    if (!floatEmulated) {
+      switch (kind) {
+      case tt::RMWOp::ADD:
+      case tt::RMWOp::FADD: fn = "atomic_fetch_add_explicit"; break;
+      case tt::RMWOp::MAX:
+      case tt::RMWOp::UMAX: fn = "atomic_fetch_max_explicit"; break;
+      case tt::RMWOp::MIN:
+      case tt::RMWOp::UMIN: fn = "atomic_fetch_min_explicit"; break;
+      case tt::RMWOp::AND: fn = "atomic_fetch_and_explicit"; break;
+      case tt::RMWOp::OR: fn = "atomic_fetch_or_explicit"; break;
+      case tt::RMWOp::XOR: fn = "atomic_fetch_xor_explicit"; break;
+      case tt::RMWOp::XCHG: fn = "atomic_exchange_explicit"; break;
+      default: return false;
+      }
+    }
+    auto &ptrs = names(ar.getPtr());
+    auto &vals = names(ar.getVal());
+    bool hasMask = ar.getMask() != nullptr;
+    SmallVector<std::string> *mask = hasMask ? &names(ar.getMask()) : nullptr;
+    bool uniform = !isa<RankedTensorType>(ar.getPtr().getType());
+    int rc = ptrs.size();
+
+    unsigned laneFree = 0, warpFree = 0, regFree = 0;
+    if (!uniform) {
+      auto ptrTy = cast<RankedTensorType>(ar.getPtr().getType());
+      tt::LinearLayout ll = ttg::toLinearLayout(ptrTy);
+      MLIRContext *c = ar.getContext();
+      auto masks = ll.getFreeVariableMasks();
+      laneFree = masks.lookup(StringAttr::get(c, "lane"));
+      warpFree = masks.lookup(StringAttr::get(c, "warp"));
+      regFree = masks.lookup(StringAttr::get(c, "register"));
+    }
+    std::string threadPred;
+    if (laneFree)
+      threadPred = "((" + laneId + " & " + std::to_string(laneFree) + ") == 0)";
+    if (warpFree) {
+      std::string wp = "((" + warpId + " & " + std::to_string(warpFree) + ") == 0)";
+      threadPred = threadPred.empty() ? wp : threadPred + " && " + wp;
+    }
+    tt::MemSemantic sem = ar.getSem();
+
+    SmallVector<std::string> ids(rc);
+    for (int r = 0; r < rc; ++r) {
+      if (regFree && (r & regFree) != 0) {
+        ids[r] = ids[r & ~regFree];
+        continue;
+      }
+      const std::string &p = ptrs[r];
+      const std::string &v = vals[vals.size() == 1 ? 0 : r];
+      std::string id = fresh();
+      body.push_back(ctx.declStmt(scTy, id, astInit0(sc)));
+      std::string guard;
+      if (uniform) guard = tidId + ".x == 0";
+      else if (!threadPred.empty()) guard = threadPred;
+      if (hasMask) {
+        const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
+        guard = guard.empty() ? m : guard + " && " + m;
+      }
+      msl::Block inner;
+      if (floatEmulated) {
+        // Self-contained emulated CAS loop: captured verbatim (advances nextId).
+        // Bake indentation for the guard-body depth (inner nests inside ifScope).
+        int savedInd = indent;
+        if (!guard.empty())
+          ++indent;
+        inner.push_back(captureRaw([&] {
+          std::string cur = fresh();
+          if (bw == 16) {
+            std::string vh = emitRoundedHalfValue(sc, v);
+            std::string newExpr = floatRmwExpr(kind, cur, vh);
+            auto base = emitPacked16Base(p, sc);
+            emitPacked16CASLoop(base.first, base.second, sc, cur, newExpr, id);
+          } else {
+            std::string newExpr = floatRmwExpr(kind, cur, "(float)(" + v + ")");
+            emitFloat32CASLoop(p, cur, newExpr, id);
+          }
+        }));
+        indent = savedInd;
+      } else {
+        std::string order = "memory_order_relaxed";
+        switch (sem) {
+        case tt::MemSemantic::ACQUIRE: order = "memory_order_acquire"; break;
+        case tt::MemSemantic::RELEASE: order = "memory_order_release"; break;
+        case tt::MemSemantic::ACQUIRE_RELEASE: order = "memory_order_acq_rel"; break;
+        default: break;
+        }
+        bool memFlags = order != "memory_order_relaxed";
+        inner.push_back(ctx.assignStmt(
+            ctx.var(id),
+            astAtomicRmwCall(fn, atomicTy, p, v, order, memFlags)));
+      }
+      if (!guard.empty())
+        body.push_back(ctx.ifScope(ctx.raw(guard), std::move(inner)));
+      else
+        for (msl::Stmt *s : inner)
+          body.push_back(s);
+      if (!uniform && laneFree) {
+        std::string src = "(uint)(" + laneId + " & " +
+                          std::to_string(~laneFree & 31) + ")";
+        id = astShuffle("simd_shuffle", sc, id, src, body);
+      }
+      ids[r] = id;
+    }
+
+    if (!uniform && warpFree) {
+      auto ptrTy = cast<RankedTensorType>(ar.getPtr().getType());
+      tt::LinearLayout ll = ttg::toLinearLayout(ptrTy);
+      MLIRContext *c = ar.getContext();
+      int64_t numWarps = ll.hasInDim(StringAttr::get(c, "warp"))
+                             ? ll.getInDimSize(StringAttr::get(c, "warp")) : 1;
+      std::string bcbuf = fresh();
+      body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup),
+                                  bcbuf, astPoolRegion(0, sc)));
+      body.push_back(ctx.barrier(false));
+      std::string wcanon =
+          "((" + warpId + " & " + std::to_string(warpFree) + ") == 0)";
+      std::string warpKey =
+          "(" + warpId + " & " + std::to_string(~warpFree & (numWarps - 1)) + ")";
+      auto slotFor = [&](int reg) -> msl::Expr * {
+        return ctx.raw("((" + warpKey + " * " + std::to_string(rc * 32) +
+                       ") + " + std::to_string(reg) + " * 32 + (" + laneId +
+                       " & " + std::to_string(~laneFree & 31) + "))");
+      };
+      for (int r = 0; r < rc; ++r) {
+        if (regFree && (r & regFree) != 0) continue;
+        body.push_back(ctx.compactIf(
+            ctx.raw(wcanon),
+            ctx.assignStmt(ctx.subscript(ctx.var(bcbuf), slotFor(r)),
+                           ctx.var(ids[r]))));
+      }
+      body.push_back(ctx.barrier(false));
+      for (int r = 0; r < rc; ++r) {
+        int srcr = regFree ? (r & ~regFree) : r;
+        std::string bc = fresh();
+        body.push_back(ctx.declStmt(
+            scTy, bc, ctx.subscript(ctx.var(bcbuf), slotFor(srcr))));
+        ids[r] = bc;
+      }
+    }
+    valMap[res] = ids;
+    return true;
+  }
+
+  // tt.atomic_poll: elected-thread spin/probe on the aligned word + broadcast.
+  if (auto pl = dyn_cast<tt::AtomicPollOp>(op)) {
+    Type expTy = pl.getExpected().getType();
+    unsigned bw = expTy.getIntOrFloatBitWidth();
+    if (bw != 16 && bw != 32 && bw != 64)
+      return false;
+    bool acquire = pl.getSem() == tt::MemSemantic::ACQUIRE;
+    const std::string &p = names(pl.getPtr())[0];
+    const std::string &exp = names(pl.getExpected())[0];
+    // Poll barriers spell the flags device-first for acquire (differs from the
+    // peephole's canonical order), so emit as a raw call ExprStmt.
+    std::string barrierFlags =
+        acquire ? "mem_flags::mem_device | mem_flags::mem_threadgroup"
+                : "mem_flags::mem_threadgroup";
+    msl::Stmt *pollBarrier =
+        ctx.exprStmt(ctx.raw("threadgroup_barrier(" + barrierFlags + ")"));
+    std::string wordTy = bw == 16 ? "ushort" : (bw == 64 ? "ulong" : "uint");
+
+    // Bind wordPtr decls into `into`, returning the load-expr string.
+    auto probe = [&](msl::Block &into) -> std::string {
+      std::string wordPtr = fresh();
+      std::string loadExpr;
+      if (bw == 16) {
+        std::string isHigh = fresh();
+        into.push_back(ctx.declStmt(
+            ctx.scalar(msl::Scalar::I1), isHigh,
+            ctx.raw("((size_t)(" + p + ") & 2u) != 0u")));
+        into.push_back(ctx.declStmt(
+            ctx.named("device atomic_uint *"), wordPtr,
+            ctx.raw("(device atomic_uint *)((size_t)(" + p + ") & ~(size_t)3)")));
+        loadExpr = "(ushort)((" + isHigh +
+                   ") ? (atomic_load_explicit(" + wordPtr +
+                   ", memory_order_relaxed) >> 16) : (atomic_load_explicit(" +
+                   wordPtr + ", memory_order_relaxed) & 0xffffu))";
+      } else if (bw == 64) {
+        into.push_back(ctx.declStmt(
+            ctx.named("volatile device ulong *"), wordPtr,
+            ctx.raw("(volatile device ulong *)(" + p + ")")));
+        loadExpr = "(*" + wordPtr + ")";
+      } else {
+        into.push_back(ctx.declStmt(
+            ctx.named("device atomic_uint *"), wordPtr,
+            ctx.raw("(device atomic_uint *)(" + p + ")")));
+        loadExpr = "atomic_load_explicit(" + wordPtr + ", memory_order_relaxed)";
+      }
+      return loadExpr;
+    };
+
+    std::string result = fresh();
+    if (!pl.getTimeout()) {
+      msl::Block ifBody;
+      std::string loadExpr = probe(ifBody);
+      std::string want = fresh();
+      ifBody.push_back(ctx.declStmt(ctx.named(wordTy), want,
+                                    ctx.raw("(" + wordTy + ")" + exp)));
+      ifBody.push_back(ctx.whileScope(
+          ctx.binary(B::Ne, ctx.raw(loadExpr), ctx.var(want)), msl::Block{}));
+      body.push_back(ctx.ifScope(
+          ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0")),
+          std::move(ifBody)));
+      body.push_back(pollBarrier);
+      body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), result,
+                                  ctx.lit("true")));
+      valMap[pl.getResult()] = {result};
+      return true;
+    }
+    std::string flag = fresh();
+    body.push_back(ctx.declStmt(ctx.named("threadgroup bool"), flag, nullptr));
+    msl::Block ifBody;
+    std::string loadExpr = probe(ifBody);
+    std::string want = fresh(), loaded = fresh();
+    ifBody.push_back(ctx.declStmt(ctx.named(wordTy), want,
+                                  ctx.raw("(" + wordTy + ")" + exp)));
+    ifBody.push_back(ctx.declStmt(ctx.named(wordTy), loaded, ctx.raw(loadExpr)));
+    ifBody.push_back(ctx.assignStmt(
+        ctx.var(flag),
+        ctx.paren(ctx.binary(B::Eq, ctx.var(loaded), ctx.var(want)))));
+    body.push_back(ctx.ifScope(
+        ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0")),
+        std::move(ifBody)));
+    body.push_back(pollBarrier);
+    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), result,
+                                ctx.var(flag)));
+    valMap[pl.getResult()] = {result};
+    return true;
+  }
+
+  // tt.atomic_cas: int32/float32/packed16 compare-exchange + uniform spinlock.
+  if (auto ca = dyn_cast<tt::AtomicCASOp>(op)) {
+    Value res = ca.getResult();
+    Type scalarTy = elementScalarType(res.getType());
+    std::string sc = mslScalarType(scalarTy);
+    msl::Type *scTy = astScalarType(scalarTy);
+    bool isFloat = isa<FloatType>(scalarTy);
+    unsigned bw = scalarTy.getIntOrFloatBitWidth();
+    bool packed16 = isFloat && bw == 16;
+    bool word32 = bw == 32;
+    if (!packed16 && !word32)
+      return false;
+    auto &ptrs = names(ca.getPtr());
+    auto &cmps = names(ca.getCmp());
+    auto &vals = names(ca.getVal());
+    bool uniform = !isa<RankedTensorType>(ca.getPtr().getType());
+    int rc = ptrs.size();
+    SmallVector<std::string> ids;
+    for (int r = 0; r < rc; ++r) {
+      const std::string &p = ptrs[r];
+      const std::string &c = cmps[cmps.size() == 1 ? 0 : r];
+      const std::string &v = vals[vals.size() == 1 ? 0 : r];
+      std::string id = fresh();
+      msl::Block casBody;
+      // The CAS leaf declares `id` when !uniform; when uniform we pre-declare it.
+      if (packed16) {
+        std::string wp, ih;
+        for (msl::Stmt *s : astPacked16Base(p, wp, ih))
+          casBody.push_back(s);
+        for (msl::Stmt *s : astPacked16CAS(wp, ih, c, v, sc, id, !uniform))
+          casBody.push_back(s);
+      } else if (isFloat)
+        for (msl::Stmt *s : astFloat32CAS(p, c, v, id, !uniform))
+          casBody.push_back(s);
+      else
+        for (msl::Stmt *s : astInt32CAS(p, c, v, sc, id, !uniform))
+          casBody.push_back(s);
+
+      if (uniform) {
+        body.push_back(ctx.declStmt(scTy, id, ctx.var(c)));
+        body.push_back(ctx.ifScope(
+            ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0")),
+            std::move(casBody)));
+        // Broadcast lane-0's result to every lane through a scratch slot.
+        std::string bcast = fresh();
+        body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup),
+                                    bcast, astPoolRegion(0, sc)));
+        body.push_back(ctx.compactIf(
+            ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0")),
+            ctx.assignStmt(ctx.subscript(ctx.var(bcast), ctx.lit("0")),
+                           ctx.var(id))));
+        body.push_back(astAcquireFence());
+        body.push_back(ctx.barrier(false));
+        body.push_back(ctx.assignStmt(
+            ctx.var(id), ctx.subscript(ctx.var(bcast), ctx.lit("0"))));
+        body.push_back(ctx.barrier(false));
+      } else {
+        for (msl::Stmt *s : casBody)
+          body.push_back(s);
+      }
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return true;
+  }
+
   // tt.scan: per-run register fold + lane shuffle prefix + cross-warp carry +
   // cross-run carry. Mirrors emitScan with AST nodes.
   if (auto sn = dyn_cast<tt::ScanOp>(op)) {

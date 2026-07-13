@@ -23,9 +23,11 @@ using namespace mlir;
 namespace mlir::triton::applegpu {
 
 namespace {
-// Private fresh() over a copy of the emitter's id counter (mirrors fresh()).
+// fresh() over the emitter's live id counter (by reference): these atomic AST
+// builders are the sole emission path now, so they mint real names that advance
+// nextId, keeping downstream ops in lockstep.
 struct LocalGen {
-  int id;
+  int &id;
   std::string fresh() { return "v" + std::to_string(id++); }
 };
 } // namespace
@@ -242,7 +244,7 @@ msl::Block MSLEmitter::astInt32CAS(StringRef p, StringRef c, StringRef v,
   std::string exp = g.fresh();
   msl::Type *scTy = ctx.named(sc);
 
-  msl::Type *aiptr = ctx.ptr(ctx.named(ba::Int), msl::AddrSpace::Device);
+  msl::Type *aiptr = ctx.named(("device " + std::string(ba::Int) + " *"));
   msl::Expr *cas = ctx.call(
       ba::CompareExchangeWeak,
       {ctx.cast(CS::CStyle, aiptr, ctx.var(p)), ctx.addrOf(ctx.var(exp)),
@@ -275,7 +277,7 @@ msl::Block MSLEmitter::astFloat32CAS(StringRef p, StringRef c, StringRef v,
     return ctx.cast(CS::AsType, ctx.scalar(msl::Scalar::U32), x);
   };
 
-  msl::Type *auptr = ctx.ptr(ctx.named(ba::Uint), msl::AddrSpace::Device);
+  msl::Type *auptr = ctx.named(("device " + std::string(ba::Uint) + " *"));
   msl::Expr *cas = ctx.call(
       ba::CompareExchangeWeak,
       {ctx.cast(CS::CStyle, auptr, ctx.var(p)), ctx.addrOf(ctx.var(exp)),

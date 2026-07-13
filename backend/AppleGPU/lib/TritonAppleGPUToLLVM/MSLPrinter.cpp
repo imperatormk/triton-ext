@@ -512,6 +512,11 @@ void MSLPrinter::printStmt(const Stmt *s) {
       printExpr(f->cond);
     else
       os << "true";
+    // A spin-wait with an empty body renders on one line: `while (c) {}`.
+    if (f->body.empty()) {
+      os << ") {}\n";
+      return;
+    }
     os << ") {\n";
     ++indent;
     printBlock(f->body);

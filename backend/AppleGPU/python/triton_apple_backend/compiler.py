@@ -374,38 +374,12 @@ class MPSBackend(BaseBackend):
 
     def make_msl_metallib(self, mod, metadata, options):
         msl = metadata.pop("_msl_src")
-        with tempfile.NamedTemporaryFile(suffix='.metal', delete=False) as f:
-            src_path = f.name
-            f.write(msl.encode())
-        air_path = src_path + '.air'
-        lib_path = src_path + '.metallib'
         # Safe math globally. Metal fast-math assumes no NaN/Inf and reassociates
-        # FP, which silently miscompiles any kernel that produces or consumes
-        # Inf/NaN (sort/argmax/reductions over NaN, div-by-zero, extremal muls)
-        # or relies on RTNE (the rtne downcast reference). Which kernels see
-        # Inf/NaN is a runtime property, not statically detectable, so scoping
-        # is unsound. Safe math is proven zero-cost on the simdgroup-matrix GEMM
-        # path (identical AIR); the only cost is precise transcendentals.
-        math_flags = ['-fmetal-math-mode=safe']
-        try:
-            subprocess.run(
-                ['xcrun', '-sdk', 'macosx', 'metal', *math_flags,
-                 '-c', src_path, '-o', air_path],
-                check=True, capture_output=True)
-            subprocess.run(
-                ['xcrun', '-sdk', 'macosx', 'metallib', air_path, '-o',
-                 lib_path], check=True, capture_output=True)
-            with open(lib_path, 'rb') as f:
-                return f.read()
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"MSL compile failed:\n{e.stderr.decode(errors='replace')}")
-        finally:
-            for p in (src_path, air_path, lib_path):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+        # FP, silently miscompiling any kernel that produces or consumes Inf/NaN
+        # or relies on RTNE. Which kernels see Inf/NaN is a runtime property, so
+        # scoping is unsound; safe math is proven zero-cost on the GEMM path.
+        from triton_apple_backend import metal_utils
+        return metal_utils.compile_source(msl, 'safe')
 
     # ── Stage 3: LLVM IR with simdgroup intrinsics ─────────────────────────
     def make_llir(self, mod, metadata, options):

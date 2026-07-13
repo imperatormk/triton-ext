@@ -272,6 +272,69 @@ static PyObject *py_load_metallib(PyObject *self, PyObject *args) {
   }
 }
 
+static PyObject *py_compile_source(PyObject *self, PyObject *args) {
+  const char *src, *math_mode;
+  if (!PyArg_ParseTuple(args, "ss", &src, &math_mode))
+    return NULL;
+
+  @autoreleasepool {
+    MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+    // Safe math is load-bearing: fast-math assumes no NaN/Inf and reassociates
+    // FP, silently miscompiling kernels over Inf/NaN or relying on RTNE. Match
+    // the old xcrun -fmetal-math-mode=safe (safe mode + precise transcendentals).
+    if (strcmp(math_mode, "safe") == 0) {
+      if ([opt respondsToSelector:@selector(setMathMode:)]) {
+        opt.mathMode = MTLMathModeSafe;
+        opt.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+      } else {
+        opt.fastMathEnabled = NO;
+      }
+    }
+
+    NSString *source = [NSString stringWithUTF8String:src];
+    NSError *error = nil;
+    id<MTLLibrary> lib =
+        [get_device() newLibraryWithSource:source options:opt error:&error];
+    if (!lib) {
+      NSMutableString *full = [NSMutableString string];
+      [full appendFormat:@"%@", [error localizedDescription]];
+      NSDictionary *info = [error userInfo];
+      if (info && [info count])
+        [full appendFormat:@" | userInfo=%@", info];
+      PyErr_Format(PyExc_RuntimeError, "MSL compile failed: %s",
+                   [full UTF8String]);
+      return NULL;
+    }
+
+    if (![lib respondsToSelector:@selector(serializeToURL:error:)]) {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "MTLLibrary serializeToURL: unavailable on this SDK");
+      return NULL;
+    }
+
+    NSString *tmp = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:
+            [[NSProcessInfo processInfo] globallyUniqueString]];
+    tmp = [tmp stringByAppendingPathExtension:@"metallib"];
+    NSURL *url = [NSURL fileURLWithPath:tmp];
+
+    if (![lib serializeToURL:url error:&error]) {
+      PyErr_Format(PyExc_RuntimeError, "metallib serialize failed: %s",
+                   [[error localizedDescription] UTF8String]);
+      return NULL;
+    }
+
+    NSData *data = [NSData dataWithContentsOfURL:url];
+    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+    if (!data || [data length] == 0) {
+      PyErr_SetString(PyExc_RuntimeError, "serialized metallib is empty");
+      return NULL;
+    }
+
+    return PyBytes_FromStringAndSize((const char *)[data bytes], [data length]);
+  }
+}
+
 static PyObject *py_get_device_name(PyObject *self, PyObject *Py_UNUSED(args)) {
   return PyUnicode_FromString([[get_device() name] UTF8String]);
 }
@@ -282,6 +345,7 @@ static PyObject *py_is_available(PyObject *self, PyObject *Py_UNUSED(args)) {
 
 static PyMethodDef module_methods[] = {
     {"load_metallib", py_load_metallib, METH_VARARGS, NULL},
+    {"compile_source", py_compile_source, METH_VARARGS, NULL},
     {"get_device_name", py_get_device_name, METH_NOARGS, NULL},
     {"is_available", py_is_available, METH_NOARGS, NULL},
     {NULL}};

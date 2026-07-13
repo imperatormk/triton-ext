@@ -194,6 +194,11 @@ private:
   msl::Type *astUnsignedType(Type t);
   msl::Type *astStorageType(Type t);
 
+  // Per-element value builders for the reshape/aliasing ops. makeRange yields
+  // `start + off`; splat/reshape/join/split just alias a source register name.
+  msl::Expr *astMakeRangeElem(int start, StringRef off);
+  msl::Expr *astAliasElem(StringRef name);
+
   int nextId = 0;
   int indent = 1;
   llvm::DenseMap<Value, SmallVector<std::string>> valMap;
@@ -1225,22 +1230,9 @@ private:
     return failure();
   }
 
-  std::string floatLit(const APFloat &v) {
-    if (v.isInfinity())
-      return v.isNegative() ? "(-INFINITY)" : "INFINITY";
-    if (v.isNaN())
-      return "NAN";
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.17g", v.convertToDouble());
-    return buf;
-  }
-
-  std::string floatLit(const APFloat &v, StringRef sc) {
-    std::string lit = floatLit(v);
-    if (sc == "bfloat" || sc == "half")
-      return sc.str() + "(" + lit + ")";
-    return lit;
-  }
+  std::string floatLit(const APFloat &v);
+  std::string floatLit(const APFloat &v, StringRef sc);
+  msl::Expr *astFloatLit(const APFloat &v, StringRef sc);
 
   LogicalResult emitConstant(arith::ConstantOp op) {
     Value res = op.getResult();
@@ -1473,133 +1465,27 @@ private:
     return success();
   }
 
-  LogicalResult emitIntBinary(Operation *op) {
-    const char *o = isa<arith::AddIOp>(op)   ? "+"
-                    : isa<arith::SubIOp>(op) ? "-"
-                    : isa<arith::MulIOp>(op) ? "*"
-                    : isa<arith::DivSIOp, arith::DivUIOp>(op) ? "/"
-                                                              : "%";
-    Type resElem = elementScalarType(op->getResult(0).getType());
-    if (auto it = dyn_cast<IntegerType>(resElem); it && it.getWidth() == 1) {
-      Value res = op->getResult(0);
-      auto &lhs = names(op->getOperand(0));
-      auto &rhs = names(op->getOperand(1));
-      int rc = regCount(res);
-      SmallVector<std::string> ids;
-      for (int r = 0; r < rc; ++r) {
-        std::string id = fresh();
-        const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
-        const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
-        os << ind() << "bool " << id << " = (bool)((((int)" << a << ") " << o
-           << " ((int)" << b << ")) & 1);\n";
-        ids.push_back(id);
-      }
-      valMap[res] = ids;
-      return success();
-    }
-    std::string sc =
-        mslScalarType(elementScalarType(op->getResult(0).getType()));
-    std::string opCast;
-    if (isa<arith::DivUIOp, arith::RemUIOp>(op)) {
-      opCast = mslUnsignedType(elementScalarType(op->getResult(0).getType()));
-      sc = opCast;
-    }
-    return emitElementwise(op, o, sc, opCast);
-  }
-
-  LogicalResult emitFloatBinary(Operation *op) {
-    const char *o = isa<arith::AddFOp>(op)   ? "+"
-                    : isa<arith::SubFOp>(op) ? "-"
-                    : isa<arith::MulFOp>(op) ? "*"
-                                             : "/";
-    std::string sc =
-        mslScalarType(elementScalarType(op->getResult(0).getType()));
-    return emitElementwise(op, o, sc);
-  }
-
-  LogicalResult emitShift(Operation *op) {
-    std::string sc =
-        mslScalarType(elementScalarType(op->getResult(0).getType()));
-    std::string usc = sc.front() == 'u' ? sc : "u" + sc;
-    const char *o = isa<arith::ShLIOp>(op) ? "<<" : ">>";
-    bool logical = isa<arith::ShLIOp, arith::ShRUIOp>(op);
-    Value res = op->getResult(0);
-    auto &lhs = names(op->getOperand(0));
-    auto &rhs = names(op->getOperand(1));
-    int rc = regCount(res);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
-      const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
-      std::string lcast = logical ? usc + "(" + a + ")" : a;
-      os << ind() << sc << " " << id << " = (" << lcast << " " << o << " " << b
-         << ");\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
-
+  LogicalResult emitIntBinary(Operation *op);
+  LogicalResult emitFloatBinary(Operation *op);
+  LogicalResult emitShift(Operation *op);
   LogicalResult emitElementwise(Operation *op, StringRef binop, StringRef sc,
-                                StringRef opCast = "") {
-    Value res = op->getResult(0);
-    auto &lhs = names(op->getOperand(0));
-    auto &rhs = names(op->getOperand(1));
-    int rc = regCount(res);
-    std::string pre = opCast.empty() ? "" : "(" + opCast.str() + ")";
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
-      const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
-      os << ind() << "" << sc.str() << " " << id << " = (" << pre << a << " "
-         << binop.str() << " " << pre << b << ");\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
-
+                                StringRef opCast = "");
   LogicalResult emitMinMax(Operation *op, StringRef fn, StringRef opCast = "",
-                           bool propagateNan = false) {
-    Value res = op->getResult(0);
-    std::string sc = mslScalarType(elementScalarType(res.getType()));
-    std::string pre = opCast.empty() ? "" : "(" + opCast.str() + ")";
-    auto &lhs = names(op->getOperand(0));
-    auto &rhs = names(op->getOperand(1));
-    int rc = regCount(res);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      const std::string &a = lhs[lhs.size() == 1 ? 0 : r];
-      const std::string &b = rhs[rhs.size() == 1 ? 0 : r];
-      std::string expr = fn.str() + "(" + pre + a + ", " + pre + b + ")";
-      if (propagateNan)
-        expr = "((metal::isnan(" + a + ") || metal::isnan(" + b + ")) ? " + a +
-               " + " + b + " : " + expr + ")";
-      os << ind() << sc << " " << id << " = " << expr << ";\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
+                           bool propagateNan = false);
+  LogicalResult emitUnary(Operation *op, StringRef fn, StringRef sc);
 
-  LogicalResult emitUnary(Operation *op, StringRef fn, StringRef sc) {
-    Value res = op->getResult(0);
-    auto &a = names(op->getOperand(0));
-    int rc = regCount(res);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      const std::string &v = a[a.size() == 1 ? 0 : r];
-      os << ind() << sc.str() << " " << id << " = (" << sc.str() << ")"
-         << fn.str() << "(" << v << ");\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
+  // AST sub-expression builders: yield the RHS Expr* the string paths above
+  // print, resolving operands from already-looked-up register names. Not yet
+  // driving output (Layer 2); later layers assign these into DeclStmt inits.
+  msl::Expr *astIntBinaryExpr(Operation *op, StringRef a, StringRef b);
+  msl::Expr *astShiftExpr(Operation *op, StringRef a, StringRef b);
+  msl::Expr *astElementwiseExpr(msl::BinOp op, msl::Type *opCast, StringRef a,
+                                StringRef b);
+  msl::Expr *astMinMaxExpr(StringRef fn, msl::Type *opCast, bool propagateNan,
+                           StringRef a, StringRef b);
+  msl::Expr *astUnaryExpr(StringRef fn, msl::Type *sc, StringRef v);
+  msl::Expr *astTernaryCallExpr(StringRef fn, StringRef a, StringRef b,
+                                StringRef c);
 
   LogicalResult emitMathUnary(Operation *op) {
     std::string sc = mslScalarType(elementScalarType(op->getResult(0).getType()));
@@ -1663,250 +1549,21 @@ private:
     return failure();
   }
 
-  LogicalResult emitTernary(Operation *op, StringRef fn, StringRef sc) {
-    Value res = op->getResult(0);
-    auto &a = names(op->getOperand(0));
-    auto &b = names(op->getOperand(1));
-    auto &c = names(op->getOperand(2));
-    int rc = regCount(res);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      os << ind() << sc.str() << " " << id << " = " << fn.str() << "("
-         << a[a.size() == 1 ? 0 : r] << ", " << b[b.size() == 1 ? 0 : r] << ", "
-         << c[c.size() == 1 ? 0 : r] << ");\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
+  LogicalResult emitTernary(Operation *op, StringRef fn, StringRef sc);
+  LogicalResult emitCast(Operation *op);
+  LogicalResult emitPtrIntCast(Operation *op);
+  LogicalResult emitBitcast(Operation *op);
+  LogicalResult emitClamp(tt::ClampFOp op);
+  LogicalResult emitCmpI(arith::CmpIOp op);
+  LogicalResult emitCmpF(arith::CmpFOp op);
+  LogicalResult emitSelect(arith::SelectOp op);
 
-  LogicalResult emitCast(Operation *op) {
-    Value res = op->getResult(0);
-    std::string dst = mslScalarType(elementScalarType(res.getType()));
-    if (dst.empty()) {
-      op->emitError("EmitMSL: unhandled cast target type");
-      return failure();
-    }
-    {
-      Type srcElem = elementScalarType(op->getOperand(0).getType());
-      bool toHalf = dst == "half" || dst == "bfloat";
-      if (srcElem.isF32() && toHalf) {
-        bool rtz = false, handle = false;
-        if (auto f = dyn_cast<tt::FpToFpOp>(op)) {
-          if (auto rnd = f.getRounding()) {
-            handle = true;
-            rtz = *rnd == tt::RoundingMode::RTZ;
-          }
-        } else if (isa<arith::TruncFOp>(op)) {
-          handle = true;
-        }
-        if (handle) {
-          auto &a = names(op->getOperand(0));
-          int rc = regCount(res);
-          SmallVector<std::string> ids;
-          for (int r = 0; r < rc; ++r) {
-            const std::string &v = a[a.size() == 1 ? 0 : r];
-            ids.push_back(rtz ? emitTruncatedFloatValue(dst, v)
-                              : emitRoundedHalfValueFull(dst, v));
-          }
-          valMap[res] = ids;
-          return success();
-        }
-      }
-    }
-    std::string srcCast;
-    if (isa<arith::ExtUIOp, arith::UIToFPOp>(op))
-      srcCast = mslUnsignedType(elementScalarType(op->getOperand(0).getType()));
-    auto &a = names(op->getOperand(0));
-    int rc = regCount(res);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      const std::string &v = a[a.size() == 1 ? 0 : r];
-      std::string src = srcCast.empty() ? v : "(" + srcCast + ")" + v;
-      os << ind() << dst << " " << id << " = static_cast<" << dst << ">(" << src
-         << ");\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
-
-  LogicalResult emitPtrIntCast(Operation *op) {
-    Value res = op->getResult(0);
-    bool toPtr = isa<tt::IntToPtrOp>(op);
-    std::string dst = toPtr
-                          ? mslStorageType(res.getType())
-                          : mslScalarType(elementScalarType(res.getType()));
-    if (dst.empty()) {
-      op->emitError("EmitMSL: unhandled ptr/int cast type");
-      return failure();
-    }
-    auto &a = names(op->getOperand(0));
-    int rc = regCount(res);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      const std::string &v = a[a.size() == 1 ? 0 : r];
-      os << ind() << dst << " " << id << " = (" << dst << ")" << v << ";\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
-
-  LogicalResult emitBitcast(Operation *op) {
-    Value res = op->getResult(0);
-    Type resElem = res.getType();
-    if (auto rt = dyn_cast<RankedTensorType>(resElem))
-      resElem = rt.getElementType();
-    bool isPtr = isa<tt::PointerType>(resElem);
-    std::string dst = isPtr ? mslStorageType(res.getType())
-                            : mslScalarType(elementScalarType(res.getType()));
-    if (dst.empty()) {
-      op->emitError("EmitMSL: unhandled bitcast target type");
-      return failure();
-    }
-    auto &a = names(op->getOperand(0));
-    int rc = regCount(res);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      const std::string &v = a[a.size() == 1 ? 0 : r];
-      if (isPtr)
-        os << ind() << dst << " " << id << " = (" << dst << ")" << v << ";\n";
-      else
-        os << ind() << dst << " " << id << " = as_type<" << dst << ">(" << v
-           << ");\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
-
-  LogicalResult emitClamp(tt::ClampFOp op) {
-    Value res = op.getResult();
-    std::string sc = mslScalarType(elementScalarType(res.getType()));
-    auto &x = names(op.getX());
-    auto &lo = names(op.getMin());
-    auto &hi = names(op.getMax());
-    int rc = regCount(res);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      const std::string &xv = x[x.size() == 1 ? 0 : r];
-      const std::string &lv = lo[lo.size() == 1 ? 0 : r];
-      const std::string &hv = hi[hi.size() == 1 ? 0 : r];
-      std::string clamped = "metal::clamp(" + xv + ", " + lv + ", " + hv + ")";
-      if (op.getPropagateNan() == tt::PropagateNan::ALL)
-        clamped = "(metal::isnan(" + xv + ") ? " + xv + " : " + clamped + ")";
-      os << ind() << sc << " " << id << " = " << clamped << ";\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
-
-  LogicalResult emitCmpI(arith::CmpIOp op) {
-    const char *o;
-    bool uns = false;
-    switch (op.getPredicate()) {
-    case arith::CmpIPredicate::ult:
-      uns = true;
-      [[fallthrough]];
-    case arith::CmpIPredicate::slt:
-      o = "<";
-      break;
-    case arith::CmpIPredicate::ule:
-      uns = true;
-      [[fallthrough]];
-    case arith::CmpIPredicate::sle:
-      o = "<=";
-      break;
-    case arith::CmpIPredicate::ugt:
-      uns = true;
-      [[fallthrough]];
-    case arith::CmpIPredicate::sgt:
-      o = ">";
-      break;
-    case arith::CmpIPredicate::uge:
-      uns = true;
-      [[fallthrough]];
-    case arith::CmpIPredicate::sge:
-      o = ">=";
-      break;
-    case arith::CmpIPredicate::eq:
-      o = "==";
-      break;
-    case arith::CmpIPredicate::ne:
-      o = "!=";
-      break;
-    }
-    std::string opCast =
-        uns ? mslUnsignedType(elementScalarType(op.getLhs().getType())) : "";
-    return emitElementwise(op, o, "bool", opCast);
-  }
-
-  LogicalResult emitCmpF(arith::CmpFOp op) {
-    const char *o;
-    switch (op.getPredicate()) {
-    case arith::CmpFPredicate::OLT:
-    case arith::CmpFPredicate::ULT:
-      o = "<";
-      break;
-    case arith::CmpFPredicate::OLE:
-    case arith::CmpFPredicate::ULE:
-      o = "<=";
-      break;
-    case arith::CmpFPredicate::OGT:
-    case arith::CmpFPredicate::UGT:
-      o = ">";
-      break;
-    case arith::CmpFPredicate::OGE:
-    case arith::CmpFPredicate::UGE:
-      o = ">=";
-      break;
-    case arith::CmpFPredicate::OEQ:
-    case arith::CmpFPredicate::UEQ:
-      o = "==";
-      break;
-    case arith::CmpFPredicate::ONE:
-    case arith::CmpFPredicate::UNE:
-      o = "!=";
-      break;
-    default:
-      op.emitError("EmitMSL: unsupported cmpf predicate");
-      return failure();
-    }
-    return emitElementwise(op, o, "bool");
-  }
-
-  LogicalResult emitSelect(arith::SelectOp op) {
-    Value res = op.getResult();
-    auto &cond = names(op.getCondition());
-    auto &tval = names(op.getTrueValue());
-    auto &fval = names(op.getFalseValue());
-    Type resElem = res.getType();
-    if (auto rt = dyn_cast<RankedTensorType>(resElem))
-      resElem = rt.getElementType();
-    std::string sc = isa<tt::PointerType>(resElem)
-                         ? mslStorageType(res.getType())
-                         : mslScalarType(elementScalarType(res.getType()));
-    int rc = regCount(res);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      const std::string &c = cond[cond.size() == 1 ? 0 : r];
-      const std::string &t = tval[tval.size() == 1 ? 0 : r];
-      const std::string &f = fval[fval.size() == 1 ? 0 : r];
-      os << ind() << sc << " " << id << " = " << c << " ? " << t << " : " << f
-         << ";\n";
-      ids.push_back(id);
-    }
-    valMap[res] = ids;
-    return success();
-  }
+  msl::Expr *astCastExpr(Operation *op, StringRef v);
+  msl::Expr *astPtrIntCastExpr(Operation *op, StringRef v);
+  msl::Expr *astBitcastExpr(Operation *op, StringRef v);
+  msl::Expr *astClampExpr(tt::ClampFOp op, StringRef x, StringRef lo,
+                          StringRef hi);
+  msl::Expr *astSelectExpr(StringRef c, StringRef t, StringRef f);
 
   LogicalResult emitRegionBody(Region &region) {
     Block &blk = region.front();
@@ -2733,43 +2390,12 @@ private:
   // and bfloat scalars, so those are bitcast to an integer type of the same
   // width, shuffled, and reassembled.
   std::string emitShuffle(StringRef op, StringRef sc, StringRef val,
-                          StringRef arg) {
-    std::string out = fresh();
-    if (sc == "long" || sc == "ulong") {
-      std::string lo = fresh(), hi = fresh();
-      os << ind() << "uint2 " << lo << " = as_type<uint2>(" << val << ");\n";
-      os << ind() << "uint2 " << hi << ";\n";
-      os << ind() << hi << ".x = " << op << "(" << lo << ".x, " << arg
-         << ");\n";
-      os << ind() << hi << ".y = " << op << "(" << lo << ".y, " << arg
-         << ");\n";
-      os << ind() << sc << " " << out << " = as_type<" << sc << ">(" << hi
-         << ");\n";
-      return out;
-    }
-    if (sc == "bool") {
-      std::string b = fresh(), s = fresh();
-      os << ind() << "uchar " << b << " = (uchar)" << val << ";\n";
-      os << ind() << "uchar " << s << " = " << op << "(" << b << ", " << arg
-         << ");\n";
-      os << ind() << sc << " " << out << " = (bool)" << s << ";\n";
-      return out;
-    }
-    if (sc == "bfloat" || sc == "half" || sc == "short" || sc == "char") {
-      std::string bits = sc == "char" ? "uchar" : "ushort";
-      std::string b = fresh(), s = fresh();
-      os << ind() << bits << " " << b << " = as_type<" << bits << ">(" << val
-         << ");\n";
-      os << ind() << bits << " " << s << " = " << op << "(" << b << ", " << arg
-         << ");\n";
-      os << ind() << sc << " " << out << " = as_type<" << sc << ">(" << s
-         << ");\n";
-      return out;
-    }
-    os << ind() << sc << " " << out << " = " << op << "(" << val << ", " << arg
-       << ");\n";
-    return out;
-  }
+                          StringRef arg);
+
+  // Single-expression form of the shuffle (no temporaries): the bitcast-through
+  // wrapper collapsed into one nested Expr. `sc` picks the reinterpret path.
+  msl::Expr *astShuffleExpr(StringRef op, StringRef sc, StringRef val,
+                            StringRef arg);
 
   // Cross-warp inclusive carry for one register group (one independent scan).
   // Every lane writes its lane-inclusive total to threadgroup scratch keyed by

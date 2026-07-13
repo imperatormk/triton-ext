@@ -466,6 +466,11 @@ void MSLPrinter::printStmt(const Stmt *s) {
     printType(f->counterTy);
     os << " " << f->counter << " = 0; ; " << f->counter << " += 1) {\n";
     ++indent;
+    // iv decl + compact break guard first (never floated into the header).
+    printStmt(f->ivDecl);
+    ind() << "if (!(";
+    printExpr(f->guard);
+    os << ")) break;\n";
     printBlock(f->body);
     flushBarrier();
     --indent;

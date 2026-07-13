@@ -274,22 +274,14 @@ msl::TripCountForScope *MSLEmitter::astTripCountForScope(
   std::string hi = names(op.getUpperBound())[0];
   std::string st = names(op.getStep())[0];
   msl::Type *ty = ctx.named(ivTy);
-  msl::Block full;
   // iv = lo + tc * st
   msl::Expr *ivInit = ctx.binary(
       B::Add, ctx.var(lo),
       ctx.binary(B::Mul, ctx.var(counter), ctx.var(st)));
-  full.push_back(ctx.declStmt(ty, iv, ivInit));
-  // if (!(iv < hi)) break;
-  msl::Expr *guard =
-      ctx.unary(msl::UnOp::LNot, ctx.paren(ctx.binary(B::Lt, ctx.var(iv),
-                                                      ctx.var(hi))));
-  msl::Block brk;
-  brk.push_back(ctx.breakStmt());
-  full.push_back(ctx.ifScope(guard, std::move(brk)));
-  for (msl::Stmt *s : body)
-    full.push_back(s);
-  return ctx.tripCountForScope(ty, counter, std::move(full));
+  msl::Stmt *ivDecl = ctx.declStmt(ty, iv, ivInit);
+  // guard `iv < hi` (printer renders `if (!(iv < hi)) break;`).
+  msl::Expr *guard = ctx.binary(B::Lt, ctx.var(iv), ctx.var(hi));
+  return ctx.tripCountForScope(ty, counter, ivDecl, guard, std::move(body));
 }
 
 msl::Stmt *MSLEmitter::astForNode(scf::ForOp op, msl::Block body, StringRef iv,
@@ -871,11 +863,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   // scf.for (non-fused, non-wide-IV). Fused GEMM K-loops and i64-IV loops keep
   // the string path (captured) for now.
   if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    if (getenv("MSL_AST_NO_CF"))
+      return false;
     if (matchGemmDotLoop(forOp))
       return false;
     Type ivType = forOp.getInductionVar().getType();
-    if (ivType.isInteger(64))
-      return false;
+    bool wideIv = ivType.isInteger(64);
 
     SmallVector<SmallVector<std::string>> carried;
     for (auto [i, init, res] :
@@ -897,17 +890,22 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       carried.push_back(vars);
     }
 
+    // Wide-IV (i64) loops carry `tc` as the header counter and the real IV decl
+    // as the first body stmt (the AGX i65 Gauss-sum dodge). The string path mints
+    // iv first then tc; match that order.
     std::string iv = fresh();
+    std::string tc = wideIv ? fresh() : "";
     bindScalar(forOp.getInductionVar(), iv);
     std::string ivTy = mslScalarType(ivType);
     if (ivTy.empty())
       ivTy = "int";
 
-    msl::Block loopBody = astWalkBlock(forOp.getRegion().front(), (unsigned)indent + 1);
+    unsigned d = (unsigned)indent + 1;
+    msl::Block loopBody = astWalkBlock(forOp.getRegion().front(), d);
     for (msl::Stmt *s :
          astYieldAssign(forOp.getBody()->getTerminator(), carried))
       loopBody.push_back(s);
-    body.push_back(astForScope(forOp, std::move(loopBody), iv, ivTy));
+    body.push_back(astForNode(forOp, std::move(loopBody), iv, tc, ivTy, wideIv));
     return true;
   }
 

@@ -79,22 +79,13 @@ int main() {
 
   // Wide-IV trip-count loop: iv declared INSIDE the body (dodges the i65 fold).
   {
-    Block tcBody;
-    tcBody.push_back(ctx.declStmt(
+    Stmt *ivDecl = ctx.declStmt(
         ctx.scalar(Scalar::I64), "iv",
         ctx.binary(BinOp::Add, ctx.lit("0"),
-                   ctx.binary(BinOp::Mul, ctx.var("tc"), ctx.lit("1")))));
-    tcBody.push_back(ctx.ifScope(
-        ctx.unary(UnOp::LNot,
-                  ctx.paren(ctx.binary(BinOp::Lt, ctx.var("iv"),
-                                       ctx.lit("100")))),
-        [&] {
-          Block b;
-          b.push_back(ctx.breakStmt());
-          return b;
-        }()));
-    body.push_back(
-        ctx.tripCountForScope(ctx.scalar(Scalar::I64), "tc", std::move(tcBody)));
+                   ctx.binary(BinOp::Mul, ctx.var("tc"), ctx.lit("1"))));
+    Expr *guard = ctx.binary(BinOp::Lt, ctx.var("iv"), ctx.lit("100"));
+    body.push_back(ctx.tripCountForScope(ctx.scalar(Scalar::I64), "tc", ivDecl,
+                                         guard, Block{}));
   }
 
   // Kernel signature: device float* x [[buffer(0)]], uint3 tid [[...]]
@@ -149,9 +140,7 @@ int main() {
       "    simdgroup_multiply_accumulate(a, b, c, c);\n"
       "    for (long tc = 0; ; tc += 1) {\n"
       "        long iv = 0 + tc * 1;\n"
-      "        if (!(iv < 100)) {\n"
-      "            break;\n"
-      "        }\n"
+      "        if (!(iv < 100)) break;\n"
       "    }\n"
       "}\n";
 

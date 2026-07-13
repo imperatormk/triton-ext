@@ -339,10 +339,13 @@ struct ForScope : Stmt {
 struct TripCountForScope : Stmt {
   Type *counterTy;
   llvm::StringRef counter;
+  Stmt *ivDecl;  // `ivTy iv = lo + tc*st;` (first body stmt; i65 dodge)
+  Expr *guard;   // rendered compactly: `if (!(guard)) break;`
   Block body;
-  TripCountForScope(Type *ct, llvm::StringRef c, Block b)
-      : Stmt(Kind::TripCountForScope), counterTy(ct), counter(c),
-        body(std::move(b)) {}
+  TripCountForScope(Type *ct, llvm::StringRef c, Stmt *ivDecl, Expr *guard,
+                    Block b)
+      : Stmt(Kind::TripCountForScope), counterTy(ct), counter(c), ivDecl(ivDecl),
+        guard(guard), body(std::move(b)) {}
   static bool classof(const Stmt *s) {
     return s->kind == Kind::TripCountForScope;
   }
@@ -499,8 +502,9 @@ public:
   ForScope *forScope(Stmt *init, Expr *c, Stmt *step, Block b) {
     return make<ForScope>(init, c, step, std::move(b));
   }
-  TripCountForScope *tripCountForScope(Type *ct, llvm::StringRef c, Block b) {
-    return make<TripCountForScope>(ct, save(c), std::move(b));
+  TripCountForScope *tripCountForScope(Type *ct, llvm::StringRef c, Stmt *ivDecl,
+                                       Expr *guard, Block b) {
+    return make<TripCountForScope>(ct, save(c), ivDecl, guard, std::move(b));
   }
   IfScope *ifScope(Expr *c, Block t) {
     return make<IfScope>(c, std::move(t), Block{}, false);

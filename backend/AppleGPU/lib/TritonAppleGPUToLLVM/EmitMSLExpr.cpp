@@ -301,9 +301,8 @@ msl::Expr *MSLEmitter::astShuffleExpr(StringRef op, StringRef sc, StringRef val,
 // Per-element builders for reshape / aliasing ops (emission stays in-header)
 //===----------------------------------------------------------------------===//
 
-msl::Expr *MSLEmitter::astMakeRangeElem(int start, StringRef off) {
-  return ctx.binary(msl::BinOp::Add, ctx.lit(std::to_string(start)),
-                    ctx.raw(off));
+msl::Expr *MSLEmitter::astMakeRangeElem(int start, msl::Expr *off) {
+  return ctx.binary(msl::BinOp::Add, ctx.i32lit(start), off);
 }
 
 msl::Expr *MSLEmitter::astAliasElem(StringRef name) { return ctx.var(name); }

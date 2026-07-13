@@ -1058,7 +1058,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     auto rt = cast<RankedTensorType>(mr.getResult().getType());
     int start = mr.getStart();
     return astDeclBind(op, ctx.scalar(msl::Scalar::I32), body, [&](int r) {
-      return astMakeRangeElem(start, layoutOffsetExpr(rt, r));
+      return astMakeRangeElem(start, astLayoutOffsetExpr(rt, r));
     });
   }
 

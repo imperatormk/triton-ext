@@ -232,7 +232,7 @@ private:
 
   // Per-element value builders for the reshape/aliasing ops. makeRange yields
   // `start + off`; splat/reshape/join/split just alias a source register name.
-  msl::Expr *astMakeRangeElem(int start, StringRef off);
+  msl::Expr *astMakeRangeElem(int start, msl::Expr *off);
   msl::Expr *astAliasElem(StringRef name);
 
   int nextId = 0;

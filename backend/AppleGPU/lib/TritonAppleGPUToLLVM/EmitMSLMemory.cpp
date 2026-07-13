@@ -50,7 +50,7 @@ msl::Expr *MSLEmitter::astLayoutCoordExpr(RankedTensorType rt, int reg,
         continue;
       // (((idExpr >> b) & 1) * basis)
       msl::Expr *shifted = ctx.paren(
-          ctx.binary(msl::BinOp::Shr, ctx.raw(idExpr), ctx.lit(std::to_string(b))));
+          ctx.binary(msl::BinOp::Shr, ctx.var(idExpr), ctx.i32lit(b)));
       msl::Expr *bit =
           ctx.paren(ctx.binary(msl::BinOp::And, shifted, ctx.lit("1")));
       msl::Expr *term = ctx.paren(

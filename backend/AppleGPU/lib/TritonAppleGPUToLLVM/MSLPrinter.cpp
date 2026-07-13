@@ -307,6 +307,15 @@ void MSLPrinter::printStmtInline(const Stmt *s) {
     printExpr(a->rhs);
     return;
   }
+  if (auto *e = llvm::dyn_cast<ExprStmt>(s)) {
+    printExpr(e->e);
+    return;
+  }
+  if (auto *b = llvm::dyn_cast<BreakStmt>(s)) {
+    (void)b;
+    os << "break";
+    return;
+  }
   llvm_unreachable("printStmtInline: unsupported stmt");
 }
 
@@ -461,6 +470,13 @@ void MSLPrinter::printStmt(const Stmt *s) {
     printExpr(f->cond);
     os << "; ";
     printStmtInline(f->step);
+    if (f->compact) {
+      // `for (...) <expr>;` on one line.
+      os << ") ";
+      printExpr(llvm::cast<ExprStmt>(f->body.front())->e);
+      os << ";\n";
+      return;
+    }
     os << ") {\n";
     ++indent;
     printBlock(f->body);

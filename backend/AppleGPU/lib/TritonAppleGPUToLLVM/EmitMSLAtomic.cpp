@@ -422,15 +422,12 @@ msl::Stmt *MSLEmitter::astHistZeroInit(StringRef bins, StringRef zi,
                                  ctx.member(ctx.var(tidId), "x"));
   msl::Expr *cond =
       ctx.binary(B::Lt, ctx.var(zi), ctx.lit(std::to_string(nBins) + "u"));
-  msl::Stmt *step = ctx.assignStmt(
-      ctx.var(zi),
-      ctx.binary(B::Add, ctx.var(zi), ctx.lit(std::to_string(threads) + "u")));
+  msl::Stmt *step =
+      ctx.addAssignStmt(ctx.var(zi), ctx.lit(std::to_string(threads) + "u"));
   msl::Expr *store = ctx.call(
       ba::Store, {ctx.addrOf(ctx.subscript(ctx.var(bins), ctx.var(zi))),
                   ctx.lit("0u"), ctx.lit(border::Relaxed)});
-  msl::Block body;
-  body.push_back(ctx.exprStmt(store));
-  return ctx.forScope(init, cond, step, std::move(body));
+  return ctx.compactForScope(init, cond, step, ctx.exprStmt(store));
 }
 
 // if (guard) atomic_fetch_add_explicit(&bins[v], 1u, memory_order_relaxed);
@@ -439,9 +436,7 @@ msl::Stmt *MSLEmitter::astHistFetchAdd(msl::Expr *guard, StringRef bins,
   msl::Expr *add = ctx.call(
       ba::FetchAdd, {ctx.addrOf(ctx.subscript(ctx.var(bins), ctx.var(v))),
                      ctx.lit("1u"), ctx.lit(border::Relaxed)});
-  msl::Block then;
-  then.push_back(ctx.exprStmt(add));
-  return ctx.ifScope(guard, std::move(then));
+  return ctx.compactIf(guard, ctx.exprStmt(add));
 }
 
 } // namespace mlir::triton::applegpu

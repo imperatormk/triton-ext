@@ -336,9 +336,12 @@ struct ForScope : Stmt {
   Expr *cond;
   Stmt *step; // AssignStmt (iv += st), rendered without trailing `;`
   Block body;
-  ForScope(Stmt *init, Expr *c, Stmt *step, Block b)
+  // compact => `for (...) <single-stmt>;` on one line, no braces (histogram
+  // zero-init). Requires body.size()==1 and an ExprStmt body.
+  bool compact;
+  ForScope(Stmt *init, Expr *c, Stmt *step, Block b, bool compact)
       : Stmt(Kind::ForScope), initDecl(init), cond(c), step(step),
-        body(std::move(b)) {}
+        body(std::move(b)), compact(compact) {}
   static bool classof(const Stmt *s) { return s->kind == Kind::ForScope; }
 };
 
@@ -512,7 +515,12 @@ public:
     return make<DeviceFn>(rt, save(n), p, std::move(b));
   }
   ForScope *forScope(Stmt *init, Expr *c, Stmt *step, Block b) {
-    return make<ForScope>(init, c, step, std::move(b));
+    return make<ForScope>(init, c, step, std::move(b), false);
+  }
+  ForScope *compactForScope(Stmt *init, Expr *c, Stmt *step, Stmt *bodyStmt) {
+    Block b;
+    b.push_back(bodyStmt);
+    return make<ForScope>(init, c, step, std::move(b), true);
   }
   TripCountForScope *tripCountForScope(Type *ct, llvm::StringRef c, Stmt *ivDecl,
                                        Expr *guard, Block b) {

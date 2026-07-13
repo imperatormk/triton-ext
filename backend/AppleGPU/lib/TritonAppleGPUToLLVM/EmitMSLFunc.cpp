@@ -1485,6 +1485,81 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  // tt.histogram: zero-init threadgroup bins, per-register guarded fetch_add,
+  // barrier, then per-result-register atomic_load.
+  if (auto hg = dyn_cast<tt::HistogramOp>(op)) {
+    auto srcTy = cast<RankedTensorType>(hg.getSrc().getType());
+    auto resTy = cast<RankedTensorType>(hg.getResult().getType());
+    int64_t nBins = tileSize(resTy);
+    int64_t threads = 32;
+    if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+      threads = nw.getInt() * 32;
+
+    std::string bins = fresh();
+    body.push_back(astHistBinsDecl(bins));
+    std::string zi = fresh();
+    body.push_back(astHistZeroInit(bins, zi, nBins, threads));
+    body.push_back(ctx.barrier(false));
+
+    auto &srcVals = names(hg.getSrc());
+    SmallVector<std::string> *maskVals = hg.getMask() ? &names(hg.getMask()) : nullptr;
+    std::string srcU = mslUnsignedType(elementScalarType(hg.getSrc().getType()));
+
+    MLIRContext *mctx = hg.getContext();
+    tt::LinearLayout srcLL = ttg::toLinearLayout(srcTy);
+    auto kLane = StringAttr::get(mctx, "lane");
+    auto kWarp = StringAttr::get(mctx, "warp");
+    auto srcOut = llvm::to_vector(srcLL.getOutDimNames());
+    uint32_t freeMask = 0;
+    auto scanFree = [&](StringAttr in, int shift) {
+      if (!srcLL.hasInDim(in)) return;
+      for (int b = 0, n = srcLL.getInDimSizeLog2(in); b < n; ++b) {
+        bool moves = false;
+        for (auto od : srcOut)
+          if (srcLL.getBasis(in, b, od) != 0) moves = true;
+        if (!moves) freeMask |= 1u << (shift + b);
+      }
+    };
+    scanFree(kLane, 0);
+    scanFree(kWarp, 5);
+    std::string ownerGuard =
+        freeMask == 0 ? ""
+                      : "(" + tidId + ".x & " + std::to_string(freeMask) +
+                            "u) == 0u";
+    for (int r = 0; r < (int)srcVals.size(); ++r) {
+      const std::string &v = srcVals[r];
+      std::string guard =
+          "(" + srcU + ")" + v + " < " + std::to_string(nBins) + "u";
+      if (!ownerGuard.empty())
+        guard = ownerGuard + " && (" + guard + ")";
+      if (maskVals)
+        guard = "(" + (*maskVals)[maskVals->size() == 1 ? 0 : r] + ") && (" +
+                guard + ")";
+      body.push_back(astHistFetchAdd(ctx.raw(guard), bins, v));
+    }
+    body.push_back(ctx.barrier(false));
+
+    auto outDims = llvm::to_vector(ttg::toLinearLayout(resTy).getOutDimNames());
+    msl::Type *resScTy = astScalarType(resTy.getElementType());
+    std::string resSc = mslScalarType(resTy.getElementType());
+    int nResReg = regCount(hg.getResult());
+    SmallVector<std::string> resIds;
+    for (int r = 0; r < nResReg; ++r) {
+      msl::Expr *idx = astLayoutCoordExpr(resTy, r, outDims[0]);
+      std::string id = fresh();
+      // (resSc)atomic_load_explicit(&bins[idx], memory_order_relaxed)
+      msl::Expr *load = ctx.cast(
+          CS::CStyle, resScTy,
+          ctx.call("atomic_load_explicit",
+                   {ctx.addrOf(ctx.subscript(ctx.var(bins), idx)),
+                    ctx.lit("memory_order_relaxed")}));
+      body.push_back(ctx.declStmt(resScTy, id, load));
+      resIds.push_back(id);
+    }
+    valMap[hg.getResult()] = resIds;
+    return true;
+  }
+
   // tt.atomic_rmw: native fetch_* (AST) or fp-emulated CAS loop (captured), with
   // redundant-thread guard + lane/warp replica broadcast.
   if (auto ar = dyn_cast<tt::AtomicRMWOp>(op)) {

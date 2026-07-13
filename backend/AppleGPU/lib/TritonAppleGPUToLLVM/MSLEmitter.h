@@ -344,8 +344,6 @@ private:
   // function / scope / control-flow sibling builders (EmitMSLFunc.cpp). Each
   // takes a pre-built body Block and returns the scope node; they never emit,
   // so the flip layer (7b) walks the ops into the body then wraps it here.
-  msl::KernelFn *astKernelFn(tt::FuncOp func, msl::Block body);
-  msl::DeviceFn *astDeviceFn(tt::FuncOp func, msl::Block body);
   msl::DeviceFn *astDeviceProto(tt::FuncOp func);
   msl::NamedType *astRetStructType(tt::FuncOp func);
   msl::Stmt *astRetStructDecl(tt::FuncOp func); // ArrayDecl-less; RawStmt struct
@@ -370,7 +368,6 @@ private:
                             ArrayRef<SmallVector<std::string>> dsts);
   // Helpers below mint fresh names over a raw id counter passed by reference
   // (seeded from nextId by the caller) so they never mutate nextId directly.
-  llvm::SmallVector<msl::Stmt *, 2> laneWarpDecls(int &id, StringRef tid);
   llvm::SmallVector<msl::Stmt *, 2> laneWarpProlog();
   llvm::SmallVector<msl::Param, 8> deviceParams(tt::FuncOp func, int &id,
                                                 bool bind);
@@ -443,32 +440,6 @@ private:
   std::string fresh() { return "v" + std::to_string(nextId++); }
 
   std::string ind() const { return std::string(indent * 4, ' '); }
-
-  // Barrier peephole: a barrier is held pending rather than written immediately,
-  // so two barriers emitted back-to-back with no intervening statement collapse
-  // into one (keeping the stronger memory scope). flushBarrier() must run before
-  // any non-barrier output and at every scope boundary so a pending barrier is
-  // never lost or reordered past a real memory operation.
-  bool barrierPending = false;
-  bool barrierPendingDevice = false;
-
-  void emitBarrier(bool device) {
-    barrierPending = true;
-    barrierPendingDevice = barrierPendingDevice || device;
-  }
-
-  void flushBarrier() {
-    if (!barrierPending)
-      return;
-    barrierPending = false;
-    bool device = barrierPendingDevice;
-    barrierPendingDevice = false;
-    if (device)
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup | "
-                     "mem_flags::mem_device);\n";
-    else
-      os << ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  }
 
   // Number of per-thread registers (unrolled elements) for a value.
   int regCount(Value v) {
@@ -1138,18 +1109,8 @@ private:
     return success();
   }
 
-  LogicalResult emitIntBinary(Operation *op);
-  LogicalResult emitFloatBinary(Operation *op);
-  LogicalResult emitShift(Operation *op);
-  LogicalResult emitElementwise(Operation *op, StringRef binop, StringRef sc,
-                                StringRef opCast = "");
-  LogicalResult emitMinMax(Operation *op, StringRef fn, StringRef opCast = "",
-                           bool propagateNan = false);
-  LogicalResult emitUnary(Operation *op, StringRef fn, StringRef sc);
-
-  // AST sub-expression builders: yield the RHS Expr* the string paths above
-  // print, resolving operands from already-looked-up register names. Not yet
-  // driving output (Layer 2); later layers assign these into DeclStmt inits.
+  // AST sub-expression builders: yield the RHS Expr* the decl init uses,
+  // resolving operands from already-looked-up register names.
   msl::Expr *astIntBinaryExpr(Operation *op, StringRef a, StringRef b);
   msl::Expr *astShiftExpr(Operation *op, StringRef a, StringRef b);
   msl::Expr *astElementwiseExpr(msl::BinOp op, msl::Type *opCast, StringRef a,
@@ -1160,77 +1121,6 @@ private:
   msl::Expr *astTernaryCallExpr(StringRef fn, StringRef a, StringRef b,
                                 StringRef c);
 
-  LogicalResult emitMathUnary(Operation *op) {
-    std::string sc = mslScalarType(elementScalarType(op->getResult(0).getType()));
-    StringRef n = op->getName().getStringRef();
-    // metal:: trig/exp/log/sqrt lower to air.fast_* (approximate) even under
-    // -fmetal-math-mode=safe; the math mode never controls transcendental
-    // accuracy, only the namespace does. Inductor checks against aten's accurate
-    // transcendentals at fp32 tolerance (rel ~1e-6), which the fast_* variants
-    // miss (e.g. tan via sin/cos, pow via exp2/log2). Use metal::precise:: for
-    // the accuracy-sensitive functions; exact ops (floor/ceil/round/abs) keep
-    // the plain form.
-    namespace bi = msl::builtin;
-    static const llvm::StringMap<StringRef> unary = {
-        {"math.exp", bi::precise::Exp},
-        {"math.exp2", bi::precise::Exp2},
-        {"math.log", bi::precise::Log},
-        {"math.log2", bi::precise::Log2},
-        {"math.log10", bi::precise::Log10},
-        {"math.sin", bi::precise::Sin},
-        {"math.cos", bi::precise::Cos},
-        {"math.tan", bi::precise::Tan},
-        {"math.tanh", bi::precise::Tanh},
-        {"math.sinh", bi::precise::Sinh},
-        {"math.cosh", bi::precise::Cosh},
-        {"math.asin", bi::precise::Asin},
-        {"math.acos", bi::precise::Acos},
-        {"math.atan", bi::precise::Atan},
-        {"math.sqrt", bi::precise::Sqrt},
-        {"math.rsqrt", bi::precise::Rsqrt},
-        {"math.cbrt", bi::precise::Cbrt},
-        {"math.floor", bi::math::Floor}, {"math.ceil", bi::math::Ceil},
-        {"math.absf", bi::math::Fabs},   {"math.absi", bi::math::Abs},
-        {"math.erf", "tt_erf"},          {"math.round", bi::math::Round},
-        {"math.trunc", bi::math::Trunc}, {"math.roundeven", bi::math::Rint}};
-    if (auto it = unary.find(n); it != unary.end())
-      return emitUnary(op, it->second, sc);
-    static const llvm::StringMap<StringRef> binary = {
-        {"math.atan2", bi::precise::Atan2},
-        {"math.powf", bi::precise::Pow},
-        {"math.fpowi", bi::precise::Pow},
-        {"math.copysign", bi::math::Copysign}};
-    if (auto it = binary.find(n); it != binary.end())
-      return emitMinMax(op, it->second);
-    if (n == "math.fma")
-      return emitTernary(op, msl::builtin::math::Fma, sc);
-    if (n == "math.exp10") {
-      Value res = op->getResult(0);
-      auto &a = names(op->getOperand(0));
-      int rc = regCount(res);
-      SmallVector<std::string> ids;
-      for (int r = 0; r < rc; ++r) {
-        std::string id = fresh();
-        os << ind() << sc << " " << id << " = " << msl::builtin::precise::Pow
-           << "((" << sc << ")10, " << a[a.size() == 1 ? 0 : r] << ");\n";
-        ids.push_back(id);
-      }
-      valMap[res] = ids;
-      return success();
-    }
-    op->emitError("EmitMSL: unhandled math op '" + n + "'");
-    return failure();
-  }
-
-  LogicalResult emitTernary(Operation *op, StringRef fn, StringRef sc);
-  LogicalResult emitCast(Operation *op);
-  LogicalResult emitPtrIntCast(Operation *op);
-  LogicalResult emitBitcast(Operation *op);
-  LogicalResult emitClamp(tt::ClampFOp op);
-  LogicalResult emitCmpI(arith::CmpIOp op);
-  LogicalResult emitCmpF(arith::CmpFOp op);
-  LogicalResult emitSelect(arith::SelectOp op);
-
   msl::Expr *astCastExpr(Operation *op, StringRef v);
   msl::Expr *astPtrIntCastExpr(Operation *op, StringRef v);
   msl::Expr *astBitcastExpr(Operation *op, StringRef v);
@@ -1240,25 +1130,6 @@ private:
 
 
 
-  SmallVector<std::string> declResultVars(Value v, StringRef init) {
-    Type elem = v.getType();
-    if (auto rt = dyn_cast<RankedTensorType>(elem))
-      elem = rt.getElementType();
-    std::string sc = isa<tt::PointerType>(elem)
-                         ? mslStorageType(v.getType())
-                         : mslScalarType(elementScalarType(v.getType()));
-    int rc = regCount(v);
-    SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      os << ind() << sc << " " << id;
-      if (!init.empty())
-        os << " = " << init.str();
-      os << ";\n";
-      ids.push_back(id);
-    }
-    return ids;
-  }
 
   static bool isDatalessType(Type t) {
     return isa<ttg::AsyncTokenType>(t);
@@ -1412,15 +1283,9 @@ private:
     return bits;
   }
 
-  // Emit a warp shuffle (simd_shuffle / _up / _down) of `val` (type `sc`),
-  // returning the fresh result name. Metal's shuffle intrinsics reject 64-bit
-  // and bfloat scalars, so those are bitcast to an integer type of the same
-  // width, shuffled, and reassembled.
-  std::string emitShuffle(StringRef op, StringRef sc, StringRef val,
-                          StringRef arg);
-
-  // Single-expression form of the shuffle (no temporaries): the bitcast-through
-  // wrapper collapsed into one nested Expr. `sc` picks the reinterpret path.
+  // Single-expression form of the warp shuffle (no temporaries): the
+  // bitcast-through wrapper collapsed into one nested Expr. `sc` picks the
+  // reinterpret path (64-bit/bfloat scalars reject the intrinsic directly).
   msl::Expr *astShuffleExpr(StringRef op, StringRef sc, StringRef val,
                             StringRef arg);
 

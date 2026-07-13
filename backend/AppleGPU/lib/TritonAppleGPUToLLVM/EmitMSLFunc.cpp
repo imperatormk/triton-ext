@@ -97,71 +97,6 @@ msl::Type *MSLEmitter::astDeviceRetType(tt::FuncOp func) {
 // Kernel / device-function signatures
 //===----------------------------------------------------------------------===//
 
-// kernel void <name>( device T* v [[buffer(N)]], ..., constant char* args
-// [[buffer(K)]], uint3 tgpos [[..]], uint3 tid [[..]], uint3 numtg [[..]] )
-// plus the scalar-arg readback DeclStmts and lane/warp DeclStmts prepended to
-// `body`. Mirrors emitFunc's param + prologue string emission exactly.
-msl::KernelFn *MSLEmitter::astKernelFn(tt::FuncOp func, msl::Block body) {
-  int id = nextId;
-  LocalGen g{id};
-  auto fnTy = func.getFunctionType();
-
-  msl::Attr *maxThreads = nullptr;
-  if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
-    maxThreads = ctx.maxThreadsAttr(nw.getInt() * 32);
-
-  llvm::SmallVector<msl::Param, 8> params;
-  llvm::SmallVector<BlockArgument> scalarArgs;
-  unsigned buffer = 0;
-  for (auto [i, argTy] : llvm::enumerate(fnTy.getInputs())) {
-    BlockArgument arg = func.getArgument(i);
-    if (auto pt = dyn_cast<tt::PointerType>(argTy)) {
-      msl::Type *sc = ctx.ptr(astScalarType(pt.getPointeeType()),
-                              msl::AddrSpace::Device);
-      params.push_back(ctx.param(sc, g.fresh(), ctx.bufferAttr(buffer++)));
-    } else {
-      scalarArgs.push_back(arg);
-    }
-  }
-
-  std::string argbufId;
-  if (!scalarArgs.empty()) {
-    argbufId = g.fresh();
-    msl::Type *cc = ctx.ptr(ctx.scalar(msl::Scalar::I8), msl::AddrSpace::Constant);
-    params.push_back(ctx.param(cc, argbufId, ctx.bufferAttr(buffer++)));
-  }
-
-  msl::Type *u3 = ctx.vector(msl::Scalar::U32, 3);
-  std::string tgpos = g.fresh(), tid = g.fresh(), numtg = g.fresh();
-  params.push_back(ctx.param(u3, tgpos, ctx.tgPosAttr()));
-  params.push_back(ctx.param(u3, tid, ctx.threadPosAttr()));
-  params.push_back(ctx.param(u3, numtg, ctx.tgsPerGridAttr()));
-
-  // Prologue: scalar readback + lane/warp, prepended ahead of the walked body.
-  msl::Block prologue;
-  int off = 0;
-  for (BlockArgument arg : scalarArgs) {
-    Type ty = arg.getType();
-    unsigned bits = ty.getIntOrFloatBitWidth();
-    int size = bits == 1 ? 1 : (int)(bits / 8);
-    off = (off + size - 1) / size * size;
-    msl::Type *sc = astScalarType(ty);
-    // *(constant sc*)(argbuf + off)
-    msl::Expr *addr = ctx.paren(
-        ctx.binary(B::Add, ctx.var(argbufId), ctx.lit(std::to_string(off))));
-    msl::Expr *rd = ctx.deref(
-        ctx.cast(CS::CStyle, ctx.ptr(sc, msl::AddrSpace::Constant), addr));
-    prologue.push_back(ctx.declStmt(sc, g.fresh(), rd));
-    off += size;
-  }
-  for (msl::Stmt *s : laneWarpDecls(id, tid))
-    prologue.push_back(s);
-
-  for (msl::Stmt *s : body)
-    prologue.push_back(s);
-  return ctx.kernelFn(maxThreads, mslKernelName(func.getName()), params,
-                      std::move(prologue));
-}
 
 // `int lane = (int)(tid.x & 31u); int warp = (int)(tid.x >> 5);` using the
 // already-minted laneId/warpId/tidId members (kernel + device-fn prologues).
@@ -178,22 +113,6 @@ llvm::SmallVector<msl::Stmt *, 2> MSLEmitter::laneWarpProlog() {
   return {ctx.declStmt(i32, laneId, lane), ctx.declStmt(i32, warpId, warp)};
 }
 
-// `int lane = (int)(tid.x & 31u); int warp = (int)(tid.x >> 5);` - shared by
-// kernel + device-fn prologues.
-llvm::SmallVector<msl::Stmt *, 2> MSLEmitter::laneWarpDecls(int &id,
-                                                            StringRef tid) {
-  LocalGen g{id};
-  msl::Type *i32 = ctx.scalar(msl::Scalar::I32);
-  msl::Expr *tidx = ctx.member(ctx.var(tid), "x");
-  msl::Expr *lane = ctx.cast(
-      CS::CStyle, i32,
-      ctx.paren(ctx.binary(B::And, tidx, ctx.lit("31u"))));
-  msl::Expr *warp = ctx.cast(
-      CS::CStyle, i32,
-      ctx.paren(ctx.binary(B::Shr, ctx.member(ctx.var(tid), "x"), ctx.lit("5"))));
-  return {ctx.declStmt(i32, g.fresh(), lane),
-          ctx.declStmt(i32, g.fresh(), warp)};
-}
 
 // Build the device-fn param list. `bind` mirrors emitDeviceSignature's bindArgs:
 // true mints fresh() names (the definition), false uses aN/__tgpos/... (the
@@ -229,19 +148,6 @@ msl::DeviceFn *MSLEmitter::astDeviceProto(tt::FuncOp func) {
                       deviceParams(func, id, /*bind=*/false), msl::Block{});
 }
 
-msl::DeviceFn *MSLEmitter::astDeviceFn(tt::FuncOp func, msl::Block body) {
-  int id = nextId;
-  auto params = deviceParams(func, id, /*bind=*/true);
-  // lane/warp read the bound tid param (index = #inputs + 1).
-  StringRef tid = params[func.getFunctionType().getInputs().size() + 1].name;
-  msl::Block prologue;
-  for (msl::Stmt *s : laneWarpDecls(id, tid))
-    prologue.push_back(s);
-  for (msl::Stmt *s : body)
-    prologue.push_back(s);
-  return ctx.deviceFn(astDeviceRetType(func), mslDeviceFuncName(func.getName()),
-                      params, std::move(prologue));
-}
 
 //===----------------------------------------------------------------------===//
 // Return
@@ -414,11 +320,6 @@ bool MSLEmitter::astCombineN(Region &region, ArrayRef<std::string> aVals,
     o.emitError("EmitMSL: unhandled combiner op '" +
                 o.getName().getStringRef() + "'");
     emitFailed = true;
-    if (barrierPending) {
-      body.push_back(ctx.barrier(barrierPendingDevice));
-      barrierPending = false;
-      barrierPendingDevice = false;
-    }
   }
   indent = savedIndent;
   if (emitFailed)
@@ -694,11 +595,6 @@ MSLEmitter::astWalkBlock2(Block &blk,
       op.emitError("EmitMSL: unhandled CFG op '" +
                    op.getName().getStringRef() + "'");
       emitFailed = true;
-    }
-    if (barrierPending) {
-      body.push_back(ctx.barrier(barrierPendingDevice));
-      barrierPending = false;
-      barrierPendingDevice = false;
     }
     for (Value res : op.getResults()) {
       auto it = hoist.find(res);
@@ -1014,11 +910,6 @@ msl::Block MSLEmitter::astWalkBlock(Block &blk, unsigned depth) {
     // A captured op may leave a pending string-path barrier (it flushes only at
     // scope boundaries). Translate it to a BarrierStmt so the printer peephole
     // still collapses it with an adjacent barrier uniformly.
-    if (barrierPending) {
-      body.push_back(ctx.barrier(barrierPendingDevice));
-      barrierPending = false;
-      barrierPendingDevice = false;
-    }
   }
   indent = savedIndent;
   return body;
@@ -1063,12 +954,6 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       valMap[r] = SmallVector<std::string>{};
     return true;
   }
-
-  // A/B harness: force every value-producing family to the string capture path
-  // (the always-safe no-ops above still flow through AST). Lets any flipped op be
-  // diffed against its string emitter. Transitional; unset in normal builds.
-  if (getenv("MSL_AST_NO_FLIP"))
-    return false;
 
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
@@ -1412,8 +1297,6 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       });
     return false; // unhandled math op: let string path emit the error
   }
-
-  bool noCF = getenv("MSL_AST_NO_CF");
 
   // Pure register-rebind ops (no text emitted): splat / expand_dims / broadcast /
   // join / split / unsplat. Their string emitters only rewrite valMap, so calling
@@ -2800,7 +2683,6 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
 
   // scf.if: predeclare result vars, then IfScope with then/else sub-blocks.
   if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-    if (noCF) return false;
     SmallVector<SmallVector<std::string>> results;
     for (Value res : ifOp.getResults())
       results.push_back(astDeclResultVars(res, body));
@@ -2831,8 +2713,6 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   // scf.for (non-fused, non-wide-IV). Fused GEMM K-loops and i64-IV loops keep
   // the string path (captured) for now.
   if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-    if (noCF)
-      return false;
     if (auto m = matchGemmDotLoop(forOp))
       return astEmitFusedGemm(forOp, m->first, m->second, body);
     Type ivType = forOp.getInductionVar().getType();
@@ -2879,7 +2759,6 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
 
   // scf.while: `while (true) { <before> if (!(c)) { <fwd> break; } <after> <yield> }`
   if (auto wh = dyn_cast<scf::WhileOp>(op)) {
-    if (noCF) return false;
     SmallVector<SmallVector<std::string>> carried;
     for (auto [i, init] : llvm::enumerate(wh.getInits())) {
       auto &initNames = names(init);

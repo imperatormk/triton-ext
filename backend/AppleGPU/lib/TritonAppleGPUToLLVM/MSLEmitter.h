@@ -395,6 +395,11 @@ private:
   SmallVector<std::string> astDeclResultVars(Value v, msl::Block &body);
   msl::Expr *astDerefPtr(Value ptr, StringRef name, StringRef scName);
   void astStoreBody(tt::StoreOp op, msl::Block &body);
+  bool astCombineN(Region &region, ArrayRef<std::string> aVals,
+                   ArrayRef<std::string> bVals, msl::Block &body,
+                   SmallVectorImpl<std::string> &results);
+  std::string astShuffle(StringRef op, StringRef sc, StringRef val,
+                         StringRef arg, msl::Block &body);
   void astBandRoundTrip(msl::Block &body, StringRef buf, int64_t total,
                         int64_t band, int srcRc, int resRc,
                         ArrayRef<std::string> outs,

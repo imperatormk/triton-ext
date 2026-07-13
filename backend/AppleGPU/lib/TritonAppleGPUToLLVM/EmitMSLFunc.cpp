@@ -18,8 +18,6 @@
 //    fire; the break is an IfScope + BreakStmt.
 //  - a barrier is a BarrierStmt node (the printer's peephole collapses adjacent
 //    ones); builders here never spell threadgroup_barrier text.
-//  - a sibling never mutates nextId/indent - emission owns those - so builders
-//    that mint fresh names run over a private LocalGen seeded from nextId.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -27,16 +25,6 @@
 using namespace mlir;
 
 namespace mlir::triton::applegpu {
-
-namespace {
-// Private fresh() over a copy of the emitter's id counter (mirrors fresh()); it
-// carries the running id by reference so a single scope's param + prologue names
-// stay sequential without touching the emitter's nextId.
-struct LocalGen {
-  int &id;
-  std::string fresh() { return "v" + std::to_string(id++); }
-};
-} // namespace
 
 using B = msl::BinOp;
 using CS = msl::Cast::Style;
@@ -896,20 +884,11 @@ msl::Block MSLEmitter::astWalkBlock(Block &blk, unsigned depth) {
   for (Operation &op : blk) {
     if (astEmitOp(&op, body))
       continue;
-    Operation *opp = &op;
-    (void)opp;
     // No real-kernel op family falls through: astEmitOp is exhaustive. An
     // unhandled op is a hard error.
     op.emitError("EmitMSL: unhandled op '" + op.getName().getStringRef() + "'");
     emitFailed = true;
-    msl::Stmt *raw = ctx.rawVerbatim("");
-    // An alias/dataless op (splat/reshape/broadcast/...) rebinds valMap but emits
-    // no text; drop its empty RawStmt so no node lingers for it.
-    if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
-      body.push_back(raw);
-    // A captured op may leave a pending string-path barrier (it flushes only at
-    // scope boundaries). Translate it to a BarrierStmt so the printer peephole
-    // still collapses it with an adjacent barrier uniformly.
+    continue;
   }
   indent = savedIndent;
   return body;

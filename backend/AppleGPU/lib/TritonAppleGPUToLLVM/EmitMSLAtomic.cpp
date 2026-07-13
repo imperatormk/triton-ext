@@ -11,9 +11,6 @@
 //
 // INVARIANT: the printer inserts no grouping parens; wherever the string path
 // wrapped a subexpression the AST sibling inserts an explicit ctx.paren(...).
-// A sibling must never touch nextId/indent - emission owns those - so builders
-// that mint fresh names run over a private LocalGen id counter seeded from the
-// emitter's current nextId without mutating it.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -21,16 +18,6 @@
 using namespace mlir;
 
 namespace mlir::triton::applegpu {
-
-namespace {
-// fresh() over the emitter's live id counter (by reference): these atomic AST
-// builders are the sole emission path now, so they mint real names that advance
-// nextId, keeping downstream ops in lockstep.
-struct LocalGen {
-  int &id;
-  std::string fresh() { return "v" + std::to_string(id++); }
-};
-} // namespace
 
 namespace ba = msl::builtin::atomic;
 namespace border = msl::builtin::order;

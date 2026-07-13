@@ -35,6 +35,13 @@ namespace mlir::triton::applegpu {
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 
+// fresh() over the emitter's live id counter (by reference): AST sibling
+// builders mint real names that advance the caller's id in lockstep.
+struct LocalGen {
+  int &id;
+  std::string fresh() { return "v" + std::to_string(id++); }
+};
+
 inline std::string mslScalarType(Type t) {
   if (t.isF32() || t.isF64())
     return "float";
@@ -214,12 +221,11 @@ private:
     fwd.swap(prev);
     return ctx.rawVerbatim(buf);
   }
-  // AST arena. Unused by emission yet; later layers build nodes into it and the
-  // printer renders them, replacing the string emission below.
+  // AST arena. Builders allocate nodes into it and the printer renders them.
   msl::MSLContext ctx;
 
   // AST-typed forms of the string type helpers (mslScalarType/mslUnsignedType/
-  // mslStorageType). Definitions in MSLTypes.cpp. Not yet used by emission.
+  // mslStorageType). Definitions in MSLTypes.cpp.
   msl::Type *astScalarType(Type t);
   msl::Type *astUnsignedType(Type t);
   msl::Type *astStorageType(Type t);
@@ -240,8 +246,8 @@ private:
   };
   llvm::DenseMap<Value, MemDescInfo> memdescMap;
 
-  // AST siblings of the offset/address string helpers (defs in
-  // EmitMSLMemory.cpp). Not yet driving emission; mirror the string parens.
+  // AST forms of the offset/address helpers (defs in EmitMSLMemory.cpp);
+  // insert explicit parens where the string path wrapped subexpressions.
   msl::Expr *astLayoutCoordExpr(RankedTensorType rt, int reg, StringAttr outDim);
   msl::Expr *astLayoutOffsetExpr(RankedTensorType rt, int reg);
   msl::Expr *astPoolRegion(int64_t byteOffset, StringRef sc);
@@ -263,15 +269,6 @@ private:
   msl::Stmt *astSgStore(StringRef acc, StringRef base, int64_t off, int64_t ld);
   msl::Stmt *astSgMultiplyAccumulate(StringRef acc, StringRef a, StringRef b);
   msl::Expr *astReadbackValue(StringRef buf, msl::Expr *off, StringRef base);
-
-  // fp-narrowing siblings. The bit-twiddling body is the design-sanctioned Raw
-  // escape hatch; only the outer `sc h = as_type<sc>(bits);` decl is real nodes.
-  msl::Stmt *astRoundedHalfValueFull(const std::string &sc, const std::string &v,
-                                     std::string &outName);
-  msl::Stmt *astTruncatedFloatValue(const std::string &sc, const std::string &v,
-                                    std::string &outName);
-  msl::Stmt *astRoundedHalfValue(const std::string &sc, const std::string &v,
-                                 std::string &outName);
 
   // atomic siblings (EmitMSLAtomic.cpp). Multi-statement builders return a
   // msl::Block so the caller splices them at its own indent (no stray braces);

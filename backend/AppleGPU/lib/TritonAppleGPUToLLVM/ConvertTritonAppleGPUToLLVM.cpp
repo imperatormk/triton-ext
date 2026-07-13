@@ -46,6 +46,91 @@ using namespace mlir::LLVM;
 using namespace mlir::arith;
 namespace ttg = mlir::triton::gpu;
 
+// tt.fp_to_fp carries an explicit rounding mode; arith.truncf/extf do not, so
+// the frontend only emits it when a non-default rounding is requested. The
+// generic elementwise patterns do not cover it, so lower it here. RTZ f32->half
+// narrowing is done by bit manipulation (Metal's (half)/(bfloat) casts are
+// round-to-nearest-even); the same LLVM IR feeds both the MSL and AIR paths.
+struct FpToFpOpConversion
+    : public ttg::ElementwiseOpConversionBase<mlir::triton::FpToFpOp,
+                                              FpToFpOpConversion> {
+  using Base = ttg::ElementwiseOpConversionBase<mlir::triton::FpToFpOp,
+                                                FpToFpOpConversion>;
+  using Base::Base;
+  using OpAdaptor = typename mlir::triton::FpToFpOp::Adaptor;
+
+  static Value convertFp32ToHalfRTZ(Location loc,
+                                    ConversionPatternRewriter &rewriter,
+                                    Value v, bool toBf16) {
+    TritonLLVMOpBuilder b(loc, rewriter);
+    Value u = b.bitcast(v, rewriter.getI32Type());
+    Value bits;
+    if (toBf16) {
+      bits = b.trunc(rewriter.getI16Type(), b.lshr(u, b.i32_val(16)));
+    } else {
+      Value sgn =
+          b.and_(b.lshr(u, b.i32_val(16)), b.i32_val(0x8000));
+      Value rawExp = b.and_(b.lshr(u, b.i32_val(23)), b.i32_val(0xff));
+      Value ex = b.sub(rawExp, b.i32_val(112));
+      Value mant = b.and_(u, b.i32_val(0x7fffff));
+
+      Value isNanInf = b.icmp_eq(rawExp, b.i32_val(0xff));
+      Value nanInfBits = b.or_(
+          b.or_(sgn, b.i32_val(0x7c00)),
+          b.select(b.icmp_ne(mant, b.i32_val(0)), b.i32_val(0x200),
+                   b.i32_val(0)));
+
+      Value isOverflow = b.icmp_sge(ex, b.i32_val(31));
+      Value overflowBits = b.or_(sgn, b.i32_val(0x7bff));
+
+      Value isSub = b.icmp_sle(ex, b.i32_val(0));
+      Value isFlush = b.icmp_slt(ex, b.i32_val(-10));
+      Value fm = b.or_(mant, b.i32_val(0x800000));
+      Value sh = b.sub(b.i32_val(14), ex);
+      Value subMant = b.lshr(fm, sh);
+      Value subBits = b.select(isFlush, sgn, b.or_(sgn, subMant));
+
+      Value normBits =
+          b.or_(b.or_(sgn, b.shl(ex, b.i32_val(10))),
+                b.lshr(mant, b.i32_val(13)));
+
+      Value r = b.select(isSub, subBits, normBits);
+      r = b.select(isOverflow, overflowBits, r);
+      r = b.select(isNanInf, nanInfBits, r);
+      bits = b.trunc(rewriter.getI16Type(), r);
+    }
+    Type dstTy = toBf16 ? cast<Type>(rewriter.getBF16Type())
+                        : cast<Type>(rewriter.getF16Type());
+    return b.bitcast(bits, dstTy);
+  }
+
+  SmallVector<Value> createDestOps(mlir::triton::FpToFpOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy,
+                                   ttg::MultipleOperandsRange operands,
+                                   Location loc) const {
+    TritonLLVMOpBuilder b(loc, rewriter);
+    Type srcElem = getElementTypeOrSelf(op.getSrc());
+    Type dstElem = getElementTypeOrSelf(op.getResult());
+    auto rounding = op.getRounding();
+
+    SmallVector<Value> out;
+    for (Value v : operands[0]) {
+      if (srcElem.isF32() && (dstElem.isF16() || dstElem.isBF16()) &&
+          rounding && *rounding == RoundingMode::RTZ) {
+        out.push_back(
+            convertFp32ToHalfRTZ(loc, rewriter, v, dstElem.isBF16()));
+      } else if (srcElem.getIntOrFloatBitWidth() >
+                 dstElem.getIntOrFloatBitWidth()) {
+        out.push_back(b.fptrunc(dstElem, v));
+      } else {
+        out.push_back(b.fpext(dstElem, v));
+      }
+    }
+    return out;
+  }
+};
+
 struct ConvertTritonAppleGPUToLLVMPass
     : public PassWrapper<ConvertTritonAppleGPUToLLVMPass,
                          OperationPass<ModuleOp>> {
@@ -255,6 +340,8 @@ struct ConvertTritonAppleGPUToLLVMPass
     POPULATE_FLOAT_OP(arith::SIToFPOp, LLVM::SIToFPOp);
     POPULATE_FLOAT_OP(arith::FPToSIOp, LLVM::FPToSIOp);
 #undef POPULATE_FLOAT_OP
+    patterns.add<FpToFpOpConversion>(typeConverter, axisInfoAnalysis,
+                                     patternBenefitDefault + 1);
 
     // Fragment-ABI elementwise/mask/view lowerings (kkt op-web). Benefit +5 so
     // they win over the generic flat lowering when operands are fragment

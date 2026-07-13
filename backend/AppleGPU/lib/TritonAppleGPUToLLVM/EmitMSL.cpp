@@ -122,47 +122,7 @@ class MSLEmitter {
 public:
   MSLEmitter(ModuleOp mod, raw_ostream &os) : mod(mod), os(os) {}
 
-  // Metal has no double type; f64 anywhere means a genuine hardware limit. Emit
-  // a clear error instead of narrowing f64 to float and returning wrong values.
-  LogicalResult rejectF64() {
-    LogicalResult status = success();
-    mod.walk([&](Operation *op) {
-      auto isF64 = [](Type t) {
-        if (auto rt = dyn_cast<RankedTensorType>(t))
-          t = rt.getElementType();
-        if (auto pt = dyn_cast<tt::PointerType>(t))
-          t = pt.getPointeeType();
-        return t.isF64();
-      };
-      for (Type t : op->getOperandTypes())
-        if (isF64(t)) {
-          op->emitError("EmitMSL: float64 is not supported on Metal");
-          status = failure();
-          return;
-        }
-      for (Type t : op->getResultTypes())
-        if (isF64(t)) {
-          op->emitError("EmitMSL: float64 is not supported on Metal");
-          status = failure();
-          return;
-        }
-    });
-    for (auto func : mod.getOps<tt::FuncOp>())
-      for (Type t : func.getFunctionType().getInputs()) {
-        Type e = t;
-        if (auto pt = dyn_cast<tt::PointerType>(e))
-          e = pt.getPointeeType();
-        if (e.isF64()) {
-          func.emitError("EmitMSL: float64 is not supported on Metal");
-          status = failure();
-        }
-      }
-    return status;
-  }
-
   LogicalResult emit() {
-    if (failed(rejectF64()))
-      return failure();
     os << "#include <metal_stdlib>\n";
     os << "#include <metal_simdgroup_matrix>\n";
     os << "using namespace metal;\n\n";
@@ -1141,7 +1101,7 @@ private:
           mslUnsignedType(elementScalarType(op->getResult(0).getType())));
     if (isa<tt::PreciseSqrtOp>(op))
       return emitUnary(
-          op, "metal::sqrt",
+          op, "metal::precise::sqrt",
           mslScalarType(elementScalarType(op->getResult(0).getType())));
     if (isa<tt::PreciseDivFOp>(op))
       return emitFloatBinary(op);

@@ -1040,6 +1040,171 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  // ttg.convert_layout: full-tile threadgroup round-trip (3 banding modes).
+  if (auto cl = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+    if (convertLayoutIsDeadDotStage(cl) ||
+        convertLayoutIsDeadDotStageSource(cl)) {
+      valMap[cl.getResult()] = SmallVector<std::string>{};
+      return true;
+    }
+    Value src = cl.getSrc(), res = cl.getResult();
+    auto srcTy = cast<RankedTensorType>(src.getType());
+    auto resTy = cast<RankedTensorType>(res.getType());
+    Type elemTy = resTy.getElementType();
+    bool isPtr = isa<tt::PointerType>(elemTy);
+    std::string ptrTyStr = mslStorageType(resTy);
+    std::string scStr = isPtr ? "ulong" : ptrTyStr;
+    msl::Type *scTy = isPtr ? ctx.scalar(msl::Scalar::U64) : astStorageType(resTy);
+    msl::Type *ptrDeclTy = astStorageType(resTy);
+    auto &srcNames = names(src);
+    int64_t elemBytes = bitsOf(elemTy) / 8;
+    int64_t tileBytes = tileSize(resTy) * elemBytes;
+    int rank = resTy.getRank();
+    ArrayRef<int64_t> shape = resTy.getShape();
+
+    std::string buf = fresh();
+    body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
+                                astPoolRegion(0, scStr)));
+    // scatter value expr: `(ulong)sv` when isPtr, else `sv`.
+    auto scatterVal = [&](StringRef nm) -> msl::Expr * {
+      msl::Expr *v = ctx.var(nm);
+      return isPtr ? ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U64), v) : v;
+    };
+    // gather value expr: `(ptrTy)buf[off]` when isPtr, else `buf[off]`.
+    auto gatherVal = [&](msl::Expr *slot) -> msl::Expr * {
+      return isPtr ? ctx.cast(CS::CStyle, ptrDeclTy, slot) : slot;
+    };
+
+    int64_t convCap = poolBudget();
+    if (tileBytes > convCap && rank >= 2) {
+      int64_t N = shape[rank - 1];
+      int64_t bandRows = convCap / (N * elemBytes);
+      if (bandRows < 1) bandRows = 1;
+      int64_t rowsTotal = shape[rank - 2];
+      auto srcOut = llvm::to_vector(ttg::toLinearLayout(srcTy).getOutDimNames());
+      StringAttr srcRowDim = srcOut[rank - 2];
+      auto resOut = llvm::to_vector(ttg::toLinearLayout(resTy).getOutDimNames());
+      StringAttr resRowDim = resOut[rank - 2];
+      SmallVector<std::string> ids(regCount(res));
+
+      auto bandOffset = [&](RankedTensorType rt, int reg,
+                            int64_t r0) -> msl::Expr * {
+        auto outN = llvm::to_vector(ttg::toLinearLayout(rt).getOutDimNames());
+        msl::Expr *expr = nullptr;
+        int64_t stride = 1;
+        for (int d = rank - 1; d >= 0; --d) {
+          msl::Expr *c = astLayoutCoordExpr(rt, reg, outN[d]);
+          if (d == rank - 2)
+            c = ctx.paren(ctx.binary(B::Sub, c, ctx.lit(std::to_string(r0))));
+          msl::Expr *term = stride == 1
+                                ? c
+                                : ctx.paren(ctx.binary(
+                                      B::Mul, c, ctx.lit(std::to_string(stride))));
+          expr = expr ? ctx.paren(ctx.binary(B::Add, expr, term)) : term;
+          stride *= (d == rank - 2) ? bandRows : shape[d];
+        }
+        return expr ? expr : ctx.lit("0");
+      };
+      for (int64_t r0 = 0; r0 < rowsTotal; r0 += bandRows) {
+        int64_t r1 = std::min<int64_t>(r0 + bandRows, rowsTotal);
+        body.push_back(ctx.barrier(false));
+        for (int r = 0, n = regCount(src); r < n; ++r) {
+          msl::Expr *rowc = astLayoutCoordExpr(srcTy, r, srcRowDim);
+          msl::Expr *cond = ctx.binary(
+              B::LAnd, ctx.binary(B::Ge, rowc, ctx.lit(std::to_string(r0))),
+              ctx.binary(B::Lt, astLayoutCoordExpr(srcTy, r, srcRowDim),
+                         ctx.lit(std::to_string(r1))));
+          body.push_back(ctx.compactIf(
+              cond, ctx.assignStmt(
+                        ctx.subscript(ctx.var(buf), bandOffset(srcTy, r, r0)),
+                        scatterVal(srcNames[r]))));
+        }
+        body.push_back(ctx.barrier(false));
+        for (int r = 0, n = regCount(res); r < n; ++r) {
+          if (ids[r].empty()) {
+            ids[r] = fresh();
+            body.push_back(ctx.declStmt(ptrDeclTy, ids[r], nullptr));
+          }
+          msl::Expr *rowc = astLayoutCoordExpr(resTy, r, resRowDim);
+          msl::Expr *cond = ctx.binary(
+              B::LAnd, ctx.binary(B::Ge, rowc, ctx.lit(std::to_string(r0))),
+              ctx.binary(B::Lt, astLayoutCoordExpr(resTy, r, resRowDim),
+                         ctx.lit(std::to_string(r1))));
+          msl::Expr *rd = gatherVal(
+              ctx.subscript(ctx.var(buf), bandOffset(resTy, r, r0)));
+          body.push_back(
+              ctx.compactIf(cond, ctx.assignStmt(ctx.var(ids[r]), rd)));
+        }
+      }
+      valMap[res] = ids;
+      return true;
+    }
+
+    if (tileBytes > convCap) {
+      int64_t total = tileSize(resTy);
+      int64_t band = reshapeBandElems(total, elemBytes, convCap);
+      SmallVector<std::string> ids(regCount(res));
+      for (int r = 0, n = regCount(res); r < n; ++r) {
+        ids[r] = fresh();
+        body.push_back(ctx.declStmt(ptrDeclTy, ids[r], nullptr));
+      }
+      for (int64_t lo = 0; lo < total; lo += band) {
+        int64_t hi = std::min(lo + band, total);
+        body.push_back(ctx.barrier(false));
+        for (int r = 0, n = regCount(src); r < n; ++r) {
+          msl::Block b;
+          b.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), "__f",
+                                   astFlatTileOffset(srcTy, r)));
+          msl::Expr *cond = ctx.binary(
+              B::LAnd,
+              ctx.binary(B::Ge, ctx.var("__f"), ctx.lit(std::to_string(lo))),
+              ctx.binary(B::Lt, ctx.var("__f"), ctx.lit(std::to_string(hi))));
+          msl::Expr *idx = ctx.binary(B::Sub, ctx.var("__f"),
+                                      ctx.lit(std::to_string(lo)));
+          b.push_back(ctx.compactIf(
+              cond, ctx.assignStmt(ctx.subscript(ctx.var(buf), idx),
+                                   scatterVal(srcNames[r]))));
+          body.push_back(ctx.plainScope(std::move(b)));
+        }
+        body.push_back(ctx.barrier(false));
+        for (int r = 0, n = regCount(res); r < n; ++r) {
+          msl::Block b;
+          b.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), "__f",
+                                   astFlatTileOffset(resTy, r)));
+          msl::Expr *cond = ctx.binary(
+              B::LAnd,
+              ctx.binary(B::Ge, ctx.var("__f"), ctx.lit(std::to_string(lo))),
+              ctx.binary(B::Lt, ctx.var("__f"), ctx.lit(std::to_string(hi))));
+          msl::Expr *idx = ctx.binary(B::Sub, ctx.var("__f"),
+                                      ctx.lit(std::to_string(lo)));
+          msl::Expr *rd = gatherVal(ctx.subscript(ctx.var(buf), idx));
+          b.push_back(
+              ctx.compactIf(cond, ctx.assignStmt(ctx.var(ids[r]), rd)));
+          body.push_back(ctx.plainScope(std::move(b)));
+        }
+      }
+      valMap[res] = ids;
+      return true;
+    }
+
+    body.push_back(ctx.barrier(false));
+    for (int r = 0, n = regCount(src); r < n; ++r)
+      body.push_back(ctx.assignStmt(
+          ctx.subscript(ctx.var(buf), astFlatTileOffset(srcTy, r)),
+          scatterVal(srcNames[r])));
+    body.push_back(ctx.barrier(false));
+    SmallVector<std::string> ids;
+    for (int r = 0, n = regCount(res); r < n; ++r) {
+      std::string id = fresh();
+      msl::Expr *rd = gatherVal(
+          ctx.subscript(ctx.var(buf), astFlatTileOffset(resTy, r)));
+      body.push_back(ctx.declStmt(ptrDeclTy, id, rd));
+      ids.push_back(id);
+    }
+    valMap[res] = ids;
+    return true;
+  }
+
   // tt.cat: scatter both halves (rhs shifted past lhs flat size), gather result.
   if (auto ct = dyn_cast<tt::CatOp>(op)) {
     Value lhs = ct.getLhs(), rhs = ct.getRhs(), res = ct.getResult();

@@ -1040,6 +1040,91 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  // memdesc_index / memdesc_subslice: pure memdescMap rebinds (no text).
+  if (auto mi = dyn_cast<ttg::MemDescIndexOp>(op))
+    return succeeded(emitMemDescIndex(mi));
+  if (auto ms = dyn_cast<ttg::MemDescSubsliceOp>(op))
+    return succeeded(emitMemDescSubslice(ms));
+
+  // ttg.local_alloc: declare a threadgroup buffer, optional init scatter.
+  if (auto la = dyn_cast<ttg::LocalAllocOp>(op)) {
+    auto mt = cast<ttg::MemDescType>(la.getResult().getType());
+    // `threadgroup sc buf[N];` - the address space is part of the element type
+    // spelling for a threadgroup array decl.
+    msl::Type *scTy = ctx.named("threadgroup " + mslScalarType(mt.getElementType()));
+    std::string buf = "__tg_buf_" + std::to_string(tgScratchId++);
+    body.push_back(ctx.arrayDeclStmt(scTy, buf, memdescFlatSize(mt)));
+    memdescMap[la.getResult()] = {buf, "0"};
+    if (Value init = la.getSrc()) {
+      auto srcTy = cast<RankedTensorType>(init.getType());
+      auto &vals = names(init);
+      body.push_back(ctx.barrier(false));
+      for (int r = 0, n = regCount(init); r < n; ++r)
+        body.push_back(ctx.assignStmt(
+            ctx.subscript(ctx.var(buf), astFlatTileOffset(srcTy, r)),
+            ctx.var(vals[r])));
+      body.push_back(ctx.barrier(false));
+    }
+    return true;
+  }
+
+  // ttg.local_store: scatter src registers into the memdesc buffer + barrier.
+  if (auto ls = dyn_cast<ttg::LocalStoreOp>(op)) {
+    auto srcTy = cast<RankedTensorType>(ls.getSrc().getType());
+    MemDescInfo dst = memdescMap[ls.getDst()];
+    auto &vals = names(ls.getSrc());
+    for (int r = 0, n = regCount(ls.getSrc()); r < n; ++r)
+      body.push_back(ctx.assignStmt(
+          ctx.subscript(ctx.var(dst.buf), astMemdescElemAddr(dst, srcTy, r)),
+          ctx.var(vals[r])));
+    body.push_back(ctx.barrier(false));
+    return true;
+  }
+
+  // ttg.local_load: gather result registers from the memdesc buffer.
+  if (auto ll = dyn_cast<ttg::LocalLoadOp>(op)) {
+    if (localLoadIsDeadDotStage(ll)) {
+      valMap[ll.getResult()] = SmallVector<std::string>{};
+      return true;
+    }
+    auto resTy = cast<RankedTensorType>(ll.getResult().getType());
+    MemDescInfo src = memdescMap[ll.getSrc()];
+    msl::Type *scTy = astScalarType(resTy.getElementType());
+    SmallVector<std::string> ids;
+    for (int r = 0, n = regCount(ll.getResult()); r < n; ++r) {
+      std::string id = fresh();
+      body.push_back(ctx.declStmt(
+          scTy, id,
+          ctx.subscript(ctx.var(src.buf), astMemdescElemAddr(src, resTy, r))));
+      ids.push_back(id);
+    }
+    valMap[ll.getResult()] = ids;
+    return true;
+  }
+
+  // ttg.async_copy_global_to_local: synchronous masked per-thread stage + barrier.
+  if (auto ac = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
+    auto srcTy = cast<RankedTensorType>(ac.getSrc().getType());
+    MemDescInfo dst = memdescMap[ac.getResult()];
+    auto &ptrs = names(ac.getSrc());
+    bool hasMask = ac.getMask() != nullptr;
+    SmallVector<std::string> *mask = hasMask ? &names(ac.getMask()) : nullptr;
+    for (int r = 0, n = regCount(ac.getSrc()); r < n; ++r) {
+      msl::Expr *addr =
+          ctx.subscript(ctx.var(dst.buf), astMemdescElemAddr(dst, srcTy, r));
+      msl::Expr *load = ctx.deref(ctx.var(ptrs[r]));
+      msl::Stmt *asn = ctx.assignStmt(addr, load);
+      if (hasMask)
+        body.push_back(ctx.compactIf(
+            ctx.var((*mask)[mask->size() == 1 ? 0 : r]), asn));
+      else
+        body.push_back(asn);
+    }
+    body.push_back(ctx.barrier(false));
+    valMap[ac.getResult()] = SmallVector<std::string>{};
+    return true;
+  }
+
   // ttg.convert_layout: full-tile threadgroup round-trip (3 banding modes).
   if (auto cl = dyn_cast<ttg::ConvertLayoutOp>(op)) {
     if (convertLayoutIsDeadDotStage(cl) ||

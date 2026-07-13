@@ -210,6 +210,19 @@ private:
   };
   llvm::DenseMap<Value, MemDescInfo> memdescMap;
 
+  // AST siblings of the offset/address string helpers (defs in
+  // EmitMSLMemory.cpp). Not yet driving emission; mirror the string parens.
+  msl::Expr *astLayoutCoordExpr(RankedTensorType rt, int reg, StringAttr outDim);
+  msl::Expr *astLayoutOffsetExpr(RankedTensorType rt, int reg);
+  msl::Expr *astPoolRegion(int64_t byteOffset, StringRef sc);
+  msl::Expr *astFlatTileOffset(RankedTensorType rt, int reg);
+  msl::Expr *astSliceFlatOffset(RankedTensorType rt, int reg);
+  msl::Expr *astBatchCoordExpr(RankedTensorType rt, int reg);
+  msl::Expr *astTransFlatOffset(RankedTensorType srcTy, ArrayRef<int32_t> perm,
+                                ArrayRef<int64_t> resShape, int reg);
+  msl::Expr *astMemdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
+                                int reg);
+
   std::string fresh() { return "v" + std::to_string(nextId++); }
 
   std::string ind() const { return std::string(indent * 4, ' '); }

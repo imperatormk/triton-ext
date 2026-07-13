@@ -416,10 +416,14 @@ msl::Block MSLEmitter::astWalkBlock(Block &blk, unsigned depth) {
     if (astEmitOp(&op, body))
       continue;
     Operation *opp = &op;
-    body.push_back(captureRaw([&] {
+    msl::Stmt *raw = captureRaw([&] {
       if (failed(emitOp(opp)))
         emitFailed = true;
-    }));
+    });
+    // An alias/dataless op (splat/reshape/broadcast/...) rebinds valMap but emits
+    // no text; drop its empty RawStmt so no node lingers for it.
+    if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
+      body.push_back(raw);
     // A captured op may leave a pending string-path barrier (it flushes only at
     // scope boundaries). Translate it to a BarrierStmt so the printer peephole
     // still collapses it with an adjacent barrier uniformly.
@@ -544,6 +548,61 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), id, e));
     bindScalar(op->getResult(0), id);
     return true;
+  }
+
+  // arith.constant: scalar / splat-tensor / dense-table.
+  if (auto cst = dyn_cast<arith::ConstantOp>(op)) {
+    Value res = cst.getResult();
+    if (auto rt = dyn_cast<RankedTensorType>(res.getType())) {
+      auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+      if (!dense)
+        return false; // string path emits the error
+      msl::Type *sc = astScalarType(rt.getElementType());
+      bool isFloat = isa<FloatType>(rt.getElementType());
+      std::string scStr = mslScalarType(rt.getElementType());
+      if (dense.isSplat()) {
+        std::string lit =
+            isFloat ? floatLit(dense.getSplatValue<APFloat>(), scStr)
+                    : std::to_string(dense.getSplatValue<APInt>().getSExtValue());
+        return astDeclBind(op, sc, body,
+                           [&](int) { return ctx.lit(lit); });
+      }
+      // Dense table: `sc tbl[N] = {..}; sc id = tbl[flatTileOffset];`
+      SmallVector<msl::Expr *> init;
+      if (isFloat)
+        for (const APFloat &v : dense.getValues<APFloat>())
+          init.push_back(astFloatLit(v, scStr));
+      else
+        for (const APInt &v : dense.getValues<APInt>())
+          init.push_back(ctx.lit(std::to_string(v.getSExtValue())));
+      std::string tbl = fresh();
+      body.push_back(ctx.arrayDeclStmt(sc, tbl, dense.getNumElements(), init));
+      return astDeclBind(op, sc, body, [&](int r) {
+        return ctx.subscript(ctx.var(tbl), astFlatTileOffset(rt, r));
+      });
+    }
+    msl::Type *sc = astScalarType(res.getType());
+    std::string scStr = mslScalarType(res.getType());
+    msl::Expr *lit;
+    if (auto fa = dyn_cast<FloatAttr>(cst.getValue()))
+      lit = astFloatLit(fa.getValue(), scStr);
+    else if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
+      lit = ctx.lit(std::to_string(ia.getInt()));
+    else
+      return false;
+    std::string id = fresh();
+    body.push_back(ctx.declStmt(sc, id, lit));
+    bindScalar(res, id);
+    return true;
+  }
+
+  // make_range: `int id = start + off;`
+  if (auto mr = dyn_cast<tt::MakeRangeOp>(op)) {
+    auto rt = cast<RankedTensorType>(mr.getResult().getType());
+    int start = mr.getStart();
+    return astDeclBind(op, ctx.scalar(msl::Scalar::I32), body, [&](int r) {
+      return astMakeRangeElem(start, layoutOffsetExpr(rt, r));
+    });
   }
 
   // Integer compare: `bool id = (casta o castb);`

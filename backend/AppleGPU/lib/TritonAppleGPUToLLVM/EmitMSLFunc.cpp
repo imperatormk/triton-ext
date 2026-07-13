@@ -478,7 +478,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   }
 
   // Structural no-ops that neither emit text nor bind a named value.
-  if (isa<ttg::LocalDeallocOp, scf::YieldOp>(op))
+  if (isa<ttg::LocalDeallocOp, scf::YieldOp, scf::ConditionOp>(op))
     return true;
   if (op->getName().getStringRef() == "llvm.intr.assume")
     return true;
@@ -831,8 +831,11 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return false; // unhandled math op: let string path emit the error
   }
 
+  bool noCF = getenv("MSL_AST_NO_CF");
+
   // scf.if: predeclare result vars, then IfScope with then/else sub-blocks.
   if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    if (noCF) return false;
     SmallVector<SmallVector<std::string>> results;
     for (Value res : ifOp.getResults())
       results.push_back(astDeclResultVars(res, body));
@@ -863,7 +866,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   // scf.for (non-fused, non-wide-IV). Fused GEMM K-loops and i64-IV loops keep
   // the string path (captured) for now.
   if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-    if (getenv("MSL_AST_NO_CF"))
+    if (noCF)
       return false;
     if (matchGemmDotLoop(forOp))
       return false;
@@ -906,6 +909,55 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
          astYieldAssign(forOp.getBody()->getTerminator(), carried))
       loopBody.push_back(s);
     body.push_back(astForNode(forOp, std::move(loopBody), iv, tc, ivTy, wideIv));
+    return true;
+  }
+
+  // scf.while: `while (true) { <before> if (!(c)) { <fwd> break; } <after> <yield> }`
+  if (auto wh = dyn_cast<scf::WhileOp>(op)) {
+    if (noCF) return false;
+    SmallVector<SmallVector<std::string>> carried;
+    for (auto [i, init] : llvm::enumerate(wh.getInits())) {
+      auto &initNames = names(init);
+      SmallVector<std::string> vars = astDeclResultVars(init, body);
+      for (size_t r = 0; r < vars.size(); ++r)
+        body.push_back(ctx.assignStmt(
+            ctx.var(vars[r]),
+            ctx.var(initNames[initNames.size() == 1 ? 0 : r])));
+      valMap[wh.getBeforeArguments()[i]] = vars;
+      carried.push_back(vars);
+    }
+    SmallVector<SmallVector<std::string>> results;
+    for (Value res : wh.getResults())
+      results.push_back(astDeclResultVars(res, body));
+
+    unsigned d = (unsigned)indent + 1;
+    msl::Block loopBody = astWalkBlock(wh.getBefore().front(), d);
+    auto cond = cast<scf::ConditionOp>(wh.getBefore().front().getTerminator());
+    // if (!(c)) { <forward results> break; }
+    msl::Block brk;
+    for (auto [i, fwd] : llvm::enumerate(cond.getArgs())) {
+      auto &src = names(fwd);
+      for (size_t r = 0; r < results[i].size(); ++r)
+        brk.push_back(ctx.assignStmt(ctx.var(results[i][r]),
+                                     ctx.var(src[src.size() == 1 ? 0 : r])));
+    }
+    brk.push_back(ctx.breakStmt());
+    msl::Expr *guard = ctx.unary(
+        msl::UnOp::LNot, ctx.paren(ctx.var(names(cond.getCondition())[0])));
+    loopBody.push_back(ctx.ifScope(guard, std::move(brk)));
+
+    for (auto [i, fwd] : llvm::enumerate(cond.getArgs()))
+      valMap[wh.getAfterArguments()[i]] = names(fwd);
+
+    for (msl::Stmt *s : astWalkBlock(wh.getAfter().front(), d))
+      loopBody.push_back(s);
+    for (msl::Stmt *s :
+         astYieldAssign(wh.getAfter().front().getTerminator(), carried))
+      loopBody.push_back(s);
+
+    body.push_back(ctx.whileScope(nullptr, std::move(loopBody)));
+    for (auto [i, res] : llvm::enumerate(wh.getResults()))
+      valMap[res] = results[i];
     return true;
   }
 

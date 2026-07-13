@@ -574,6 +574,122 @@ bool MSLEmitter::astScanWarpCarry(
   return true;
 }
 
+// Multi-block region -> state-machine dispatch Block. Predeclares block-arg vars
+// + cross-block hoisted vars, then a StateMachineScope with per-block cases
+// (walked ops + hoist spills + terminator edge). Mirrors emitBlockCFG.
+msl::Block MSLEmitter::astEmitBlockCFG(Region &region) {
+  msl::Block out;
+  blockLabel.clear();
+  int idx = 0;
+  for (Block &blk : region)
+    blockLabel[&blk] = std::to_string(idx++);
+
+  for (Block &blk : llvm::drop_begin(region))
+    for (BlockArgument arg : blk.getArguments()) {
+      if (isDatalessType(arg.getType())) {
+        valMap[arg] = SmallVector<std::string>{};
+        continue;
+      }
+      valMap[arg] = astDeclResultVars(arg, out);
+    }
+  llvm::DenseMap<Value, SmallVector<std::string>> hoist;
+  for (Block &blk : region)
+    for (Operation &op : blk)
+      for (Value res : op.getResults()) {
+        if (isDatalessType(res.getType()))
+          continue;
+        bool crosses = llvm::any_of(res.getUsers(), [&](Operation *u) {
+          return u->getBlock() != &blk;
+        });
+        if (crosses)
+          hoist[res] = astDeclResultVars(res, out);
+      }
+
+  std::string state = fresh();
+  cfgState = state;
+  llvm::SmallVector<std::pair<std::string, msl::Block>> cases;
+  for (Block &blk : region) {
+    msl::Block caseBody = astWalkBlock2(blk, hoist);
+    // terminator edge
+    for (msl::Stmt *s : astTerminatorEdge(blk.getTerminator(), state))
+      caseBody.push_back(s);
+    cases.push_back({blockLabel[&blk], std::move(caseBody)});
+  }
+  cfgState.clear();
+  out.push_back(astBlockCFG(region, state, cases));
+  return out;
+}
+
+// Walk a CFG block's non-terminator ops, spilling cross-block results into their
+// hoisted vars (and rebinding) after each defining op.
+msl::Block
+MSLEmitter::astWalkBlock2(Block &blk,
+                          llvm::DenseMap<Value, SmallVector<std::string>> &hoist) {
+  msl::Block body;
+  int savedIndent = indent;
+  ++indent; // state-machine case body prints one level deeper
+  ++indent;
+  for (Operation &op : blk.without_terminator()) {
+    if (!astEmitOp(&op, body)) {
+      Operation *opp = &op;
+      msl::Stmt *raw = captureRaw([&] {
+        if (failed(emitOp(opp)))
+          emitFailed = true;
+      });
+      if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
+        body.push_back(raw);
+      if (barrierPending) {
+        body.push_back(ctx.barrier(barrierPendingDevice));
+        barrierPending = false;
+        barrierPendingDevice = false;
+      }
+    }
+    for (Value res : op.getResults()) {
+      auto it = hoist.find(res);
+      if (it == hoist.end())
+        continue;
+      auto &cur = names(res);
+      for (size_t r = 0; r < it->second.size(); ++r)
+        body.push_back(ctx.assignStmt(
+            ctx.var(it->second[r]), ctx.var(cur[cur.size() == 1 ? 0 : r])));
+      valMap[res] = it->second;
+    }
+  }
+  indent = savedIndent;
+  return body;
+}
+
+// Terminator -> state transition: branch (edge), cond_branch (if/else edges), or
+// a normal op (return, walked via astEmitOp/capture).
+msl::Block MSLEmitter::astTerminatorEdge(Operation *term, StringRef state) {
+  msl::Block out;
+  if (auto br = dyn_cast<cf::BranchOp>(term)) {
+    for (msl::Stmt *s : astBranchEdge(br.getDest(), br.getDestOperands(), state))
+      out.push_back(s);
+    return out;
+  }
+  if (auto cbr = dyn_cast<cf::CondBranchOp>(term)) {
+    msl::Block thenB =
+        astBranchEdge(cbr.getTrueDest(), cbr.getTrueDestOperands(), state);
+    msl::Block elseB =
+        astBranchEdge(cbr.getFalseDest(), cbr.getFalseDestOperands(), state);
+    out.push_back(astCondBranch(cbr.getCondition(), std::move(thenB),
+                                std::move(elseB)));
+    return out;
+  }
+  // return / other terminator through astEmitOp (or capture).
+  if (!astEmitOp(term, out)) {
+    Operation *tp = term;
+    msl::Stmt *raw = captureRaw([&] {
+      if (failed(emitOp(tp)))
+        emitFailed = true;
+    });
+    if (!llvm::cast<msl::RawStmt>(raw)->text.empty())
+      out.push_back(raw);
+  }
+  return out;
+}
+
 // Fused GEMM K-loop: carry iter-args, run the dot Decl phase, the K-loop with
 // the MMA-phase dot in its body, the non-acc carry, direct-store setup, then the
 // Readback-phase dot. Mirrors emitFusedGemm with AST nodes.
@@ -833,6 +949,8 @@ msl::Block MSLEmitter::astWalkBlock(Block &blk, unsigned depth) {
     if (astEmitOp(&op, body))
       continue;
     Operation *opp = &op;
+    if (getenv("MSL_LOG_CAPTURE"))
+      llvm::errs() << "CAPTURE: " << op.getName().getStringRef() << "\n";
     msl::Stmt *raw = captureRaw([&] {
       if (failed(emitOp(opp)))
         emitFailed = true;
@@ -2474,6 +2592,67 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   // tt.return
   if (auto ret = dyn_cast<tt::ReturnOp>(op)) {
     body.push_back(astReturn(ret));
+    return true;
+  }
+
+  // tt.call: build the device-fn call expr, bind results (scalar/multi/tensor).
+  if (auto cl = dyn_cast<tt::CallOp>(op)) {
+    auto callee = mod.lookupSymbol<tt::FuncOp>(cl.getCalleeAttr().getValue());
+    if (!callee)
+      return false;
+    llvm::SmallVector<msl::Expr *> args;
+    for (Value operand : cl.getOperands()) {
+      auto &nm = names(operand);
+      if (nm.size() != 1)
+        return false;
+      args.push_back(ctx.var(nm[0]));
+    }
+    args.push_back(ctx.var(tgposId));
+    args.push_back(ctx.var(tidId));
+    args.push_back(ctx.var(numTgId));
+    if (globalPoolBytes > 0)
+      args.push_back(ctx.var(poolBuf.empty() ? "__pool" : poolBuf));
+    auto call = ctx.call(mslDeviceFuncName(callee.getName()), args);
+
+    unsigned nRes = cl.getNumResults();
+    if (nRes == 1 && isa<RankedTensorType>(cl.getResult(0).getType())) {
+      Value res = cl.getResult(0);
+      msl::Type *scTy = astScalarType(
+          cast<RankedTensorType>(res.getType()).getElementType());
+      std::string tmp = fresh();
+      body.push_back(ctx.declStmt(astDeviceRetType(callee), tmp, call));
+      int rc = regCount(res);
+      SmallVector<std::string> idsV;
+      for (int i = 0; i < rc; ++i) {
+        std::string id = fresh();
+        body.push_back(ctx.declStmt(
+            scTy, id, ctx.member(ctx.var(tmp), "f" + std::to_string(i))));
+        idsV.push_back(id);
+      }
+      valMap[res] = idsV;
+      return true;
+    }
+    if (nRes == 0) {
+      body.push_back(ctx.exprStmt(call));
+      return true;
+    }
+    if (nRes == 1) {
+      if (!isa<IntegerType, FloatType>(cl.getResult(0).getType()))
+        return false;
+      std::string id = fresh();
+      body.push_back(ctx.declStmt(astScalarType(cl.getResult(0).getType()), id,
+                                  call));
+      bindScalar(cl.getResult(0), id);
+      return true;
+    }
+    std::string tmp = fresh();
+    body.push_back(ctx.declStmt(astDeviceRetType(callee), tmp, call));
+    for (auto [i, res] : llvm::enumerate(cl.getResults())) {
+      std::string id = fresh();
+      body.push_back(ctx.declStmt(astScalarType(res.getType()), id,
+                                  ctx.member(ctx.var(tmp), "f" + std::to_string(i))));
+      bindScalar(res, id);
+    }
     return true;
   }
 

@@ -392,6 +392,10 @@ private:
   // false when the op has no whole-op sibling yet (flip layer 7b fills these).
   bool astEmitOp(Operation *op, msl::Block &body);
   msl::Block astWalkBlock(Block &blk, unsigned depth);
+  msl::Block astEmitBlockCFG(Region &region);
+  msl::Block astWalkBlock2(Block &blk,
+                           llvm::DenseMap<Value, SmallVector<std::string>> &hoist);
+  msl::Block astTerminatorEdge(Operation *term, StringRef state);
   SmallVector<std::string> astDeclResultVars(Value v, msl::Block &body);
   msl::Expr *astDerefPtr(Value ptr, StringRef name, StringRef scName);
   void astStoreBody(tt::StoreOp op, msl::Block &body);
@@ -611,17 +615,12 @@ private:
     }
 
     Region &region = func.getBody();
-    if (region.hasOneBlock()) {
-      msl::Block body = astWalkBlock(region.front(), indent);
-      if (emitFailed)
-        return failure();
-      msl::MSLPrinter printer(os);
-      printer.printBlockAt(body, indent);
-    } else {
-      if (failed(emitBlockCFG(region)))
-        return failure();
-      flushBarrier();
-    }
+    msl::Block body = region.hasOneBlock() ? astWalkBlock(region.front(), indent)
+                                           : astEmitBlockCFG(region);
+    if (emitFailed)
+      return failure();
+    msl::MSLPrinter printer(os);
+    printer.printBlockAt(body, indent);
     os << "}\n";
     return success();
   }
@@ -743,17 +742,12 @@ private:
     poolBuf = devPoolPtr;
     curDevFunc = func;
     Region &region = func.getBody();
-    if (region.hasOneBlock()) {
-      msl::Block body = astWalkBlock(region.front(), indent);
-      if (emitFailed)
-        return failure();
-      msl::MSLPrinter printer(os);
-      printer.printBlockAt(body, indent);
-    } else {
-      if (failed(emitBlockCFG(region)))
-        return failure();
-      flushBarrier();
-    }
+    msl::Block body = region.hasOneBlock() ? astWalkBlock(region.front(), indent)
+                                           : astEmitBlockCFG(region);
+    if (emitFailed)
+      return failure();
+    msl::MSLPrinter printer(os);
+    printer.printBlockAt(body, indent);
     curDevFunc = nullptr;
     os << "}\n";
     return success();

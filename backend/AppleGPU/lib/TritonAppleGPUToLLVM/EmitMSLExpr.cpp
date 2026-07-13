@@ -146,10 +146,13 @@ msl::Expr *MSLEmitter::astTernaryCallExpr(StringRef fn, StringRef a,
 msl::Expr *MSLEmitter::astCastExpr(Operation *op, StringRef v) {
   Type resElem = elementScalarType(op->getResult(0).getType());
   msl::Expr *src = ctx.var(v);
-  if (isa<arith::ExtUIOp, arith::UIToFPOp>(op))
-    src = ctx.cast(msl::Cast::Style::CStyle,
-                   astUnsignedType(elementScalarType(op->getOperand(0).getType())),
-                   src);
+  if (isa<arith::ExtUIOp, arith::UIToFPOp>(op)) {
+    // i1 has no unsigned MSL type; a bool source needs no reinterpret cast
+    // (bool->wider is already zero-extending), so skip it as the string path did.
+    if (msl::Type *u =
+            astUnsignedType(elementScalarType(op->getOperand(0).getType())))
+      src = ctx.cast(msl::Cast::Style::CStyle, u, src);
+  }
   return ctx.cast(msl::Cast::Style::Static, astScalarType(resElem), src);
 }
 

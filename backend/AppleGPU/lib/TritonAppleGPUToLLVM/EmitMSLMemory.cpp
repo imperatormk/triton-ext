@@ -1,13 +1,10 @@
-// EmitMSLMemory.cpp - memory / offset-expression lowering (string + AST forms).
+// EmitMSLMemory.cpp - memory / offset-expression lowering.
 //
-// Out-lined AST siblings (astXxx) of the offset/address string builders in
-// MSLEmitter.h. They rebuild the same runtime address expression as typed
-// msl::Expr nodes; emission still runs on the string path this layer, so text
-// is unchanged.
+// AST builders (astXxx) that build the runtime offset/address expressions as
+// typed msl::Expr nodes for the printer to emit.
 //
-// INVARIANT: the printer inserts no grouping parens. Wherever the string path
-// wrapped a subexpression for precedence, the AST sibling inserts an explicit
-// ctx.paren(...) so both forms print identically.
+// INVARIANT: the printer inserts no grouping parens; a builder inserts an
+// explicit ctx.paren(...) wherever a subexpression needs precedence grouping.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -186,8 +183,7 @@ msl::Expr *MSLEmitter::astMemdescElemAddr(const MemDescInfo &info,
   }
   if (info.baseOffset == "0")
     return off;
-  // baseOffset is still std::string on MemDescInfo this layer; bridge via raw.
-  // The flip layer should convert baseOffset to Expr* and drop this ctx.raw.
+  // baseOffset is a std::string on MemDescInfo, bridged here via ctx.raw.
   return ctx.paren(ctx.binary(msl::BinOp::Add, ctx.raw(info.baseOffset), off));
 }
 

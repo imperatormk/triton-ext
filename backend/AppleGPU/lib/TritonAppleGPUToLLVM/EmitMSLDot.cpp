@@ -1,19 +1,16 @@
-// EmitMSLDot.cpp - dot/GEMM simdgroup-matrix + fp-narrowing lowering
-// (string + AST forms).
+// EmitMSLDot.cpp - dot/GEMM simdgroup-matrix + fp-narrowing lowering.
 //
-// Out-lined AST siblings of the simdgroup-matrix fragment MMA sub-builders in
-// emitDot/emitDotScalar/emitFusedGemm, plus the fp_to_fp narrowing helpers.
-// Emission still runs on the string path this layer; these nodes only need to
-// exist and print byte-identically once the flip layer routes emission here.
+// AST builders for the simdgroup-matrix fragment MMA (astEmitDot /
+// astEmitDotScalar / astEmitFusedGemm), plus the fp_to_fp narrowing helpers.
 //
-// INVARIANT: the printer inserts no grouping parens; wherever the string path
-// wrapped a subexpression the AST sibling inserts an explicit ctx.paren(...).
+// INVARIANT: the printer inserts no grouping parens; a builder inserts an
+// explicit ctx.paren(...) wherever a subexpression needs precedence grouping.
 // The fp-narrowing bit-twiddling body is the design-sanctioned Raw escape
-// hatch (MSL_AST_DESIGN.md): the sibling wraps the exact string block in one
-// RawStmt and keeps only the outer `sc h = as_type<sc>(bits);` as real nodes.
-// These siblings must never touch nextId/indent - emission owns those - so the
-// fp helpers reconstruct their block through a private id/indent local seeded
-// from the emitter's current state without mutating it.
+// hatch (MSL_AST_DESIGN.md): the builder wraps that block in one RawStmt and
+// keeps only the outer `sc h = as_type<sc>(bits);` as real nodes. The fp
+// helpers must never touch nextId/indent, so they reconstruct their block
+// through a private id/indent local seeded from the emitter's current state
+// without mutating it.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -28,10 +25,10 @@ using B = msl::BinOp;
 using CS = msl::Cast::Style;
 } // namespace
 
-// tt.dot -> simdgroup-matrix fragment MMA. Full AST mirror of emitDot: panel /
-// fused (Decl/MMA/Readback + direct-store) / per-dot (disjoint / aliased-banded)
-// paths. Guard/offset compound exprs are ctx.raw leaves matching the string
-// spelling; the per-fragment MMA + readback are the shared astSg* siblings.
+// tt.dot -> simdgroup-matrix fragment MMA: panel / fused (Decl/MMA/Readback +
+// direct-store) / per-dot (disjoint / aliased-banded) paths. Guard/offset
+// compound exprs are ctx.raw leaves; the per-fragment MMA + readback are the
+// shared astSg* builders.
 bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
   auto aTy = cast<RankedTensorType>(op.getA().getType());
   auto bTy = cast<RankedTensorType>(op.getB().getType());
@@ -741,7 +738,7 @@ msl::MatrixType *MSLEmitter::astSgFragType(Type t) {
   return ctx.matrix(msl::MatrixType::Elem::Float);
 }
 
-// `base + off` (no outer paren - the string path emits it bare inside the call).
+// `base + off` (no outer paren - emitted bare inside the call).
 msl::Expr *MSLEmitter::astFragAddr(StringRef base, int64_t off) {
   return ctx.binary(msl::BinOp::Add, ctx.var(base), ctx.lit(std::to_string(off)));
 }

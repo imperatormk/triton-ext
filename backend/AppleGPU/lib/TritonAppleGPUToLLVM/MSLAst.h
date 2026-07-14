@@ -274,8 +274,8 @@ struct BarrierStmt : Stmt {
 
 // `if (cond) <stmt>` on one line, no braces (load mask, store guard, etc.).
 // parenCond=false renders `if <cond> <stmt>` (cond already carries its parens);
-// used by the dot guards whose string form is `if (...) ...` with the parens
-// baked into the raw guard expression.
+// used by the dot guards that render `if (...) ...` with the parens baked into
+// the raw guard expression.
 struct CompactIfStmt : Stmt {
   Expr *cond;
   Stmt *then;
@@ -287,8 +287,8 @@ struct CompactIfStmt : Stmt {
 
 struct RawStmt : Stmt {
   llvm::StringRef text;
-  // verbatim => print text exactly (no indent, no trailing newline); used by the
-  // transitional capture path where `text` already carries indentation+newlines.
+  // verbatim => print text exactly (no indent, no trailing newline); used by
+  // captureRaw, where `text` already carries indentation+newlines.
   bool verbatim;
   RawStmt(llvm::StringRef t, bool verbatim)
       : Stmt(Kind::Raw), text(t), verbatim(verbatim) {}

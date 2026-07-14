@@ -1,9 +1,8 @@
 // MSLTypes.cpp - AST-typed forms of the MSL type helpers.
 //
 // Node-returning counterparts to mslScalarType/mslUnsignedType/mslStorageType
-// in MSLEmitter.h. Not yet wired into emission (Layer 1); they exist so later
-// layers build msl::Type nodes instead of type strings. Mappings mirror the
-// string helpers exactly (f64 -> float, pointee -> `device T*`).
+// in MSLEmitter.h: they build msl::Type nodes (f64 -> float, pointee ->
+// `device T*`) for the builders to use instead of type strings.
 
 #include "MSLEmitter.h"
 

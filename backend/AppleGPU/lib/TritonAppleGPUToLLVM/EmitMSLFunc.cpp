@@ -1,18 +1,14 @@
-// EmitMSLFunc.cpp - function / scope / control-flow AST sibling builders.
+// EmitMSLFunc.cpp - function / scope / control-flow AST builders.
 //
-// Out-lined AST siblings of the scope emitters in MSLEmitter.h: emitFunc,
-// emitDeviceFunc/Signature/Proto, declRetStruct/deviceRetType, emitReturn,
-// emitFor/emitIf/emitWhile, emitBlockCFG/emitBranchEdge/emitTerminator,
-// emitRegionBody/emitYieldAssign, and the emitOp dispatch spine (astEmitOp).
+// AST builders for the function scopes (driven from emitFunc / emitDeviceFunc /
+// emitDeviceFuncProto / declRetStruct in MSLEmitter.h) plus the per-op dispatch
+// spine (astEmitOp): each op's body is walked into a Block and wrapped with a
+// scope builder here, and astEmitOp is the sole minter of fresh() names.
 //
 // Control flow is modelled with real scope nodes (KernelFn/DeviceFn/ForScope/
 // TripCountForScope/IfScope/WhileScope/StateMachineScope) - never Raw blocks.
-// Emission still runs on the string path this layer; these builders only need
-// to compile and be structurally faithful. The flip layer (7b) walks each op's
-// body into a Block and wraps it with the scope builders here, at which point
-// astEmitOp becomes the sole minter of fresh() names.
 //
-// INVARIANTS mirrored from the string path:
+// INVARIANTS:
 //  - wide-IV i64 loops carry the induction-var decl as the FIRST body stmt
 //    (never floated into the for-header) so the AGX i65 Gauss-sum fold can't
 //    fire; the break is an IfScope + BreakStmt.
@@ -35,9 +31,7 @@ using CS = msl::Cast::Style;
 
 // The `struct fn_<name>_ret { sc f0; ... };` declaration. The field body has no
 // dedicated node kind (a struct decl is not a Stmt in the set), so it is a
-// RawStmt - the one design-sanctioned escape for a leaf with no node. Emission
-// still writes it via declRetStruct; this only exists for the flip's module
-// preamble assembly.
+// RawStmt - the one design-sanctioned escape for a leaf with no node.
 msl::Stmt *MSLEmitter::astRetStructDecl(tt::FuncOp func) {
   auto results = func.getFunctionType().getResults();
   std::string name = mslDeviceFuncName(func.getName()) + "_ret";

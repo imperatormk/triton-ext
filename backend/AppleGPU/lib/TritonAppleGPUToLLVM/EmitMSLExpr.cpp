@@ -1,13 +1,11 @@
-// EmitMSLExpr.cpp - value-producing expression lowering (string + AST forms).
+// EmitMSLExpr.cpp - value-producing expression lowering.
 //
-// Out-lined from MSLEmitter.h: the string helpers that emit an SSA-register
-// decl for each value-producing op, plus their AST siblings (astXxxExpr) that
-// build the same RHS as typed msl::Expr nodes. The AST builders do not drive
-// output yet (Layer 2); later layers assign their result into a DeclStmt init.
+// AST builders (astXxxExpr) that build the RHS for each value-producing op as
+// typed msl::Expr nodes, which astEmitOp assigns into a DeclStmt init.
 //
-// INVARIANT: the printer is dumb - it inserts no grouping parens. Wherever the
-// string path wrapped a subexpression in parens for precedence, the matching
-// AST builder inserts an explicit ctx.paren(...), so both forms print alike.
+// INVARIANT: the printer is dumb - it inserts no grouping parens. A builder
+// inserts an explicit ctx.paren(...) wherever a subexpression needs precedence
+// grouping.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -100,7 +98,7 @@ msl::Expr *MSLEmitter::astShiftExpr(Operation *op, StringRef a, StringRef b) {
   bool logical = isa<arith::ShLIOp, arith::ShRUIOp>(op);
   msl::Expr *lhs = ctx.var(a);
   if (logical) {
-    // Functional-style cast `usc(a)` (matches emitShift's string form).
+    // Functional-style cast `usc(a)`.
     std::string usc = mslUnsignedType(resElem);
     if (usc.empty())
       usc = "u" + mslScalarType(resElem);
@@ -148,7 +146,7 @@ msl::Expr *MSLEmitter::astCastExpr(Operation *op, StringRef v) {
   msl::Expr *src = ctx.var(v);
   if (isa<arith::ExtUIOp, arith::UIToFPOp>(op)) {
     // i1 has no unsigned MSL type; a bool source needs no reinterpret cast
-    // (bool->wider is already zero-extending), so skip it as the string path did.
+    // (bool->wider is already zero-extending), so skip it.
     if (msl::Type *u =
             astUnsignedType(elementScalarType(op->getOperand(0).getType())))
       src = ctx.cast(msl::Cast::Style::CStyle, u, src);
@@ -200,9 +198,9 @@ msl::Expr *MSLEmitter::astSelectExpr(StringRef c, StringRef t, StringRef f) {
 // Cross-lane shuffle
 //===----------------------------------------------------------------------===//
 
-// Statement form of the shuffle: emit the same temp decls emitShuffle writes
-// into `body` and return the fresh result name (used by reduce/scan where the
-// shuffled value must be a name the combiner region binds to).
+// Statement form of the shuffle: push the temp decls into `body` and return the
+// fresh result name (used by reduce/scan where the shuffled value must be a name
+// the combiner region binds to).
 std::string MSLEmitter::astShuffle(StringRef op, StringRef sc, StringRef val,
                                    StringRef arg, msl::Block &body) {
   using CS = msl::Cast::Style;

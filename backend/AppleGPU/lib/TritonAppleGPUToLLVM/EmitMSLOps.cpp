@@ -1,10 +1,9 @@
-// EmitMSLOps.cpp - op-dispatch spine + its lowering helpers (AST siblings).
+// EmitMSLOps.cpp - op-dispatch spine + its AST lowering helpers.
 //
-// Out-lined from EmitMSLFunc.cpp: the astEmitOp waterfall and the per-family
-// helpers it calls (astElemwiseDecls/astCombineN/astScanWarpCarry/astEmitMapCFG/
-// astEmitFusedGemm/astDeclResultVars/astDeclBind/astDerefPtr/astBandRoundTrip/
-// astStoreBody) plus the local cmpBinOp string->BinOp map. Pure code motion -
-// no behaviour change; the spine (EmitMSLFunc.cpp) drives astEmitOp.
+// The astEmitOp waterfall and the per-family helpers it calls
+// (astElemwiseDecls/astCombineN/astScanWarpCarry/astEmitMapCFG/astEmitFusedGemm/
+// astDeclResultVars/astDeclBind/astDerefPtr/astBandRoundTrip/astStoreBody) plus
+// the local cmpBinOp string->BinOp map.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -29,9 +28,8 @@ static msl::BinOp cmpBinOp(llvm::StringRef o) {
 // Op dispatch spine
 //===----------------------------------------------------------------------===//
 
-// Append the sibling nodes for a single elementwise/expr op's per-register
-// DeclStmts, using the expr-sibling `mk(r)` per register. Names come from a
-// LocalGen (not emission's nextId); post-flip astEmitOp mints the real names.
+// Append the nodes for a single elementwise/expr op's per-register DeclStmts,
+// using the expr-builder `mk(r)` per register. astEmitOp mints the real names.
 bool MSLEmitter::astElemwiseDecls(
     Operation *op, msl::Type *declTy, int &id, msl::Block &body,
     llvm::function_ref<msl::Expr *(int)> mk) {
@@ -43,9 +41,9 @@ bool MSLEmitter::astElemwiseDecls(
 }
 
 // Evaluate a reduce/scan/map combiner region into `body`: bind the 2N block
-// args to the operand names, AST-walk the region (its ops - arith/math/select -
-// are all flipped), and return the N terminator result names. The combiner ops
-// are all single-block, so a plain walk suffices.
+// args to the operand names, AST-walk the region (its ops - arith/math/select),
+// and return the N terminator result names. The combiner ops are all
+// single-block, so a plain walk suffices.
 bool MSLEmitter::astCombineN(Region &region, ArrayRef<std::string> aVals,
                              ArrayRef<std::string> bVals, msl::Block &body,
                              SmallVectorImpl<std::string> &results) {
@@ -72,9 +70,8 @@ bool MSLEmitter::astCombineN(Region &region, ArrayRef<std::string> aVals,
   return true;
 }
 
-// AST form of emitScanWarpCarry: the cross-warp inclusive-carry for one register
-// group. Mirrors the string emitter node-for-node (compound guard/index exprs
-// are ctx.raw leaves, matching the string's spelling exactly).
+// Cross-warp inclusive-carry for one register group. Compound guard/index exprs
+// are ctx.raw leaves.
 bool MSLEmitter::astScanWarpCarry(
     Region &region, int nOp, ArrayRef<std::string> scTys,
     ArrayRef<int64_t> byteWidths, ArrayRef<std::pair<int, int32_t>> warpBits,
@@ -405,8 +402,8 @@ MSLEmitter::astDeclResultVars(Value v, msl::Block &body) {
   return ids;
 }
 
-// Flip-aware per-register decls: mints real fresh() names (advancing nextId so
-// downstream captured/flipped ops stay in lockstep) and binds valMap[result].
+// Per-register decls: mints fresh() names (advancing nextId so downstream ops
+// stay in lockstep) and binds valMap[result].
 bool MSLEmitter::astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
                              llvm::function_ref<msl::Expr *(int)> mk) {
   int rc = regCount(op->getResult(0));
@@ -535,10 +532,9 @@ void MSLEmitter::astStoreBody(tt::StoreOp op, msl::Block &body) {
   }
 }
 
-// Route `op` to its sibling-builder(s), appending nodes to `body`. Returns true
-// when handled (including alias/dataless ops that append nothing). Ops whose
-// full lowering is not yet expressible from existing siblings return false -
-// the flip layer (7b) wires those; see the report for the exact list.
+// Route `op` to its builder(s), appending nodes to `body`. Returns true when
+// handled (including alias/dataless ops that append nothing); false for an
+// unsupported op, which the caller turns into a hard error.
 bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   auto opnd = [&](Value v, int r) -> StringRef {
     auto &nm = names(v);
@@ -592,7 +588,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     });
 
   // Integer add/sub/mul/div/rem (astIntBinaryExpr handles the i1 and unsigned
-  // paths; the decl type must match the string path's unsigned promotion).
+  // paths; the decl type must match the unsigned promotion).
   if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp, arith::DivSIOp,
           arith::DivUIOp, arith::RemSIOp, arith::RemUIOp>(op)) {
     msl::Type *declTy = astScalarType(resElem);
@@ -654,7 +650,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     if (auto rt = dyn_cast<RankedTensorType>(res.getType())) {
       auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
       if (!dense)
-        return false; // string path emits the error
+        return false; // unsupported: caller emits the error
       msl::Type *sc = astScalarType(rt.getElementType());
       bool isFloat = isa<FloatType>(rt.getElementType());
       std::string scStr = mslScalarType(rt.getElementType());
@@ -742,7 +738,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     case arith::CmpFPredicate::UEQ: o = "=="; break;
     case arith::CmpFPredicate::ONE:
     case arith::CmpFPredicate::UNE: o = "!="; break;
-    default: return false; // unsupported predicate: let string path error
+    default: return false; // unsupported predicate: caller emits the error
     }
     msl::BinOp bo = cmpBinOp(o);
     return astDeclBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
@@ -780,8 +776,8 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     });
   // TruncF / FpToFp: f32->half/bfloat narrowing emits a self-contained multi-line
   // block (RTZ or RTNE); other float casts are a plain static_cast. The narrowing
-  // block is captured verbatim (imperative multi-stmt, no expr sibling) but still
-  // advances the real nextId + binds valMap via the string helper.
+  // block is a captureRaw leaf (imperative multi-stmt) that still advances the
+  // real nextId + binds valMap.
   if (isa<arith::TruncFOp, tt::FpToFpOp>(op)) {
     std::string dst = mslScalarType(elementScalarType(op->getResult(0).getType()));
     Type srcElem = elementScalarType(op->getOperand(0).getType());
@@ -834,7 +830,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     });
 
   // min/max family (decl type is always the signed scalar; opCast/propagateNan
-  // per the string emitMinMax). Covers arith min/max, mulhi, remf(fmod).
+  // set per op). Covers arith min/max, mulhi, remf(fmod).
   {
     StringRef fn;
     msl::Type *opCast = nullptr;
@@ -915,12 +911,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
         msl::Expr *ten = ctx.cast(CS::CStyle, sc, ctx.lit("10"));
         return ctx.call(bi::precise::Pow, {ten, ctx.var(opnd(op->getOperand(0), r))});
       });
-    return false; // unhandled math op: let string path emit the error
+    return false; // unhandled math op: caller emits the error
   }
 
   // Pure register-rebind ops (no text emitted): splat / expand_dims / broadcast /
-  // join / split / unsplat. Their string emitters only rewrite valMap, so calling
-  // them here writes nothing to `os` and keeps the symbol table correct.
+  // join / split / unsplat. Their handlers only rewrite valMap, so calling them
+  // here writes nothing and keeps the symbol table correct.
   if (auto sp = dyn_cast<tt::SplatOp>(op))
     return succeeded(emitSplat(sp));
   if (auto u = dyn_cast<tt::UnsplatOp>(op)) {
@@ -1259,8 +1255,8 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return astEmitDot(dt, body);
 
   // tt.map_elementwise: per-group inline of the scalar region. Single-block
-  // groups AST-walk the region; multi-block groups use the string state machine
-  // (captured), as they are rare and self-contained.
+  // groups AST-walk the region; multi-block groups use the state-machine
+  // lowering (astEmitMapCFG).
   if (auto mp = dyn_cast<tt::MapElementwiseOp>(op)) {
     Region &region = mp.getScalarOp();
     Block &blk = region.front();
@@ -1759,7 +1755,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     unsigned axisLaneLow = axisLaneMask & (~axisLaneMask + 1);
     unsigned normMask = axisLaneMask / (axisLaneLow ? axisLaneLow : 1);
     if (axisLaneMask && (normMask & (normMask + 1)))
-      return false; // unsupported lane layout: let string path error
+      return false; // unsupported lane layout: caller emits the error
     unsigned axisWarpMask = 0;
     for (auto &pr : warpBits) axisWarpMask |= (1u << pr.first);
     int numWarps = ll.hasInDim(kWarp) ? ll.getInDimSize(kWarp) : 1;
@@ -2350,8 +2346,8 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
-  // scf.for (non-fused, non-wide-IV). Fused GEMM K-loops and i64-IV loops keep
-  // the string path (captured) for now.
+  // scf.for. Fused GEMM K-loops route to astEmitFusedGemm; i64-IV loops take the
+  // wide-IV shape below.
   if (auto forOp = dyn_cast<scf::ForOp>(op)) {
     if (auto m = matchGemmDotLoop(forOp))
       return astEmitFusedGemm(forOp, m->first, m->second, body);
@@ -2379,8 +2375,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     }
 
     // Wide-IV (i64) loops carry `tc` as the header counter and the real IV decl
-    // as the first body stmt (the AGX i65 Gauss-sum dodge). The string path mints
-    // iv first then tc; match that order.
+    // as the first body stmt (the AGX i65 Gauss-sum dodge). Mint iv before tc.
     std::string iv = fresh();
     std::string tc = wideIv ? fresh() : "";
     bindScalar(forOp.getInductionVar(), iv);
@@ -2445,8 +2440,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
-  // --- Flipped families slot in above this line; unflipped ops fall through to
-  // the string capture in astWalkBlock. ---
+  // Unsupported op: astWalkBlock turns this false into a hard error.
   return false;
 }
 

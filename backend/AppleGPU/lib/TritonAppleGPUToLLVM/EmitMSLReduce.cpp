@@ -1,20 +1,16 @@
-// EmitMSLReduce.cpp - reduce / scan / map_elementwise lowering (string + AST
-// forms).
+// EmitMSLReduce.cpp - reduce / scan / map_elementwise lowering.
 //
-// Out-lined AST siblings of the sub-builders in emitReduce, emitScan,
-// emitScanWarpCarry, emitMapElementwise, emitMapCFG and emitCombineN
-// (MSLEmitter.h). The cross-lane warp-carry sequences use the simd_shuffle
-// family via builtin::simd; the map_elementwise unstructured region is modelled
-// as a real StateMachineScope node (MSL forbids goto), the scan sweep loops as
-// guarded IfScope updates. Emission still runs on the string path this layer;
-// these nodes only need to exist and print byte-identically once the flip layer
-// routes emission here.
+// AST builders for the reduce/scan/map families, dispatched from astEmitOp. The
+// cross-lane warp-carry sequences use the simd_shuffle family via builtin::simd;
+// the map_elementwise unstructured region is modelled as a real
+// StateMachineScope node (MSL forbids goto), the scan sweep loops as guarded
+// IfScope updates.
 //
-// INVARIANT: the printer inserts no grouping parens; wherever the string path
-// wrapped a subexpression the AST sibling inserts an explicit ctx.paren(...).
-// A sibling must never touch nextId/indent - emission owns those - so builders
-// minting fresh names run over a private LocalGen id counter seeded from the
-// emitter's current nextId without mutating it.
+// INVARIANT: the printer inserts no grouping parens; a builder inserts an
+// explicit ctx.paren(...) wherever a subexpression needs precedence grouping.
+// A builder must never touch nextId/indent, so builders minting fresh names run
+// over a private LocalGen id counter seeded from the emitter's current nextId
+// without mutating it.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -73,7 +69,7 @@ msl::Stmt *MSLEmitter::astReduceScratchStore(StringRef scratch, StringRef acc) {
 }
 
 // The cross-warp base index ((warpId & <~warpMask>) * 32 + laneId), spelled as
-// a paren so scratch[base + K] mirrors the string path's parenthesised base.
+// a paren so scratch[base + K] keeps the base parenthesised.
 msl::Expr *MSLEmitter::astReduceWarpBase(unsigned warpMask) {
   msl::Expr *masked = ctx.paren(ctx.binary(
       B::And, ctx.var(warpId), ctx.lit(std::to_string(~warpMask))));
@@ -116,8 +112,8 @@ msl::Expr *MSLEmitter::astScanLaneShuffle(bool rev, StringRef sc,
 }
 
 // The axis-local lane predicate: `(laneId & <axisLaneMask>) >= <delta>` for a
-// forward sweep, `<= <axisLaneMask - delta>` for reverse. Returned parens
-// mirror the string path's local subexpression grouping.
+// forward sweep, `<= <axisLaneMask - delta>` for reverse. Returned parens keep
+// the local subexpression grouping.
 msl::Expr *MSLEmitter::astScanLaneGuard(bool rev, unsigned axisLaneMask,
                                         unsigned delta) {
   msl::Expr *local = ctx.paren(ctx.binary(

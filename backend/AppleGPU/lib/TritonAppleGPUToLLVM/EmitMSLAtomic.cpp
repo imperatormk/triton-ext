@@ -1,16 +1,12 @@
-// EmitMSLAtomic.cpp - atomic RMW / CAS / poll + histogram lowering
-// (string + AST forms).
+// EmitMSLAtomic.cpp - atomic RMW / CAS / poll + histogram lowering.
 //
-// Out-lined AST siblings of the atomic sub-builders in emitAtomicRMW,
-// emitAtomicCAS, emitAtomicPoll and emitHistogram (MSLEmitter.h). The CAS /
+// AST builders for the atomic families, dispatched from astEmitOp. The CAS /
 // spin / zero-init control flow is modelled as real WhileScope / IfScope /
 // ForScope node trees (not Raw blocks) - atomics control flow is exactly what
-// the node set exists to express. Emission still runs on the string path this
-// layer; these nodes only need to exist and print byte-identically once the
-// flip layer routes emission here.
+// the node set exists to express.
 //
-// INVARIANT: the printer inserts no grouping parens; wherever the string path
-// wrapped a subexpression the AST sibling inserts an explicit ctx.paren(...).
+// INVARIANT: the printer inserts no grouping parens; a builder inserts an
+// explicit ctx.paren(...) wherever a subexpression needs precedence grouping.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -36,8 +32,8 @@ msl::Expr *MSLEmitter::astInit0(StringRef sc) {
 
 // (device <atomicTy>*)p - the atomic-typed device pointer the RMW/poll casts to.
 // atomicTy is spelled by name (atomic_int/atomic_uint/atomic_float/...) so the
-// pointee is a NamedType, keeping the sibling agnostic to the string path's
-// scalar->atomic choice.
+// pointee is a NamedType, keeping the builder agnostic to the scalar->atomic
+// choice.
 msl::Expr *MSLEmitter::astDeviceAtomicPtr(StringRef atomicTy, StringRef p) {
   msl::Type *ptr = ctx.ptr(ctx.named(atomicTy), msl::AddrSpace::Device);
   return ctx.cast(CS::CStyle, ptr, ctx.var(p));
@@ -87,7 +83,7 @@ msl::Block MSLEmitter::astPacked16Base(StringRef p, std::string &wordPtrOut,
 
 // fn((device atomicTy*)p, v, order[, mem_flags::mem_device]).
 // `order` / `memflags` come from MSLConstants so the ordering surface stays
-// greppable; the memflags arg is present iff the string path appended `tail`.
+// greppable; the memflags arg is present iff `tail` is set.
 msl::Expr *MSLEmitter::astAtomicRmwCall(StringRef fn, StringRef atomicTy,
                                         StringRef p, StringRef v,
                                         StringRef order, bool memFlags) {

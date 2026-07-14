@@ -35,8 +35,8 @@ namespace mlir::triton::applegpu {
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 
-// fresh() over the emitter's live id counter (by reference): AST sibling
-// builders mint real names that advance the caller's id in lockstep.
+// fresh() over the emitter's live id counter (by reference): builders mint real
+// names that advance the caller's id in lockstep.
 struct LocalGen {
   int &id;
   std::string fresh() { return "v" + std::to_string(id++); }
@@ -125,7 +125,7 @@ inline Type elementScalarType(Type t) {
 }
 
 // Forwarding stream: `os` writes here, and the sink can be retargeted so a
-// still-string op family can be captured into a buffer (hybrid RawStmt path).
+// design-sanctioned raw leaf's text can be captured into a buffer (RawStmt).
 class ForwardOStream : public llvm::raw_ostream {
 public:
   explicit ForwardOStream(llvm::raw_ostream *sink) : sink(sink) {
@@ -209,9 +209,9 @@ private:
   ForwardOStream fwd;
   raw_ostream &os;
 
-  // Capture the string output of `fn` (which writes to `os`) into a verbatim
-  // RawStmt. Transitional: lets a not-yet-flipped op family print byte-identical
-  // while the surrounding function is AST-driven. Removed once all families flip.
+  // Capture the text `fn` writes to `os` into a verbatim RawStmt. Used for the
+  // design-sanctioned raw leaves (fp-emulated CAS, fp-narrowing) that have no
+  // dedicated node kind.
   template <typename Fn> msl::Stmt *captureRaw(Fn &&fn) {
     std::string buf;
     llvm::raw_string_ostream ss(buf);
@@ -247,7 +247,7 @@ private:
   llvm::DenseMap<Value, MemDescInfo> memdescMap;
 
   // AST forms of the offset/address helpers (defs in EmitMSLMemory.cpp);
-  // insert explicit parens where the string path wrapped subexpressions.
+  // insert explicit parens where a subexpression needs precedence grouping.
   msl::Expr *astLayoutCoordExpr(RankedTensorType rt, int reg, StringAttr outDim);
   msl::Expr *astLayoutOffsetExpr(RankedTensorType rt, int reg);
   msl::Expr *astPoolRegion(int64_t byteOffset, StringRef sc);
@@ -259,8 +259,8 @@ private:
   msl::Expr *astMemdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
                                 int reg);
 
-  // AST siblings of the dot/GEMM simdgroup-matrix emission (defs in
-  // EmitMSLDot.cpp). Not driving emission this layer; mirror the string parens.
+  // AST builders for the dot/GEMM simdgroup-matrix lowering (defs in
+  // EmitMSLDot.cpp).
   msl::MatrixType *astSgFragType(Type t);
   msl::Expr *astFragAddr(StringRef base, int64_t off);
   msl::Stmt *astFragDecl(msl::MatrixType *frag, StringRef name);
@@ -270,7 +270,7 @@ private:
   msl::Stmt *astSgMultiplyAccumulate(StringRef acc, StringRef a, StringRef b);
   msl::Expr *astReadbackValue(StringRef buf, msl::Expr *off, StringRef base);
 
-  // atomic siblings (EmitMSLAtomic.cpp). Multi-statement builders return a
+  // atomic builders (EmitMSLAtomic.cpp). Multi-statement builders return a
   // msl::Block so the caller splices them at its own indent (no stray braces);
   // single-node builders return Stmt*/Expr*.
   msl::Expr *astInit0(StringRef sc);
@@ -299,7 +299,7 @@ private:
                              int64_t threads);
   msl::Stmt *astHistFetchAdd(msl::Expr *guard, StringRef bins, StringRef v);
 
-  // reduce / scan / map siblings (EmitMSLReduce.cpp). Multi-statement builders
+  // reduce / scan / map builders (EmitMSLReduce.cpp). Multi-statement builders
   // return a msl::Block spliced at caller indent; single-node builders return
   // Stmt*/Expr*. The cross-lane shuffles go through astShuffleExpr with the
   // builtin::simd names; control flow is real If/State-machine node trees.
@@ -338,9 +338,9 @@ private:
       StringRef state,
       ArrayRef<std::pair<std::string, msl::Block>> cases);
 
-  // function / scope / control-flow sibling builders (EmitMSLFunc.cpp). Each
-  // takes a pre-built body Block and returns the scope node; they never emit,
-  // so the flip layer (7b) walks the ops into the body then wraps it here.
+  // function / scope / control-flow builders (EmitMSLFunc.cpp). Each takes a
+  // pre-built body Block and returns the scope node: astEmitOp walks the ops
+  // into the body, then wraps it here.
   msl::DeviceFn *astDeviceProto(tt::FuncOp func);
   msl::NamedType *astRetStructType(tt::FuncOp func);
   msl::Stmt *astRetStructDecl(tt::FuncOp func); // ArrayDecl-less; RawStmt struct
@@ -373,9 +373,9 @@ private:
                         llvm::function_ref<msl::Expr *(int)> mk);
   bool astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
                    llvm::function_ref<msl::Expr *(int)> mk);
-  // Dispatch spine: appends the sibling nodes for `op` to `body`. Returns true
-  // when the op is wired (nodes appended, or nothing for alias/dataless ops);
-  // false when the op has no whole-op sibling yet (flip layer 7b fills these).
+  // Dispatch spine: appends the nodes for `op` to `body`. Returns true when the
+  // op is handled (nodes appended, or nothing for alias/dataless ops); false for
+  // an unsupported op, which astWalkBlock turns into a hard error.
   bool astEmitOp(Operation *op, msl::Block &body);
   msl::Block astWalkBlock(Block &blk, unsigned depth);
   msl::Block astEmitBlockCFG(Region &region);
@@ -689,7 +689,7 @@ private:
   std::string tgposId, tidId, numTgId, laneId, warpId;
   bool scalarSpinlock = false;
 
-  // Register-resident C GEMM fusion. When emitFor recognises an
+  // Register-resident C GEMM fusion. When the scf.for handler recognises an
   // `acc = tl.dot(a, b, acc)` K-loop it drives the enclosed tt.dot through the
   // three-phase path below: PhaseDecl declares persistent simdgroup fragments
   // (once, pre-loop), PhaseMMA stages A/B and accumulates into them (each
@@ -720,8 +720,8 @@ private:
   };
   FusedDotCtx fusedDot;
   // Terminal stores the fused readback already wrote directly to device (keyed
-  // by op), each with the runtime predicate under which it did so. emitStore
-  // guards the store on the negation to avoid a double write.
+  // by op), each with the runtime predicate under which it did so. The tt.store
+  // handler guards the store on the negation to avoid a double write.
   DenseMap<Operation *, std::string> directStoreHandled;
 
   static bool tracesToKernelArg(Value v) {
@@ -1186,14 +1186,14 @@ private:
     // Gate: the fused path only wins with a small warp-tile (<= 8
     // simdgroup_float8x8 accumulators per warp) AND the disjoint staging path
     // where staged A+B+C fits the pool (band == M, one readback). Anything
-    // larger falls back to the per-dot path. Staging bytes mirror emitDot: an
+    // larger falls back to the per-dot path. Staging bytes mirror the dot path: an
     // operand already resident in a threadgroup buffer (in-place) stages 0.
     int64_t aBytes = M * K * (bitsOf(aElem) / 8);
     int64_t bBytes = N * K * (bitsOf(aElem) / 8);
     int64_t cFull = M * N * 4;
     bool wholeTileFits = aBytes + bBytes <= 32768;
     // A/B that structurally resolve to a local_alloc buffer are loaded in place
-    // by emitDot (stage 0). The precise in-place base lives in memdescMap, which
+    // by astEmitDot (stage 0). The precise in-place base lives in memdescMap, which
     // is only populated once the enclosing memdesc_index is emitted inside the
     // loop; here (pre-loop) the structural walk is the reliable signal.
     int64_t stagedA = aBytes, stagedB = bBytes;

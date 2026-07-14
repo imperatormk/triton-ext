@@ -1,11 +1,10 @@
-// EmitMSLControlFlow.cpp - region / CFG-walk + scope-builder AST siblings.
+// EmitMSLControlFlow.cpp - region / CFG-walk + scope-builder AST builders.
 //
-// Out-lined from EmitMSLFunc.cpp: the structured-control-flow scope builders
-// (astForScope/astTripCountForScope/astForNode/astIfScope/astWhileScope), the
-// unstructured-CFG -> state-machine dispatch (astBlockCFG/astEmitBlockCFG/
-// astWalkBlock/astWalkBlock2/astBranchEdge/astCondBranch/astTerminatorEdge) and
-// the loop-carried / if-result yield resolution (astYieldAssign). Pure code
-// motion - no behaviour change; the spine (EmitMSLFunc.cpp) drives these.
+// The structured-control-flow scope builders (astForScope/astTripCountForScope/
+// astForNode/astIfScope/astWhileScope), the unstructured-CFG -> state-machine
+// dispatch (astBlockCFG/astEmitBlockCFG/astWalkBlock/astWalkBlock2/
+// astBranchEdge/astCondBranch/astTerminatorEdge) and the loop-carried /
+// if-result yield resolution (astYieldAssign). astEmitOp drives these.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -207,7 +206,7 @@ MSLEmitter::astWalkBlock2(Block &blk,
 }
 
 // Terminator -> state transition: branch (edge), cond_branch (if/else edges), or
-// a normal op (return, walked via astEmitOp/capture).
+// a normal op (return, walked via astEmitOp).
 msl::Block MSLEmitter::astTerminatorEdge(Operation *term, StringRef state) {
   msl::Block out;
   if (auto br = dyn_cast<cf::BranchOp>(term)) {
@@ -233,11 +232,9 @@ msl::Block MSLEmitter::astTerminatorEdge(Operation *term, StringRef state) {
   return out;
 }
 
-// Walk a single-block region's ops into a Block: each op goes through astEmitOp,
-// falling back to a verbatim capture of the string emitOp for not-yet-flipped
-// families. `depth` is the printer nesting the Block prints at, so a captured op
-// bakes matching indentation. Terminators (yield/return/branch) are walked too;
-// astEmitOp handles the dataless ones and captures the rest.
+// Walk a single-block region's ops into a Block: each op goes through astEmitOp.
+// `depth` is the printer nesting the Block prints at. Terminators
+// (yield/return/branch) are walked too; astEmitOp handles the dataless ones.
 msl::Block MSLEmitter::astWalkBlock(Block &blk, unsigned depth) {
   msl::Block body;
   int savedIndent = indent;

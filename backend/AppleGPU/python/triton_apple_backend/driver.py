@@ -2,7 +2,7 @@
 Apple GPU Triton backend driver.
 
 Dispatch pipeline:
-  metallib bytes (from compiler.py make_metallib stage)
+  metallib bytes (from compiler.py make_msl_metallib stage)
     → metal_utils.load_metallib(bytes)   [prebuilt extension, links against libtorch]
     → MetalLibrary.get_function(name)    → MetalKernel (PSO)
     → kernel(*tensors, threads=, group_size=)  [zero-copy via getMTLBufferStorage]

@@ -169,9 +169,6 @@ class MPSBackend(BaseBackend):
         # overlap benefit. No pipelining pass runs here.
 
         pm.run(mod, 'make_ttgir')
-        # Preliminary shared memory estimate (reduction scratchpad only).
-        # Overwritten in make_llir with the real total after convert_layout
-        # adds __tg_cvt_* threadgroup globals.
         metadata["shared"] = mod.get_int_attr("ttg.shared") or 0
         return mod
 

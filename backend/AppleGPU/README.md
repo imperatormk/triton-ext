@@ -1,20 +1,20 @@
 # Apple GPU Backend for Triton
 
-Out-of-tree Apple GPU (AIR) backend for the Triton compiler, built as a
-triton-ext plugin.
+Out-of-tree Apple GPU backend for the Triton compiler, built as a triton-ext
+plugin. Codegen lowers TTGIR straight to Metal Shading Language (MSL) text,
+which is compiled to a `.metallib` in-process via the Metal framework.
 
 ## Architecture
 
 ```text
 triton-ext/backend/AppleGPU/
   ├── ExportAppleGPU.cpp         Plugin registration (tritonGetPluginInfo API)
-  ├── CMakeLists.txt + lib/      C++ MLIR passes
-  ├── python/                    Python backend (pip installable)
-  │     └── triton_apple_backend/
-  │           ├── compiler.py    TTIR → TTGIR → LLVM IR → metallib
-  │           ├── driver.py      MPS GPU dispatch, buffer binding, scalar packing
-  │           └── metal_utils.m  ObjC++ Metal bridge (compiled at install time)
-  └── llvm-metal-target/         LLVM IR → AIR → metallib compiler
+  ├── CMakeLists.txt + lib/      C++ MLIR passes (incl. the EmitMSL emitter)
+  └── python/                    Python backend (pip installable)
+        └── triton_apple_backend/
+              ├── compiler.py    TTIR → TTGIR → MSL → metallib
+              ├── driver.py      MPS GPU dispatch, buffer binding, scalar packing
+              └── metal_utils.m  ObjC++ Metal bridge (compiled at install time)
 ```
 
 ## Prerequisites
@@ -72,13 +72,12 @@ cmake -S . -B build -G Ninja \
   -DLLVM_TABLEGEN_EXE=<llvm-project>/build/bin/llvm-tblgen
 # (export LLVM_INSTALL_DIR=<pinned llvm dir> so MLIR/LLVM cmake packages resolve)
 
-ninja -C build metal-llc libapplegpu_backend.dylib
+ninja -C build libapplegpu_backend.dylib
 ```
 
-This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/` and the
-`metal-llc` binary under `build/bin/`. cmake configures every extension
-(`dialect pass backend language extensions`); naming the ninja targets keeps the
-build to AppleGPU only.
+This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/`. cmake
+configures every extension (`dialect pass backend language extensions`); naming
+the ninja target keeps the build to AppleGPU only.
 
 ### 4. Run
 
@@ -87,7 +86,6 @@ dylib in `TRITON_PLUGIN_PATHS` and the `triton_apple_backend` on `PYTHONPATH`
 must come from the same build.
 
 ```bash
-export METAL_LLC_PATH=$PWD/build/bin/metal-llc
 export TRITON_PLUGIN_PATHS=$PWD/build/lib/libapplegpu_backend.dylib
 export TRITON_PASS_PLUGIN_PATH=$TRITON_PLUGIN_PATHS
 export PYTHONPATH=$PWD/backend/AppleGPU/python
@@ -120,13 +118,13 @@ print("vecadd ok")
 
 ### C++ MLIR Passes (loaded via TRITON_PLUGIN_PATHS)
 
-| Pass                             | Purpose                                                     |
-| -------------------------------- | ----------------------------------------------------------- |
-| `add_accelerate_matmul`          | Rewrite tt.dot → AppleMmaEncoding (simdgroup MMA)           |
-| `add_simplify_gather`            | Strip efficient_layout from large gathers (Metal JIT limit) |
-| `add_to_llvmir`                  | Lower AppleMmaEncoding → LLVM IR with simdgroup intrinsics  |
-| `add_lower_gpu_to_air`           | Lower gpu.thread_id/block_dim → AIR intrinsics              |
-| `add_reconcile_unrealized_casts` | Clean up leftover conversion casts                          |
+| Pass                    | Purpose                                                     |
+| ----------------------- | ----------------------------------------------------------- |
+| `add_accelerate_matmul` | Rewrite tt.dot → AppleMmaEncoding (simdgroup MMA)           |
+| `add_simplify_gather`   | Strip efficient_layout from large gathers (Metal JIT limit) |
+| `add_store_shuffle_layout` | Re-lay MMA epilogue stores as within-simdgroup shuffles  |
+| `add_widen_staging`     | Widen pipelined staging slots for barrier elision           |
+| `add_emit_msl`          | Emit MSL text directly from TTGIR (terminal codegen)        |
 
 ### TritonAppleGPU Dialect
 

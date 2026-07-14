@@ -868,7 +868,7 @@ private:
   // convert_layout is taken; anything else (dtype cast, reduction, second dot,
   // extra users) falls back to the pool readback. Fills `ds` on success.
   bool matchDirectStore(Value forResult, DirectStore &ds) {
-    if (getenv("MSL_NO_DIRECT_STORE"))
+    if (getenv("MSL_NO_DIRECT_STORE")) // escape hatch: fall back to pool readback
       return false;
     if (!forResult.hasOneUse())
       return false;
@@ -1139,7 +1139,7 @@ private:
   // iter-arg index, or nullopt.
   std::optional<std::pair<tt::DotOp, unsigned>>
   matchGemmDotLoop(scf::ForOp op) {
-    if (getenv("MSL_NO_FUSE"))
+    if (getenv("MSL_NO_FUSE")) // escape hatch: fall back to the per-dot path
       return std::nullopt;
     Block *body = op.getBody();
     auto yield = cast<scf::YieldOp>(body->getTerminator());

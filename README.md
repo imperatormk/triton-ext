@@ -63,32 +63,22 @@ extensions.
   automatically register extensions with Triton.
 
 - **[`backend/AppleGPU/`](./backend/AppleGPU/)**: Apple GPU backend plugin.
-  Lowers Triton kernels through TritonGPU → LLVM IR → AIR bitcode → `.metallib`
-  and dispatches via `MTLComputeCommandEncoder`. Pairs with the out-of-tree LLVM
-  Metal target below.
-
-  - The Apple GPU backend ships an out-of-tree LLVM Metal/AIR target under
-    [`backend/AppleGPU/llvm-metal-target/`](./backend/AppleGPU/llvm-metal-target/).
-    It builds against Triton's pinned LLVM via `find_package(LLVM CONFIG)`,
-    produces a `metal-llc` binary that the plugin shells out to at runtime, and
-    emits `.metallib` containers loadable by Apple's Metal runtime. No core LLVM
-    patches required.
+  Lowers Triton kernels from TTGIR directly to Metal Shading Language (MSL) text,
+  compiles that to a `.metallib` in-process via the Metal framework, and
+  dispatches via `MTLComputeCommandEncoder`. See
+  [`backend/AppleGPU/README.md`](./backend/AppleGPU/README.md) for details.
 
 ## Apple GPU quick start
 
 ```bash
-# 1. Build triton-ext normally. This produces both libTritonAppleGPUBackend
-#    and the metal-llc binary under build/bin/.
-make build
+# 1. Build the AppleGPU plugin (libapplegpu_backend.dylib under build/lib/).
+ninja -C build libapplegpu_backend.dylib
 
-# 2. Use it. The AppleGPU plugin auto-discovers metal-llc relative to its
-#    own install location, so no environment variables are needed.
-TRITON_PLUGIN_PATHS=/path/to/build/lib/libTritonAppleGPUBackend.dylib \
+# 2. Use it. The plugin compiles MSL to a metallib in-process, so no
+#    external tools or path overrides are needed.
+TRITON_PLUGIN_PATHS=/path/to/build/lib/libapplegpu_backend.dylib \
     pytest python/test/unit/language/test_core.py --device mps
 ```
-
-Override the metal-llc path for development with
-`METAL_LLC_PATH=/custom/metal-llc`.
 
 ## Prerequisites
 

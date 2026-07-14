@@ -1,9 +1,10 @@
 # MSL AST rewrite — architecture spec
 
+STATUS: shipped. This is the as-built design record for the MSL AST codegen.
+
 Rewrite of `EmitMSL.cpp`'s text-emission engine from raw `os << ind() << "..."`
 string-slinging into a typed MSL AST + a printer that owns all scope, brace, and
-indentation emission. Branch: `msl-ast-rewrite` (big-bang; merges to `msl-mlir`
-only when the full corpus is green).
+indentation emission.
 
 ## Why (not EmitC, not an RAII wrapper)
 
@@ -26,9 +27,9 @@ owns indent + the barrier-flush invariant, so no lowering method ever writes a
 - `MSLPrinter.h` / `MSLPrinter.cpp` — walks the AST, owns indent + scope braces +
   barrier peephole, produces the final MSL text. THE ONLY place `{`/`}`/indent
   is emitted.
-- `EmitMSL.cpp` — becomes the TTGIR->AST lowering (`emitXxx` build nodes, never
-  strings). Keeps all IR-analysis state (valMap, LinearLayout helpers, pool
-  accounting, fused-dot matchers, memdescMap).
+- `EmitMSL.cpp` + the `EmitMSL*.cpp` family — the TTGIR->AST lowering (`astXxx`
+  build nodes, never strings). Holds all IR-analysis state (valMap, LinearLayout
+  helpers, pool accounting, fused-dot matchers, memdescMap).
 
 ## Node set (fully typed — "model everything")
 
@@ -115,7 +116,7 @@ the body are one node; you cannot emit a header without its block).
 - The preamble (`#include`s, `using namespace metal;`, `tt_erf`) is a fixed
   header the printer emits before walking functions.
 
-## State that STAYS in EmitMSL (the lowering), unchanged in behavior
+## State that stays in EmitMSL (the lowering), unchanged in behavior
 
 These are IR-analysis, not text, and keep their exact semantics:
 - `valMap : DenseMap<Value, SmallVector<std::string>>` — the per-register symbol
@@ -123,36 +124,38 @@ These are IR-analysis, not text, and keep their exact semantics:
   unchanged.
 - `fresh()` name generator; fixed names `__pool`, `__tg_buf_n`, `__tgpos`, etc.
 - LinearLayout helpers: `regCount`, `registerCoords`, `layoutOffsetExpr`,
-  `flatTileOffset`, ... (these now return `Expr*` where they returned strings).
+  `flatTileOffset`, ... (these return `Expr*` where they returned strings).
 - Pool accounting: `poolBytes`, `globalPoolBytes`, `liveTgBytes`, `poolBudget()`,
   `scanPool` — unchanged.
-- `memdescMap` — but `baseOffset` becomes `Expr*` not `std::string`.
+- `memdescMap` — `baseOffset` stays a `std::string`, bridged into the AST via
+  `ctx.raw` at its one use site.
 - Fused-dot state: `FusedDotCtx`, `DirectStore`, `InPlaceOperand`, the matchers
   `matchGemmDotLoop`/`matchDirectStore`/`matchRowMajorOffset`/`matchBoundaryMask`
   — unchanged IR analysis; they now steer which Scope/Stmt nodes get built.
 - CFG: `blockLabel`, `cfgState` — feed `StateMachineScope`.
 - `scalarSpinlock` — flips `PointerType.coherent`.
 
-## Migration (big-bang on branch)
+## Migration (as-built)
 
-1. Land `MSLAst.h/.cpp` + `MSLPrinter.h/.cpp` with the full node set + a
-   round-trip test (build a small AST by hand, print it, diff against expected
-   MSL). Wire into CMake. This is the foundation; nothing else starts until the
-   printer round-trips.
-2. Convert EmitMSL bottom-up: types first (all `mslType`-family helpers return
-   `Type*`), then expressions (binary/cmp/cast/call/select), then the leaf
-   statements (decl/assign/store/load), then each scope family (func, for, if,
-   while, state-machine, fused-dot). Each converted family compiles but the file
-   is RED until the whole walk is nodes.
-3. Flip `emit()` to: build one AST per function, hand to `MSLPrinter`. Delete the
-   raw `os`/`indent`/`ind()`/inline `flushBarrier` from the emitter.
-4. Bring the corpus green: core (dot/scan/atomics/reduce/cast/precise_math),
-   test_kernels, fla, gluon, inductor GPUTests + stress. Byte-diff emitted MSL
-   against the pre-rewrite output for a sample of kernels where practical
-   (semantics-preserving refactor; diffs should be whitespace-only or explained).
-5. Merge to `msl-mlir` only when green.
+The rewrite landed in this order:
 
-## Invariants the rewrite must not break
+1. `MSLAst.h/.cpp` + `MSLPrinter.h/.cpp` with the full node set + a round-trip
+   test (build a small AST by hand, print it, diff against expected MSL), wired
+   into the build. The printer round-trip was the foundation everything else
+   built on.
+2. EmitMSL was converted bottom-up: types first (the `mslType`-family helpers
+   gained `Type*`-returning `astXxx` counterparts), then expressions
+   (binary/cmp/cast/call/select), then the leaf statements
+   (decl/assign/store/load), then each scope family (func, for, if, while,
+   state-machine, fused-dot).
+3. `emit()` builds one AST per function and hands it to `MSLPrinter`; the raw
+   `os`/`indent`/`ind()`/inline `flushBarrier` are gone from the emitter.
+4. The corpus was brought green: core (dot/scan/atomics/reduce/cast/
+   precise_math), test_kernels, fla, gluon, inductor GPUTests + stress. Emitted
+   MSL was byte-diffed against the pre-rewrite output (semantics-preserving
+   refactor; residual diffs are whitespace-only or explained).
+
+## Invariants the rewrite preserves
 
 - Barrier peephole semantics (adjacent-barrier collapse, stronger-scope wins,
   flush at every boundary) — now printer-owned but behaviorally identical.

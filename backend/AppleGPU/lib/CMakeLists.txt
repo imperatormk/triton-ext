@@ -1,2 +1,0 @@
-add_subdirectory(TritonAppleGPUTransforms)
-add_subdirectory(TritonAppleGPUToLLVM)

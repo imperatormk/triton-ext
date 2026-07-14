@@ -1,50 +1,18 @@
 """Apple MPS Triton backend.
 
-Compiles Triton kernels through TTIR → TTGIR → LLVM IR → metallib,
-then dispatches via MTLComputeCommandEncoder.
+Compiles Triton kernels through TTIR → TTGIR → MSL → metallib, then dispatches
+via MTLComputeCommandEncoder.
 """
 
 from dataclasses import dataclass
 import hashlib
 import os
 import re
-import subprocess
 import tempfile
 import threading
 
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton._C.libtriton import ir, passes, llvm
-
-
-def _host_macos_major() -> int:
-    """Target macOS major for AIR emission (host == target since we JIT).
-
-    The simdgroup-MMA intrinsic signature is keyed on this; macOS 26 maps to
-    the "16" era. Override with TRITON_MPS_TARGET_OS_MAJOR.
-    """
-    env = os.environ.get("TRITON_MPS_TARGET_OS_MAJOR")
-    if env:
-        try:
-            return int(env)
-        except ValueError:
-            pass
-    try:
-        import platform
-        major = int(platform.mac_ver()[0].split(".")[0])
-        major = 16 if major >= 16 else major
-    except Exception:
-        major = 16  # default: current shipping target
-    # Export so the C++ DotOp lowering pass selects the matching intrinsic.
-    os.environ.setdefault("TRITON_MPS_TARGET_OS_MAJOR", str(major))
-    return major
-
-
-def _air_triple(os_major: int) -> str:
-    """Canonical AIR triple for a target macOS major. subarch _vNN = major+12;
-    macOS 16-era is written as macosx26 (Apple renumber)."""
-    sub = os_major + 12
-    triple_os = 26 if os_major >= 16 else os_major
-    return f"air64_v{sub}-apple-macosx{triple_os}.0.0"
+from triton._C.libtriton import ir, passes
 
 
 # Libdevice patching: see _LibdevicePatchFinder in __init__.py
@@ -61,99 +29,6 @@ _msl_out_lock = threading.Lock()
 def _pmaybe_enable_debug(pm):
     if os.environ.get('TRITON_MPS_DEBUG'):
         pm.enable_debug()
-
-
-def _find_llc():
-    """Locate the metal-llc binary (nested or standalone build layout).
-
-    Override with METAL_LLC_PATH for ad-hoc dev.
-    """
-    if os.environ.get('METAL_LLC_PATH'):
-        return os.environ['METAL_LLC_PATH']
-    here = os.path.dirname(os.path.abspath(__file__))
-    apple_gpu = os.path.abspath(os.path.join(here, '..', '..'))
-    triton_ext = os.path.abspath(os.path.join(apple_gpu, '..', '..'))
-    candidates = [
-        os.path.join(triton_ext, 'build', 'bin', 'metal-llc'),
-        os.path.join(apple_gpu, 'llvm-metal-target', 'build', 'bin',
-                     'metal-llc'),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return None
-
-
-def _load_metalir():
-    """Return a compile function backed by the out-of-tree `metal-llc`."""
-    llc = _find_llc()
-    if not llc:
-        raise RuntimeError(
-            "metal-llc not found. Build the out-of-tree Metal target:\n"
-            "  cd <triton-ext>/llvm-metal-target && \\\n"
-            "    cmake -B build -G Ninja && cmake --build build")
-
-    def compile_ir(llvm_ir: str) -> tuple:
-        """One llc run: metallib bytes plus the post-pipeline threadgroup
-        total, emitted by the writer as a standard optimization remark
-        (-pass-remarks-output YAML), so the budget needs no second pass."""
-        import yaml  # type: ignore[import-untyped]
-
-        class _Remarks(yaml.SafeLoader):
-            pass
-
-        # remarks docs are tagged (!Passed/!Missed); map them all
-        _Remarks.add_multi_constructor(
-            '!', lambda loader, _suffix, node: loader.construct_mapping(node))
-        with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as out_f:
-            out_path = out_f.name
-        remarks_path = out_path + '.yaml'
-        try:
-            if os.environ.get('TRITON_MPS_DEBUG'):
-                print(
-                    f"[mps] llc: {llc} -mtriple={_air_triple(_host_macos_major())} (os_major={_host_macos_major()})"
-                )
-            proc = subprocess.run([
-                llc, '-mtriple=' + _air_triple(_host_macos_major()),
-                '-filetype=obj', '-pass-remarks-output=' + remarks_path, '-o',
-                out_path, '-'
-            ],
-                                  input=llvm_ir.encode(),
-                                  capture_output=True,
-                                  check=False)
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f"llc failed: {proc.stderr.decode(errors='replace')}")
-            with open(out_path, 'rb') as f:
-                obj = f.read()
-            tg = None
-            with open(remarks_path, 'r') as rf:
-                for doc in yaml.load_all(rf, Loader=_Remarks):
-                    if doc and doc.get('Name') == 'TGBytes':
-                        for arg in doc.get('Args', []):
-                            if 'TGBytes' in arg:
-                                tg = int(arg['TGBytes'])
-            if tg is None:
-                raise RuntimeError('TGBytes remark missing from llc output')
-            return obj, tg
-        finally:
-            for pth in (out_path, remarks_path):
-                try:
-                    os.unlink(pth)
-                except OSError:
-                    pass
-
-    return compile_ir
-
-
-_metalir_compile = None
-
-
-def _get_metalir_compile():
-    global _metalir_compile
-    if _metalir_compile is None:
-        _metalir_compile = _load_metalir()
-    return _metalir_compile
 
 
 @dataclass(frozen=True)
@@ -288,20 +163,10 @@ class MPSBackend(BaseBackend):
         passes.ttgpuir.add_fuse_nested_loops(pm)
         passes.common.add_canonicalizer(pm)
 
-        # Software pipeliner: multi-buffer loads, lowered to
-        # air.simdgroup_async_copy_2d (hardware DMA). The MSL path has no async
-        # copy (staging lowers to a synchronous threadgroup copy), so the
-        # multi-buffer pipeline only adds staging, barriers and slot rotation
-        # with no overlap benefit; skip it and stay single-buffered.
-        msl_path = bool(os.environ.get('TRITON_MPS_EMIT_MSL_MLIR'))
-        if options.num_stages > 1 and not msl_path:
-            passes.ttgpuir.add_assign_latencies(pm, options.num_stages)
-            passes.ttgpuir.add_schedule_loops(pm)
-            passes.ttgpuir.add_pipeline(pm, options.num_stages, False)
-            # num_stages=2 gets one staging slot upstream (forces a per-dot TG
-            # barrier); widen to 2 rotating slots so barrier elision fires. The
-            # pass bails itself when 2 slots break the 32KB TG budget.
-            _plugin.add_widen_staging(pm)
+        # The MSL path has no async copy (staging lowers to a synchronous
+        # threadgroup copy), so it stays single-buffered — the software
+        # pipeliner would only add staging, barriers and slot rotation with no
+        # overlap benefit. No pipelining pass runs here.
 
         pm.run(mod, 'make_ttgir')
         # Preliminary shared memory estimate (reduction scratchpad only).
@@ -345,33 +210,6 @@ class MPSBackend(BaseBackend):
         metadata["shared"] = 0
         return mod
 
-    def make_msl_llir(self, mod, metadata, options):
-        # The MSL path lowers TTGIR straight to MSL source, so it produces no
-        # LLVM IR. Tests that inspect asm["llir"] (licm.disable markers, poison
-        # propagation) still need one, so we run the AIR path's TTGIR->LLVM
-        # lowering purely to expose that IR. EmitMSL is read-only, so the module
-        # it saw is intact here; make_llir mutates it to the LLVM dialect, which
-        # is fine because make_msl already stashed the MSL source in metadata and
-        # make_msl_metallib ignores its module argument.
-        name = metadata.get("name")
-        shared = metadata.get("shared")
-        old_opt = os.environ.get('METAL_LLVM_OPT_LEVEL')
-        os.environ['METAL_LLVM_OPT_LEVEL'] = '0'
-        try:
-            llvm_mod = self.make_llir(mod, metadata, options)
-        finally:
-            if old_opt is None:
-                os.environ.pop('METAL_LLVM_OPT_LEVEL', None)
-            else:
-                os.environ['METAL_LLVM_OPT_LEVEL'] = old_opt
-        metadata.pop("_llvm_ir", None)
-        metadata.pop("_dynamic_smem_bytes", None)
-        if name is not None:
-            metadata["name"] = name
-        if shared is not None:
-            metadata["shared"] = shared
-        return llvm_mod
-
     def make_msl_metallib(self, mod, metadata, options):
         msl = metadata.pop("_msl_src")
         # Safe math globally. Metal fast-math assumes no NaN/Inf and reassociates
@@ -382,148 +220,9 @@ class MPSBackend(BaseBackend):
         return metal_utils.compile_source(msl, 'safe')
 
     # ── Stage 3: LLVM IR with simdgroup intrinsics ─────────────────────────
-    def make_llir(self, mod, metadata, options):
-        # Exports TRITON_MPS_TARGET_OS_MAJOR, which the C++ DotOp->AIR pass reads
-        # to pick the simdgroup-matrix intrinsic signature. Must run here;
-        # make_metallib is too late and the wrong signature crashes PSO creation.
-        _host_macos_major()
-
-        pm = ir.pass_manager(mod.context)
-        _pmaybe_enable_debug(pm)
-
-        # Standard TritonGPU → LLVM lowering prerequisites
-        passes.convert.add_scf_to_cf(pm)
-        passes.ttgpuir.add_allocate_shared_memory(pm)
-        passes.convert.add_index_to_llvmir(pm)
-
-        # Apple plugin passes
-        _plugin.add_to_llvmir(pm)
-        _plugin.add_lower_gpu_to_air(pm)
-        _plugin.add_reconcile_unrealized_casts(pm)
-
-        # Shared cleanup
-        passes.common.add_canonicalizer(pm)
-        passes.common.add_cse(pm)
-
-        pm.run(mod, 'make_llir')
-
-        # Dynamic threadgroup memory: the arena is now a kernel param, so the
-        # writer reports staticTG=0. Carry the real arena size (set by the
-        # rebase in ConvertTritonAppleGPUToLLVM) to the dispatch length binding.
-        metadata["_dynamic_smem_bytes"] = mod.get_int_attr(
-            "applegpu.dynamic_smem_bytes")
-
-        # Convert MLIR LLVM dialect → LLVM module
-        llvm.init_targets()
-        context = llvm.context()
-        llvm_mod = llvm.to_module(mod, context)
-        # Mid-end optimization; metal-llc only runs the codegen prologue.
-        _opt_level = {
-            '0': None,
-            '1': llvm.OPTIMIZE_O1,
-            '2': llvm.OPTIMIZE_O2,
-            '3': llvm.OPTIMIZE_O3,
-        }[os.environ.get('METAL_LLVM_OPT_LEVEL', '3')]
-        if _opt_level is not None:
-            # METAL_DUMP_PREOPT_DIR captures the pre-O3 module for offline triage
-            # of a mid-end hang.
-            _preopt_dir = os.environ.get('METAL_DUMP_PREOPT_DIR')
-            _preopt_path = None
-            if _preopt_dir:
-                try:
-                    import hashlib as _hl
-                    os.makedirs(_preopt_dir, exist_ok=True)
-                    _pre = str(llvm_mod)
-                    _kn = (metadata.get('name') if isinstance(metadata, dict)
-                           else getattr(metadata, 'name', None)) or 'kernel'
-                    _h = _hl.sha1(_pre.encode()).hexdigest()[:12]
-                    _preopt_path = os.path.join(_preopt_dir,
-                                                f'{_kn}-{_h}.preopt.ll')
-                    with open(_preopt_path, 'w') as _f:
-                        _f.write(_pre)
-                except Exception:
-                    _preopt_path = None
-            llvm.optimize_module(llvm_mod, _opt_level)
-            if _preopt_path:
-                try:
-                    os.unlink(_preopt_path)
-                except OSError:
-                    pass
-        llvm_ir = str(llvm_mod)
-        if os.environ.get('TRITON_MPS_DEBUG'):
-            open('/tmp/raw_pre.ll', 'w').write(llvm_ir)
-
-        # ttg.shared counts only the reduction scratchpad; the real total
-        # (incl. __tg_cvt_* convert globals) is recomputed downstream from the
-        # IR so the autotuner can reject configs over the 32 KB limit.
-        metadata["_llvm_ir"] = llvm_ir
-
-        return llvm_mod
-
-    # ── Stage 4: LLVM IR → metallib ───────────────────────────────────────
-    def make_metallib(self, llvm_mod, metadata, options):
-        llvm_ir = metadata.pop("_llvm_ir", None) or str(llvm_mod)
-
-        # Extract the kernel name: the `define void @` that no `call` targets
-        # (a noinline device callee adds a second, called, define).
-        defined_names = [
-            line[len('define void @'):].split('(')[0]
-            for line in llvm_ir.splitlines()
-            if line.startswith('define void @')
-        ]
-        if not defined_names:
-            raise RuntimeError("no 'define void @' kernel entry found")
-        called = {
-            m.group(1)
-            for m in re.finditer(r'call[^@\n]*@([\w$.]+)\s*\(', llvm_ir)
-        }
-        entry_names = [n for n in defined_names if n not in called]
-        if len(entry_names) != 1:
-            # Inlining a noinline helper's only call site can leave a dead
-            # uncalled define; disambiguate via the "air-kernel" attribute.
-            attr_groups = {
-                m.group(1)
-                for m in re.finditer(
-                    r'^attributes (#\d+) = \{[^}]*"air-kernel"', llvm_ir, re.M)
-            }
-            marked = [
-                n for n in entry_names if any(
-                    re.search(
-                        r'^define void @' + re.escape(n) + r'\(.*\) [^\n]*' +
-                        re.escape(g) + r'\b', llvm_ir, re.M)
-                    for g in attr_groups)
-            ]
-            if len(marked) == 1:
-                entry_names = marked
-            else:
-                raise RuntimeError(
-                    f"expected exactly one uncalled kernel entry among "
-                    f"{defined_names}, found {len(entry_names)}: {entry_names}"
-                )
-        metadata["name"] = entry_names[0]
-
-        debug = os.environ.get('TRITON_MPS_DEBUG')
-
-        if debug:
-            kname = metadata["name"]
-            open(f'/tmp/dot_kernel_{kname}.ll', 'w').write(llvm_ir)
-
-        # MetalIR C++ pipeline: LLVM IR -> AIR -> v1 bitcode -> metallib. The
-        # llc run also returns the real threadgroup total, replacing the
-        # front-end estimate.
-        result, tg_bytes = _get_metalir_compile()(llvm_ir)
-        # With dynamic TG the arena lives in a kernel param, so the writer's
-        # static total is ~0; use the rebased arena size as the dispatch length
-        # and the budget figure the autotuner checks against the 32KB cap.
-        dyn_smem = metadata.pop("_dynamic_smem_bytes", None)
-        metadata["shared"] = dyn_smem if dyn_smem else tg_bytes
-        if debug:
-            open(f'/tmp/dot_kernel_{kname}.metallib', 'wb').write(result)
-        return result
-
     # ── Gluon frontend: AST is lowered directly to TTGIR, so we skip make_ttir
     # and only run the dialect-generic Gluon passes that resolve explicit/auto
-    # layouts before rejoining the shared TTGIR → LLIR → metallib path.
+    # layouts before rejoining the shared TTGIR → MSL → metallib path.
     def gluon_to_ttgir(self, src, metadata, options):
         mod = src
         pm = ir.pass_manager(mod.context)
@@ -551,14 +250,6 @@ class MPSBackend(BaseBackend):
                 src, meta, options)
             stages["ttgir"] = lambda src, meta: self.make_ttgir(
                 src, meta, options)
-        if os.environ.get('TRITON_MPS_EMIT_MSL_MLIR'):
-            stages["msl"] = lambda src, meta: self.make_msl(src, meta, options)
-            stages["llir"] = lambda src, meta: self.make_msl_llir(
-                src, meta, options)
-            stages["metallib"] = lambda src, meta: self.make_msl_metallib(
-                src, meta, options)
-        else:
-            stages["llir"] = lambda src, meta: self.make_llir(
-                src, meta, options)
-            stages["metallib"] = lambda src, meta: self.make_metallib(
-                src, meta, options)
+        stages["msl"] = lambda src, meta: self.make_msl(src, meta, options)
+        stages["metallib"] = lambda src, meta: self.make_msl_metallib(
+            src, meta, options)

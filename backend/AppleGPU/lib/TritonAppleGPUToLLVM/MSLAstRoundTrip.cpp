@@ -1,13 +1,13 @@
 // MSLAstRoundTrip.cpp - standalone printer round-trip self-test.
 //
-// Excluded from the normal dylib build (guarded by MSL_AST_SELFTEST so it emits
-// no symbols into libapplegpu_backend). Compile + run standalone (LLVMROOT is
-// the prebuilt Triton LLVM; adjust the hash for your machine):
+// Manual dev aid: excluded from the dylib build (guarded by MSL_AST_SELFTEST so
+// it emits no symbols into libapplegpu_backend). Compile + run standalone;
+// LLVMROOT is the prebuilt Triton LLVM, discovered by glob (no pinned hash):
 //
-//   LLVMROOT=~/.triton/llvm/llvm-62b7cf96-macos-arm64-2
-//   clang++ -std=c++17 -DMSL_AST_SELFTEST -I$LLVMROOT/include \
+//   LLVMROOT=$(echo ~/.triton/llvm/llvm-*-macos-arm64-* | tr ' ' '\n' | tail -1)
+//   clang++ -std=c++17 -DMSL_AST_SELFTEST -I"$LLVMROOT/include" \
 //     MSLAstRoundTrip.cpp MSLPrinter.cpp \
-//     $LLVMROOT/lib/libLLVMSupport.a $LLVMROOT/lib/libLLVMDemangle.a \
+//     "$LLVMROOT/lib/libLLVMSupport.a" "$LLVMROOT/lib/libLLVMDemangle.a" \
 //     -lz -lcurses -o /tmp/msl_selftest && /tmp/msl_selftest
 //
 // Exits nonzero and prints an expected-vs-got diff on mismatch.

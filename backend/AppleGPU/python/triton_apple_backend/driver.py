@@ -214,9 +214,9 @@ class MPSUtils:
             # instead of hard-failing the compile. See test_large_block_sizes.
             if 'exceeds available stack space' in msg:
                 raise OutOfResources(0, 0, "Metal PSO stack space") from e
-            # Opaque PSO-compile errors lose the real LLVM/AIR diagnostic (it dies
-            # in MTLCompilerService). Replay the metallib offline to recover the
-            # precise error, then rethrow with it inlined.
+            # Opaque PSO-compile errors lose the real Metal compiler diagnostic
+            # (it dies in MTLCompilerService). Replay the metallib offline to
+            # recover the precise error, then rethrow with it inlined.
             _opaque = ('materializeAll', 'XPC_ERROR_CONNECTION_INTERRUPTED',
                        'XPC_CONNECTION_INTERRUPTED', 'PSO creation failed',
                        'Unexpected bitcode')

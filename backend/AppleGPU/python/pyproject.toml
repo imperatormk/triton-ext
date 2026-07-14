@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "triton-apple-backend"
 version = "0.1.0"
-description = "Apple GPU backend for Triton (Metal/AIR)"
+description = "Apple GPU backend for Triton (Metal)"
 requires-python = ">=3.10"
 dependencies = ["triton>=3.6.0"]
 

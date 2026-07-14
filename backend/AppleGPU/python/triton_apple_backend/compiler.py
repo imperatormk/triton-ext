@@ -172,7 +172,7 @@ class MPSBackend(BaseBackend):
         metadata["shared"] = mod.get_int_attr("ttg.shared") or 0
         return mod
 
-    # ── MSL path: TTGIR → MSL source (no air.*), gated behind the flag ─────
+    # ── TTGIR → MSL source → metallib ─────────────────────────────────────
     def make_msl(self, mod, metadata, options):
         with tempfile.NamedTemporaryFile(suffix='.metal', delete=False) as f:
             msl_path = f.name

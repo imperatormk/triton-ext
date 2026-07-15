@@ -2,7 +2,7 @@
 //
 // The structured-control-flow scope builders (astForScope/astTripCountForScope/
 // astForNode/astIfScope/astWhileScope), the unstructured-CFG -> state-machine
-// dispatch (astBlockCFG/astEmitBlockCFG/astWalkBlock/astWalkBlock2/
+// dispatch (astEmitBlockCFG/astWalkBlock/astWalkBlock2/
 // astBranchEdge/astCondBranch/astTerminatorEdge) and the loop-carried /
 // if-result yield resolution (astYieldAssign). astEmitOp drives these.
 
@@ -77,28 +77,21 @@ msl::WhileScope *MSLEmitter::astWhileScope(scf::WhileOp op, msl::Block body) {
 // Unstructured CFG -> state-machine dispatch
 //===----------------------------------------------------------------------===//
 
-msl::StateMachineScope *MSLEmitter::astBlockCFG(
-    Region &region, StringRef state,
-    ArrayRef<std::pair<std::string, msl::Block>> cases) {
-  llvm::SmallVector<msl::StateMachineScope::Case, 4> smCases;
-  for (auto &c : cases)
-    smCases.push_back({ctx.save(c.first), c.second});
-  return ctx.stateMachineScope(ctx.scalar(msl::Scalar::I32), state,
-                               std::move(smCases));
-}
-
 // phi-assign the successor's arg vars from the branch operands, set the state
 // var, and continue. Returned as a Block the caller splices into the case body.
+// Per-register `dst[r] = src[bcast]` with the size==1 splat broadcast.
+void MSLEmitter::astCopyRegs(msl::Block &out, ArrayRef<std::string> dst,
+                             ArrayRef<std::string> src) {
+  for (size_t r = 0; r < dst.size(); ++r)
+    out.push_back(ctx.assignStmt(
+        ctx.var(dst[r]), ctx.var(src[src.size() == 1 ? 0 : r])));
+}
+
 msl::Block MSLEmitter::astBranchEdge(Block *succ, Operation::operand_range args,
                                      StringRef state) {
   msl::Block out;
-  for (auto [i, operand] : llvm::enumerate(args)) {
-    auto &src = names(operand);
-    auto &dst = valMap[succ->getArgument(i)];
-    for (size_t r = 0; r < dst.size(); ++r)
-      out.push_back(ctx.assignStmt(
-          ctx.var(dst[r]), ctx.var(src[src.size() == 1 ? 0 : r])));
-  }
+  for (auto [i, operand] : llvm::enumerate(args))
+    astCopyRegs(out, valMap[succ->getArgument(i)], names(operand));
   out.push_back(ctx.assignStmt(ctx.var(state), ctx.lit(blockLabel[succ])));
   out.push_back(ctx.continueStmt());
   return out;
@@ -119,13 +112,8 @@ msl::Stmt *MSLEmitter::astCondBranch(Value cond, msl::Block thenB,
 msl::Block MSLEmitter::astYieldAssign(
     Operation *term, ArrayRef<SmallVector<std::string>> dsts) {
   msl::Block out;
-  for (auto [i, operand] : llvm::enumerate(term->getOperands())) {
-    auto &src = names(operand);
-    const SmallVector<std::string> &dst = dsts[i];
-    for (size_t r = 0; r < dst.size(); ++r)
-      out.push_back(ctx.assignStmt(
-          ctx.var(dst[r]), ctx.var(src[src.size() == 1 ? 0 : r])));
-  }
+  for (auto [i, operand] : llvm::enumerate(term->getOperands()))
+    astCopyRegs(out, dsts[i], names(operand));
   return out;
 }
 
@@ -171,7 +159,7 @@ msl::Block MSLEmitter::astEmitBlockCFG(Region &region) {
     cases.push_back({blockLabel[&blk], std::move(caseBody)});
   }
   cfgState.clear();
-  out.push_back(astBlockCFG(region, state, cases));
+  out.push_back(astMapCFGStateMachine(state, cases));
   return out;
 }
 

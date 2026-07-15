@@ -362,9 +362,8 @@ private:
                         StringRef tc, StringRef ivTy, bool wideIv);
   msl::IfScope *astIfScope(scf::IfOp op, msl::Block thenB, msl::Block elseB);
   msl::WhileScope *astWhileScope(scf::WhileOp op, msl::Block body);
-  msl::StateMachineScope *astBlockCFG(
-      Region &region, StringRef state,
-      ArrayRef<std::pair<std::string, msl::Block>> cases);
+  void astCopyRegs(msl::Block &out, ArrayRef<std::string> dst,
+                   ArrayRef<std::string> src);
   msl::Block astBranchEdge(Block *succ, Operation::operand_range args,
                            StringRef state);
   msl::Stmt *astCondBranch(Value cond, msl::Block thenB, msl::Block elseB);

@@ -23,79 +23,6 @@ def _load_metal_utils():
     return metal_utils
 
 
-def _materialize_offline_error(metallib_bytes, name=None):
-    """Replay a metallib through the offline Metal toolchain to surface the real
-    lowering error behind an opaque in-process PSO failure.
-
-    metal-objdump -d runs the bitcode verifier (precise error) and runs first;
-    xcrun metallib is the blunter cross-check. Returns a combined diagnostic str
-    (incl. saved metallib path) or None. Best-effort: failures are swallowed.
-    With METAL_PSO_FAIL_DIR set, the failing metallib + a .txt sidecar persist to
-    a stable, named location so the config survives inductor's reaped tempdir.
-    """
-    import subprocess as _sp
-    import tempfile as _tf
-
-    def _run(argv):
-        try:
-            p = _sp.run(argv, capture_output=True, check=False, timeout=60)
-            err = (p.stderr or b'').decode(errors='replace').strip()
-            out = (p.stdout or b'').decode(errors='replace').strip()
-            return p.returncode, (err or out)
-        except (OSError, _sp.SubprocessError, ValueError):
-            return None, None
-
-    mlib = None
-    fail_dir = _os.environ.get('METAL_PSO_FAIL_DIR')
-    if fail_dir:
-        try:
-            import hashlib as _hl
-            _os.makedirs(fail_dir, exist_ok=True)
-            h = _hl.sha1(bytes(metallib_bytes)).hexdigest()[:12]
-            stem = f"{name or 'kernel'}-{h}"
-            mlib = _os.path.join(fail_dir, stem + '.metallib')
-            with open(mlib, 'wb') as f:
-                f.write(metallib_bytes)
-        except (OSError, ValueError):
-            mlib = None
-    if mlib is None:
-        try:
-            with _tf.NamedTemporaryFile(suffix='.metallib', delete=False) as f:
-                f.write(metallib_bytes)
-                mlib = f.name
-        except (OSError, ValueError):
-            return None
-
-    parts = [f"(metallib saved for inspection: {mlib})"]
-
-    # metal-objdump: precise verifier diagnostic.
-    rc, txt = _run(['xcrun', '-sdk', 'macosx', 'metal-objdump', '-d', mlib])
-    if txt:
-        parts.append(f"metal-objdump -d:\n{txt}")
-
-    # xcrun metallib: blunt cross-check.
-    rc2, txt2 = _run(
-        ['xcrun', '-sdk', 'macosx', 'metallib', mlib, '-o', mlib + '.out'])
-    try:
-        _os.unlink(mlib + '.out')
-    except OSError:
-        pass
-    if txt2:
-        parts.append(f"xcrun metallib:\n{txt2}")
-
-    if rc is None and rc2 is None:
-        return None  # no offline toolchain available
-    diagnostic = "\n".join(parts)
-    # Persist a sidecar so the failing config is greppable after the run.
-    if fail_dir and mlib and mlib.startswith(fail_dir):
-        try:
-            with open(mlib + '.txt', 'w') as f:
-                f.write(f"kernel: {name}\n{diagnostic}\n")
-        except OSError:
-            pass
-    return diagnostic
-
-
 def ty_to_cpp(ty):
     if ty[0] == '*':
         return "void*"
@@ -214,19 +141,6 @@ class MPSUtils:
             # instead of hard-failing the compile. See test_large_block_sizes.
             if 'exceeds available stack space' in msg:
                 raise OutOfResources(0, 0, "Metal PSO stack space") from e
-            # Opaque PSO-compile errors lose the real Metal compiler diagnostic
-            # (it dies in MTLCompilerService). Replay the metallib offline to
-            # recover the precise error, then rethrow with it inlined.
-            _opaque = ('materializeAll', 'XPC_ERROR_CONNECTION_INTERRUPTED',
-                       'XPC_CONNECTION_INTERRUPTED', 'PSO creation failed',
-                       'Unexpected bitcode')
-            if any(s in msg for s in _opaque):
-                detail = _materialize_offline_error(bytes(metallib_bytes),
-                                                    name)
-                if detail:
-                    raise RuntimeError(f"{msg}\n\n"
-                                       f"offline Metal toolchain diagnostic:\n"
-                                       f"{detail}") from e
             raise
 
     def unload_module(self, module):

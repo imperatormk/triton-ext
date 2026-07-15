@@ -133,8 +133,6 @@ print("vecadd ok")
 
 - `TRITON_MSL_DUMP=<path>` — write the emitted MSL for each kernel to `<path>`.
 - `TRITON_MPS_DEBUG=1` — print the emitted MSL to stdout.
-- `METAL_PSO_FAIL_DIR=<dir>` — on a pipeline-state / metallib compile failure,
-  save the failing metallib under `<dir>`.
 - `TRITON_MSL_OUT` — internal handoff for the MSL output path between the C++
   emitter and the Python compiler; set automatically, not a user knob.
 - `MSL_NO_DIRECT_STORE=1` — escape hatch: disable the fused-store optimization

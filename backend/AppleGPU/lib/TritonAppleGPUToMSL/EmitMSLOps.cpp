@@ -862,20 +862,21 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
         return toF8 ? std::string("tt_f32_to_fp8") + k + "_rtne"
                     : std::string("tt_fp8") + k + "_to_f32";
       };
-      return astDeclBind(op, astScalarType(dstE), body, [&](int r) -> msl::Expr * {
-        msl::Expr *src = ctx.var(reg(op->getOperand(0), r));
-        if (srcFp8) {
-          msl::Expr *b =
-              ctx.cast(msl::Cast::Style::CStyle, ctx.scalar(msl::Scalar::U8), src);
-          msl::Expr *f = ctx.call(fp8Fn(srcE, false), {b});
-          if (dstE.isF32())
-            return f;
-          return ctx.cast(msl::Cast::Style::CStyle, astScalarType(dstE), f);
-        }
-        msl::Expr *f =
-            ctx.cast(msl::Cast::Style::CStyle, ctx.scalar(msl::Scalar::F32), src);
-        return ctx.call(fp8Fn(dstE, true), {f});
-      });
+      return astDeclBind(
+          op, astScalarType(dstE), body, [&](int r) -> msl::Expr * {
+            msl::Expr *src = ctx.var(reg(op->getOperand(0), r));
+            if (srcFp8) {
+              msl::Expr *b = ctx.cast(msl::Cast::Style::CStyle,
+                                      ctx.scalar(msl::Scalar::U8), src);
+              msl::Expr *f = ctx.call(fp8Fn(srcE, false), {b});
+              if (dstE.isF32())
+                return f;
+              return ctx.cast(msl::Cast::Style::CStyle, astScalarType(dstE), f);
+            }
+            msl::Expr *f = ctx.cast(msl::Cast::Style::CStyle,
+                                    ctx.scalar(msl::Scalar::F32), src);
+            return ctx.call(fp8Fn(dstE, true), {f});
+          });
     }
   }
 

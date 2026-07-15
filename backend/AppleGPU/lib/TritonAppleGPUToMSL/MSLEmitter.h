@@ -441,6 +441,13 @@ private:
 
   SmallVector<std::string> &names(Value v) { return valMap[v]; }
 
+  // Broadcast-aware per-register operand pick: a splat has 1 name, a tensor
+  // has regCount names.
+  StringRef reg(Value v, int r) {
+    auto &nm = valMap[v];
+    return nm[nm.size() == 1 ? 0 : r];
+  }
+
   void bindScalar(Value v, std::string name) {
     valMap[v] = SmallVector<std::string>{std::move(name)};
   }

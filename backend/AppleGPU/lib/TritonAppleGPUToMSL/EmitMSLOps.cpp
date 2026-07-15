@@ -596,10 +596,6 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
 // float / int / bitwise / shift binops.
 std::optional<bool> MSLEmitter::astEmitArithBinop(Operation *op,
                                                   msl::Block &body) {
-  auto opnd = [&](Value v, int r) -> StringRef {
-    auto &nm = names(v);
-    return nm[nm.size() == 1 ? 0 : r];
-  };
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
@@ -609,8 +605,8 @@ std::optional<bool> MSLEmitter::astEmitArithBinop(Operation *op,
           tt::PreciseDivFOp>(op))
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
       return astElementwiseExpr(arithBinOp(op), nullptr,
-                                opnd(op->getOperand(0), r),
-                                opnd(op->getOperand(1), r));
+                                reg(op->getOperand(0), r),
+                                reg(op->getOperand(1), r));
     });
 
   // Integer add/sub/mul/div/rem (astIntBinaryExpr handles the i1 and unsigned
@@ -623,8 +619,8 @@ std::optional<bool> MSLEmitter::astEmitArithBinop(Operation *op,
     else if (isa<arith::DivUIOp, arith::RemUIOp>(op))
       declTy = astUnsignedType(resElem);
     return astDeclBind(op, declTy, body, [&](int r) {
-      return astIntBinaryExpr(op, opnd(op->getOperand(0), r),
-                              opnd(op->getOperand(1), r));
+      return astIntBinaryExpr(op, reg(op->getOperand(0), r),
+                              reg(op->getOperand(1), r));
     });
   }
 
@@ -632,16 +628,16 @@ std::optional<bool> MSLEmitter::astEmitArithBinop(Operation *op,
   if (isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op)) {
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
       return astElementwiseExpr(arithBinOp(op), nullptr,
-                                opnd(op->getOperand(0), r),
-                                opnd(op->getOperand(1), r));
+                                reg(op->getOperand(0), r),
+                                reg(op->getOperand(1), r));
     });
   }
 
   // Shifts.
   if (isa<arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp>(op))
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astShiftExpr(op, opnd(op->getOperand(0), r),
-                          opnd(op->getOperand(1), r));
+      return astShiftExpr(op, reg(op->getOperand(0), r),
+                          reg(op->getOperand(1), r));
     });
 
   return std::nullopt;
@@ -720,10 +716,6 @@ std::optional<bool> MSLEmitter::astEmitConstGrid(Operation *op,
 // cmp / select / clamp / casts / negf / min-max family / precise_sqrt.
 std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
                                                  msl::Block &body) {
-  auto opnd = [&](Value v, int r) -> StringRef {
-    auto &nm = names(v);
-    return nm[nm.size() == 1 ? 0 : r];
-  };
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
@@ -746,8 +738,8 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
     msl::Type *opCast =
         uns ? astUnsignedType(elementScalarType(ci.getLhs().getType())) : nullptr;
     return astDeclBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
-      return astElementwiseExpr(bo, opCast, opnd(op->getOperand(0), r),
-                                opnd(op->getOperand(1), r));
+      return astElementwiseExpr(bo, opCast, reg(op->getOperand(0), r),
+                                reg(op->getOperand(1), r));
     });
   }
   if (auto cf = dyn_cast<arith::CmpFOp>(op)) {
@@ -768,8 +760,8 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
     default: return false; // unsupported predicate: caller emits the error
     }
     return astDeclBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
-      return astElementwiseExpr(bo, nullptr, opnd(op->getOperand(0), r),
-                                opnd(op->getOperand(1), r));
+      return astElementwiseExpr(bo, nullptr, reg(op->getOperand(0), r),
+                                reg(op->getOperand(1), r));
     });
   }
 
@@ -782,23 +774,23 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
                             ? astStorageType(op->getResult(0).getType())
                             : astScalarType(elementScalarType(re));
     return astDeclBind(op, declTy, body, [&](int r) {
-      return astSelectExpr(opnd(s.getCondition(), r), opnd(s.getTrueValue(), r),
-                           opnd(s.getFalseValue(), r));
+      return astSelectExpr(reg(s.getCondition(), r), reg(s.getTrueValue(), r),
+                           reg(s.getFalseValue(), r));
     });
   }
 
   // Clamp.
   if (auto c = dyn_cast<tt::ClampFOp>(op))
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astClampExpr(c, opnd(c.getX(), r), opnd(c.getMin(), r),
-                          opnd(c.getMax(), r));
+      return astClampExpr(c, reg(c.getX(), r), reg(c.getMin(), r),
+                          reg(c.getMax(), r));
     });
 
   // Casts (non fp-narrowing) / bitcast / ptr<->int.
   if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp,
           arith::ExtFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(op))
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astCastExpr(op, opnd(op->getOperand(0), r));
+      return astCastExpr(op, reg(op->getOperand(0), r));
     });
   // TruncF / FpToFp: f32->half/bfloat narrowing emits a self-contained multi-line
   // block (RTZ or RTNE); other float casts are a plain static_cast. The narrowing
@@ -835,24 +827,24 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
     }
     // Non-narrowing float cast: static_cast<dst>(v).
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astCastExpr(op, opnd(op->getOperand(0), r));
+      return astCastExpr(op, reg(op->getOperand(0), r));
     });
   }
   if (isa<arith::BitcastOp, tt::BitcastOp>(op))
     return astDeclBind(op, astStorageType(op->getResult(0).getType()), body,
                        [&](int r) {
-                         return astBitcastExpr(op, opnd(op->getOperand(0), r));
+                         return astBitcastExpr(op, reg(op->getOperand(0), r));
                        });
   if (isa<tt::IntToPtrOp, tt::PtrToIntOp>(op))
     return astDeclBind(op, astStorageType(op->getResult(0).getType()), body,
                        [&](int r) {
-                         return astPtrIntCastExpr(op, opnd(op->getOperand(0), r));
+                         return astPtrIntCastExpr(op, reg(op->getOperand(0), r));
                        });
 
   // negf: `sc id = -a;`
   if (isa<arith::NegFOp>(op))
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return ctx.unary(msl::UnOp::Neg, ctx.var(opnd(op->getOperand(0), r)));
+      return ctx.unary(msl::UnOp::Neg, ctx.var(reg(op->getOperand(0), r)));
     });
 
   // min/max family (decl type is always the signed scalar; opCast/propagateNan
@@ -877,8 +869,8 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
     if (isMinMax)
       return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
         return astMinMaxExpr(fn, opCast, propagateNan,
-                             opnd(op->getOperand(0), r),
-                             opnd(op->getOperand(1), r));
+                             reg(op->getOperand(0), r),
+                             reg(op->getOperand(1), r));
       });
   }
 
@@ -886,7 +878,7 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
   if (isa<tt::PreciseSqrtOp>(op))
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
       return astUnaryExpr(msl::builtin::precise::Sqrt, astScalarType(resElem),
-                          opnd(op->getOperand(0), r));
+                          reg(op->getOperand(0), r));
     });
 
   return std::nullopt;
@@ -894,10 +886,6 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
 
 // math.* dialect: unary/binary transcendentals, fma, exp10.
 std::optional<bool> MSLEmitter::astEmitMath(Operation *op, msl::Block &body) {
-  auto opnd = [&](Value v, int r) -> StringRef {
-    auto &nm = names(v);
-    return nm[nm.size() == 1 ? 0 : r];
-  };
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
@@ -923,7 +911,7 @@ std::optional<bool> MSLEmitter::astEmitMath(Operation *op, msl::Block &body) {
     if (auto it = unary.find(n); it != unary.end()) {
       StringRef fn = it->second;
       return astDeclBind(op, sc, body, [&](int r) {
-        return astUnaryExpr(fn, sc, opnd(op->getOperand(0), r));
+        return astUnaryExpr(fn, sc, reg(op->getOperand(0), r));
       });
     }
     static const llvm::StringMap<StringRef> binary = {
@@ -932,21 +920,21 @@ std::optional<bool> MSLEmitter::astEmitMath(Operation *op, msl::Block &body) {
     if (auto it = binary.find(n); it != binary.end()) {
       StringRef fn = it->second;
       return astDeclBind(op, sc, body, [&](int r) {
-        return astMinMaxExpr(fn, nullptr, false, opnd(op->getOperand(0), r),
-                             opnd(op->getOperand(1), r));
+        return astMinMaxExpr(fn, nullptr, false, reg(op->getOperand(0), r),
+                             reg(op->getOperand(1), r));
       });
     }
     if (n == "math.fma")
       return astDeclBind(op, sc, body, [&](int r) {
-        return astTernaryCallExpr(bi::math::Fma, opnd(op->getOperand(0), r),
-                                  opnd(op->getOperand(1), r),
-                                  opnd(op->getOperand(2), r));
+        return astTernaryCallExpr(bi::math::Fma, reg(op->getOperand(0), r),
+                                  reg(op->getOperand(1), r),
+                                  reg(op->getOperand(2), r));
       });
     if (n == "math.exp10")
       return astDeclBind(op, sc, body, [&](int r) {
         // pow((sc)10, a)
         msl::Expr *ten = ctx.cast(CS::CStyle, sc, ctx.lit("10"));
-        return ctx.call(bi::precise::Pow, {ten, ctx.var(opnd(op->getOperand(0), r))});
+        return ctx.call(bi::precise::Pow, {ten, ctx.var(reg(op->getOperand(0), r))});
       });
     return false; // unhandled math op: caller emits the error
   }

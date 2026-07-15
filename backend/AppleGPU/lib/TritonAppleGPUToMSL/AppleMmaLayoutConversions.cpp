@@ -28,30 +28,17 @@ AppleMmaEncodingAttr::toLinearLayout(llvm::ArrayRef<int64_t> shape) const {
   auto dimCol = dimNames[1]; // "dim1"
 
   // ── Single 8×8 simdgroup tile ─────────────────────────────────────────
-  // PHYSICAL layout matches simdgroup_matrix per-lane storage so the
-  // #mma<->simdgroup_matrix bridge is lane-local. It is UNCONDITIONAL: forcing
-  // the logical layout here would miscompile the C-accumulator bridges.
-  bool physLayout = true;
-  std::vector<std::vector<int32_t>> registerBases =
-      physLayout ? std::vector<std::vector<int32_t>>{{0, 1}}
-                 : std::vector<std::vector<int32_t>>{
-                       {4, 0} // reg bit 0 → row=4, col=0
-                   };
-  std::vector<std::vector<int32_t>> laneBases =
-      physLayout ? std::vector<std::vector<int32_t>>{
-                       {0, 2}, // L0 -> col bit1
-                       {1, 0}, // L1 -> row bit0
-                       {2, 0}, // L2 -> row bit1
-                       {0, 4}, // L3 -> col bit2
-                       {4, 0}, // L4 -> row bit2
-                   }
-                 : std::vector<std::vector<int32_t>>{
-                       {0, 1}, // lane bit 0 → row=0, col=1
-                       {0, 2}, // lane bit 1 → row=0, col=2
-                       {0, 4}, // lane bit 2 → row=0, col=4
-                       {1, 0}, // lane bit 3 → row=1, col=0
-                       {2, 0}, // lane bit 4 → row=2, col=0
-                   };
+  // Physical layout matches simdgroup_matrix per-lane storage so the
+  // #mma<->simdgroup_matrix bridge is lane-local. Forcing a logical layout here
+  // would miscompile the C-accumulator bridges.
+  std::vector<std::vector<int32_t>> registerBases{{0, 1}};
+  std::vector<std::vector<int32_t>> laneBases{
+      {0, 2}, // L0 -> col bit1
+      {1, 0}, // L1 -> row bit0
+      {2, 0}, // L2 -> row bit1
+      {0, 4}, // L3 -> col bit2
+      {4, 0}, // L4 -> row bit2
+  };
   LinearLayout ctaLayout(
       SmallVector<std::pair<StringAttr, std::vector<std::vector<int32_t>>>>{
           {S("register"), registerBases}, {S("lane"), laneBases}},

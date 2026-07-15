@@ -6,7 +6,7 @@
 // INVARIANT: the printer inserts no grouping parens; a builder inserts an
 // explicit ctx.paren(...) wherever a subexpression needs precedence grouping.
 // The fp-narrowing bit-twiddling body is the design-sanctioned Raw escape
-// hatch (MSL_AST_DESIGN.md): the builder wraps that block in one RawStmt and
+// hatch: the builder wraps that block in one RawStmt and
 // keeps only the outer `sc h = as_type<sc>(bits);` as real nodes. The fp
 // helpers must never touch nextId/indent, so they reconstruct their block
 // through a private id/indent local seeded from the emitter's current state

@@ -1,8 +1,7 @@
 // MSLEmitter.h - TritonGPU IR -> MSL lowering state (the emitter class).
 //
 // Extracted from EmitMSL.cpp. Method definitions live in EmitMSL.cpp; the
-// AST type helpers (astScalarType/...) live in MSLTypes.cpp. See
-// MSL_AST_DESIGN.md for the frozen AST contract.
+// AST type helpers (astScalarType/...) live in MSLTypes.cpp.
 #ifndef MSL_EMITTER_H
 #define MSL_EMITTER_H
 

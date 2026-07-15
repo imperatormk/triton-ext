@@ -4,7 +4,7 @@
 // (math, simd, simdgroup-matrix, atomics, memory ordering). Call sites use these
 // constants instead of bare string literals so a typo is a compile error and the
 // full builtin surface is greppable in one place. Flat named constants by design
-// (see MSL_AST_DESIGN.md) - no registry framework.
+// - no registry framework.
 #ifndef MSL_CONSTANTS_H
 #define MSL_CONSTANTS_H
 

@@ -1,7 +1,7 @@
 // MSLPrinter.h - walks the msl:: AST and emits MSL text.
 //
 // THE ONLY place `{`/`}` and indentation are emitted. Owns the barrier
-// peephole (moved out of the emitter). See MSL_AST_DESIGN.md.
+// peephole (moved out of the emitter).
 #ifndef MSL_PRINTER_H
 #define MSL_PRINTER_H
 

@@ -2,7 +2,6 @@
 //
 // Build-once/print-once nodes, arena-allocated on MSLContext. All layout,
 // braces, indentation and the barrier peephole live in MSLPrinter, never here.
-// See MSL_AST_DESIGN.md for the frozen contract.
 #ifndef MSL_AST_H
 #define MSL_AST_H
 

@@ -29,7 +29,7 @@ namespace {
 
 // A layout-parametric op whose semantics are independent of the distributed
 // encoding, so cloning it with a different result encoding is value-preserving.
-static bool isRelayable(Operation *op) {
+static bool isRelayableLayoutParametricOp(Operation *op) {
   return isa<tt::MakeRangeOp, tt::SplatOp, tt::ExpandDimsOp, tt::BroadcastOp,
              tt::AddPtrOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
              arith::DivSIOp, arith::DivUIOp, arith::RemSIOp, arith::RemUIOp,
@@ -41,47 +41,37 @@ static bool isRelayable(Operation *op) {
 class StoreShuffleLayoutPass
     : public impl::StoreShuffleLayoutBase<StoreShuffleLayoutPass> {
 
-  // Recursively rebuild `v` so its tensor result carries encoding `wantEnc`.
-  // Returns nullptr on failure (unhandled op / non-tensor / shape mismatch).
-  // Memoized per (value, encoding) so shared subexpressions are cloned once.
-  Value relay(Value v, Attribute wantEnc, OpBuilder &b,
-              DenseMap<std::pair<Value, Attribute>, Value> &memo) {
-    auto tt2 = dyn_cast<RankedTensorType>(v.getType());
-    if (!tt2)
-      return v; // scalars are layout-free, pass through
-    if (tt2.getEncoding() == wantEnc)
-      return v; // already in the target layout
-    auto key = std::make_pair(v, wantEnc);
-    if (auto it = memo.find(key); it != memo.end())
-      return it->second;
+  using RelayMemo = DenseMap<std::pair<Value, Attribute>, Value>;
 
-    Operation *def = v.getDefiningOp();
-    if (!def || !isRelayable(def))
+  // A convert_layout in the slice is just a layout reshuffle of its source;
+  // re-lay its source directly into the wanted layout, dropping the convert.
+  Value relayConvert(ttg::ConvertLayoutOp cv, Attribute wantEnc, OpBuilder &b,
+                     RelayMemo &memo) {
+    return relay(cv.getSrc(), wantEnc, b, memo);
+  }
+
+  // A splat constant carries its layout in the value attribute's type; rebuild
+  // it directly in the wanted layout.
+  Value relayConstant(arith::ConstantOp cst, RankedTensorType tt2,
+                      Attribute wantEnc, OpBuilder &b) {
+    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat())
       return nullptr;
+    auto newResTy =
+        RankedTensorType::get(tt2.getShape(), tt2.getElementType(), wantEnc);
+    auto newAttr =
+        DenseElementsAttr::get(newResTy, dense.getSplatValue<Attribute>());
+    return arith::ConstantOp::create(b, cst.getLoc(), newResTy, newAttr);
+  }
 
-    // A convert_layout in the slice is just a layout reshuffle of its source;
-    // re-lay its source directly into the wanted layout, dropping the convert.
-    if (auto cv = dyn_cast<ttg::ConvertLayoutOp>(def)) {
-      Value re = relay(cv.getSrc(), wantEnc, b, memo);
-      if (re)
-        memo[key] = re;
-      return re;
-    }
-
-    // A splat constant carries its layout in the value attribute's type;
-    // rebuild it directly in the wanted layout.
-    if (auto cst = dyn_cast<arith::ConstantOp>(def)) {
-      auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
-      if (!dense || !dense.isSplat())
-        return nullptr;
-      auto newResTy =
-          RankedTensorType::get(tt2.getShape(), tt2.getElementType(), wantEnc);
-      auto newAttr =
-          DenseElementsAttr::get(newResTy, dense.getSplatValue<Attribute>());
-      Value res = arith::ConstantOp::create(b, cst.getLoc(), newResTy, newAttr);
-      memo[key] = res;
-      return res;
-    }
+  // Clone a relayable op, re-laying its tensor operands and stamping the wanted
+  // result encoding. Only single-result, region-free ops are relayable, so the
+  // OperationState carries exactly one result type and no regions.
+  Value cloneRelayableOpWithEncoding(Operation *def, RankedTensorType tt2,
+                                     Attribute wantEnc, OpBuilder &b,
+                                     RelayMemo &memo) {
+    assert(def->getNumResults() == 1 && def->getNumRegions() == 0 &&
+           "relayable op must be single-result and region-free");
 
     // Encoding the tensor operands must carry to yield wantEnc: equals wantEnc
     // for elementwise ops, the slice/parent encoding for expand_dims/broadcast.
@@ -114,8 +104,36 @@ class StoreShuffleLayoutPass
     state.addTypes({newResTy});
     state.addAttributes(def->getAttrs());
     Operation *cloned = b.create(state);
-    Value res = cloned->getResult(0);
-    memo[key] = res;
+    return cloned->getResult(0);
+  }
+
+  // Recursively rebuild `v` so its tensor result carries encoding `wantEnc`.
+  // Returns nullptr on failure (unhandled op / non-tensor / shape mismatch).
+  // Memoized per (value, encoding) so shared subexpressions are cloned once.
+  Value relay(Value v, Attribute wantEnc, OpBuilder &b, RelayMemo &memo) {
+    auto tt2 = dyn_cast<RankedTensorType>(v.getType());
+    if (!tt2)
+      return v; // scalars are layout-free, pass through
+    if (tt2.getEncoding() == wantEnc)
+      return v; // already in the target layout
+    auto key = std::make_pair(v, wantEnc);
+    if (auto it = memo.find(key); it != memo.end())
+      return it->second;
+
+    Operation *def = v.getDefiningOp();
+    if (!def || !isRelayableLayoutParametricOp(def))
+      return nullptr;
+
+    Value res;
+    if (auto cv = dyn_cast<ttg::ConvertLayoutOp>(def))
+      res = relayConvert(cv, wantEnc, b, memo);
+    else if (auto cst = dyn_cast<arith::ConstantOp>(def))
+      res = relayConstant(cst, tt2, wantEnc, b);
+    else
+      res = cloneRelayableOpWithEncoding(def, tt2, wantEnc, b, memo);
+
+    if (res)
+      memo[key] = res;
     return res;
   }
 

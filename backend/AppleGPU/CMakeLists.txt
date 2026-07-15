@@ -35,16 +35,16 @@ mlir_tablegen(TritonAppleGPUTransforms/Passes.h.inc -gen-pass-decls -name Triton
 add_public_tablegen_target(TritonAppleGPUTransformsPassesIncGen)
 
 # Collect all C++ sources
-file(GLOB DIALECT_SRCS lib/TritonAppleGPUToLLVM/Dialect.cpp)
+file(GLOB DIALECT_SRCS lib/TritonAppleGPUToMSL/Dialect.cpp)
 file(GLOB TRANSFORM_SRCS lib/TritonAppleGPUTransforms/*.cpp)
-file(GLOB TOLLVM_SRCS lib/TritonAppleGPUToLLVM/*.cpp)
+file(GLOB TOMSL_SRCS lib/TritonAppleGPUToMSL/*.cpp)
 
 # Build as a single shared library
 add_mlir_library(TritonAppleGPUBackend
     ExportAppleGPU.cpp
     ${DIALECT_SRCS}
     ${TRANSFORM_SRCS}
-    ${TOLLVM_SRCS}
+    ${TOMSL_SRCS}
 
     SHARED
 

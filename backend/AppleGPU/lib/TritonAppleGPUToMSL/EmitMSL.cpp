@@ -6,7 +6,7 @@
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
-#include "TritonAppleGPUToLLVM/Passes.h"
+#include "TritonAppleGPUToMSL/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"

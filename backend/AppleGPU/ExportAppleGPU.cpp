@@ -3,7 +3,7 @@
 /// shared library.
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
-#include "TritonAppleGPUToLLVM/Passes.h"
+#include "TritonAppleGPUToMSL/Passes.h"
 #include "TritonAppleGPUTransforms/Passes.h"
 #include "triton/Tools/PluginUtils.h"
 

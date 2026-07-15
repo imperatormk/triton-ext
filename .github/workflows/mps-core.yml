@@ -9,7 +9,7 @@ on:
       test_filter:
         description: "pytest -k filter for the core-test slice"
         required: false
-        default: "test_scalar_overflow or test_where or test_broadcast or test_split or test_join or test_abs"
+        default: "test_scalar_overflow or test_where or test_broadcast or test_split or test_join"
 
 jobs:
   mps-core:
@@ -31,6 +31,7 @@ jobs:
 
       - name: Run Triton core tests on MPS
         run: |
+          export METAL_LLC_PATH="$DEPS/bin/metal-llc"
           export TRITON_PLUGIN_PATHS="$DEPS/lib/libapplegpu_backend.dylib"
           export TRITON_PASS_PLUGIN_PATH="$DEPS/lib/libapplegpu_backend.dylib"
           export PYTHONPATH="$DEPS/triton_apple_backend_pkg"

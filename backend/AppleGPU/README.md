@@ -21,6 +21,22 @@ triton-ext/backend/AppleGPU/
 
 - macOS 26+ with Xcode (Metal framework + clang)
 - Python 3.10+
+
+### Metal version and hardware
+
+The emitter stays within the Metal 3 feature set (simdgroup_matrix MMA, bfloat,
+relaxed device atomics). It uses no Metal 4 only construct, so the generated MSL
+runs forward on Metal 4 and M3+ hardware without change; the driver compiles it
+at whatever language version the running OS defaults to. Forward validity is
+therefore free, but forward optimality is not: on M3+ with Metal 4 there is
+faster hardware we do not target yet (cooperative_tensor MMA, packed fp8/MX
+storage), so GEMM and conv run correctly at Metal 3 fragment speed rather than
+peak. Per device limits such as max threads per threadgroup are read back from
+the compiled pipeline at runtime, not assumed.
+
+Only macOS is a supported host. iOS, iPadOS, visionOS and tvOS are out of scope:
+they have no PyTorch MPS backend to bridge tensor storage from, and they
+restrict the runtime shader compilation that Triton's JIT model depends on.
 - CMake + Ninja
 
 ## Setup

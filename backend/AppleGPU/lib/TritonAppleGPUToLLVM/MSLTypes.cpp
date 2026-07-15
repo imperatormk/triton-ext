@@ -60,4 +60,45 @@ msl::Type *MSLEmitter::astStorageType(Type t) {
   return astScalarType(t);
 }
 
+bool MSLEmitter::isDatalessType(Type t) {
+  return isa<ttg::AsyncTokenType>(t);
+}
+
+int64_t MSLEmitter::bitsOf(Type t) {
+  if (isa<tt::PointerType>(t))
+    return 64;
+  int64_t bits = t.getIntOrFloatBitWidth();
+  return bits == 1 ? 8 : bits;
+}
+
+bool MSLEmitter::isDotOperandElem(Type t) {
+  return t.isF32() || t.isF16() || t.isBF16();
+}
+
+std::string MSLEmitter::sgFragType(Type t) {
+  if (t.isF16())
+    return msl::builtin::sg::Half8x8.str();
+  if (t.isBF16())
+    return msl::builtin::sg::Bfloat8x8.str();
+  return msl::builtin::sg::Float8x8.str();
+}
+
+std::string MSLEmitter::sgOperandScalar(Type t) {
+  if (t.isF16())
+    return "half";
+  if (t.isBF16())
+    return "bfloat";
+  return "float";
+}
+
+std::string MSLEmitter::init0(const std::string &sc) {
+  return sc == "float" || sc == "half" ? "0.0" : "0";
+}
+
+std::string MSLEmitter::inPlaceBase(const InPlaceOperand &op) {
+  if (op.baseOffset == "0")
+    return op.buf;
+  return "(" + op.buf + " + " + op.baseOffset + ")";
+}
+
 } // namespace mlir::triton::applegpu

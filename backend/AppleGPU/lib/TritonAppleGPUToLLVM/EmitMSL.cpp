@@ -2,8 +2,7 @@
 //
 // Consumes TTGIR (tt.*, arith.*, scf.*) plus TritonGPU blocked layouts and
 // emits Metal Shading Language source. Cross-lane ops, thread indices and
-// address spaces come from the MLIR types and TritonGPU LinearLayout, never
-// from air.* intrinsics.
+// address spaces come from the MLIR types and TritonGPU LinearLayout.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"

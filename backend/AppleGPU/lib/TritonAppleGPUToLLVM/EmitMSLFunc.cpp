@@ -143,4 +143,239 @@ msl::Stmt *MSLEmitter::astReturn(tt::ReturnOp op) {
   return ctx.returnStmt(nullptr, fields);
 }
 
+LogicalResult MSLEmitter::emit() {
+  msl::MSLPrinter preamblePrinter(os);
+  preamblePrinter.printPreamble();
+
+  llvm::DenseSet<StringRef> callTargets;
+  mod.walk([&](tt::CallOp call) {
+    callTargets.insert(call.getCalleeAttr().getValue());
+  });
+
+  SmallVector<tt::FuncOp> devFuncs, kernels;
+  for (auto func : mod.getOps<tt::FuncOp>()) {
+    if (callTargets.contains(func.getSymName()))
+      devFuncs.push_back(func);
+    else
+      kernels.push_back(func);
+  }
+
+  // MSL forbids declaring threadgroup memory in a non-kernel function, so a
+  // shared pool is declared once in the kernel and passed down to every
+  // device function as a threadgroup pointer. Size it for the whole module.
+  globalPoolBytes = 0;
+  for (auto func : mod.getOps<tt::FuncOp>()) {
+    poolBytes = 0;
+    liveTgBytes = 0;
+    func.walk([&](ttg::LocalAllocOp la) {
+      auto mt = cast<ttg::MemDescType>(la.getResult().getType());
+      liveTgBytes += memdescFlatSize(mt) *
+                     (bitsOf(mt.getElementType()) / 8);
+    });
+    for (Block &blk : func.getBody())
+      for (Operation &op : blk)
+        scanPool(&op);
+    globalPoolBytes = std::max(globalPoolBytes, poolBytes);
+  }
+  moduleHasDevFuncs = !devFuncs.empty();
+
+  for (auto func : devFuncs)
+    if (failed(emitDeviceFuncProto(func, /*asDecl=*/true)))
+      return failure();
+  if (!devFuncs.empty())
+    os << "\n";
+  for (auto func : devFuncs)
+    if (failed(emitDeviceFunc(func)))
+      return failure();
+  for (auto func : kernels)
+    if (failed(emitFunc(func)))
+      return failure();
+  return success();
+}
+
+LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
+  auto fnTy = func.getFunctionType();
+  // Pin the threadgroup size the runtime always dispatches (num_warps*32) so
+  // the Metal compiler budgets for exactly this size instead of an
+  // occupancy-driven ceiling that could reject a valid launch.
+  msl::Attr *maxThreads = nullptr;
+  if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+    maxThreads = ctx.maxThreadsAttr(nw.getInt() * 32);
+
+  // Params + prologue mint real fresh() names IN ORDER (before the body walk)
+  // so body register names stay in lockstep with the string ABI numbering.
+  unsigned buffer = 0;
+  llvm::SmallVector<msl::Param, 8> params;
+  SmallVector<BlockArgument> scalarArgs;
+  for (auto [i, argTy] : llvm::enumerate(fnTy.getInputs())) {
+    BlockArgument arg = func.getArgument(i);
+    if (auto pt = dyn_cast<tt::PointerType>(argTy)) {
+      std::string id = fresh();
+      params.push_back(ctx.param(
+          ctx.ptr(astScalarType(pt.getPointeeType()), msl::AddrSpace::Device),
+          id, ctx.bufferAttr(buffer++)));
+      bindScalar(arg, id);
+    } else if (isa<IntegerType, FloatType>(argTy)) {
+      scalarArgs.push_back(arg);
+    } else {
+      func.emitError("EmitMSL: unsupported kernel argument type");
+      return failure();
+    }
+  }
+  std::string argbufId;
+  if (!scalarArgs.empty()) {
+    argbufId = fresh();
+    params.push_back(ctx.param(
+        ctx.ptr(ctx.scalar(msl::Scalar::I8), msl::AddrSpace::Constant),
+        argbufId, ctx.bufferAttr(buffer++)));
+  }
+  msl::Type *u3 = ctx.vector(msl::Scalar::U32, 3);
+  tgposId = fresh();
+  tidId = fresh();
+  numTgId = fresh();
+  params.push_back(ctx.param(u3, tgposId, ctx.tgPosAttr()));
+  params.push_back(ctx.param(u3, tidId, ctx.threadPosAttr()));
+  params.push_back(ctx.param(u3, numTgId, ctx.tgsPerGridAttr()));
+
+  msl::Block prologue;
+  int off = 0;
+  for (BlockArgument arg : scalarArgs) {
+    Type ty = arg.getType();
+    unsigned bits = ty.getIntOrFloatBitWidth();
+    int size = bits == 1 ? 1 : (int)(bits / 8);
+    off = (off + size - 1) / size * size;
+    msl::Type *sc = astScalarType(ty);
+    std::string id = fresh();
+    // *(constant sc*)(argbuf + off)
+    msl::Expr *addr = ctx.paren(
+        ctx.binary(msl::BinOp::Add, ctx.var(argbufId),
+                   ctx.lit(std::to_string(off))));
+    prologue.push_back(ctx.declStmt(
+        sc, id,
+        ctx.deref(ctx.cast(msl::Cast::Style::CStyle,
+                           ctx.ptr(sc, msl::AddrSpace::Constant), addr))));
+    bindScalar(arg, id);
+    off += size;
+  }
+  laneId = fresh();
+  warpId = fresh();
+  for (msl::Stmt *s : laneWarpProlog())
+    prologue.push_back(s);
+
+  scalarSpinlock = false;
+  func.walk([&](tt::AtomicCASOp cas) {
+    if (isa<RankedTensorType>(cas.getPtr().getType()))
+      return;
+    if (tracesToKernelArg(cas.getPtr()))
+      scalarSpinlock = true;
+  });
+
+  poolBytes = 0;
+  liveTgBytes = 0;
+  func.walk([&](ttg::LocalAllocOp la) {
+    auto mt = cast<ttg::MemDescType>(la.getResult().getType());
+    liveTgBytes += memdescFlatSize(mt) * (bitsOf(mt.getElementType()) / 8);
+  });
+  for (Block &blk : func.getBody())
+    for (Operation &op : blk)
+      scanPool(&op);
+  int64_t kernelPool = moduleHasDevFuncs ? globalPoolBytes : poolBytes;
+  if (kernelPool > 0) {
+    poolBuf = "__pool";
+    prologue.push_back(ctx.arrayDeclStmt(ctx.named("threadgroup char"),
+                                         poolBuf, kernelPool));
+  }
+
+  Region &region = func.getBody();
+  msl::Block body = region.hasOneBlock() ? astWalkBlock(region.front(), indent)
+                                         : astEmitBlockCFG(region);
+  if (emitFailed)
+    return failure();
+  for (msl::Stmt *s : body)
+    prologue.push_back(s);
+  msl::KernelFn *fn = ctx.kernelFn(maxThreads, mslKernelName(func.getName()),
+                                   params, std::move(prologue));
+  msl::MSLPrinter printer(os);
+  printer.print(fn);
+  return success();
+}
+
+LogicalResult MSLEmitter::declRetStruct(tt::FuncOp func) {
+  auto results = func.getFunctionType().getResults();
+  if (!isTensorResult(results) && results.size() <= 1)
+    return success();
+  for (Type ty : results)
+    if (!isTensorResult(results) && !isa<IntegerType, FloatType>(ty)) {
+      func.emitError("EmitMSL: unsupported device function result type");
+      return failure();
+    }
+  devRetStruct[func] = mslDeviceFuncName(func.getName()) + "_ret";
+  msl::MSLPrinter printer(os);
+  printer.print(astRetStructDecl(func));
+  os << "\n";
+  return success();
+}
+
+LogicalResult MSLEmitter::emitDeviceFuncProto(tt::FuncOp func, bool asDecl) {
+  if (failed(declRetStruct(func)))
+    return failure();
+  msl::MSLPrinter printer(os);
+  printer.printProto(astDeviceProto(func));
+  return success();
+}
+
+LogicalResult MSLEmitter::emitDeviceFunc(tt::FuncOp func) {
+  auto fnTy = func.getFunctionType();
+  llvm::SmallVector<msl::Param, 8> params;
+  for (auto [i, argTy] : llvm::enumerate(fnTy.getInputs())) {
+    std::string id = fresh();
+    if (auto pt = dyn_cast<tt::PointerType>(argTy))
+      params.push_back(ctx.param(
+          ctx.ptr(astScalarType(pt.getPointeeType()), msl::AddrSpace::Device),
+          id));
+    else if (isa<IntegerType, FloatType>(argTy))
+      params.push_back(ctx.param(astScalarType(argTy), id));
+    else {
+      func.emitError("EmitMSL: unsupported device function argument type");
+      return failure();
+    }
+    bindScalar(func.getArgument(i), id);
+  }
+  msl::Type *u3 = ctx.vector(msl::Scalar::U32, 3);
+  tgposId = fresh();
+  tidId = fresh();
+  numTgId = fresh();
+  params.push_back(ctx.param(u3, tgposId));
+  params.push_back(ctx.param(u3, tidId));
+  params.push_back(ctx.param(u3, numTgId));
+  devPoolPtr.clear();
+  if (globalPoolBytes > 0) {
+    devPoolPtr = fresh();
+    params.push_back(ctx.param(
+        ctx.ptr(ctx.scalar(msl::Scalar::I8), msl::AddrSpace::Threadgroup),
+        devPoolPtr));
+  }
+
+  laneId = fresh();
+  warpId = fresh();
+  msl::Block prologue = laneWarpProlog();
+
+  poolBuf = devPoolPtr;
+  curDevFunc = func;
+  Region &region = func.getBody();
+  msl::Block body = region.hasOneBlock() ? astWalkBlock(region.front(), indent)
+                                         : astEmitBlockCFG(region);
+  if (emitFailed)
+    return failure();
+  curDevFunc = nullptr;
+  for (msl::Stmt *s : body)
+    prologue.push_back(s);
+  msl::DeviceFn *fn = ctx.deviceFn(astDeviceRetType(func),
+                                   mslDeviceFuncName(func.getName()), params,
+                                   std::move(prologue));
+  msl::MSLPrinter printer(os);
+  printer.print(fn);
+  return success();
+}
+
 } // namespace mlir::triton::applegpu

@@ -2524,4 +2524,132 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
   return std::nullopt;
 }
 
+LogicalResult MSLEmitter::emitSplat(tt::SplatOp op) {
+  std::string src = names(op.getSrc())[0];
+  int rc = regCount(op.getResult());
+  SmallVector<std::string> ids;
+  for (int r = 0; r < rc; ++r)
+    ids.push_back(src);
+  valMap[op.getResult()] = ids;
+  return success();
+}
+
+LogicalResult MSLEmitter::emitReshapeLike(Value res, Value src, int axis,
+                                          bool isExpand) {
+  auto srcTy = cast<RankedTensorType>(src.getType());
+  auto resTy = cast<RankedTensorType>(res.getType());
+  auto &srcNames = names(src);
+  int srcRc = regCount(src);
+  int resRc = regCount(res);
+
+  llvm::DenseMap<uint64_t, int> srcByCoord;
+  auto keyOf = [](ArrayRef<int32_t> c) -> uint64_t {
+    uint64_t k = 0;
+    for (int32_t v : c)
+      k = k * 100003u + (uint32_t)v + 1;
+    return k;
+  };
+  for (int r = 0; r < srcRc; ++r)
+    srcByCoord[keyOf(registerCoords(srcTy, r))] = r;
+
+  auto srcShape = srcTy.getShape();
+  SmallVector<std::string> ids;
+  for (int r = 0; r < resRc; ++r) {
+    SmallVector<int32_t> rc = registerCoords(resTy, r);
+    SmallVector<int32_t> sc;
+    if (isExpand) {
+      for (int d = 0; d < (int)rc.size(); ++d)
+        if (d != axis)
+          sc.push_back(rc[d]);
+    } else {
+      for (int d = 0; d < (int)rc.size(); ++d)
+        sc.push_back(srcShape[d] == 1 ? 0 : rc[d]);
+    }
+    auto it = srcByCoord.find(keyOf(sc));
+    if (it == srcByCoord.end()) {
+      res.getDefiningOp()->emitError(
+          "EmitMSL: reshape register coordinate has no source");
+      return failure();
+    }
+    ids.push_back(srcNames[srcNames.size() == 1 ? 0 : it->second]);
+  }
+  valMap[res] = ids;
+  return success();
+}
+
+uint64_t MSLEmitter::coordKey(ArrayRef<int32_t> c) {
+  uint64_t k = 0;
+  for (int32_t v : c)
+    k = k * 100003u + (uint32_t)v + 1;
+  return k;
+}
+
+LogicalResult MSLEmitter::emitJoin(tt::JoinOp op) {
+  Value res = op.getResult();
+  auto resTy = cast<RankedTensorType>(res.getType());
+  int trailing = resTy.getRank() - 1;
+  SmallVector<SmallVector<std::string> *> srcNames = {&names(op.getLhs()),
+                                                      &names(op.getRhs())};
+  auto srcTy = cast<RankedTensorType>(op.getLhs().getType());
+  int srcRc = regCount(op.getLhs());
+
+  llvm::DenseMap<uint64_t, int> srcByCoord;
+  for (int r = 0; r < srcRc; ++r)
+    srcByCoord[coordKey(registerCoords(srcTy, r))] = r;
+
+  int resRc = regCount(res);
+  SmallVector<std::string> ids(resRc);
+  for (int r = 0; r < resRc; ++r) {
+    SmallVector<int32_t> rc = registerCoords(resTy, r);
+    int t = rc[trailing];
+    rc.pop_back();
+    auto it = srcByCoord.find(coordKey(rc));
+    if (it == srcByCoord.end() || t < 0 || t > 1) {
+      op.emitError("EmitMSL: join register coordinate has no source");
+      return failure();
+    }
+    auto &sn = *srcNames[t];
+    ids[r] = sn[sn.size() == 1 ? 0 : it->second];
+  }
+  valMap[res] = ids;
+  return success();
+}
+
+LogicalResult MSLEmitter::emitSplit(tt::SplitOp op) {
+  Value src = op.getOperand();
+  auto srcTy = cast<RankedTensorType>(src.getType());
+  int trailing = srcTy.getRank() - 1;
+  auto &srcNames = names(src);
+  int srcRc = regCount(src);
+
+  llvm::DenseMap<uint64_t, int> srcByCoord;
+  for (int r = 0; r < srcRc; ++r)
+    srcByCoord[coordKey(registerCoords(srcTy, r))] = r;
+
+  for (int k = 0; k < 2; ++k) {
+    Value res = op.getResult(k);
+    auto resTy = cast<RankedTensorType>(res.getType());
+    int resRc = regCount(res);
+    SmallVector<std::string> ids(resRc);
+    for (int r = 0; r < resRc; ++r) {
+      SmallVector<int32_t> rc = registerCoords(resTy, r);
+      rc.push_back(k);
+      auto it = srcByCoord.find(coordKey(rc));
+      if (it == srcByCoord.end()) {
+        op.emitError("EmitMSL: split register coordinate has no source");
+        return failure();
+      }
+      (void)trailing;
+      ids[r] = srcNames[srcNames.size() == 1 ? 0 : it->second];
+    }
+    valMap[res] = ids;
+  }
+  return success();
+}
+
+bool MSLEmitter::isPureBarrierOp(Operation *op) {
+  return isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp, ttg::BarrierOp,
+             mlir::gpu::BarrierOp>(op);
+}
+
 } // namespace mlir::triton::applegpu

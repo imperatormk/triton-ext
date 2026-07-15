@@ -15,6 +15,7 @@
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
 
 using namespace mlir;
 
@@ -786,6 +787,454 @@ msl::Expr *MSLEmitter::astReadbackValue(StringRef buf, msl::Expr *off,
                                         StringRef base) {
   return ctx.binary(msl::BinOp::Add, ctx.subscript(ctx.var(buf), off),
                     ctx.var(base));
+}
+
+bool MSLEmitter::tracesToKernelArg(Value v) {
+  while (v) {
+    if (isa<BlockArgument>(v))
+      return true;
+    Operation *def = v.getDefiningOp();
+    if (auto ap = dyn_cast_or_null<tt::AddPtrOp>(def)) {
+      v = ap.getPtr();
+      continue;
+    }
+    if (auto sp = dyn_cast_or_null<tt::SplatOp>(def)) {
+      v = sp.getSrc();
+      continue;
+    }
+    if (auto bc = dyn_cast_or_null<tt::BitcastOp>(def)) {
+      v = bc.getSrc();
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+Value MSLEmitter::peelBroadcastExpand(Value v) {
+  while (v) {
+    Operation *def = v.getDefiningOp();
+    if (auto b = dyn_cast_or_null<tt::BroadcastOp>(def)) {
+      v = b.getSrc();
+      continue;
+    }
+    if (auto e = dyn_cast_or_null<tt::ExpandDimsOp>(def)) {
+      v = e.getSrc();
+      continue;
+    }
+    return v;
+  }
+  return v;
+}
+
+Value MSLEmitter::matchTileIndex(Value v) {
+  v = peelBroadcastExpand(v);
+  auto add = dyn_cast_or_null<arith::AddIOp>(v.getDefiningOp());
+  if (!add)
+    return Value();
+  Value a = peelBroadcastExpand(add.getLhs());
+  Value b = peelBroadcastExpand(add.getRhs());
+  auto isIota = [](Value x) {
+    auto sp = dyn_cast_or_null<tt::SplatOp>(x.getDefiningOp());
+    Value base = sp ? sp.getSrc() : x;
+    auto mr = dyn_cast_or_null<tt::MakeRangeOp>(
+        peelBroadcastExpand(base).getDefiningOp());
+    return mr && mr.getStart() == 0;
+  };
+  auto splatScalar = [](Value x) -> Value {
+    auto sp = dyn_cast_or_null<tt::SplatOp>(x.getDefiningOp());
+    return sp ? sp.getSrc() : Value();
+  };
+  if (isIota(b))
+    if (Value s = splatScalar(a))
+      return s;
+  if (isIota(a))
+    if (Value s = splatScalar(b))
+      return s;
+  return Value();
+}
+
+bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
+                                     Value &colBase) {
+  auto add = dyn_cast_or_null<arith::AddIOp>(off.getDefiningOp());
+  if (!add)
+    return false;
+  auto tryTerm = [&](Value rowT, Value colT) {
+    Value cb = matchTileIndex(colT);
+    if (!cb)
+      return false;
+    Value rowScaled = peelBroadcastExpand(rowT);
+    auto mul = dyn_cast_or_null<arith::MulIOp>(rowScaled.getDefiningOp());
+    if (!mul)
+      return false;
+    auto scalarSrc = [](Value x) -> Value {
+      auto sp = dyn_cast_or_null<tt::SplatOp>(
+          peelBroadcastExpand(x).getDefiningOp());
+      return sp ? sp.getSrc() : Value();
+    };
+    Value rIdxA = mul.getLhs(), rIdxB = mul.getRhs();
+    Value rb = matchTileIndex(rIdxA);
+    Value stride = scalarSrc(rIdxB);
+    if (!rb || !stride) {
+      rb = matchTileIndex(rIdxB);
+      stride = scalarSrc(rIdxA);
+    }
+    if (!rb || !stride)
+      return false;
+    rowBase = rb;
+    ldc = stride;
+    colBase = cb;
+    return true;
+  };
+  return tryTerm(add.getLhs(), add.getRhs()) ||
+         tryTerm(add.getRhs(), add.getLhs());
+}
+
+bool MSLEmitter::matchBoundaryMask(Value m, Value &boundM, Value &boundN) {
+  auto conj = dyn_cast_or_null<arith::AndIOp>(m.getDefiningOp());
+  if (!conj)
+    return false;
+  auto cmpBound = [&](Value side, bool wantRow) -> Value {
+    Value c = peelBroadcastExpand(side);
+    auto cmp = dyn_cast_or_null<arith::CmpIOp>(c.getDefiningOp());
+    if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt)
+      return Value();
+    if (!matchTileIndex(cmp.getLhs()))
+      return Value();
+    auto sp = dyn_cast_or_null<tt::SplatOp>(
+        peelBroadcastExpand(cmp.getRhs()).getDefiningOp());
+    return sp ? sp.getSrc() : Value();
+  };
+  if (Value bm = cmpBound(conj.getLhs(), true))
+    if (Value bn = cmpBound(conj.getRhs(), false)) {
+      boundM = bm;
+      boundN = bn;
+      return true;
+    }
+  if (Value bm = cmpBound(conj.getRhs(), true))
+    if (Value bn = cmpBound(conj.getLhs(), false)) {
+      boundM = bm;
+      boundN = bn;
+      return true;
+    }
+  return false;
+}
+
+bool MSLEmitter::matchDirectStore(Value forResult, DirectStore &ds) {
+  if (getenv("MSL_NO_DIRECT_STORE")) // escape hatch: fall back to pool readback
+    return false;
+  if (!forResult.hasOneUse())
+    return false;
+  auto cvt = dyn_cast<ttg::ConvertLayoutOp>(*forResult.user_begin());
+  if (!cvt || !cvt.getResult().hasOneUse())
+    return false;
+  auto store = dyn_cast<tt::StoreOp>(*cvt.getResult().user_begin());
+  if (!store || store.getValue() != cvt.getResult())
+    return false;
+  auto cTy = dyn_cast<RankedTensorType>(cvt.getResult().getType());
+  if (!cTy || !cTy.getElementType().isF32())
+    return false;
+  auto ptr = dyn_cast_or_null<tt::AddPtrOp>(store.getPtr().getDefiningOp());
+  if (!ptr)
+    return false;
+  auto splat = dyn_cast_or_null<tt::SplatOp>(ptr.getPtr().getDefiningOp());
+  if (!splat || !isa<BlockArgument>(splat.getSrc()))
+    return false;
+  Value rowBase, ldc, colBase;
+  if (!matchRowMajorOffset(ptr.getOffset(), rowBase, ldc, colBase))
+    return false;
+  Value boundM, boundN;
+  if (store.getMask()) {
+    if (!matchBoundaryMask(store.getMask(), boundM, boundN))
+      return false;
+  }
+  ds.store = store;
+  ds.basePtr = splat.getSrc();
+  ds.ldc = ldc;
+  ds.rowBase = rowBase;
+  ds.colBase = colBase;
+  ds.boundM = boundM;
+  ds.boundN = boundN;
+  return true;
+}
+
+std::optional<std::pair<tt::DotOp, unsigned>>
+MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
+  if (getenv("MSL_NO_FUSE")) // escape hatch: fall back to the per-dot path
+    return std::nullopt;
+  Block *body = op.getBody();
+  auto yield = cast<scf::YieldOp>(body->getTerminator());
+  tt::DotOp found;
+  int nDots = 0;
+  for (Operation &o : body->without_terminator())
+    if (auto d = dyn_cast<tt::DotOp>(&o)) {
+      found = d;
+      ++nDots;
+    }
+  if (nDots != 1 || !found)
+    return std::nullopt;
+
+  auto cArg = dyn_cast<BlockArgument>(found.getC());
+  if (!cArg || cArg.getOwner() != body)
+    return std::nullopt;
+  unsigned idx = cArg.getArgNumber();
+  if (idx == 0)
+    return std::nullopt; // arg 0 is the induction var
+  unsigned iterIdx = idx - 1;
+  if (yield.getOperand(iterIdx) != found.getResult())
+    return std::nullopt;
+  // The iter-arg feeds the dot's C and nothing else; the dot result feeds the
+  // yield and nothing else. This keeps the accumulator purely register-carried.
+  for (Operation *u : cArg.getUsers())
+    if (u != found.getOperation())
+      return std::nullopt;
+  for (Operation *u : found.getResult().getUsers())
+    if (u != yield.getOperation())
+      return std::nullopt;
+
+  auto cTy = dyn_cast<RankedTensorType>(found.getResult().getType());
+  if (!cTy || cTy.getRank() != 2)
+    return std::nullopt;
+  Type aElem = cast<RankedTensorType>(found.getA().getType()).getElementType();
+  Type cElem = cTy.getElementType();
+  if (isa<IntegerType>(aElem) || !(cElem.isF32() || cElem.isF16()))
+    return std::nullopt;
+  int64_t M = cTy.getShape()[0], N = cTy.getShape()[1];
+  int64_t K = cast<RankedTensorType>(found.getA().getType()).getShape()[1];
+  if (M % 8 || N % 8 || K % 8)
+    return std::nullopt;
+
+  // Gate: the fused path only wins with a small warp-tile (<= 8
+  // simdgroup_float8x8 accumulators per warp) AND the disjoint staging path
+  // where staged A+B+C fits the pool (band == M, one readback). Anything
+  // larger falls back to the per-dot path. Staging bytes mirror the dot path: an
+  // operand already resident in a threadgroup buffer (in-place) stages 0.
+  int64_t aBytes = M * K * (bitsOf(aElem) / 8);
+  int64_t bBytes = N * K * (bitsOf(aElem) / 8);
+  int64_t cFull = M * N * 4;
+  bool wholeTileFits = aBytes + bBytes <= 32768;
+  // A/B that structurally resolve to a local_alloc buffer are loaded in place
+  // by astEmitDot (stage 0). The precise in-place base lives in memdescMap, which
+  // is only populated once the enclosing memdesc_index is emitted inside the
+  // loop; here (pre-loop) the structural walk is the reliable signal.
+  int64_t stagedA = aBytes, stagedB = bBytes;
+  if (wholeTileFits) {
+    if (dotOperandLocalLoad(found.getA(), M, K))
+      stagedA = 0;
+    if (dotOperandLocalLoad(found.getB(), K, N))
+      stagedB = 0;
+  }
+  if (stagedA + stagedB + cFull > poolBudget())
+    return std::nullopt;
+  tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
+  auto kWarpDim = StringAttr::get(op.getContext(), "warp");
+  int64_t numWarps = cLL.hasInDim(kWarpDim) ? cLL.getInDimSize(kWarpDim) : 1;
+  int64_t nFrag = (M / 8) * (N / 8);
+  if (numWarps > nFrag)
+    numWarps = nFrag;
+  int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
+  if (fragsPerWarp > 8)
+    return std::nullopt;
+
+  return std::make_pair(found, iterIdx);
+}
+
+unsigned MSLEmitter::reduceMask(const tt::LinearLayout &ll, StringAttr inDim,
+                                StringAttr outDim) {
+  unsigned mask = 0;
+  if (!ll.hasInDim(inDim))
+    return 0;
+  for (int b = 0, n = ll.getInDimSizeLog2(inDim); b < n; ++b)
+    if (ll.getBasis(inDim, b, outDim) != 0)
+      mask |= (1u << b);
+  return mask;
+}
+
+SmallVector<int> MSLEmitter::subsetsOf(unsigned mask, int numWarps) {
+  SmallVector<int> bits;
+  for (int b = 0; b < 16; ++b)
+    if (mask & (1u << b))
+      bits.push_back(b);
+  SmallVector<int> vals;
+  for (int s = 0; s < (1 << bits.size()); ++s) {
+    int v = 0;
+    for (int i = 0; i < (int)bits.size(); ++i)
+      if (s & (1 << i))
+        v |= (1 << bits[i]);
+    if (v < numWarps)
+      vals.push_back(v);
+  }
+  return vals;
+}
+
+SmallVector<std::pair<int, int32_t>>
+MSLEmitter::axisBits(const tt::LinearLayout &ll, StringAttr inDim,
+                     StringAttr outDim) {
+  SmallVector<std::pair<int, int32_t>> bits;
+  if (!ll.hasInDim(inDim))
+    return bits;
+  for (int b = 0, n = ll.getInDimSizeLog2(inDim); b < n; ++b) {
+    int32_t basis = ll.getBasis(inDim, b, outDim);
+    if (basis != 0)
+      bits.push_back({b, basis});
+  }
+  llvm::sort(bits, [](auto &a, auto &c) { return a.second < c.second; });
+  return bits;
+}
+
+ttg::LocalLoadOp MSLEmitter::dotOperandLocalLoad(Value operand, int64_t rows,
+                                                 int64_t cols) {
+  Value v = operand;
+  while (auto cvt = dyn_cast_or_null<ttg::ConvertLayoutOp>(v.getDefiningOp()))
+    v = cvt.getSrc();
+  auto ll = dyn_cast_or_null<ttg::LocalLoadOp>(v.getDefiningOp());
+  if (!ll)
+    return nullptr;
+  auto mt = cast<ttg::MemDescType>(ll.getSrc().getType());
+  if (mt.getRank() != 2 || mt.getShape()[0] != rows ||
+      mt.getShape()[1] != cols)
+    return nullptr;
+  Value src = ll.getSrc();
+  while (Operation *def = src.getDefiningOp()) {
+    if (auto mi = dyn_cast<ttg::MemDescIndexOp>(def)) {
+      src = mi.getSrc();
+      continue;
+    }
+    if (isa<ttg::LocalAllocOp>(def))
+      return ll;
+    return nullptr;
+  }
+  return nullptr;
+}
+
+bool MSLEmitter::dotReadsOperandInPlace(tt::DotOp d, Value operand) {
+  auto cTy = cast<RankedTensorType>(d.getResult().getType());
+  if (cTy.getRank() != 2)
+    return false;
+  int64_t M = cTy.getShape()[0], N = cTy.getShape()[1];
+  int64_t Kd = cast<RankedTensorType>(d.getA().getType()).getShape()[1];
+  int64_t aBy = M * Kd * (bitsOf(cast<RankedTensorType>(d.getA().getType())
+                                     .getElementType()) /
+                          8);
+  int64_t bBy = Kd * N * (bitsOf(cast<RankedTensorType>(d.getB().getType())
+                                     .getElementType()) /
+                          8);
+  if (aBy + bBy > 32768)
+    return false;
+  if (operand == d.getA())
+    return dotOperandLocalLoad(operand, M, Kd);
+  if (operand == d.getB())
+    return dotOperandLocalLoad(operand, Kd, N);
+  return false;
+}
+
+bool MSLEmitter::convertLayoutIsDeadDotStage(ttg::ConvertLayoutOp c) {
+  if (c.getResult().use_empty())
+    return false;
+  for (OpOperand &use : c.getResult().getUses()) {
+    auto d = dyn_cast<tt::DotOp>(use.getOwner());
+    if (!d || !dotReadsOperandInPlace(d, c.getResult()))
+      return false;
+  }
+  return true;
+}
+
+bool MSLEmitter::localLoadIsDeadDotStage(ttg::LocalLoadOp ll) {
+  if (ll.getResult().use_empty())
+    return false;
+  for (OpOperand &use : ll.getResult().getUses()) {
+    Operation *owner = use.getOwner();
+    if (auto c = dyn_cast<ttg::ConvertLayoutOp>(owner)) {
+      if (!convertLayoutIsDeadDotStage(c))
+        return false;
+      continue;
+    }
+    auto d = dyn_cast<tt::DotOp>(owner);
+    if (!d || !dotReadsOperandInPlace(d, ll.getResult()))
+      return false;
+  }
+  return true;
+}
+
+std::optional<InPlaceOperand>
+MSLEmitter::dotOperandInPlaceBuf(Value operand, int64_t rows, int64_t cols) {
+  ttg::LocalLoadOp ll = dotOperandLocalLoad(operand, rows, cols);
+  if (!ll)
+    return std::nullopt;
+  auto it = memdescMap.find(ll.getSrc());
+  if (it == memdescMap.end() || !it->second.bufStrides.empty())
+    return std::nullopt;
+  return InPlaceOperand{it->second.buf, it->second.baseOffset};
+}
+
+Value MSLEmitter::dotOperandConvertSource(tt::DotOp d, Value operand) {
+  auto cvt = dyn_cast_or_null<ttg::ConvertLayoutOp>(operand.getDefiningOp());
+  if (!cvt)
+    return nullptr;
+  Value src = cvt.getSrc();
+  auto st = dyn_cast<RankedTensorType>(src.getType());
+  if (!st || st.getRank() != 2)
+    return nullptr;
+  if (dotOperandLocalLoad(operand, st.getShape()[0], st.getShape()[1]))
+    return nullptr;
+  auto cTy = cast<RankedTensorType>(d.getResult().getType());
+  if (cTy.getRank() != 2)
+    return nullptr;
+  return src;
+}
+
+bool MSLEmitter::convertLayoutIsDeadDotStageSource(ttg::ConvertLayoutOp c) {
+  if (c.getResult().use_empty())
+    return false;
+  for (OpOperand &use : c.getResult().getUses()) {
+    auto d = dyn_cast<tt::DotOp>(use.getOwner());
+    if (!d)
+      return false;
+    if (use.get() != d.getA() && use.get() != d.getB())
+      return false;
+    auto cTy = cast<RankedTensorType>(d.getResult().getType());
+    if (cTy.getRank() != 2)
+      return false;
+    if (!dotOperandConvertSource(d, use.get()))
+      return false;
+  }
+  return true;
+}
+
+void MSLEmitter::dotPanelDims(int64_t M, int64_t N, int64_t K, int64_t elemBytes,
+                              int64_t accBytes, int64_t &mp, int64_t &np) {
+  mp = M;
+  np = N;
+  auto fits = [&](int64_t m, int64_t n) {
+    return m * K * elemBytes + K * n * elemBytes + m * n * accBytes <= 32768;
+  };
+  while (!fits(mp, np)) {
+    if (mp >= np && mp > 8)
+      mp -= 8;
+    else if (np > 8)
+      np -= 8;
+    else if (mp > 8)
+      mp -= 8;
+    else
+      break;
+  }
+}
+
+bool MSLEmitter::dotNeedsPanel(int64_t M, int64_t N, int64_t K,
+                               int64_t elemBytes, int64_t accBytes) {
+  return M * K * elemBytes + K * N * elemBytes > 32768;
+}
+
+int64_t MSLEmitter::dotCBandRows(int64_t M, int64_t N, int64_t cBudget,
+                                 int64_t accBytes) {
+  int64_t rowBytes = N * accBytes;
+  int64_t band = cBudget / rowBytes;
+  band -= band % 8;
+  if (band < 8)
+    band = 8;
+  if (band > M)
+    band = M;
+  return band;
 }
 
 } // namespace mlir::triton::applegpu

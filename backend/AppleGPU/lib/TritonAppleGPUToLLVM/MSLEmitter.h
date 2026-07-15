@@ -380,6 +380,8 @@ private:
   // op is handled (nodes appended, or nothing for alias/dataless ops); false for
   // an unsupported op, which astWalkBlock turns into a hard error.
   bool astEmitOp(Operation *op, msl::Block &body);
+  void astProgramDim(Operation *op, StringRef builtinVar, tt::ProgramIDDim axis,
+                     msl::Block &body);
   msl::Block astWalkBlock(Block &blk, unsigned depth);
   msl::Block astEmitBlockCFG(Region &region);
   void astEmitMapCFG(Region &region, ArrayRef<std::string> capture,

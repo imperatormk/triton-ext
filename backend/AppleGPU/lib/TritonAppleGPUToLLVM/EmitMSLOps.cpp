@@ -523,6 +523,23 @@ void MSLEmitter::astStoreBody(tt::StoreOp op, msl::Block &body) {
   }
 }
 
+static const char *axisComp(tt::ProgramIDDim axis) {
+  return axis == tt::ProgramIDDim::X   ? "x"
+         : axis == tt::ProgramIDDim::Y ? "y"
+                                       : "z";
+}
+
+// `int id = (int)(builtinVar.comp);` and bind the result.
+void MSLEmitter::astProgramDim(Operation *op, StringRef builtinVar,
+                               tt::ProgramIDDim axis, msl::Block &body) {
+  msl::Expr *e = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::I32),
+                          ctx.paren(ctx.member(ctx.var(builtinVar),
+                                               axisComp(axis))));
+  std::string id = fresh();
+  body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), id, e));
+  bindScalar(op->getResult(0), id);
+}
+
 // Route `op` to its builder(s), appending nodes to `body`. Returns true when
 // handled (including alias/dataless ops that append nothing); false for an
 // unsupported op, which the caller turns into a hard error.
@@ -608,25 +625,11 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
 
   // Program-id / num-programs: `int id = (int)(builtin.comp);`
   if (auto p = dyn_cast<tt::GetProgramIdOp>(op)) {
-    const char *comp = p.getAxis() == tt::ProgramIDDim::X   ? "x"
-                       : p.getAxis() == tt::ProgramIDDim::Y ? "y"
-                                                            : "z";
-    msl::Expr *e = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::I32),
-                            ctx.paren(ctx.member(ctx.var(tgposId), comp)));
-    std::string id = fresh();
-    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), id, e));
-    bindScalar(op->getResult(0), id);
+    astProgramDim(op, tgposId, p.getAxis(), body);
     return true;
   }
   if (auto n = dyn_cast<tt::GetNumProgramsOp>(op)) {
-    const char *comp = n.getAxis() == tt::ProgramIDDim::X   ? "x"
-                       : n.getAxis() == tt::ProgramIDDim::Y ? "y"
-                                                            : "z";
-    msl::Expr *e = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::I32),
-                            ctx.paren(ctx.member(ctx.var(numTgId), comp)));
-    std::string id = fresh();
-    body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), id, e));
-    bindScalar(op->getResult(0), id);
+    astProgramDim(op, numTgId, n.getAxis(), body);
     return true;
   }
 

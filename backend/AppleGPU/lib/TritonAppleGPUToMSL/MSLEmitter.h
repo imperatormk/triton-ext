@@ -614,6 +614,15 @@ private:
   static int64_t reshapeBandElems(int64_t totalElems, int64_t elemBytes,
                                   int64_t budget = kTGResidentBudgetBytes);
 
+  // Flat element band for a threadgroup-staged reshape/trans round-trip,
+  // clamped to the live pool budget so emission bands identically to how
+  // scanPool/tgScratchBytes sized the pool (no sizing/lowering drift).
+  int64_t reshapeBand(int64_t totalElems, int64_t elemBytes) const {
+    return totalElems * elemBytes > poolBudget()
+               ? reshapeBandElems(totalElems, elemBytes, poolBudget())
+               : totalElems;
+  }
+
   // Full flat size (product of shape) of a tensor tile.
   int64_t tileSize(RankedTensorType rt);
 

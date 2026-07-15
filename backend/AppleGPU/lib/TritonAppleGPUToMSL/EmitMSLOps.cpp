@@ -1030,10 +1030,7 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
     std::string buf = fresh();
     body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
                                 astPoolRegion(0, sc)));
-    int64_t band =
-        total * elemBytes > kTGResidentBudgetBytes
-            ? reshapeBandElems(total, elemBytes)
-            : total;
+    int64_t band = reshapeBand(total, elemBytes);
     SmallVector<std::string> ids = astDeclResultVars(res, body);
     astBandRoundTrip(
         body, buf, total, band, srcRc, resRc, ids,
@@ -1069,10 +1066,7 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
     std::string buf = fresh();
     body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
                                 astPoolRegion(0, sc)));
-    int64_t band =
-        total * elemBytes > kTGResidentBudgetBytes
-            ? reshapeBandElems(total, elemBytes)
-            : total;
+    int64_t band = reshapeBand(total, elemBytes);
     SmallVector<std::string> outs = astDeclResultVars(res, body);
     astBandRoundTrip(
         body, buf, total, band, srcRc, resRc, outs,

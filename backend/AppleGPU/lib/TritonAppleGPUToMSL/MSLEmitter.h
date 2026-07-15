@@ -657,6 +657,11 @@ private:
   // Full flat size (product of shape) of a tensor tile.
   int64_t tileSize(RankedTensorType rt);
 
+  // Threadgroup scratch bytes for a full tile of `ty`, clamped to the live pool
+  // budget (poolBudget()) when it overflows. band2D uses the rk>=2 row-band
+  // clamp (last dim intact); otherwise the flat reshape-band clamp.
+  int64_t tgScratchBytes(RankedTensorType ty, bool band2D);
+
   // Peak byte footprint of a single transient scratch site.
   void scanPool(Operation *op);
 

@@ -265,46 +265,40 @@ int64_t MSLEmitter::tileSize(RankedTensorType rt) {
   return n;
 }
 
+int64_t MSLEmitter::tgScratchBytes(RankedTensorType ty, bool band2D) {
+  Type e = ty.getElementType();
+  int64_t elemBytes = bitsOf(e) / 8;
+  int64_t bytes = tileSize(ty) * elemBytes;
+  int64_t cap = poolBudget();
+  if (bytes <= cap)
+    return bytes;
+  int rk = ty.getRank();
+  if (band2D && rk >= 2) {
+    int64_t N = ty.getShape()[rk - 1];
+    int64_t bandRows = cap / (N * elemBytes);
+    if (bandRows < 1)
+      bandRows = 1;
+    return bandRows * N * elemBytes;
+  }
+  return reshapeBandElems(tileSize(ty), elemBytes, cap) * elemBytes;
+}
+
 void MSLEmitter::scanPool(Operation *op) {
   if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op)) {
     if (convertLayoutIsDeadDotStage(c) || convertLayoutIsDeadDotStageSource(c))
       return;
     auto st = cast<RankedTensorType>(c.getSrc().getType());
-    Type e = st.getElementType();
-    int64_t elemBytes = bitsOf(e) / 8;
-    int64_t bytes = tileSize(st) * elemBytes;
-    int rk = st.getRank();
-    int64_t cap = poolBudget();
-    if (bytes > cap && rk >= 2) {
-      int64_t N = st.getShape()[rk - 1];
-      int64_t bandRows = cap / (N * elemBytes);
-      if (bandRows < 1)
-        bandRows = 1;
-      bytes = bandRows * N * elemBytes;
-    } else if (bytes > cap) {
-      bytes = reshapeBandElems(tileSize(st), elemBytes, cap) * elemBytes;
-    }
-    poolBytes = std::max(poolBytes, bytes);
+    poolBytes = std::max(poolBytes, tgScratchBytes(st, /*band2D=*/true));
   } else if (auto t = dyn_cast<tt::TransOp>(op)) {
     auto rt = cast<RankedTensorType>(t.getResult().getType());
-    Type e = rt.getElementType();
-    int64_t elemBytes = bitsOf(e) / 8;
-    int64_t bytes = tileSize(rt) * elemBytes;
-    if (bytes > 32768)
-      bytes = reshapeBandElems(tileSize(rt), elemBytes) * elemBytes;
-    poolBytes = std::max(poolBytes, bytes);
+    poolBytes = std::max(poolBytes, tgScratchBytes(rt, /*band2D=*/false));
   } else if (auto c = dyn_cast<tt::CatOp>(op)) {
     auto rt = cast<RankedTensorType>(c.getResult().getType());
     Type e = rt.getElementType();
     poolBytes = std::max(poolBytes, tileSize(rt) * (bitsOf(e) / 8));
   } else if (auto rs = dyn_cast<tt::ReshapeOp>(op)) {
     auto rt = cast<RankedTensorType>(rs.getResult().getType());
-    Type e = rt.getElementType();
-    int64_t elemBytes = bitsOf(e) / 8;
-    int64_t bytes = tileSize(rt) * elemBytes;
-    if (bytes > 32768)
-      bytes = reshapeBandElems(tileSize(rt), elemBytes) * elemBytes;
-    poolBytes = std::max(poolBytes, bytes);
+    poolBytes = std::max(poolBytes, tgScratchBytes(rt, /*band2D=*/false));
   } else if (auto g = dyn_cast<tt::GatherOp>(op)) {
     auto st = cast<RankedTensorType>(g.getSrc().getType());
     Type e = st.getElementType();

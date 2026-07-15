@@ -513,17 +513,6 @@ private:
   // extra users) falls back to the pool readback. Fills `ds` on success.
   bool matchDirectStore(Value forResult, DirectStore &ds);
 
-  // Build the MSL offset expression for register `reg` of a distributed 1-D
-  // tensor value, using its TritonGPU LinearLayout. block/lane/warp are runtime
-  // ids; register bits are compile-time constant. Contributions XOR together
-  // (general linear-layout semantics).
-  std::string layoutOffsetExpr(RankedTensorType rt, int reg);
-
-  // MSL expression for the coordinate of register `reg` along a single tensor
-  // out-dim (dim0, dim1, ...). block/lane/warp are runtime ids; register bits
-  // are compile-time constant. Contributions XOR together.
-  std::string layoutCoordExpr(RankedTensorType rt, int reg, StringAttr outDim);
-
   static bool isPureBarrierOp(Operation *op);
 
 
@@ -647,8 +636,6 @@ private:
 
   static int64_t bitsOf(Type t);
 
-  std::string poolRegion(int64_t byteOffset, StringRef sc);
-
   // Elements per band for a threadgroup-staged reshape whose full tile exceeds
   // the 32KB budget: the largest chunk of flat offsets that fits.
   static int64_t reshapeBandElems(int64_t totalElems, int64_t elemBytes,
@@ -664,24 +651,6 @@ private:
 
   // Peak byte footprint of a single transient scratch site.
   void scanPool(Operation *op);
-
-  // Row-major flat offset expression (into a full tile buffer) for register r.
-  std::string flatTileOffset(RankedTensorType rt, int reg);
-
-  // Row-major flat offset of register r within its batch slice: the row-major
-  // offset over the trailing (rank-1) out-dims only, dropping the leading batch
-  // dim. Used to index a single per-batch staging region reused across slices.
-  std::string sliceFlatOffset(RankedTensorType rt, int reg);
-
-  std::string batchCoordExpr(RankedTensorType rt, int reg);
-
-  // Row-major flat offset of source register r, with its out-dim coordinates
-  // permuted by `perm` and strides taken from `resShape` (the transposed
-  // shape). Places the source element at its transposed logical position.
-  std::string transFlatOffset(RankedTensorType srcTy, ArrayRef<int32_t> perm,
-                              ArrayRef<int64_t> resShape, int reg);
-
-
 
 
 
@@ -738,7 +707,6 @@ private:
   // registers back. Emits simdgroup_load / simdgroup_multiply_accumulate /
   // simdgroup_store only.
   static bool isDotOperandElem(Type t);
-  static std::string sgFragType(Type t);
   static std::string sgOperandScalar(Type t);
 
   // Row band (multiple of 8) for the C store/readback so its threadgroup

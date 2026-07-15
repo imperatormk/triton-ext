@@ -186,66 +186,9 @@ msl::Expr *MSLEmitter::astMemdescElemAddr(const MemDescInfo &info,
   return ctx.paren(ctx.binary(msl::BinOp::Add, info.baseOffset, off));
 }
 
-std::string MSLEmitter::layoutOffsetExpr(RankedTensorType rt, int reg) {
-  tt::LinearLayout ll = ttg::toLinearLayout(rt);
-  auto outDim = *ll.getOutDimNames().begin();
-  return layoutCoordExpr(rt, reg, outDim);
-}
-
-std::string MSLEmitter::layoutCoordExpr(RankedTensorType rt, int reg,
-                                        StringAttr outDim) {
-  MLIRContext *ctx = rt.getContext();
-  tt::LinearLayout ll = ttg::toLinearLayout(rt);
-  auto kReg = StringAttr::get(ctx, "register");
-  auto kLane = StringAttr::get(ctx, "lane");
-  auto kWarp = StringAttr::get(ctx, "warp");
-  auto kBlock = StringAttr::get(ctx, "block");
-
-  SmallVector<std::string> terms;
-
-  int32_t constPart = 0;
-  for (int b = 0, n = ll.getInDimSizeLog2(kReg); b < n; ++b)
-    if (reg & (1 << b))
-      constPart ^= ll.getBasis(kReg, b, outDim);
-  if (constPart != 0)
-    terms.push_back(std::to_string(constPart));
-
-  auto runtimeDim = [&](StringAttr in, StringRef idExpr) {
-    if (!ll.hasInDim(in))
-      return;
-    for (int b = 0, n = ll.getInDimSizeLog2(in); b < n; ++b) {
-      int32_t basis = ll.getBasis(in, b, outDim);
-      if (basis == 0)
-        continue;
-      std::string bitExpr =
-          "(((" + idExpr.str() + " >> " + std::to_string(b) + ") & 1) * " +
-          std::to_string(basis) + ")";
-      terms.push_back(bitExpr);
-    }
-  };
-  runtimeDim(kLane, laneId);
-  runtimeDim(kWarp, warpId);
-  runtimeDim(kBlock, tgposId + ".x");
-
-  if (terms.empty())
-    return "0";
-  std::string expr = terms[0];
-  for (size_t i = 1; i < terms.size(); ++i)
-    expr = "(" + expr + " ^ " + terms[i] + ")";
-  return expr;
-}
-
 int64_t MSLEmitter::poolBudget() const {
   int64_t b = 32768 - liveTgBytes;
   return b < 0 ? 0 : b;
-}
-
-std::string MSLEmitter::poolRegion(int64_t byteOffset, StringRef sc) {
-  std::string base = byteOffset == 0
-                         ? poolBuf
-                         : "(" + poolBuf + " + " + std::to_string(byteOffset) +
-                               ")";
-  return "((threadgroup " + sc.str() + "*)" + base + ")";
 }
 
 int64_t MSLEmitter::reshapeBandElems(int64_t totalElems, int64_t elemBytes,
@@ -393,65 +336,6 @@ void MSLEmitter::scanPool(Operation *op) {
     for (Block &blk : reg)
       for (Operation &o : blk)
         scanPool(&o);
-}
-
-std::string MSLEmitter::flatTileOffset(RankedTensorType rt, int reg) {
-  MLIRContext *ctx = rt.getContext();
-  tt::LinearLayout ll = ttg::toLinearLayout(rt);
-  auto outNames = llvm::to_vector(ll.getOutDimNames());
-  auto shape = rt.getShape();
-  std::string expr;
-  int64_t stride = 1;
-  for (int d = (int)outNames.size() - 1; d >= 0; --d) {
-    std::string c = layoutCoordExpr(rt, reg, outNames[d]);
-    std::string term = stride == 1 ? c : ("(" + c + " * " +
-                                          std::to_string(stride) + ")");
-    expr = expr.empty() ? term : ("(" + expr + " + " + term + ")");
-    stride *= shape[d];
-  }
-  (void)ctx;
-  return expr.empty() ? "0" : expr;
-}
-
-std::string MSLEmitter::sliceFlatOffset(RankedTensorType rt, int reg) {
-  tt::LinearLayout ll = ttg::toLinearLayout(rt);
-  auto outNames = llvm::to_vector(ll.getOutDimNames());
-  auto shape = rt.getShape();
-  int lo = std::max<int>(0, (int)outNames.size() - 2);
-  std::string expr;
-  int64_t stride = 1;
-  for (int d = (int)outNames.size() - 1; d >= lo; --d) {
-    std::string c = layoutCoordExpr(rt, reg, outNames[d]);
-    std::string term = stride == 1 ? c : ("(" + c + " * " +
-                                          std::to_string(stride) + ")");
-    expr = expr.empty() ? term : ("(" + expr + " + " + term + ")");
-    stride *= shape[d];
-  }
-  return expr.empty() ? "0" : expr;
-}
-
-std::string MSLEmitter::batchCoordExpr(RankedTensorType rt, int reg) {
-  tt::LinearLayout ll = ttg::toLinearLayout(rt);
-  auto outNames = llvm::to_vector(ll.getOutDimNames());
-  return layoutCoordExpr(rt, reg, outNames[0]);
-}
-
-std::string MSLEmitter::transFlatOffset(RankedTensorType srcTy,
-                                        ArrayRef<int32_t> perm,
-                                        ArrayRef<int64_t> resShape, int reg) {
-  tt::LinearLayout ll = ttg::toLinearLayout(srcTy);
-  auto outNames = llvm::to_vector(ll.getOutDimNames());
-  int rank = outNames.size();
-  std::string expr;
-  int64_t stride = 1;
-  for (int d = rank - 1; d >= 0; --d) {
-    std::string c = layoutCoordExpr(srcTy, reg, outNames[perm[d]]);
-    std::string term = stride == 1 ? c : ("(" + c + " * " +
-                                          std::to_string(stride) + ")");
-    expr = expr.empty() ? term : ("(" + expr + " + " + term + ")");
-    stride *= resShape[d];
-  }
-  return expr.empty() ? "0" : expr;
 }
 
 int64_t MSLEmitter::memdescFlatSize(ttg::MemDescType mt) {

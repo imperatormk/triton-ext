@@ -75,14 +75,6 @@ bool MSLEmitter::isDotOperandElem(Type t) {
   return t.isF32() || t.isF16() || t.isBF16();
 }
 
-std::string MSLEmitter::sgFragType(Type t) {
-  if (t.isF16())
-    return msl::builtin::sg::Half8x8.str();
-  if (t.isBF16())
-    return msl::builtin::sg::Bfloat8x8.str();
-  return msl::builtin::sg::Float8x8.str();
-}
-
 std::string MSLEmitter::sgOperandScalar(Type t) {
   if (t.isF16())
     return "half";

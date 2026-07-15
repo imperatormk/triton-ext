@@ -16,13 +16,14 @@ jobs:
     runs-on: [self-hosted, mini-mps]
     timeout-minutes: 30
     env:
+      VENV: /Users/Shared/playground/.venv
       DEPS: /Users/Shared/playground/deps
       TRITON_SRC: /Users/zimski/projects/oss/triton-main
     steps:
       - name: Report host + GPU
         run: |
           echo "host: $(hostname)  arch: $(uname -m)  macOS: $(sw_vers -productVersion)"
-          "$DEPS/.venv/bin/python" - <<'PY'
+          "$VENV/bin/python" - <<'PY'
           import triton, torch
           print("triton", triton.__version__, "torch", torch.__version__)
           print("mps available:", torch.backends.mps.is_available())
@@ -35,7 +36,7 @@ jobs:
           export PYTHONPATH="$DEPS/triton_apple_backend_pkg"
           rm -rf "$HOME/.triton/cache"
           cd "$TRITON_SRC/python/test"
-          "$DEPS/.venv/bin/python" -m pytest unit/language/test_core.py \
+          "$VENV/bin/python" -m pytest unit/language/test_core.py \
             -k "${{ github.event.inputs.test_filter }}" \
             --device mps \
             -p no:cacheprovider \

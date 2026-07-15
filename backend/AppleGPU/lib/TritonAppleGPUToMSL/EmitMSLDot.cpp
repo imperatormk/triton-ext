@@ -924,34 +924,35 @@ bool MSLEmitter::matchBoundaryMask(Value m, Value &boundM, Value &boundN) {
   return false;
 }
 
-bool MSLEmitter::matchDirectStore(Value forResult, DirectStore &ds) {
+std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   if (getenv("MSL_NO_DIRECT_STORE")) // escape hatch: fall back to pool readback
-    return false;
+    return std::nullopt;
   if (!forResult.hasOneUse())
-    return false;
+    return std::nullopt;
   auto cvt = dyn_cast<ttg::ConvertLayoutOp>(*forResult.user_begin());
   if (!cvt || !cvt.getResult().hasOneUse())
-    return false;
+    return std::nullopt;
   auto store = dyn_cast<tt::StoreOp>(*cvt.getResult().user_begin());
   if (!store || store.getValue() != cvt.getResult())
-    return false;
+    return std::nullopt;
   auto cTy = dyn_cast<RankedTensorType>(cvt.getResult().getType());
   if (!cTy || !cTy.getElementType().isF32())
-    return false;
+    return std::nullopt;
   auto ptr = definingOp<tt::AddPtrOp>(store.getPtr());
   if (!ptr)
-    return false;
+    return std::nullopt;
   auto splat = definingOp<tt::SplatOp>(ptr.getPtr());
   if (!splat || !isa<BlockArgument>(splat.getSrc()))
-    return false;
+    return std::nullopt;
   Value rowBase, ldc, colBase;
   if (!matchRowMajorOffset(ptr.getOffset(), rowBase, ldc, colBase))
-    return false;
+    return std::nullopt;
   Value boundM, boundN;
   if (store.getMask()) {
     if (!matchBoundaryMask(store.getMask(), boundM, boundN))
-      return false;
+      return std::nullopt;
   }
+  DirectStore ds;
   ds.store = store;
   ds.basePtr = splat.getSrc();
   ds.ldc = ldc;
@@ -959,7 +960,7 @@ bool MSLEmitter::matchDirectStore(Value forResult, DirectStore &ds) {
   ds.colBase = colBase;
   ds.boundM = boundM;
   ds.boundN = boundN;
-  return true;
+  return ds;
 }
 
 std::optional<std::pair<tt::DotOp, unsigned>>

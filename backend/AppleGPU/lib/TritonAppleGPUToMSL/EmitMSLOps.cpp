@@ -339,31 +339,30 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx
   }
   body.push_back(astForScope(op, std::move(loopBody), iv, ivTy));
 
-  DirectStore ds;
-  if (matchDirectStore(op.getResult(iterIdx), ds)) {
+  if (auto ds = matchDirectStore(op.getResult(iterIdx))) {
     int64_t M = cast<RankedTensorType>(dot.getResult().getType()).getShape()[0];
     int64_t N = cast<RankedTensorType>(dot.getResult().getType()).getShape()[1];
     std::string ft = fresh();
-    ds.fullTileVar = ft;
+    ds->fullTileVar = ft;
     msl::Expr *cond;
-    if (ds.boundM) {
+    if (ds->boundM) {
       // (rowBase + M <= boundM && colBase + N <= boundN)
       cond = ctx.paren(ctx.binary(
           B::LAnd,
           ctx.binary(B::Le,
-                     ctx.binary(B::Add, ctx.var(names(ds.rowBase)[0]),
+                     ctx.binary(B::Add, ctx.var(names(ds->rowBase)[0]),
                                 ctx.lit(std::to_string(M))),
-                     ctx.var(names(ds.boundM)[0])),
+                     ctx.var(names(ds->boundM)[0])),
           ctx.binary(B::Le,
-                     ctx.binary(B::Add, ctx.var(names(ds.colBase)[0]),
+                     ctx.binary(B::Add, ctx.var(names(ds->colBase)[0]),
                                 ctx.lit(std::to_string(N))),
-                     ctx.var(names(ds.boundN)[0]))));
+                     ctx.var(names(ds->boundN)[0]))));
     } else {
       cond = ctx.lit("true");
     }
     body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), ft, cond));
     fusedDot.direct = ds;
-    directStoreHandled[ds.store.getOperation()] = ft;
+    directStoreHandled[ds->store.getOperation()] = ft;
   }
 
   fusedDot.phase = FusedDotPhase::Readback;

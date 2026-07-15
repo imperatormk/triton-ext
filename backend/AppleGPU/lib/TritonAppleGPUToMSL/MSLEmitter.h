@@ -518,7 +518,7 @@ private:
   // consumer of the fused accumulator. Only an f32->f32 store through a single
   // convert_layout is taken; anything else (dtype cast, reduction, second dot,
   // extra users) falls back to the pool readback. Fills `ds` on success.
-  bool matchDirectStore(Value forResult, DirectStore &ds);
+  std::optional<DirectStore> matchDirectStore(Value forResult);
 
   static bool isPureBarrierOp(Operation *op);
 

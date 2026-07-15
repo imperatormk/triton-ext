@@ -39,8 +39,6 @@ Only macOS is a supported host. iOS, iPadOS, visionOS and tvOS are out of scope:
 they have no PyTorch MPS backend to bridge tensor storage from, and they
 restrict the runtime shader compilation that Triton's JIT model depends on.
 
-- CMake + Ninja
-
 ## Setup
 
 ### 1. Build Triton from source
@@ -165,12 +163,21 @@ inspections are not applicable.
 ## Known Limitations
 
 - `float64` — MPS has no double precision.
-- `float8` (e4m3, e5m2) — the torch MPS backend has no fp8 dtype, and the
-  emitter has no fp8 conversion path yet. A capability gap, not a hardware wall.
+- `float8` (e4m3, e5m2) — the emitter now converts fp8\<->fp32/fp16 (uint8
+  storage + RTNE/saturating pack-unpack helpers, bit-exact vs torch), so fp8
+  kernels compile and run when fp8 crosses the boundary as uint8 storage +
+  `triton.reinterpret` (the pattern triton's own fp8 tests use). A native
+  `torch.float8_*` device tensor still isn't possible — torch MPS has no fp8
+  dtype — so only `test_cast`-style tests that allocate a real fp8 device tensor
+  remain blocked upstream.
 - `int64`/`uint64` atomics — Metal has no 64-bit device atomics.
 - acquire/release atomics — Metal device atomics are relaxed-only; ordered
   variants lower to relaxed.
 - `tf32` / `bf16xN` dot input precision — split-precision emulation modes with
   no Metal equivalent (rejected at compile).
-- `num_warps >= 16` — exceeds the Apple GPU max threads per threadgroup (384).
+- large `num_warps` — a config is capped by the PSO's runtime
+  `maxTotalThreadsPerThreadgroup`, not a fixed number: the backend queries it
+  per kernel and reports it so triton drops over-large configs. The ceiling is
+  device- and kernel-dependent (register pressure lowers it); a light kernel
+  hits 1024 on M1 Pro, so `num_warps=32` (1024 threads) runs fine.
 - Cross-threadgroup spinlocks — Apple GPU has no forward-progress guarantee.

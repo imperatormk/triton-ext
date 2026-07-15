@@ -15,6 +15,8 @@ msl::Type *MSLEmitter::astScalarType(Type t) {
     return ctx.scalar(msl::Scalar::F16);
   if (t.isBF16())
     return ctx.scalar(msl::Scalar::BF16);
+  if (isFp8Type(t))
+    return ctx.scalar(msl::Scalar::U8);
   if (auto it = dyn_cast<IntegerType>(t)) {
     switch (it.getWidth()) {
     case 1:

@@ -52,7 +52,7 @@ class MPSOptions:
     sanitize_overflow: bool = False
     allowed_dot_input_precisions: tuple = ("ieee", )
     default_dot_input_precision: str = "ieee"
-    supported_fp8_dtypes: tuple = ()
+    supported_fp8_dtypes: tuple = ("fp8e4nv", "fp8e5")
     extern_libs: tuple = ()
 
     def hash(self):

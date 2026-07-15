@@ -14,8 +14,9 @@ class MSLPrinter {
 public:
   explicit MSLPrinter(llvm::raw_ostream &os) : os(os) {}
 
-  void printPreamble();
+  void printPreamble(bool usesFp8 = false);
   void printNarrowingHelpers();
+  void printFp8Helpers();
   void printAtomicHelpers();
   void printType(const Type *t);
   void printExpr(const Expr *e);

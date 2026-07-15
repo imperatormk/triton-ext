@@ -8,6 +8,7 @@
 #include "MSLAst.h"
 #include "MSLConstants.h"
 #include "MSLFusedDot.h"
+#include "MSLLayoutExpr.h"
 #include "MSLPrinter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -184,17 +185,30 @@ private:
 
   llvm::DenseMap<Value, MemDescInfo> memdescMap;
 
-  // AST forms of the offset/address helpers (defs in EmitMSLMemory.cpp);
-  // insert explicit parens where a subexpression needs precedence grouping.
+  // Layout coordinate / flat-offset exprs are built by the LayoutExprBuilder;
+  // these forward to it. astPoolRegion/astMemdescElemAddr stay here (they touch
+  // pool/memdesc state, not just layout coords).
   msl::Expr *astLayoutCoordExpr(RankedTensorType rt, int reg,
-                                StringAttr outDim);
-  msl::Expr *astLayoutOffsetExpr(RankedTensorType rt, int reg);
-  msl::Expr *astPoolRegion(int64_t byteOffset, StringRef sc);
-  msl::Expr *astFlatTileOffset(RankedTensorType rt, int reg);
-  msl::Expr *astSliceFlatOffset(RankedTensorType rt, int reg);
-  msl::Expr *astBatchCoordExpr(RankedTensorType rt, int reg);
+                                StringAttr outDim) {
+    return layout.layoutCoordExpr(rt, reg, outDim);
+  }
+  msl::Expr *astLayoutOffsetExpr(RankedTensorType rt, int reg) {
+    return layout.layoutOffsetExpr(rt, reg);
+  }
+  msl::Expr *astFlatTileOffset(RankedTensorType rt, int reg) {
+    return layout.flatTileOffset(rt, reg);
+  }
+  msl::Expr *astSliceFlatOffset(RankedTensorType rt, int reg) {
+    return layout.sliceFlatOffset(rt, reg);
+  }
+  msl::Expr *astBatchCoordExpr(RankedTensorType rt, int reg) {
+    return layout.batchCoordExpr(rt, reg);
+  }
   msl::Expr *astTransFlatOffset(RankedTensorType srcTy, ArrayRef<int32_t> perm,
-                                ArrayRef<int64_t> resShape, int reg);
+                                ArrayRef<int64_t> resShape, int reg) {
+    return layout.transFlatOffset(srcTy, perm, resShape, reg);
+  }
+  msl::Expr *astPoolRegion(int64_t byteOffset, StringRef sc);
   msl::Expr *astMemdescElemAddr(const MemDescInfo &info,
                                 RankedTensorType tileTy, int reg);
 
@@ -405,29 +419,8 @@ private:
     return ll.getInDimSize(kReg);
   }
 
-  // Per-register out-dim coordinate of a distributed tensor value, evaluated
-  // at lane=warp=block=0 (the compile-time register component). Returns the
-  // coordinate along each out-dim in tensor-dim order (dim0, dim1, ...).
   SmallVector<int32_t> registerCoords(RankedTensorType rt, int reg) {
-    MLIRContext *ctx = rt.getContext();
-    tt::LinearLayout ll = ttg::toLinearLayout(rt);
-    auto kReg = StringAttr::get(ctx, "register");
-    auto kLane = StringAttr::get(ctx, "lane");
-    auto kWarp = StringAttr::get(ctx, "warp");
-    auto kBlock = StringAttr::get(ctx, "block");
-    SmallVector<std::pair<StringAttr, int32_t>> ins;
-    ins.push_back({kReg, reg});
-    if (ll.hasInDim(kLane))
-      ins.push_back({kLane, 0});
-    if (ll.hasInDim(kWarp))
-      ins.push_back({kWarp, 0});
-    if (ll.hasInDim(kBlock))
-      ins.push_back({kBlock, 0});
-    auto outs = ll.apply(ins);
-    SmallVector<int32_t> coords;
-    for (auto &p : outs)
-      coords.push_back(p.second);
-    return coords;
+    return layout.registerCoords(rt, reg);
   }
 
   SmallVector<std::string> &names(Value v) { return valMap[v]; }
@@ -483,6 +476,8 @@ private:
   std::string tgposId, tidId, numTgId, laneId, warpId;
   bool scalarSpinlock = false;
 
+  LayoutExprBuilder layout{ctx, laneId, warpId, tgposId};
+
   // Register-resident C GEMM fusion state (FusedDotCtx / FusedDotPhase /
   // DirectStore in MSLFusedDot.h). The scf.for handler drives an
   // `acc = tl.dot(a, b, acc)` K-loop through the three-phase path: Decl
@@ -534,7 +529,9 @@ private:
   // the register->register permutation/replication changes.
   LogicalResult emitReshapeLike(Value res, Value src, int axis, bool isExpand);
 
-  static uint64_t coordKey(ArrayRef<int32_t> c);
+  static uint64_t coordKey(ArrayRef<int32_t> c) {
+    return LayoutExprBuilder::coordKey(c);
+  }
 
   // tt.join(a, b): both operands share a layout; result adds a trailing size-2
   // dim whose two entries live in the same thread (distinct registers). Result

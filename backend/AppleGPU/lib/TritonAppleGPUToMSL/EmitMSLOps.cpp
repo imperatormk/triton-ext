@@ -2693,13 +2693,6 @@ LogicalResult MSLEmitter::emitReshapeLike(Value res, Value src, int axis,
   return success();
 }
 
-uint64_t MSLEmitter::coordKey(ArrayRef<int32_t> c) {
-  uint64_t k = 0;
-  for (int32_t v : c)
-    k = k * 100003u + (uint32_t)v + 1;
-  return k;
-}
-
 LogicalResult MSLEmitter::emitJoin(tt::JoinOp op) {
   Value res = op.getResult();
   auto resTy = cast<RankedTensorType>(res.getType());

@@ -287,7 +287,7 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
 
 // Fused GEMM dot phases: Decl (declare/zero persistent frags), MMA (stage A/B +
 // accumulate, branchless or per-warp ladder), Readback (store frags + gather,
-// with optional direct-store to device C). Mirrors emitDot's fused branch.
+// with optional direct-store to device C).
 bool MSLEmitter::astEmitDotFused(
     tt::DotOp op, msl::Block &body, Value aStage, Value bStage,
     ArrayRef<std::string> aNames, ArrayRef<std::string> bNames, StringRef tgA,
@@ -467,7 +467,7 @@ bool MSLEmitter::astEmitDotFused(
 }
 
 // Panel-tiled dot: A/B panels staged into the pool, MMA per (m0,n0) panel into
-// pC, then a guarded readback. Mirrors emitDot's dotNeedsPanel branch.
+// pC, then a guarded readback.
 bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
                                  Value bStage, ArrayRef<std::string> aNames,
                                  ArrayRef<std::string> bNames,
@@ -619,7 +619,7 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
 }
 
 // Integer/scalar tt.dot: stage A/B into the pool, then each thread runs a scalar
-// K-loop for its owned C registers. Mirrors emitDotScalar.
+// K-loop for its owned C registers.
 bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
   auto aTy = cast<RankedTensorType>(op.getA().getType());
   auto bTy = cast<RankedTensorType>(op.getB().getType());

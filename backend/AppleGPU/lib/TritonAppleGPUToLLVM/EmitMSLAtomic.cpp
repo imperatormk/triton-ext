@@ -78,7 +78,7 @@ msl::Block MSLEmitter::astPacked16Base(StringRef p, std::string &wordPtrOut,
 }
 
 //===----------------------------------------------------------------------===//
-// emitAtomicRMW - native atomic_fetch_*_explicit call
+// astAtomicRmwCall - native atomic_fetch_*_explicit call
 //===----------------------------------------------------------------------===//
 
 // fn((device atomicTy*)p, v, order[, mem_flags::mem_device]).
@@ -95,7 +95,7 @@ msl::Expr *MSLEmitter::astAtomicRmwCall(StringRef fn, StringRef atomicTy,
 }
 
 //===----------------------------------------------------------------------===//
-// emitAtomicRMW - fp32 / packed-fp16 emulated CAS loops
+// astFloat32CASLoop / astPacked16CASLoop - fp32 / packed-fp16 emulated CAS loops
 //===----------------------------------------------------------------------===//
 
 // device atomic_uint *wordPtr = (device atomic_uint *)(p);
@@ -214,7 +214,7 @@ msl::Block MSLEmitter::astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
 }
 
 //===----------------------------------------------------------------------===//
-// emitAtomicCAS - int32 / float32 / packed16 compare-exchange
+// astInt32CAS / astFloat32CAS / astPacked16CAS - int32 / float32 / packed16 compare-exchange
 //===----------------------------------------------------------------------===//
 
 // sc exp = c;
@@ -286,7 +286,7 @@ msl::Block MSLEmitter::astFloat32CAS(StringRef p, StringRef c, StringRef v,
 }
 
 // The packed-fp16 CAS: word load + while(true){ read lane; if(got!=cur)break;
-// repack; if(cas)break; } (mirrors emitPacked16CAS).
+// repack; if(cas)break; }
 msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
                                       StringRef c, StringRef v, StringRef sc,
                                       StringRef id, bool declare) {
@@ -369,7 +369,7 @@ msl::Stmt *MSLEmitter::astAcquireFence() {
 }
 
 //===----------------------------------------------------------------------===//
-// emitAtomicPoll - single-probe spin loop
+// astPollSpin / astPoll64Load - single-probe spin loop
 //===----------------------------------------------------------------------===//
 
 // while (loadExpr != want) {}
@@ -390,7 +390,7 @@ msl::Expr *MSLEmitter::astPoll64Load(StringRef p, StringRef wordPtr,
 }
 
 //===----------------------------------------------------------------------===//
-// emitHistogram - threadgroup atomic bins
+// astHistBinsDecl / astHistZeroInit / astHistFetchAdd - threadgroup atomic bins
 //===----------------------------------------------------------------------===//
 
 // threadgroup atomic_uint* bins = ((threadgroup atomic_uint*)poolBuf);

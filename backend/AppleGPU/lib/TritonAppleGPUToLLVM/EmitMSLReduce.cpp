@@ -23,16 +23,16 @@ namespace bsimd = msl::builtin::simd;
 using B = msl::BinOp;
 
 //===----------------------------------------------------------------------===//
-// emitCombineN / emitCombine - bind the combined value into a target
+// astCombineAssign - bind the combined value into a target
 //===----------------------------------------------------------------------===//
 
-// dst = res;  (the single-result emitCombine tail).
+// dst = res;  (the single-result combine tail).
 msl::Stmt *MSLEmitter::astCombineAssign(StringRef dst, StringRef res) {
   return ctx.assignStmt(ctx.var(dst), ctx.var(res));
 }
 
 //===----------------------------------------------------------------------===//
-// emitReduce - per-group intra-register fold, cross-lane, cross-warp
+// astReduce* - per-group intra-register fold, cross-lane, cross-warp
 //===----------------------------------------------------------------------===//
 
 // sc acc = src;  (the group accumulator seed, and the wacc/grand seeds).
@@ -88,7 +88,7 @@ msl::Stmt *MSLEmitter::astReduceWarpLoad(StringRef sc, StringRef dst,
 }
 
 //===----------------------------------------------------------------------===//
-// emitScan - lane sweep, guarded prefix, cross-run carry
+// astScan* - lane sweep, guarded prefix, cross-run carry
 //===----------------------------------------------------------------------===//
 
 // sc acc = src;  (per-register scan accumulator seed).
@@ -145,7 +145,7 @@ msl::Expr *MSLEmitter::astScanAxisTopLane(bool rev, unsigned axisLaneMask) {
 }
 
 //===----------------------------------------------------------------------===//
-// emitScanWarpCarry - cross-warp partition scan
+// astWarpCarry* - cross-warp partition scan
 //===----------------------------------------------------------------------===//
 
 // runTotal = simd_shuffle(laneScan, axisTopLane);  (the no-warp-bits carry).
@@ -225,7 +225,7 @@ msl::Stmt *MSLEmitter::astWarpCarryApply(StringRef acc, StringRef init,
 }
 
 //===----------------------------------------------------------------------===//
-// emitMapElementwise / emitMapCFG - state-machine dispatch of a CFG region
+// astMap* - state-machine dispatch of a CFG region
 //===----------------------------------------------------------------------===//
 
 // sc capture;  (predeclared multi-block result slot).

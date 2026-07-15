@@ -87,7 +87,7 @@ llvm::SmallVector<msl::Stmt *, 2> MSLEmitter::laneWarpProlog() {
 }
 
 
-// Build the device-fn param list. `bind` mirrors emitDeviceSignature's bindArgs:
+// Build the device-fn param list. `bind`:
 // true mints fresh() names (the definition), false uses aN/__tgpos/... (the
 // prototype). Trailing thread-context uint3s + optional threadgroup pool ptr.
 llvm::SmallVector<msl::Param, 8>

@@ -288,7 +288,7 @@ void MSLEmitter::astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
 
 // Fused GEMM K-loop: carry iter-args, run the dot Decl phase, the K-loop with
 // the MMA-phase dot in its body, the non-acc carry, direct-store setup, then the
-// Readback-phase dot. Mirrors emitFusedGemm with AST nodes.
+// Readback-phase dot.
 bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
                                   msl::Block &body) {
   SmallVector<SmallVector<std::string>> carried;
@@ -418,10 +418,10 @@ bool MSLEmitter::astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
 }
 
 // `*p`, or the coherent-cast deref `*(device coherent(device) sc*)p` when a
-// scalar spinlock forces a coherent access (mirrors emitLoad/emitStoreBody).
+// scalar spinlock forces a coherent access.
 msl::Expr *MSLEmitter::astDerefPtr(Value, StringRef name, StringRef scName) {
   if (scalarSpinlock) {
-    // Exact `device coherent(device) sc*` cast form used by emitLoad/StoreBody
+    // Exact `device coherent(device) sc*` cast form used by the load/store path
     // (the printer's plain coherent-ptr form omits the leading `device`).
     msl::Type *cp = ctx.named("device coherent(device) " + scName.str() + "*");
     return ctx.deref(ctx.cast(CS::CStyle, cp, ctx.var(name)));
@@ -475,8 +475,8 @@ void MSLEmitter::astBandRoundTrip(
   }
 }
 
-// Per-register store: `[if (guard)] *p = v;` mirroring emitStoreBody's thread
-// predicate + mask guard.
+// Per-register store: `[if (guard)] *p = v;` with the thread predicate + mask
+// guard.
 void MSLEmitter::astStoreBody(tt::StoreOp op, msl::Block &body) {
   auto &ptrs = names(op.getPtr());
   auto &vals = names(op.getValue());
@@ -494,7 +494,7 @@ void MSLEmitter::astStoreBody(tt::StoreOp op, msl::Block &body) {
     laneFree = masks.lookup(StringAttr::get(c, "lane"));
     warpFree = masks.lookup(StringAttr::get(c, "warp"));
   }
-  // Thread predicate as an Expr (built to print identically to emitStoreBody).
+  // Thread predicate as an Expr.
   msl::Expr *threadPred = nullptr;
   if (uniform) {
     threadPred = ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0"));
@@ -1721,7 +1721,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   }
 
   // tt.scan: per-run register fold + lane shuffle prefix + cross-warp carry +
-  // cross-run carry. Mirrors emitScan with AST nodes.
+  // cross-run carry.
   if (auto sn = dyn_cast<tt::ScanOp>(op)) {
     bool rev = sn.getReverse();
     int nOp = sn.getNumOperands();
@@ -1919,7 +1919,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   }
 
   // tt.reduce: per-group register fold + lane-shuffle xor + optional cross-warp
-  // threadgroup combine. Mirrors emitReduce with AST nodes.
+  // threadgroup combine.
   if (auto rd = dyn_cast<tt::ReduceOp>(op)) {
     int nOp = rd.getNumOperands();
     auto srcTy = cast<RankedTensorType>(rd.getOperand(0).getType());

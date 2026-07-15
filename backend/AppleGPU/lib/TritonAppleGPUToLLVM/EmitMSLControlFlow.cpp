@@ -131,7 +131,7 @@ msl::Block MSLEmitter::astYieldAssign(
 
 // Multi-block region -> state-machine dispatch Block. Predeclares block-arg vars
 // + cross-block hoisted vars, then a StateMachineScope with per-block cases
-// (walked ops + hoist spills + terminator edge). Mirrors emitBlockCFG.
+// (walked ops + hoist spills + terminator edge).
 msl::Block MSLEmitter::astEmitBlockCFG(Region &region) {
   msl::Block out;
   blockLabel.clear();

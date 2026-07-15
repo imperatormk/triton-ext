@@ -135,10 +135,6 @@ print("vecadd ok")
 - `TRITON_MPS_DEBUG=1` — print the emitted MSL to stdout.
 - `TRITON_MSL_OUT` — internal handoff for the MSL output path between the C++
   emitter and the Python compiler; set automatically, not a user knob.
-- `MSL_NO_DIRECT_STORE=1` — escape hatch: disable the fused-store optimization
-  (falls back to the pool readback).
-- `MSL_NO_FUSE=1` — escape hatch: disable register-resident GEMM fusion (falls
-  back to the per-dot path).
 
 ## Test Status
 

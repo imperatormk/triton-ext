@@ -952,8 +952,6 @@ bool MSLEmitter::matchBoundaryMask(Value m, Value &boundM, Value &boundN) {
 }
 
 std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
-  if (getenv("MSL_NO_DIRECT_STORE")) // escape hatch: fall back to pool readback
-    return std::nullopt;
   if (!forResult.hasOneUse())
     return std::nullopt;
   auto cvt = dyn_cast<ttg::ConvertLayoutOp>(*forResult.user_begin());
@@ -992,8 +990,6 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
 
 std::optional<std::pair<tt::DotOp, unsigned>>
 MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
-  if (getenv("MSL_NO_FUSE")) // escape hatch: fall back to the per-dot path
-    return std::nullopt;
   Block *body = op.getBody();
   auto yield = cast<scf::YieldOp>(body->getTerminator());
   tt::DotOp found;

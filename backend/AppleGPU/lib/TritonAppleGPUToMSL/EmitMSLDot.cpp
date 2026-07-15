@@ -88,7 +88,8 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
   int64_t cFull = M * N * accBytes;
 
   std::optional<InPlaceOperand> aInPlace, bInPlace;
-  bool wholeTileFits = M * K * byteWidth(aElem) + bBytes <= kTGResidentBudgetBytes;
+  bool wholeTileFits =
+      M * K * byteWidth(aElem) + bBytes <= kTGResidentBudgetBytes;
   if (rank == 2 && wholeTileFits) {
     aInPlace = dotOperandInPlaceBuf(op.getA(), M, K);
     bInPlace = dotOperandInPlaceBuf(op.getB(), K, N);
@@ -417,8 +418,10 @@ bool MSLEmitter::astEmitDotFused(
   // Readback.
   if (fusedDot.direct) {
     const DirectStore &d = *fusedDot.direct;
-    std::string base = scalarName(d.basePtr).str(), ldc = scalarName(d.ldc).str();
-    std::string rowB = scalarName(d.rowBase).str(), colB = scalarName(d.colBase).str();
+    std::string base = scalarName(d.basePtr).str(),
+                ldc = scalarName(d.ldc).str();
+    std::string rowB = scalarName(d.rowBase).str(),
+                colB = scalarName(d.colBase).str();
     msl::Block ifBody;
     for (int64_t w = 0; w < numWarps; ++w) {
       msl::Block inner;

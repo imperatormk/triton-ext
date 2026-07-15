@@ -284,8 +284,7 @@ msl::Block MSLEmitter::astFloat32CAS(StringRef p, StringRef c, StringRef v,
   block.push_back(
       ctx.declStmt(ctx.scalar(msl::Scalar::U32), cbits, asU32(ctx.var(c))));
   block.push_back(ctx.whileScope(cond, msl::Block{}));
-  msl::Expr *result =
-      astAsType(ctx.scalar(msl::Scalar::F32), ctx.var(exp));
+  msl::Expr *result = astAsType(ctx.scalar(msl::Scalar::F32), ctx.var(exp));
   if (declare)
     block.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::F32), id, result));
   else
@@ -328,8 +327,7 @@ msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
   body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U16), got,
                               ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U16),
                                        astPacked16Extract(word, isHigh))));
-  body.push_back(
-      ctx.assignStmt(ctx.var(id), astAsType(scTy, ctx.var(got))));
+  body.push_back(ctx.assignStmt(ctx.var(id), astAsType(scTy, ctx.var(got))));
   msl::Block brk;
   brk.push_back(ctx.breakStmt());
   body.push_back(ctx.ifScope(ctx.binary(B::Ne, ctx.var(got), ctx.var(cur)),

@@ -876,9 +876,9 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
       std::string fn = std::string(rtz ? "tt_rtz_" : "tt_rtne_") + dst;
       msl::Type *dstTy = astScalarType(resElem);
       return astDeclBind(op, dstTy, body, [&](int r) {
-        msl::Expr *f = ctx.cast(msl::Cast::Style::CStyle,
-                                ctx.scalar(msl::Scalar::F32),
-                                ctx.var(reg(op->getOperand(0), r)));
+        msl::Expr *f =
+            ctx.cast(msl::Cast::Style::CStyle, ctx.scalar(msl::Scalar::F32),
+                     ctx.var(reg(op->getOperand(0), r)));
         return ctx.call(fn, {f});
       });
     }
@@ -1589,11 +1589,10 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
       }
       msl::Block inner;
       if (floatEmulated) {
-        int rmwOp = kind == tt::RMWOp::MAX  ? 1
-                    : kind == tt::RMWOp::MIN ? 2
-                    : (kind == tt::RMWOp::ADD || kind == tt::RMWOp::FADD)
-                        ? 0
-                        : 3;
+        int rmwOp = kind == tt::RMWOp::MAX                                ? 1
+                    : kind == tt::RMWOp::MIN                              ? 2
+                    : (kind == tt::RMWOp::ADD || kind == tt::RMWOp::FADD) ? 0
+                                                                          : 3;
         msl::Expr *fv = ctx.cast(msl::Cast::Style::CStyle,
                                  ctx.scalar(msl::Scalar::F32), ctx.var(v));
         msl::Expr *call;
@@ -1604,13 +1603,13 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
           inner.push_back(
               ctx.declStmt(ctx.scalar(msl::Scalar::I1), isHigh,
                            ctx.raw("((size_t)" + bytePtr + " & 2u) != 0u")));
-          inner.push_back(ctx.declStmt(
-              ctx.named("device atomic_uint *"), wordPtr,
-              ctx.raw("(device atomic_uint *)((size_t)" + bytePtr +
-                      " & ~(size_t)3)")));
-          call = ctx.call("tt_atomic_rmw_packed16_" + sc,
-                          {ctx.var(wordPtr), ctx.var(isHigh), fv,
-                           ctx.i32lit(rmwOp)});
+          inner.push_back(
+              ctx.declStmt(ctx.named("device atomic_uint *"), wordPtr,
+                           ctx.raw("(device atomic_uint *)((size_t)" + bytePtr +
+                                   " & ~(size_t)3)")));
+          call = ctx.call(
+              "tt_atomic_rmw_packed16_" + sc,
+              {ctx.var(wordPtr), ctx.var(isHigh), fv, ctx.i32lit(rmwOp)});
         } else {
           std::string wordPtr = fresh();
           inner.push_back(

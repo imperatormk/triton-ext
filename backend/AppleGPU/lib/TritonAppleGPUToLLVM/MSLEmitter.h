@@ -403,6 +403,9 @@ private:
   bool astEmitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
                         msl::Block &body);
   bool astEmitDotScalar(tt::DotOp op, msl::Block &body);
+  void astStageOperand(msl::Block &body, StringRef tgName, Value stage,
+                       RankedTensorType stageTy, ArrayRef<std::string> names,
+                       bool skip, llvm::function_ref<msl::Expr *(int)> guard);
   bool astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
                        Value bStage, ArrayRef<std::string> aNames,
                        ArrayRef<std::string> bNames, ArrayRef<std::string> cInit,

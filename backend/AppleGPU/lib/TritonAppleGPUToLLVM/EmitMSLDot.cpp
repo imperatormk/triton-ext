@@ -25,6 +25,25 @@ using B = msl::BinOp;
 using CS = msl::Cast::Style;
 } // namespace
 
+// Stage one dot operand's registers into its threadgroup pool:
+// `tg[sliceFlatOffset] = name[r];` per register, optionally batch-guarded.
+// `skip` short-circuits (operand is already in-place). `guard(r)` returns the
+// per-register batch condition or nullptr (unguarded).
+void MSLEmitter::astStageOperand(msl::Block &body, StringRef tgName, Value stage,
+                                 RankedTensorType stageTy,
+                                 ArrayRef<std::string> names, bool skip,
+                                 llvm::function_ref<msl::Expr *(int)> guard) {
+  if (skip)
+    return;
+  for (int r = 0, n = regCount(stage); r < n; ++r) {
+    msl::Stmt *asn = ctx.assignStmt(
+        ctx.subscript(ctx.var(tgName), astSliceFlatOffset(stageTy, r)),
+        ctx.var(names[r]));
+    msl::Expr *g = guard ? guard(r) : nullptr;
+    body.push_back(g ? ctx.compactIf(g, asn) : asn);
+  }
+}
+
 // tt.dot -> simdgroup-matrix fragment MMA: panel / fused (Decl/MMA/Readback +
 // direct-store) / per-dot (disjoint / aliased-banded) paths. Guard/offset
 // compound exprs are ctx.raw leaves; the per-fragment MMA + readback are the
@@ -210,22 +229,14 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
   };
   for (int64_t bi = 0; bi < Bd; ++bi) {
     barrier();
-    if (!aInPlace)
-      for (int r = 0, n = regCount(aStage); r < n; ++r) {
-        msl::Stmt *asn = ctx.assignStmt(
-            ctx.subscript(ctx.var(tgA), astSliceFlatOffset(aStageTy, r)),
-            ctx.var(aNames[r]));
-        body.push_back(rank == 3 ? ctx.compactIf(batchCond(aStageTy, r, bi), asn)
-                                 : asn);
-      }
-    if (!bInPlace)
-      for (int r = 0, n = regCount(bStage); r < n; ++r) {
-        msl::Stmt *asn = ctx.assignStmt(
-            ctx.subscript(ctx.var(tgB), astSliceFlatOffset(bStageTy, r)),
-            ctx.var(bNames[r]));
-        body.push_back(rank == 3 ? ctx.compactIf(batchCond(bStageTy, r, bi), asn)
-                                 : asn);
-      }
+    auto guardA = [&](int r) { return batchCond(aStageTy, r, bi); };
+    auto guardB = [&](int r) { return batchCond(bStageTy, r, bi); };
+    astStageOperand(body, tgA, aStage, aStageTy, aNames, (bool)aInPlace,
+                    rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardA)
+                              : nullptr);
+    astStageOperand(body, tgB, bStage, bStageTy, bNames, (bool)bInPlace,
+                    rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardB)
+                              : nullptr);
     barrier();
 
     if (disjointC) {
@@ -318,16 +329,8 @@ bool MSLEmitter::astEmitDotFused(
     bool stagesHere = !aInPlace || !bInPlace;
     if (stagesHere)
       barrier();
-    if (!aInPlace)
-      for (int r = 0, n = regCount(aStage); r < n; ++r)
-        body.push_back(ctx.assignStmt(
-            ctx.subscript(ctx.var(tgA), astSliceFlatOffset(aStageTy, r)),
-            ctx.var(aNames[r])));
-    if (!bInPlace)
-      for (int r = 0, n = regCount(bStage); r < n; ++r)
-        body.push_back(ctx.assignStmt(
-            ctx.subscript(ctx.var(tgB), astSliceFlatOffset(bStageTy, r)),
-            ctx.var(bNames[r])));
+    astStageOperand(body, tgA, aStage, aStageTy, aNames, (bool)aInPlace, nullptr);
+    astStageOperand(body, tgB, bStage, bStageTy, bNames, (bool)bInPlace, nullptr);
     barrier();
     bool branchless = (numWarps == nT);
     // slots: (mi, niKey, niExpr); niKey dedups bFrag, niExpr is the typed index.
@@ -674,20 +677,14 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
 
   for (int64_t bi = 0; bi < Bd; ++bi) {
     body.push_back(ctx.hardBarrier(false));
-    for (int r = 0, n = regCount(aStage); r < n; ++r) {
-      msl::Stmt *asn = ctx.assignStmt(
-          ctx.subscript(ctx.var(tgA), astSliceFlatOffset(aStageTy, r)),
-          ctx.var(aNames[r]));
-      body.push_back(rank == 3 ? ctx.compactIf(batchCond(aStageTy, r, bi), asn)
-                               : asn);
-    }
-    for (int r = 0, n = regCount(bStage); r < n; ++r) {
-      msl::Stmt *asn = ctx.assignStmt(
-          ctx.subscript(ctx.var(tgB), astSliceFlatOffset(bStageTy, r)),
-          ctx.var(bNames[r]));
-      body.push_back(rank == 3 ? ctx.compactIf(batchCond(bStageTy, r, bi), asn)
-                               : asn);
-    }
+    auto guardA = [&](int r) { return batchCond(aStageTy, r, bi); };
+    auto guardB = [&](int r) { return batchCond(bStageTy, r, bi); };
+    astStageOperand(body, tgA, aStage, aStageTy, aNames, false,
+                    rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardA)
+                              : nullptr);
+    astStageOperand(body, tgB, bStage, bStageTy, bNames, false,
+                    rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardB)
+                              : nullptr);
     body.push_back(ctx.hardBarrier(false));
 
     for (int r = 0; r < nRes; ++r) {

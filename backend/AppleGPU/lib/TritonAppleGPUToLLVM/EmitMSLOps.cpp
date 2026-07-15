@@ -15,15 +15,6 @@ namespace mlir::triton::applegpu {
 using B = msl::BinOp;
 using CS = msl::Cast::Style;
 
-static msl::BinOp cmpBinOp(llvm::StringRef o) {
-  if (o == "<") return B::Lt;
-  if (o == "<=") return B::Le;
-  if (o == ">") return B::Gt;
-  if (o == ">=") return B::Ge;
-  if (o == "==") return B::Eq;
-  return B::Ne;
-}
-
 //===----------------------------------------------------------------------===//
 // Op dispatch spine
 //===----------------------------------------------------------------------===//
@@ -701,21 +692,20 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
 
   // Integer compare: `bool id = (casta o castb);`
   if (auto ci = dyn_cast<arith::CmpIOp>(op)) {
-    const char *o;
+    msl::BinOp bo;
     bool uns = false;
     switch (ci.getPredicate()) {
     case arith::CmpIPredicate::ult: uns = true; [[fallthrough]];
-    case arith::CmpIPredicate::slt: o = "<"; break;
+    case arith::CmpIPredicate::slt: bo = B::Lt; break;
     case arith::CmpIPredicate::ule: uns = true; [[fallthrough]];
-    case arith::CmpIPredicate::sle: o = "<="; break;
+    case arith::CmpIPredicate::sle: bo = B::Le; break;
     case arith::CmpIPredicate::ugt: uns = true; [[fallthrough]];
-    case arith::CmpIPredicate::sgt: o = ">"; break;
+    case arith::CmpIPredicate::sgt: bo = B::Gt; break;
     case arith::CmpIPredicate::uge: uns = true; [[fallthrough]];
-    case arith::CmpIPredicate::sge: o = ">="; break;
-    case arith::CmpIPredicate::eq: o = "=="; break;
-    case arith::CmpIPredicate::ne: o = "!="; break;
+    case arith::CmpIPredicate::sge: bo = B::Ge; break;
+    case arith::CmpIPredicate::eq: bo = B::Eq; break;
+    case arith::CmpIPredicate::ne: bo = B::Ne; break;
     }
-    msl::BinOp bo = cmpBinOp(o);
     msl::Type *opCast =
         uns ? astUnsignedType(elementScalarType(ci.getLhs().getType())) : nullptr;
     return astDeclBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
@@ -724,23 +714,22 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     });
   }
   if (auto cf = dyn_cast<arith::CmpFOp>(op)) {
-    const char *o;
+    msl::BinOp bo;
     switch (cf.getPredicate()) {
     case arith::CmpFPredicate::OLT:
-    case arith::CmpFPredicate::ULT: o = "<"; break;
+    case arith::CmpFPredicate::ULT: bo = B::Lt; break;
     case arith::CmpFPredicate::OLE:
-    case arith::CmpFPredicate::ULE: o = "<="; break;
+    case arith::CmpFPredicate::ULE: bo = B::Le; break;
     case arith::CmpFPredicate::OGT:
-    case arith::CmpFPredicate::UGT: o = ">"; break;
+    case arith::CmpFPredicate::UGT: bo = B::Gt; break;
     case arith::CmpFPredicate::OGE:
-    case arith::CmpFPredicate::UGE: o = ">="; break;
+    case arith::CmpFPredicate::UGE: bo = B::Ge; break;
     case arith::CmpFPredicate::OEQ:
-    case arith::CmpFPredicate::UEQ: o = "=="; break;
+    case arith::CmpFPredicate::UEQ: bo = B::Eq; break;
     case arith::CmpFPredicate::ONE:
-    case arith::CmpFPredicate::UNE: o = "!="; break;
+    case arith::CmpFPredicate::UNE: bo = B::Ne; break;
     default: return false; // unsupported predicate: caller emits the error
     }
-    msl::BinOp bo = cmpBinOp(o);
     return astDeclBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
       return astElementwiseExpr(bo, nullptr, opnd(op->getOperand(0), r),
                                 opnd(op->getOperand(1), r));

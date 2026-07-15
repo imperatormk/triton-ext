@@ -21,6 +21,7 @@ triton-ext/backend/AppleGPU/
 
 - macOS 26+ with Xcode (Metal framework + clang)
 - Python 3.10+
+- CMake + Ninja
 
 ### Metal version and hardware
 
@@ -37,6 +38,7 @@ the compiled pipeline at runtime, not assumed.
 Only macOS is a supported host. iOS, iPadOS, visionOS and tvOS are out of scope:
 they have no PyTorch MPS backend to bridge tensor storage from, and they
 restrict the runtime shader compilation that Triton's JIT model depends on.
+
 - CMake + Ninja
 
 ## Setup

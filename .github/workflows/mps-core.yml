@@ -40,7 +40,8 @@ jobs:
           "$VENV/bin/python" -m pytest unit/language/test_core.py \
             -k "${{ github.event.inputs.test_filter }}" \
             --device mps \
-            -p no:cacheprovider \
+            -p no:cacheprovider -p no:warnings \
+            -o markers=interpreter \
             -v --no-header --timeout=300 \
             --junitxml="$RUNNER_TEMP/mps-core-results.xml"
 

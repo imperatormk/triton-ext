@@ -216,7 +216,6 @@ class MPSBackend(BaseBackend):
         from triton_apple_backend import metal_utils
         return metal_utils.compile_source(msl, 'safe')
 
-    # ── Stage 3: LLVM IR with simdgroup intrinsics ─────────────────────────
     # ── Gluon frontend: AST is lowered directly to TTGIR, so we skip make_ttir
     # and only run the dialect-generic Gluon passes that resolve explicit/auto
     # layouts before rejoining the shared TTGIR → MSL → metallib path.

@@ -260,37 +260,8 @@ private:
   // return a msl::Block spliced at caller indent; single-node builders return
   // Stmt*/Expr*. The cross-lane shuffles go through astShuffleExpr with the
   // builtin::simd names; control flow is real If/State-machine node trees.
-  msl::Stmt *astCombineAssign(StringRef dst, StringRef res);
-  msl::Stmt *astReduceAccInit(StringRef sc, StringRef acc, StringRef src);
-  msl::Stmt *astReduceAccStep(StringRef acc, StringRef out);
-  msl::Expr *astReduceLaneShuffle(StringRef sc, StringRef acc, unsigned m);
-  msl::Stmt *astReduceScratchDecl(StringRef sc, StringRef scratch,
-                                  int64_t byteOff);
-  msl::Stmt *astReduceScratchStore(StringRef scratch, StringRef acc);
-  msl::Expr *astReduceWarpBase(unsigned warpMask);
-  msl::Stmt *astReduceWarpLoad(StringRef sc, StringRef dst, StringRef scratch,
-                               msl::Expr *base, int off);
-  msl::Stmt *astScanAccInit(StringRef sc, StringRef acc, StringRef src);
-  msl::Stmt *astScanLaneSeed(StringRef sc, StringRef laneScan, StringRef acc);
-  msl::Expr *astScanLaneShuffle(bool rev, StringRef sc, StringRef val,
-                                unsigned delta);
-  msl::Expr *astScanLaneGuard(bool rev, unsigned axisLaneMask, unsigned delta);
-  msl::Stmt *astScanGuardedUpdate(StringRef dst, msl::Expr *guard,
-                                  StringRef out);
-  msl::Expr *astScanAxisTopLane(bool rev, unsigned axisLaneMask);
-  msl::Stmt *astWarpCarryLaneOnly(StringRef sc, StringRef runTotal,
-                                  StringRef laneScan, StringRef axisTopLane);
-  msl::Expr *astWarpCarryTopGuard(StringRef axisTopLane);
-  msl::Stmt *astWarpCarryTopStore(msl::Expr *topGuard, StringRef scratch,
-                                  StringRef laneScan);
-  msl::Expr *astWarpCarryBase(unsigned axisWarpMask, StringRef axisTopLane);
-  msl::Stmt *astWarpCarryMyPart(StringRef myPart, ArrayRef<int> maskBits);
-  msl::Expr *astWarpCarryPartCond(bool rev, StringRef myPart, int p);
-  msl::Stmt *astWarpCarryInitFlag(StringRef init);
-  msl::Stmt *astWarpCarryApply(StringRef acc, StringRef init, StringRef out);
   msl::Stmt *astMapCaptureDecl(StringRef sc, StringRef name);
   msl::Stmt *astMapReturnSpill(StringRef capture, StringRef operand);
-  msl::Stmt *astMapHoistCopy(StringRef dst, StringRef src);
   msl::Stmt *
   astMapCFGStateMachine(StringRef state,
                         ArrayRef<std::pair<std::string, msl::Block>> cases);

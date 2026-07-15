@@ -544,11 +544,6 @@ void MSLEmitter::astProgramDim(Operation *op, StringRef builtinVar,
 // handled (including alias/dataless ops that append nothing); false for an
 // unsupported op, which the caller turns into a hard error.
 bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
-  auto opnd = [&](Value v, int r) -> StringRef {
-    auto &nm = names(v);
-    return nm[nm.size() == 1 ? 0 : r];
-  };
-
   // Barriers: BarrierStmt nodes (printer peephole collapses adjacent ones).
   if (auto b = dyn_cast<ttg::BarrierOp>(op)) {
     uint32_t bits = static_cast<uint32_t>(b.getAddrSpace());
@@ -579,6 +574,32 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  // Op-family sub-dispatchers, tried in the original arm order. Each returns
+  // nullopt for an op it doesn't own (fall through to the next family), or the
+  // handled/failed bool. Unmatched by all -> false (a hard error upstream).
+  using Family = std::optional<bool> (MSLEmitter::*)(Operation *, msl::Block &);
+  static constexpr Family families[] = {
+      &MSLEmitter::astEmitArithBinop, &MSLEmitter::astEmitConstGrid,
+      &MSLEmitter::astEmitArithMisc,  &MSLEmitter::astEmitMath,
+      &MSLEmitter::astEmitReshape,    &MSLEmitter::astEmitMemDesc,
+      &MSLEmitter::astEmitDotMap,     &MSLEmitter::astEmitAtomic,
+      &MSLEmitter::astEmitScanReduce, &MSLEmitter::astEmitTensorMove,
+      &MSLEmitter::astEmitCallReturn, &MSLEmitter::astEmitControlFlow};
+  for (Family f : families)
+    if (std::optional<bool> r = (this->*f)(op, body))
+      return *r;
+
+  // Unsupported op: astWalkBlock turns this false into a hard error.
+  return false;
+}
+
+// float / int / bitwise / shift binops.
+std::optional<bool> MSLEmitter::astEmitArithBinop(Operation *op,
+                                                  msl::Block &body) {
+  auto opnd = [&](Value v, int r) -> StringRef {
+    auto &nm = names(v);
+    return nm[nm.size() == 1 ? 0 : r];
+  };
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
@@ -623,6 +644,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
                           opnd(op->getOperand(1), r));
     });
 
+  return std::nullopt;
+}
+
+// program_id / num_programs / arith.constant / make_range.
+std::optional<bool> MSLEmitter::astEmitConstGrid(Operation *op,
+                                                 msl::Block &body) {
   // Program-id / num-programs: `int id = (int)(builtin.comp);`
   if (auto p = dyn_cast<tt::GetProgramIdOp>(op)) {
     astProgramDim(op, tgposId, p.getAxis(), body);
@@ -687,6 +714,19 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     });
   }
 
+  return std::nullopt;
+}
+
+// cmp / select / clamp / casts / negf / min-max family / precise_sqrt.
+std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
+                                                 msl::Block &body) {
+  auto opnd = [&](Value v, int r) -> StringRef {
+    auto &nm = names(v);
+    return nm[nm.size() == 1 ? 0 : r];
+  };
+  Type resElem = op->getNumResults()
+                     ? elementScalarType(op->getResult(0).getType())
+                     : Type();
   // Integer compare: `bool id = (casta o castb);`
   if (auto ci = dyn_cast<arith::CmpIOp>(op)) {
     msl::BinOp bo;
@@ -849,7 +889,18 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
                           opnd(op->getOperand(0), r));
     });
 
-  // math.* dialect: unary/binary transcendentals, fma, exp10.
+  return std::nullopt;
+}
+
+// math.* dialect: unary/binary transcendentals, fma, exp10.
+std::optional<bool> MSLEmitter::astEmitMath(Operation *op, msl::Block &body) {
+  auto opnd = [&](Value v, int r) -> StringRef {
+    auto &nm = names(v);
+    return nm[nm.size() == 1 ? 0 : r];
+  };
+  Type resElem = op->getNumResults()
+                     ? elementScalarType(op->getResult(0).getType())
+                     : Type();
   if (op->getDialect() ==
       op->getContext()->getLoadedDialect<math::MathDialect>()) {
     msl::Type *sc = astScalarType(resElem);
@@ -900,6 +951,11 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return false; // unhandled math op: caller emits the error
   }
 
+  return std::nullopt;
+}
+
+// Shape ops: splat/unsplat/expand/broadcast/join/split (rebinds) + trans/reshape.
+std::optional<bool> MSLEmitter::astEmitReshape(Operation *op, msl::Block &body) {
   // Pure register-rebind ops (no text emitted): splat / expand_dims / broadcast /
   // join / split / unsplat. Their handlers only rewrite valMap, so calling them
   // here writes nothing and keeps the symbol table correct.
@@ -986,6 +1042,11 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  return std::nullopt;
+}
+
+// memdesc index/subslice, local_alloc/store/load, async_copy, convert_layout.
+std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op, msl::Block &body) {
   // memdesc_index / memdesc_subslice: pure memdescMap rebinds (no text).
   if (auto mi = dyn_cast<ttg::MemDescIndexOp>(op))
     return succeeded(emitMemDescIndex(mi));
@@ -1236,6 +1297,11 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  return std::nullopt;
+}
+
+// tt.dot / tt.map_elementwise / tt.histogram.
+std::optional<bool> MSLEmitter::astEmitDotMap(Operation *op, msl::Block &body) {
   // tt.dot: simdgroup-matrix / scalar GEMM (all staging + fusion phases).
   if (auto dt = dyn_cast<tt::DotOp>(op))
     return astEmitDot(dt, body);
@@ -1380,6 +1446,11 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  return std::nullopt;
+}
+
+// tt.atomic_rmw / tt.atomic_poll / tt.atomic_cas.
+std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
   // tt.atomic_rmw: native fetch_* (AST) or fp-emulated CAS loop (captured), with
   // redundant-thread guard + lane/warp replica broadcast.
   if (auto ar = dyn_cast<tt::AtomicRMWOp>(op)) {
@@ -1706,6 +1777,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  return std::nullopt;
+}
+
+// tt.scan / tt.reduce: cross-lane/warp fold + prefix.
+std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
+                                                  msl::Block &body) {
   // tt.scan: per-run register fold + lane shuffle prefix + cross-warp carry +
   // cross-run carry.
   if (auto sn = dyn_cast<tt::ScanOp>(op)) {
@@ -2064,6 +2141,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  return std::nullopt;
+}
+
+// tt.cat / tt.gather: threadgroup scatter/gather tile moves.
+std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
+                                                  msl::Block &body) {
   // tt.cat: scatter both halves (rhs shifted past lhs flat size), gather result.
   if (auto ct = dyn_cast<tt::CatOp>(op)) {
     Value lhs = ct.getLhs(), rhs = ct.getRhs(), res = ct.getResult();
@@ -2157,6 +2240,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  return std::nullopt;
+}
+
+// return / call / ub.poison / addptr / load / store.
+std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
+                                                  msl::Block &body) {
   // tt.return
   if (auto ret = dyn_cast<tt::ReturnOp>(op)) {
     body.push_back(astReturn(ret));
@@ -2303,6 +2392,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
+  return std::nullopt;
+}
+
+// scf.if / scf.for (+ fused-GEMM route) / scf.while.
+std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
+                                                   msl::Block &body) {
   // scf.if: predeclare result vars, then IfScope with then/else sub-blocks.
   if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
     SmallVector<SmallVector<std::string>> results;
@@ -2426,8 +2521,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   }
 
-  // Unsupported op: astWalkBlock turns this false into a hard error.
-  return false;
+  return std::nullopt;
 }
 
 } // namespace mlir::triton::applegpu

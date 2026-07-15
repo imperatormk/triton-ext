@@ -383,6 +383,18 @@ private:
   // op is handled (nodes appended, or nothing for alias/dataless ops); false for
   // an unsupported op, which astWalkBlock turns into a hard error.
   bool astEmitOp(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitArithBinop(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitConstGrid(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitArithMisc(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitMath(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitReshape(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitMemDesc(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitDotMap(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitAtomic(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitScanReduce(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitTensorMove(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitCallReturn(Operation *op, msl::Block &body);
+  std::optional<bool> astEmitControlFlow(Operation *op, msl::Block &body);
   void astProgramDim(Operation *op, StringRef builtinVar, tt::ProgramIDDim axis,
                      msl::Block &body);
   msl::Block astWalkBlock(Block &blk, unsigned depth);

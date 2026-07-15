@@ -88,7 +88,7 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
   int64_t cFull = M * N * accBytes;
 
   std::optional<InPlaceOperand> aInPlace, bInPlace;
-  bool wholeTileFits = M * K * byteWidth(aElem) + bBytes <= 32768;
+  bool wholeTileFits = M * K * byteWidth(aElem) + bBytes <= kTGResidentBudgetBytes;
   if (rank == 2 && wholeTileFits) {
     aInPlace = dotOperandInPlaceBuf(op.getA(), M, K);
     bInPlace = dotOperandInPlaceBuf(op.getB(), K, N);
@@ -1040,7 +1040,7 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   int64_t aBytes = M * K * byteWidth(aElem);
   int64_t bBytes = N * K * byteWidth(aElem);
   int64_t cFull = M * N * 4;
-  bool wholeTileFits = aBytes + bBytes <= 32768;
+  bool wholeTileFits = aBytes + bBytes <= kTGResidentBudgetBytes;
   // A/B that structurally resolve to a local_alloc buffer are loaded in place
   // by astEmitDot (stage 0). The precise in-place base lives in memdescMap,
   // which is only populated once the enclosing memdesc_index is emitted inside
@@ -1146,7 +1146,7 @@ bool MSLEmitter::dotReadsOperandInPlace(tt::DotOp d, Value operand) {
   int64_t bBy =
       Kd * N *
       (bitsOf(cast<RankedTensorType>(d.getB().getType()).getElementType()) / 8);
-  if (aBy + bBy > 32768)
+  if (aBy + bBy > kTGResidentBudgetBytes)
     return false;
   if (operand == d.getA())
     return dotOperandLocalLoad(operand, M, Kd);
@@ -1234,7 +1234,8 @@ void MSLEmitter::dotPanelDims(int64_t M, int64_t N, int64_t K,
   mp = M;
   np = N;
   auto fits = [&](int64_t m, int64_t n) {
-    return m * K * elemBytes + K * n * elemBytes + m * n * accBytes <= 32768;
+    return m * K * elemBytes + K * n * elemBytes + m * n * accBytes <=
+           kTGResidentBudgetBytes;
   };
   while (!fits(mp, np)) {
     if (mp >= np && mp > 8)
@@ -1250,7 +1251,7 @@ void MSLEmitter::dotPanelDims(int64_t M, int64_t N, int64_t K,
 
 bool MSLEmitter::dotNeedsPanel(int64_t M, int64_t N, int64_t K,
                                int64_t elemBytes, int64_t accBytes) {
-  return M * K * elemBytes + K * N * elemBytes > 32768;
+  return M * K * elemBytes + K * N * elemBytes > kTGResidentBudgetBytes;
 }
 
 int64_t MSLEmitter::dotCBandRows(int64_t M, int64_t N, int64_t cBudget,

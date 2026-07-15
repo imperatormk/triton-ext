@@ -186,7 +186,7 @@ msl::Expr *MSLEmitter::astMemdescElemAddr(const MemDescInfo &info,
 }
 
 int64_t MSLEmitter::poolBudget() const {
-  int64_t b = 32768 - liveTgBytes;
+  int64_t b = kTGResidentBudgetBytes - liveTgBytes;
   return b < 0 ? 0 : b;
 }
 
@@ -262,7 +262,7 @@ void MSLEmitter::scanPool(Operation *op) {
       int64_t accBytes = 4;
       int64_t elemBytes = byteWidth(aTy.getElementType());
       int64_t stagedA = aBy, stagedB = bBy;
-      if (rk == 2 && aBy + bBy <= 32768) {
+      if (rk == 2 && aBy + bBy <= kTGResidentBudgetBytes) {
         if (dotOperandLocalLoad(d.getA(), M, Kd))
           stagedA = 0;
         if (dotOperandLocalLoad(d.getB(), Kd, N))

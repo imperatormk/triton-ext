@@ -11,6 +11,15 @@
 
 #include "llvm/ADT/StringRef.h"
 
+namespace mlir::triton::applegpu {
+
+// Threadgroup-resident scratch budget (32KB Metal cap). The single source of
+// truth for every pool-sizing and lowering gate; sizing and emission read this
+// through poolBudget(), never a bare literal, so they cannot drift.
+inline constexpr int64_t kTGResidentBudgetBytes = 32768;
+
+} // namespace mlir::triton::applegpu
+
 namespace mlir::triton::applegpu::msl {
 
 namespace builtin {

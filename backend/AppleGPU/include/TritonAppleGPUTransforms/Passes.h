@@ -5,11 +5,6 @@
 
 namespace mlir::triton::applegpu {
 
-// Threadgroup-resident operand budget for the dot TG path (32KB Metal cap
-// minus convert-scratch margin). Shared by the lowering gates; they must not
-// drift.
-inline constexpr int64_t kTGResidentBudgetBytes = 32768;
-
 // Rewrite tt.dot with BlockedEncoding → AppleMmaEncoding
 std::unique_ptr<mlir::Pass> createAccelerateAppleMatmulPass();
 

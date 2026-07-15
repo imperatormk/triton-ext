@@ -612,7 +612,7 @@ private:
   // Elements per band for a threadgroup-staged reshape whose full tile exceeds
   // the 32KB budget: the largest chunk of flat offsets that fits.
   static int64_t reshapeBandElems(int64_t totalElems, int64_t elemBytes,
-                                  int64_t budget = 32768);
+                                  int64_t budget = kTGResidentBudgetBytes);
 
   // Full flat size (product of shape) of a tensor tile.
   int64_t tileSize(RankedTensorType rt);

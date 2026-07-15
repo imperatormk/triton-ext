@@ -278,6 +278,10 @@ private:
   // single-node builders return Stmt*/Expr*.
   msl::Expr *astInit0(StringRef sc);
   msl::Expr *astDeviceAtomicPtr(StringRef atomicTy, StringRef p);
+  msl::Expr *astCasWeak(msl::Expr *ptr, StringRef expVar, msl::Expr *newVal);
+  msl::Expr *astPacked16Extract(StringRef word, StringRef isHigh);
+  msl::Expr *astPacked16Merge(StringRef word, StringRef isHigh,
+                              msl::Expr *newBitsU32);
   msl::Block astPacked16Base(StringRef p, std::string &wordPtrOut,
                              std::string &isHighOut);
   msl::Expr *astAtomicRmwCall(StringRef fn, StringRef atomicTy, StringRef p,

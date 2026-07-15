@@ -39,6 +39,39 @@ msl::Expr *MSLEmitter::astDeviceAtomicPtr(StringRef atomicTy, StringRef p) {
   return ctx.cast(CS::CStyle, ptr, ctx.var(p));
 }
 
+// atomic_compare_exchange_weak_explicit(ptr, &exp, newVal, relaxed, relaxed).
+msl::Expr *MSLEmitter::astCasWeak(msl::Expr *ptr, StringRef expVar,
+                                  msl::Expr *newVal) {
+  return ctx.call(ba::CompareExchangeWeak,
+                  {ptr, ctx.addrOf(ctx.var(expVar)), newVal,
+                   ctx.lit(border::Relaxed), ctx.lit(border::Relaxed)});
+}
+
+// (isHigh) ? (word >> 16) : (word & 0xffffu) - the packed-16 lane selector.
+msl::Expr *MSLEmitter::astPacked16Extract(StringRef word, StringRef isHigh) {
+  msl::Expr *hi = ctx.paren(ctx.binary(B::Shr, ctx.var(word), ctx.lit("16")));
+  msl::Expr *lo =
+      ctx.paren(ctx.binary(B::And, ctx.var(word), ctx.lit("0xffffu")));
+  return ctx.paren(ctx.ternary(ctx.paren(ctx.var(isHigh)), hi, lo));
+}
+
+// (isHigh) ? ((word & 0x0000ffffu) | (newBitsU32 << 16))
+//          : ((word & 0xffff0000u) | newBitsU32)
+msl::Expr *MSLEmitter::astPacked16Merge(StringRef word, StringRef isHigh,
+                                        msl::Expr *newBitsU32) {
+  msl::Expr *hiShift =
+      ctx.paren(ctx.binary(B::Shl, ctx.paren(newBitsU32), ctx.lit("16")));
+  msl::Expr *highWord = ctx.paren(ctx.binary(
+      B::Or,
+      ctx.paren(ctx.binary(B::And, ctx.var(word), ctx.lit("0x0000ffffu"))),
+      hiShift));
+  msl::Expr *lowWord = ctx.paren(ctx.binary(
+      B::Or,
+      ctx.paren(ctx.binary(B::And, ctx.var(word), ctx.lit("0xffff0000u"))),
+      newBitsU32));
+  return ctx.ternary(ctx.paren(ctx.var(isHigh)), highWord, lowWord);
+}
+
 // device uchar *bytePtr = (device uchar *)(p);
 // size_t wordAddr = (size_t)bytePtr & ~(size_t)3;
 // bool isHigh = ((size_t)bytePtr & 2u) != 0u;
@@ -131,10 +164,7 @@ msl::Block MSLEmitter::astFloat32CASLoop(StringRef p, StringRef curId,
       ctx.paren(ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::F32),
                          ctx.paren(newFloatExpr))));
   body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U32), newWord, repacked));
-  msl::Expr *cas =
-      ctx.call(ba::CompareExchangeWeak,
-               {ctx.var(wordPtr), ctx.addrOf(ctx.var(word)), ctx.var(newWord),
-                ctx.lit(border::Relaxed), ctx.lit(border::Relaxed)});
+  msl::Expr *cas = astCasWeak(ctx.var(wordPtr), word, ctx.var(newWord));
   msl::Block casThen;
   casThen.push_back(ctx.breakStmt());
   body.push_back(ctx.ifScope(cas, std::move(casThen)));
@@ -161,13 +191,8 @@ msl::Block MSLEmitter::astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
       ctx.call(ba::Load, {ctx.var(wordPtr), ctx.lit(border::Relaxed)}));
 
   // (ushort)((isHigh) ? (word >> 16) : (word & 0xffffu))
-  msl::Expr *hi =
-      ctx.paren(ctx.binary(B::Shr, ctx.var(word), ctx.lit("16")));
-  msl::Expr *lo =
-      ctx.paren(ctx.binary(B::And, ctx.var(word), ctx.lit("0xffffu")));
-  msl::Expr *sel =
-      ctx.paren(ctx.ternary(ctx.paren(ctx.var(isHigh)), hi, lo));
-  msl::Expr *laneInit = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U16), sel);
+  msl::Expr *laneInit = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U16),
+                                 astPacked16Extract(word, isHigh));
 
   auto asType = [&](msl::Type *t, msl::Expr *x) {
     return ctx.cast(CS::AsType, t, x);
@@ -180,29 +205,13 @@ msl::Block MSLEmitter::astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
 
   // (isHigh) ? ((word & 0x0000ffffu) | ((uint)as_type<ushort>(newLane) << 16))
   //          : ((word & 0xffff0000u) | (uint)as_type<ushort>(newLane))
-  msl::Expr *newBitsU16 =
-      asType(ctx.scalar(msl::Scalar::U16), ctx.var(newLane));
-  msl::Expr *newBitsHi = ctx.paren(ctx.binary(
-      B::Shl, ctx.paren(ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U32),
-                                 newBitsU16)),
-      ctx.lit("16")));
-  msl::Expr *highWord = ctx.paren(ctx.binary(
-      B::Or,
-      ctx.paren(ctx.binary(B::And, ctx.var(word), ctx.lit("0x0000ffffu"))),
-      newBitsHi));
-  msl::Expr *newBitsLo = ctx.paren(ctx.binary(
-      B::Or,
-      ctx.paren(ctx.binary(B::And, ctx.var(word), ctx.lit("0xffff0000u"))),
-      ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U32), newBitsU16)));
-  msl::Expr *newWordInit =
-      ctx.ternary(ctx.paren(ctx.var(isHigh)), highWord, newBitsLo);
-  body.push_back(
-      ctx.declStmt(ctx.scalar(msl::Scalar::U32), newWord, newWordInit));
+  msl::Expr *newBitsU32 = ctx.cast(
+      CS::CStyle, ctx.scalar(msl::Scalar::U32),
+      asType(ctx.scalar(msl::Scalar::U16), ctx.var(newLane)));
+  body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U32), newWord,
+                              astPacked16Merge(word, isHigh, newBitsU32)));
 
-  msl::Expr *cas =
-      ctx.call(ba::CompareExchangeWeak,
-               {ctx.var(wordPtr), ctx.addrOf(ctx.var(word)), ctx.var(newWord),
-                ctx.lit(border::Relaxed), ctx.lit(border::Relaxed)});
+  msl::Expr *cas = astCasWeak(ctx.var(wordPtr), word, ctx.var(newWord));
   msl::Block casThen;
   casThen.push_back(ctx.breakStmt());
   body.push_back(ctx.ifScope(cas, std::move(casThen)));
@@ -230,10 +239,8 @@ msl::Block MSLEmitter::astInt32CAS(StringRef p, StringRef c, StringRef v,
   msl::Type *scTy = ctx.named(sc);
 
   msl::Type *aiptr = ctx.named(("device " + std::string(ba::Int) + " *"));
-  msl::Expr *cas = ctx.call(
-      ba::CompareExchangeWeak,
-      {ctx.cast(CS::CStyle, aiptr, ctx.var(p)), ctx.addrOf(ctx.var(exp)),
-       ctx.var(v), ctx.lit(border::Relaxed), ctx.lit(border::Relaxed)});
+  msl::Expr *cas = astCasWeak(ctx.cast(CS::CStyle, aiptr, ctx.var(p)), exp,
+                              ctx.var(v));
   msl::Expr *cond =
       ctx.binary(B::LAnd, ctx.binary(B::Eq, ctx.var(exp), ctx.var(c)),
                  ctx.unary(msl::UnOp::LNot, ctx.paren(cas)));
@@ -262,10 +269,8 @@ msl::Block MSLEmitter::astFloat32CAS(StringRef p, StringRef c, StringRef v,
   };
 
   msl::Type *auptr = ctx.named(("device " + std::string(ba::Uint) + " *"));
-  msl::Expr *cas = ctx.call(
-      ba::CompareExchangeWeak,
-      {ctx.cast(CS::CStyle, auptr, ctx.var(p)), ctx.addrOf(ctx.var(exp)),
-       asU32(ctx.var(v)), ctx.lit(border::Relaxed), ctx.lit(border::Relaxed)});
+  msl::Expr *cas = astCasWeak(ctx.cast(CS::CStyle, auptr, ctx.var(p)), exp,
+                              asU32(ctx.var(v)));
   msl::Expr *cond =
       ctx.binary(B::LAnd, ctx.binary(B::Eq, ctx.var(exp), ctx.var(cbits)),
                  ctx.unary(msl::UnOp::LNot, ctx.paren(cas)));
@@ -315,14 +320,11 @@ msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
     outer.push_back(ctx.assignStmt(ctx.var(id), astInit0(sc)));
 
   // ushort got = (ushort)((isHigh) ? (word >> 16) : (word & 0xffffu));
-  msl::Expr *hi = ctx.paren(ctx.binary(B::Shr, ctx.var(word), ctx.lit("16")));
-  msl::Expr *lo =
-      ctx.paren(ctx.binary(B::And, ctx.var(word), ctx.lit("0xffffu")));
-  msl::Expr *sel = ctx.paren(ctx.ternary(ctx.paren(ctx.var(isHigh)), hi, lo));
   msl::Block body;
-  body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U16), got,
-                              ctx.cast(CS::CStyle,
-                                       ctx.scalar(msl::Scalar::U16), sel)));
+  body.push_back(ctx.declStmt(
+      ctx.scalar(msl::Scalar::U16), got,
+      ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U16),
+               astPacked16Extract(word, isHigh))));
   body.push_back(ctx.assignStmt(
       ctx.var(id), ctx.cast(CS::AsType, scTy, ctx.var(got))));
   msl::Block brk;
@@ -332,26 +334,12 @@ msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
 
   // uint newWord = (isHigh) ? ((word & 0x0000ffffu) | ((uint)lane << 16))
   //                         : ((word & 0xffff0000u) | (uint)lane);
-  msl::Expr *laneHi = ctx.paren(ctx.binary(
-      B::Shl, ctx.paren(ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U32),
-                                 ctx.var(lane))),
-      ctx.lit("16")));
-  msl::Expr *highWord = ctx.paren(ctx.binary(
-      B::Or,
-      ctx.paren(ctx.binary(B::And, ctx.var(word), ctx.lit("0x0000ffffu"))),
-      laneHi));
-  msl::Expr *lowWord = ctx.paren(ctx.binary(
-      B::Or,
-      ctx.paren(ctx.binary(B::And, ctx.var(word), ctx.lit("0xffff0000u"))),
-      ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U32), ctx.var(lane))));
-  body.push_back(ctx.declStmt(
-      ctx.scalar(msl::Scalar::U32), newWord,
-      ctx.ternary(ctx.paren(ctx.var(isHigh)), highWord, lowWord)));
+  msl::Expr *newBitsU32 =
+      ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U32), ctx.var(lane));
+  body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U32), newWord,
+                              astPacked16Merge(word, isHigh, newBitsU32)));
 
-  msl::Expr *cas =
-      ctx.call(ba::CompareExchangeWeak,
-               {ctx.var(wordPtr), ctx.addrOf(ctx.var(word)), ctx.var(newWord),
-                ctx.lit(border::Relaxed), ctx.lit(border::Relaxed)});
+  msl::Expr *cas = astCasWeak(ctx.var(wordPtr), word, ctx.var(newWord));
   msl::Block casBrk;
   casBrk.push_back(ctx.breakStmt());
   body.push_back(ctx.ifScope(cas, std::move(casBrk)));

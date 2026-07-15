@@ -403,6 +403,13 @@ private:
                         llvm::function_ref<msl::Expr *(int)> srcOff,
                         llvm::function_ref<msl::Expr *(int)> srcVal,
                         llvm::function_ref<msl::Expr *(int)> resOff);
+
+  // Shared tt.trans / tt.reshape lowering: stage src regs into a pool buffer at
+  // srcOff(r), then read them back at the result's row-major flat offset. Only
+  // the source-offset mapping differs between the two ops.
+  void emitTileRoundTrip(Value res, Value src, RankedTensorType srcTy,
+                         RankedTensorType resTy, msl::Block &body,
+                         llvm::function_ref<msl::Expr *(int)> srcOff);
   bool emitFailed = false;
 
   std::string fresh() { return "v" + std::to_string(nextId++); }

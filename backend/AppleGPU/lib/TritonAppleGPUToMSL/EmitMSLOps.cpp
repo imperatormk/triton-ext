@@ -468,6 +468,32 @@ void MSLEmitter::astBandRoundTrip(msl::Block &body, StringRef buf,
   }
 }
 
+void MSLEmitter::emitTileRoundTrip(
+    Value res, Value src, RankedTensorType srcTy, RankedTensorType resTy,
+    msl::Block &body, llvm::function_ref<msl::Expr *(int)> srcOff) {
+  msl::Type *scTy = astScalarType(resTy.getElementType());
+  std::string sc = mslScalarType(resTy.getElementType());
+  auto &srcNames = names(src);
+  int srcRc = regCount(src);
+  int resRc = regCount(res);
+  int64_t elemBytes = byteWidth(resTy.getElementType());
+  int64_t total = tileSize(resTy);
+
+  std::string buf = fresh();
+  body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
+                              astPoolRegion(0, sc)));
+  int64_t band = reshapeBand(total, elemBytes);
+  SmallVector<std::string> ids = astDeclResultVars(res, body);
+  astBandRoundTrip(
+      body, buf, total, band, srcRc, resRc, ids, srcOff,
+      [&](int r) {
+        return static_cast<msl::Expr *>(
+            ctx.var(srcNames[srcNames.size() == 1 ? 0 : r]));
+      },
+      [&](int r) { return astFlatTileOffset(resTy, r); });
+  bindRegs(res, ids);
+}
+
 // Per-register store: `[if (guard)] *p = v;` with the thread predicate + mask
 // guard.
 void MSLEmitter::astStoreBody(tt::StoreOp op, msl::Block &body) {
@@ -1019,30 +1045,9 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
     auto perm = tr.getOrder();
-    msl::Type *scTy = astScalarType(resTy.getElementType());
-    std::string sc = mslScalarType(resTy.getElementType());
-    auto &srcNames = names(src);
-    int srcRc = regCount(src);
-    int resRc = regCount(res);
-    int64_t elemBytes = byteWidth(resTy.getElementType());
-    int64_t total = tileSize(resTy);
-
-    std::string buf = fresh();
-    body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
-                                astPoolRegion(0, sc)));
-    int64_t band = reshapeBand(total, elemBytes);
-    SmallVector<std::string> ids = astDeclResultVars(res, body);
-    astBandRoundTrip(
-        body, buf, total, band, srcRc, resRc, ids,
-        [&](int r) {
-          return astTransFlatOffset(srcTy, perm, resTy.getShape(), r);
-        },
-        [&](int r) {
-          return static_cast<msl::Expr *>(
-              ctx.var(srcNames[srcNames.size() == 1 ? 0 : r]));
-        },
-        [&](int r) { return astFlatTileOffset(resTy, r); });
-    bindRegs(res, ids);
+    emitTileRoundTrip(res, src, srcTy, resTy, body, [&](int r) {
+      return astTransFlatOffset(srcTy, perm, resTy.getShape(), r);
+    });
     return true;
   }
 
@@ -1055,28 +1060,8 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
     Value res = rs.getResult();
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
-    msl::Type *scTy = astScalarType(resTy.getElementType());
-    std::string sc = mslScalarType(resTy.getElementType());
-    auto &srcNames = names(src);
-    int srcRc = regCount(src);
-    int resRc = regCount(res);
-    int64_t elemBytes = byteWidth(resTy.getElementType());
-    int64_t total = tileSize(resTy);
-
-    std::string buf = fresh();
-    body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
-                                astPoolRegion(0, sc)));
-    int64_t band = reshapeBand(total, elemBytes);
-    SmallVector<std::string> outs = astDeclResultVars(res, body);
-    astBandRoundTrip(
-        body, buf, total, band, srcRc, resRc, outs,
-        [&](int r) { return astFlatTileOffset(srcTy, r); },
-        [&](int r) {
-          return static_cast<msl::Expr *>(
-              ctx.var(srcNames[srcNames.size() == 1 ? 0 : r]));
-        },
-        [&](int r) { return astFlatTileOffset(resTy, r); });
-    bindRegs(res, outs);
+    emitTileRoundTrip(res, src, srcTy, resTy, body,
+                      [&](int r) { return astFlatTileOffset(srcTy, r); });
     return true;
   }
 

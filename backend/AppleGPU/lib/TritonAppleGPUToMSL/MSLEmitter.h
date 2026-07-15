@@ -43,6 +43,10 @@ struct LocalGen {
   std::string fresh() { return "v" + std::to_string(id++); }
 };
 
+inline bool isFp8Type(Type t) {
+  return isa<Float8E4M3FNType, Float8E5M2Type>(t);
+}
+
 inline std::string mslScalarType(Type t) {
   if (t.isF32() || t.isF64())
     return "float";
@@ -50,6 +54,8 @@ inline std::string mslScalarType(Type t) {
     return "half";
   if (t.isBF16())
     return "bfloat";
+  if (isFp8Type(t))
+    return "uchar";
   if (auto it = dyn_cast<IntegerType>(t)) {
     unsigned w = it.getWidth();
     if (w == 1)

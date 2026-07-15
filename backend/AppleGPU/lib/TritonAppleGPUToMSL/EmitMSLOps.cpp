@@ -850,6 +850,35 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
                           reg(c.getMax(), r));
     });
 
+  // fp8 (e4m3/e5m2) has no native MSL scalar: it is uchar storage with
+  // bit-twiddling pack/unpack helpers. Any float<->fp8 cast routes here first.
+  if (isa<arith::TruncFOp, arith::ExtFOp, tt::FpToFpOp>(op)) {
+    Type dstE = elementScalarType(op->getResult(0).getType());
+    Type srcE = elementScalarType(op->getOperand(0).getType());
+    bool dstFp8 = isFp8Type(dstE), srcFp8 = isFp8Type(srcE);
+    if (dstFp8 || srcFp8) {
+      auto fp8Fn = [](Type t, bool toF8) -> std::string {
+        const char *k = isa<Float8E4M3FNType>(t) ? "e4m3" : "e5m2";
+        return toF8 ? std::string("tt_f32_to_fp8") + k + "_rtne"
+                    : std::string("tt_fp8") + k + "_to_f32";
+      };
+      return astDeclBind(op, astScalarType(dstE), body, [&](int r) -> msl::Expr * {
+        msl::Expr *src = ctx.var(reg(op->getOperand(0), r));
+        if (srcFp8) {
+          msl::Expr *b =
+              ctx.cast(msl::Cast::Style::CStyle, ctx.scalar(msl::Scalar::U8), src);
+          msl::Expr *f = ctx.call(fp8Fn(srcE, false), {b});
+          if (dstE.isF32())
+            return f;
+          return ctx.cast(msl::Cast::Style::CStyle, astScalarType(dstE), f);
+        }
+        msl::Expr *f =
+            ctx.cast(msl::Cast::Style::CStyle, ctx.scalar(msl::Scalar::F32), src);
+        return ctx.call(fp8Fn(dstE, true), {f});
+      });
+    }
+  }
+
   // Casts (non fp-narrowing) / bitcast / ptr<->int.
   if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp,
           arith::ExtFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(op))

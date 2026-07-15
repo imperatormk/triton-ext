@@ -654,7 +654,7 @@ void MSLPrinter::printProto(const DeviceFn *fn) {
 // Preamble (fixed; verbatim from EmitMSL L126-136)
 //===----------------------------------------------------------------------===//
 
-void MSLPrinter::printPreamble() {
+void MSLPrinter::printPreamble(bool usesFp8) {
   os << "#include <metal_stdlib>\n";
   os << "#include <metal_simdgroup_matrix>\n";
   os << "using namespace metal;\n\n";
@@ -667,6 +667,8 @@ void MSLPrinter::printPreamble() {
 
 )MSL";
   printNarrowingHelpers();
+  if (usesFp8)
+    printFp8Helpers();
   printAtomicHelpers();
 }
 
@@ -773,6 +775,100 @@ static inline bfloat tt_rtne_int_bfloat(float v){
   uint u = as_type<uint>(v);
   uint r = (u >> 16) & 1u;
   return as_type<bfloat>((ushort)(((u + 0x7fffu + r) >> 16) & 0xffffu));
+}
+
+)MSL";
+}
+
+//===----------------------------------------------------------------------===//
+// fp8 (OCP e4m3fn / e5m2) pack/unpack: no native MSL fp8 scalar, so fp8 is
+// uchar storage. RTNE + saturation on the way in; e4m3 has no inf (NaN only,
+// max 448); e5m2 is ieee-like (inf/nan). Emitted only when a kernel uses fp8.
+//===----------------------------------------------------------------------===//
+
+void MSLPrinter::printFp8Helpers() {
+  os << R"MSL(static inline uchar tt_f32_to_fp8e4m3_rtne(float v){
+  uint u = as_type<uint>(v);
+  uint sgn = (u >> 24) & 0x80u;
+  int e32 = (int)((u >> 23) & 0xffu);
+  uint mant = u & 0x7fffffu;
+  if (e32 == 0xff) { return (uchar)(sgn | 0x7fu); }
+  int ex = e32 - 127 + 7;
+  if (ex >= 16 || (ex == 15 && mant > 0x600000u)) { return (uchar)(sgn | 0x7eu); }
+  if (ex <= 0) {
+    if (ex < -6) { return (uchar)sgn; }
+    uint fm = mant | 0x800000u;
+    int sh = 21 - ex;
+    uint m = fm >> sh;
+    uint rem = fm & ((1u << sh) - 1u);
+    uint half_ = 1u << (sh - 1);
+    if (rem > half_ || (rem == half_ && (m & 1u))) m += 1;
+    return (uchar)(sgn | m);
+  }
+  uint m = mant >> 20;
+  uint rem = mant & 0xfffffu;
+  uint bits = sgn | ((uint)ex << 3) | m;
+  if (rem > 0x80000u || (rem == 0x80000u && (m & 1u))) bits += 1;
+  return (uchar)bits;
+}
+
+static inline float tt_fp8e4m3_to_f32(uchar b){
+  uint sgn = ((uint)b & 0x80u) << 24;
+  uint e = ((uint)b >> 3) & 0xfu;
+  uint m = (uint)b & 0x7u;
+  if (e == 0) {
+    if (m == 0) { return as_type<float>(sgn); }
+    int sh = 0;
+    while ((m & 0x8u) == 0) { m <<= 1; sh += 1; }
+    m &= 0x7u;
+    uint e32 = (uint)(127 - 6 - sh);
+    return as_type<float>(sgn | (e32 << 23) | (m << 20));
+  }
+  if (e == 0xf && m == 0x7u) { return as_type<float>(sgn | 0x7f800000u | 0x400000u); }
+  uint e32 = e + 127 - 7;
+  return as_type<float>(sgn | (e32 << 23) | (m << 20));
+}
+
+static inline uchar tt_f32_to_fp8e5m2_rtne(float v){
+  uint u = as_type<uint>(v);
+  uint sgn = (u >> 24) & 0x80u;
+  int e32 = (int)((u >> 23) & 0xffu);
+  uint mant = u & 0x7fffffu;
+  if (e32 == 0xff) { return (uchar)(sgn | 0x7cu | (mant ? 0x2u : 0u)); }
+  int ex = e32 - 127 + 15;
+  if (ex >= 31) { return (uchar)(sgn | 0x7cu); }
+  if (ex <= 0) {
+    if (ex < -2) { return (uchar)sgn; }
+    uint fm = mant | 0x800000u;
+    int sh = 22 - ex;
+    uint m = fm >> sh;
+    uint rem = fm & ((1u << sh) - 1u);
+    uint half_ = 1u << (sh - 1);
+    if (rem > half_ || (rem == half_ && (m & 1u))) m += 1;
+    return (uchar)(sgn | m);
+  }
+  uint m = mant >> 21;
+  uint rem = mant & 0x1fffffu;
+  uint bits = sgn | ((uint)ex << 2) | m;
+  if (rem > 0x100000u || (rem == 0x100000u && (m & 1u))) bits += 1;
+  return (uchar)bits;
+}
+
+static inline float tt_fp8e5m2_to_f32(uchar b){
+  uint sgn = ((uint)b & 0x80u) << 24;
+  uint e = ((uint)b >> 2) & 0x1fu;
+  uint m = (uint)b & 0x3u;
+  if (e == 0) {
+    if (m == 0) { return as_type<float>(sgn); }
+    int sh = 0;
+    while ((m & 0x4u) == 0) { m <<= 1; sh += 1; }
+    m &= 0x3u;
+    uint e32 = (uint)(127 - 14 - sh);
+    return as_type<float>(sgn | (e32 << 23) | (m << 21));
+  }
+  if (e == 0x1f) { return as_type<float>(sgn | 0x7f800000u | (m << 21)); }
+  uint e32 = e + 127 - 15;
+  return as_type<float>(sgn | (e32 << 23) | (m << 21));
 }
 
 )MSL";

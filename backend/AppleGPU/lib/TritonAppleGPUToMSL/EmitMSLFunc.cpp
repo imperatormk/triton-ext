@@ -141,8 +141,21 @@ msl::Stmt *MSLEmitter::astReturn(tt::ReturnOp op) {
 }
 
 LogicalResult MSLEmitter::emit() {
+  bool usesFp8 = false;
+  mod.walk([&](Operation *op) {
+    auto isFp8Ty = [](Type t) {
+      if (auto rt = dyn_cast<RankedTensorType>(t))
+        t = rt.getElementType();
+      return isFp8Type(t);
+    };
+    for (Type t : op->getOperandTypes())
+      usesFp8 |= isFp8Ty(t);
+    for (Type t : op->getResultTypes())
+      usesFp8 |= isFp8Ty(t);
+  });
+
   msl::MSLPrinter preamblePrinter(os);
-  preamblePrinter.printPreamble();
+  preamblePrinter.printPreamble(usesFp8);
 
   llvm::DenseSet<StringRef> callTargets;
   mod.walk([&](tt::CallOp call) {

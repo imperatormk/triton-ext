@@ -172,5 +172,9 @@ inspections are not applicable.
   variants lower to relaxed.
 - `tf32` / `bf16xN` dot input precision — split-precision emulation modes with
   no Metal equivalent (rejected at compile).
-- `num_warps >= 16` — exceeds the Apple GPU max threads per threadgroup (384).
+- large `num_warps` — a config is capped by the PSO's runtime
+  `maxTotalThreadsPerThreadgroup`, not a fixed number: the backend queries it
+  per kernel and reports it so triton drops over-large configs. The ceiling is
+  device- and kernel-dependent (register pressure lowers it); a light kernel
+  hits 1024 on M1 Pro, so `num_warps=32` (1024 threads) runs fine.
 - Cross-threadgroup spinlocks — Apple GPU has no forward-progress guarantee.

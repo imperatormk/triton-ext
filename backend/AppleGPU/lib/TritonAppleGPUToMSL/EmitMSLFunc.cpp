@@ -170,7 +170,7 @@ LogicalResult MSLEmitter::emit() {
     func.walk([&](ttg::LocalAllocOp la) {
       auto mt = cast<ttg::MemDescType>(la.getResult().getType());
       liveTgBytes += memdescFlatSize(mt) *
-                     (bitsOf(mt.getElementType()) / 8);
+                     byteWidth(mt.getElementType());
     });
     for (Block &blk : func.getBody())
       for (Operation &op : blk)
@@ -274,7 +274,7 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
   liveTgBytes = 0;
   func.walk([&](ttg::LocalAllocOp la) {
     auto mt = cast<ttg::MemDescType>(la.getResult().getType());
-    liveTgBytes += memdescFlatSize(mt) * (bitsOf(mt.getElementType()) / 8);
+    liveTgBytes += memdescFlatSize(mt) * byteWidth(mt.getElementType());
   });
   for (Block &blk : func.getBody())
     for (Operation &op : blk)

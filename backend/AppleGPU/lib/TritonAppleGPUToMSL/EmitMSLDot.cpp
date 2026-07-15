@@ -82,13 +82,13 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
   msl::Type *accScalarTy = astScalarType(cElem);
   std::string accScalar = mslScalarType(cElem);
 
-  int64_t aBytes = M * K * (bitsOf(aElem) / 8);
-  int64_t bBytes = N * K * (bitsOf(bElem) / 8);
+  int64_t aBytes = M * K * byteWidth(aElem);
+  int64_t bBytes = N * K * byteWidth(bElem);
   int64_t accBytes = 4;
   int64_t cFull = M * N * accBytes;
 
   std::optional<InPlaceOperand> aInPlace, bInPlace;
-  bool wholeTileFits = M * K * (bitsOf(aElem) / 8) + bBytes <= 32768;
+  bool wholeTileFits = M * K * byteWidth(aElem) + bBytes <= 32768;
   if (rank == 2 && wholeTileFits) {
     aInPlace = dotOperandInPlaceBuf(op.getA(), M, K);
     bInPlace = dotOperandInPlaceBuf(op.getB(), K, N);
@@ -209,7 +209,7 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
     }
   };
 
-  if (dotNeedsPanel(M, N, K, bitsOf(aElem) / 8, accBytes)) {
+  if (dotNeedsPanel(M, N, K, byteWidth(aElem), accBytes)) {
     if (!astEmitDotPanel(op, body, aStage, bStage, aNames, bNames, cInit, ids,
                          M, N, K, Bd, rank, opFrag, opScalar, numWarps, rowDim,
                          colDim))
@@ -490,7 +490,7 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
   auto aStageTy = cast<RankedTensorType>(aStage.getType());
   auto bStageTy = cast<RankedTensorType>(bStage.getType());
   auto cTy = cast<RankedTensorType>(op.getResult().getType());
-  int64_t elemBytes = bitsOf(aElem) / 8, accBytes = 4;
+  int64_t elemBytes = byteWidth(aElem), accBytes = 4;
   int64_t mp, np;
   dotPanelDims(M, N, K, elemBytes, accBytes, mp, np);
   int64_t aPanelBytes = mp * K * elemBytes, bPanelBytes = K * np * elemBytes;
@@ -657,7 +657,7 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
   auto &aNames = names(aStage);
   auto &bNames = names(bStage);
   auto &cInit = names(op.getC());
-  int64_t aBytes = cTy.getShape()[rank - 2] * K * (bitsOf(aElem) / 8);
+  int64_t aBytes = cTy.getShape()[rank - 2] * K * byteWidth(aElem);
 
   auto tgPtr = [&](StringRef s) { return ctx.named(("threadgroup " + s.str() + "*")); };
   std::string tgA = fresh(), tgB = fresh();
@@ -1013,8 +1013,8 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   // where staged A+B+C fits the pool (band == M, one readback). Anything
   // larger falls back to the per-dot path. Staging bytes mirror the dot path: an
   // operand already resident in a threadgroup buffer (in-place) stages 0.
-  int64_t aBytes = M * K * (bitsOf(aElem) / 8);
-  int64_t bBytes = N * K * (bitsOf(aElem) / 8);
+  int64_t aBytes = M * K * byteWidth(aElem);
+  int64_t bBytes = N * K * byteWidth(aElem);
   int64_t cFull = M * N * 4;
   bool wholeTileFits = aBytes + bBytes <= 32768;
   // A/B that structurally resolve to a local_alloc buffer are loaded in place

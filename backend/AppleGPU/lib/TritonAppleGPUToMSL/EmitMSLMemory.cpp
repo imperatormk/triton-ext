@@ -209,7 +209,7 @@ int64_t MSLEmitter::tileSize(RankedTensorType rt) {
 
 int64_t MSLEmitter::tgScratchBytes(RankedTensorType ty, bool band2D) {
   Type e = ty.getElementType();
-  int64_t elemBytes = bitsOf(e) / 8;
+  int64_t elemBytes = byteWidth(e);
   int64_t bytes = tileSize(ty) * elemBytes;
   int64_t cap = poolBudget();
   if (bytes <= cap)
@@ -237,14 +237,14 @@ void MSLEmitter::scanPool(Operation *op) {
   } else if (auto c = dyn_cast<tt::CatOp>(op)) {
     auto rt = cast<RankedTensorType>(c.getResult().getType());
     Type e = rt.getElementType();
-    poolBytes = std::max(poolBytes, tileSize(rt) * (bitsOf(e) / 8));
+    poolBytes = std::max(poolBytes, tileSize(rt) * byteWidth(e));
   } else if (auto rs = dyn_cast<tt::ReshapeOp>(op)) {
     auto rt = cast<RankedTensorType>(rs.getResult().getType());
     poolBytes = std::max(poolBytes, tgScratchBytes(rt, /*band2D=*/false));
   } else if (auto g = dyn_cast<tt::GatherOp>(op)) {
     auto st = cast<RankedTensorType>(g.getSrc().getType());
     Type e = st.getElementType();
-    poolBytes = std::max(poolBytes, tileSize(st) * (bitsOf(e) / 8));
+    poolBytes = std::max(poolBytes, tileSize(st) * byteWidth(e));
   } else if (auto d = dyn_cast<tt::DotOp>(op)) {
     auto aTy = cast<RankedTensorType>(d.getA().getType());
     auto bTy = cast<RankedTensorType>(d.getB().getType());
@@ -253,15 +253,15 @@ void MSLEmitter::scanPool(Operation *op) {
     int64_t M = cTy.getShape()[rk - 2];
     int64_t N = cTy.getShape()[rk - 1];
     int64_t Kd = aTy.getShape()[rk - 1];
-    int64_t aBy = M * Kd * (bitsOf(aTy.getElementType()) / 8);
-    int64_t bBy = Kd * N * (bitsOf(bTy.getElementType()) / 8);
+    int64_t aBy = M * Kd * byteWidth(aTy.getElementType());
+    int64_t bBy = Kd * N * byteWidth(bTy.getElementType());
     Type cE = cTy.getElementType();
     int64_t need;
     if (isa<IntegerType>(cE)) {
       need = aBy + bBy;
     } else {
       int64_t accBytes = 4;
-      int64_t elemBytes = bitsOf(aTy.getElementType()) / 8;
+      int64_t elemBytes = byteWidth(aTy.getElementType());
       int64_t stagedA = aBy, stagedB = bBy;
       if (rk == 2 && aBy + bBy <= 32768) {
         if (dotOperandLocalLoad(d.getA(), M, Kd))
@@ -293,7 +293,7 @@ void MSLEmitter::scanPool(Operation *op) {
       for (Value res : r.getResult())
         bytes += nw * 32 *
                  std::max<int64_t>(
-                     1, bitsOf(elementScalarType(res.getType())) / 8);
+                     1, byteWidth(elementScalarType(res.getType())));
       poolBytes = std::max(poolBytes, bytes);
     }
   } else if (auto h = dyn_cast<tt::HistogramOp>(op)) {
@@ -310,7 +310,7 @@ void MSLEmitter::scanPool(Operation *op) {
           ll.getFreeVariableMasks().lookup(StringAttr::get(c, "warp"));
       if (warpFree) {
         int64_t eb = std::max<int64_t>(
-            1, bitsOf(elementScalarType(ar.getResult().getType())) / 8);
+            1, byteWidth(elementScalarType(ar.getResult().getType())));
         int64_t rc = ll.getInDimSize(StringAttr::get(c, "register"));
         int64_t nw = ll.hasInDim(StringAttr::get(c, "warp"))
                          ? ll.getInDimSize(StringAttr::get(c, "warp"))
@@ -328,7 +328,7 @@ void MSLEmitter::scanPool(Operation *op) {
       int64_t nw = ll.getInDimSize(kWarp);
       int64_t bytes = 0;
       for (Value res : s.getResult())
-        bytes += nw * 32 * (bitsOf(elementScalarType(res.getType())) / 8);
+        bytes += nw * 32 * byteWidth(elementScalarType(res.getType()));
       poolBytes = std::max(poolBytes, bytes);
     }
   }

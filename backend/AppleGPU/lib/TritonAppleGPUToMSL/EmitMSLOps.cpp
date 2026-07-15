@@ -976,7 +976,7 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op, msl::Block &body) 
     auto &srcNames = names(src);
     int srcRc = regCount(src);
     int resRc = regCount(res);
-    int64_t elemBytes = bitsOf(resTy.getElementType()) / 8;
+    int64_t elemBytes = byteWidth(resTy.getElementType());
     int64_t total = tileSize(resTy);
 
     std::string buf = fresh();
@@ -1010,7 +1010,7 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op, msl::Block &body) 
     auto &srcNames = names(src);
     int srcRc = regCount(src);
     int resRc = regCount(res);
-    int64_t elemBytes = bitsOf(resTy.getElementType()) / 8;
+    int64_t elemBytes = byteWidth(resTy.getElementType());
     int64_t total = tileSize(resTy);
 
     std::string buf = fresh();
@@ -1137,7 +1137,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op, msl::Block &body) 
     msl::Type *scTy = isPtr ? ctx.scalar(msl::Scalar::U64) : astStorageType(resTy);
     msl::Type *ptrDeclTy = astStorageType(resTy);
     auto &srcNames = names(src);
-    int64_t elemBytes = bitsOf(elemTy) / 8;
+    int64_t elemBytes = byteWidth(elemTy);
     int64_t tileBytes = tileSize(resTy) * elemBytes;
     int rank = resTy.getRank();
     ArrayRef<int64_t> shape = resTy.getShape();
@@ -1785,7 +1785,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
     for (int k = 0; k < nOp; ++k) {
       scTys[k] = mslScalarType(elementScalarType(sn.getResult()[k].getType()));
       scTypes[k] = astScalarType(elementScalarType(sn.getResult()[k].getType()));
-      byteWidths[k] = bitsOf(elementScalarType(sn.getResult()[k].getType())) / 8;
+      byteWidths[k] = byteWidth(elementScalarType(sn.getResult()[k].getType()));
     }
     SmallVector<SmallVector<std::string>> srcNames(nOp);
     for (int k = 0; k < nOp; ++k)

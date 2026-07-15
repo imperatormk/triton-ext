@@ -642,6 +642,7 @@ private:
   std::string cfgState;
 
   static int64_t bitsOf(Type t);
+  static int64_t byteWidth(Type t) { return bitsOf(t) / 8; }
 
   // Elements per band for a threadgroup-staged reshape whose full tile exceeds
   // the 32KB budget: the largest chunk of flat offsets that fits.

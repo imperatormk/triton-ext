@@ -3,7 +3,7 @@
 // The fp32->half/bfloat narrowing (rtne/rtz) and the emulated fp32/packed-fp16
 // CAS loops. These are the only builders that write MSL text imperatively
 // through `os`/`ind()`/`indent`/`fresh()` (the Raw escape hatch); every
-// mask/shift/round-bias is IEEE-exact and oracle-load-bearing.
+// mask/shift/round-bias is IEEE-exact.
 
 #include "MSLEmitter.h"
 

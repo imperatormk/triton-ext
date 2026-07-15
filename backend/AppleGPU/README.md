@@ -123,7 +123,6 @@ print("vecadd ok")
 | `add_accelerate_matmul` | Rewrite tt.dot → AppleMmaEncoding (simdgroup MMA)           |
 | `add_simplify_gather`   | Strip efficient_layout from large gathers (Metal JIT limit) |
 | `add_store_shuffle_layout` | Re-lay MMA epilogue stores as within-simdgroup shuffles  |
-| `add_widen_staging`     | Widen pipelined staging slots for barrier elision           |
 | `add_emit_msl`          | Emit MSL text directly from TTGIR (terminal codegen)        |
 
 ### TritonAppleGPU Dialect

@@ -23,10 +23,6 @@ static void addStoreShuffleLayout(mlir::PassManager *pm,
                                   const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createStoreShuffleLayoutPass());
 }
-static void addWidenStaging(mlir::PassManager *pm,
-                            const std::vector<std::string> &) {
-  pm->addPass(mlir::triton::applegpu::createWidenPipelinedStagingPass());
-}
 static void addEmitMSL(mlir::PassManager *pm,
                        const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createEmitMSLPass());
@@ -49,11 +45,6 @@ static void registerSimplifyGather() {
 static void registerStoreShuffleLayout() {
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return mlir::triton::applegpu::createStoreShuffleLayoutPass();
-  });
-}
-static void registerWidenStaging() {
-  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
-    return mlir::triton::applegpu::createWidenPipelinedStagingPass();
   });
 }
 static void registerEmitMSL() {
@@ -83,7 +74,6 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       {"simplify_gather", "0.1.0", addSimplifyGather, registerSimplifyGather},
       {"store_shuffle_layout", "0.1.0", addStoreShuffleLayout,
        registerStoreShuffleLayout},
-      {"widen_staging", "0.1.0", addWidenStaging, registerWidenStaging},
       {"emit_msl", "0.1.0", addEmitMSL, registerEmitMSL},
   };
 
@@ -96,7 +86,7 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       "TritonAppleGPUBackend",
       "0.1.0",
       passes,
-      5, // numPasses
+      4, // numPasses
       dialects,
       1, // numDialects
       nullptr,

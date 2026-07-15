@@ -72,13 +72,14 @@ msl::BinOp arithBinOp(Operation *op) {
   return msl::BinOp::Xor;
 }
 
+msl::Expr *MSLEmitter::recast(msl::Type *opCast, StringRef n) {
+  msl::Expr *v = ctx.var(n);
+  return opCast ? ctx.cast(msl::Cast::Style::CStyle, opCast, v) : v;
+}
+
 msl::Expr *MSLEmitter::astElementwiseExpr(msl::BinOp op, msl::Type *opCast,
                                           StringRef a, StringRef b) {
-  auto recast = [&](StringRef n) -> msl::Expr * {
-    msl::Expr *v = ctx.var(n);
-    return opCast ? ctx.cast(msl::Cast::Style::CStyle, opCast, v) : v;
-  };
-  return ctx.paren(ctx.binary(op, recast(a), recast(b)));
+  return ctx.paren(ctx.binary(op, recast(opCast, a), recast(opCast, b)));
 }
 
 msl::Expr *MSLEmitter::astIntBinaryExpr(Operation *op, StringRef a,
@@ -120,11 +121,7 @@ msl::Expr *MSLEmitter::astShiftExpr(Operation *op, StringRef a, StringRef b) {
 msl::Expr *MSLEmitter::astMinMaxExpr(StringRef fn, msl::Type *opCast,
                                      bool propagateNan, StringRef a,
                                      StringRef b) {
-  auto recast = [&](StringRef n) -> msl::Expr * {
-    msl::Expr *v = ctx.var(n);
-    return opCast ? ctx.cast(msl::Cast::Style::CStyle, opCast, v) : v;
-  };
-  msl::Expr *call = ctx.call(fn, {recast(a), recast(b)});
+  msl::Expr *call = ctx.call(fn, {recast(opCast, a), recast(opCast, b)});
   if (!propagateNan)
     return call;
   // ((isnan(a) || isnan(b)) ? a + b : call)
@@ -208,6 +205,22 @@ msl::Expr *MSLEmitter::astSelectExpr(StringRef c, StringRef t, StringRef f) {
 // Cross-lane shuffle
 //===----------------------------------------------------------------------===//
 
+static msl::Scalar shuffleScalarOf(StringRef s) {
+  if (s == "bfloat")
+    return msl::Scalar::BF16;
+  if (s == "half")
+    return msl::Scalar::F16;
+  if (s == "short")
+    return msl::Scalar::I16;
+  if (s == "char")
+    return msl::Scalar::I8;
+  if (s == "bool")
+    return msl::Scalar::I1;
+  if (s == "long")
+    return msl::Scalar::I64;
+  return msl::Scalar::U64; // ulong
+}
+
 // Statement form of the shuffle: push the temp decls into `body` and return the
 // fresh result name (used by reduce/scan where the shuffled value must be a name
 // the combiner region binds to).
@@ -217,7 +230,7 @@ std::string MSLEmitter::astShuffle(StringRef op, StringRef sc, StringRef val,
   std::string out = fresh();
   auto call = [&](msl::Expr *v) { return ctx.call(op, {v, ctx.var(arg)}); };
   if (sc == "long" || sc == "ulong") {
-    msl::Scalar wide = sc == "long" ? msl::Scalar::I64 : msl::Scalar::U64;
+    msl::Scalar wide = shuffleScalarOf(sc);
     std::string lo = fresh(), hi = fresh();
     msl::Type *u2 = ctx.vector(msl::Scalar::U32, 2);
     body.push_back(ctx.declStmt(u2, lo,
@@ -246,10 +259,7 @@ std::string MSLEmitter::astShuffle(StringRef op, StringRef sc, StringRef val,
   if (sc == "bfloat" || sc == "half" || sc == "short" || sc == "char") {
     msl::Scalar bitsS = sc == "char" ? msl::Scalar::U8 : msl::Scalar::U16;
     msl::Type *bits = ctx.scalar(bitsS);
-    msl::Scalar scS = sc == "bfloat" ? msl::Scalar::BF16
-                      : sc == "half" ? msl::Scalar::F16
-                      : sc == "short" ? msl::Scalar::I16
-                                      : msl::Scalar::I8;
+    msl::Scalar scS = shuffleScalarOf(sc);
     std::string b = fresh(), s = fresh();
     body.push_back(ctx.declStmt(bits, b,
                                 ctx.cast(CS::AsType, bits, ctx.var(val))));
@@ -266,21 +276,6 @@ std::string MSLEmitter::astShuffle(StringRef op, StringRef sc, StringRef val,
 
 msl::Expr *MSLEmitter::astShuffleExpr(StringRef op, StringRef sc, StringRef val,
                                       StringRef arg) {
-  auto scalarOf = [&](StringRef s) -> msl::Scalar {
-    if (s == "bfloat")
-      return msl::Scalar::BF16;
-    if (s == "half")
-      return msl::Scalar::F16;
-    if (s == "short")
-      return msl::Scalar::I16;
-    if (s == "char")
-      return msl::Scalar::I8;
-    if (s == "bool")
-      return msl::Scalar::I1;
-    if (s == "long")
-      return msl::Scalar::I64;
-    return msl::Scalar::U64; // ulong
-  };
   auto shuffle = [&](msl::Expr *v) {
     return ctx.call(op, {v, ctx.var(arg)});
   };
@@ -289,7 +284,7 @@ msl::Expr *MSLEmitter::astShuffleExpr(StringRef op, StringRef sc, StringRef val,
     msl::Expr *bits =
         ctx.cast(msl::Cast::Style::AsType, u2, ctx.var(val));
     // Both lanes shuffled by the same arg; a single as_type round-trips the pair.
-    return ctx.cast(msl::Cast::Style::AsType, ctx.scalar(scalarOf(sc)),
+    return ctx.cast(msl::Cast::Style::AsType, ctx.scalar(shuffleScalarOf(sc)),
                     shuffle(bits));
   }
   if (sc == "bool") {
@@ -302,7 +297,7 @@ msl::Expr *MSLEmitter::astShuffleExpr(StringRef op, StringRef sc, StringRef val,
     msl::Type *bits =
         ctx.scalar(sc == "char" ? msl::Scalar::U8 : msl::Scalar::U16);
     msl::Expr *b = ctx.cast(msl::Cast::Style::AsType, bits, ctx.var(val));
-    return ctx.cast(msl::Cast::Style::AsType, ctx.scalar(scalarOf(sc)),
+    return ctx.cast(msl::Cast::Style::AsType, ctx.scalar(shuffleScalarOf(sc)),
                     shuffle(b));
   }
   return shuffle(ctx.var(val));

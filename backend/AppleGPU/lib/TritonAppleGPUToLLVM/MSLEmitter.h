@@ -1118,6 +1118,7 @@ private:
   // resolving operands from already-looked-up register names.
   msl::Expr *astIntBinaryExpr(Operation *op, StringRef a, StringRef b);
   msl::Expr *astShiftExpr(Operation *op, StringRef a, StringRef b);
+  msl::Expr *recast(msl::Type *opCast, StringRef n);
   msl::Expr *astElementwiseExpr(msl::BinOp op, msl::Type *opCast, StringRef a,
                                 StringRef b);
   msl::Expr *astMinMaxExpr(StringRef fn, msl::Type *opCast, bool propagateNan,

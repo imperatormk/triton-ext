@@ -156,16 +156,16 @@ msl::Block MSLEmitter::astFloat32CASLoop(StringRef p, StringRef curId,
       ctx.call(ba::Load, {ctx.var(wordPtr), ctx.lit(border::Relaxed)}));
 
   auto asF32 = [&](msl::Expr *x) {
-    return ctx.cast(CS::AsType, ctx.scalar(msl::Scalar::F32), x);
+    return astAsType(ctx.scalar(msl::Scalar::F32), x);
   };
   msl::Block body;
   body.push_back(ctx.assignStmt(ctx.var(id), asF32(ctx.var(word))));
   body.push_back(
       ctx.declStmt(ctx.scalar(msl::Scalar::F32), curId, asF32(ctx.var(word))));
   msl::Expr *repacked =
-      ctx.cast(CS::AsType, ctx.scalar(msl::Scalar::U32),
-               ctx.paren(ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::F32),
-                                  ctx.paren(newFloatExpr))));
+      astAsType(ctx.scalar(msl::Scalar::U32),
+                ctx.paren(ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::F32),
+                                   ctx.paren(newFloatExpr))));
   body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U32), newWord, repacked));
   msl::Expr *cas = astCasWeak(ctx.var(wordPtr), word, ctx.var(newWord));
   msl::Block casThen;
@@ -198,20 +198,17 @@ msl::Block MSLEmitter::astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
   msl::Expr *laneInit = ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U16),
                                  astPacked16Extract(word, isHigh));
 
-  auto asType = [&](msl::Type *t, msl::Expr *x) {
-    return ctx.cast(CS::AsType, t, x);
-  };
   msl::Block body;
   body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U16), lane, laneInit));
-  body.push_back(ctx.assignStmt(ctx.var(id), asType(scTy, ctx.var(lane))));
-  body.push_back(ctx.declStmt(scTy, curId, asType(scTy, ctx.var(lane))));
+  body.push_back(ctx.assignStmt(ctx.var(id), astAsType(scTy, ctx.var(lane))));
+  body.push_back(ctx.declStmt(scTy, curId, astAsType(scTy, ctx.var(lane))));
   body.push_back(ctx.declStmt(scTy, newLane, newHalfExpr));
 
   // (isHigh) ? ((word & 0x0000ffffu) | ((uint)as_type<ushort>(newLane) << 16))
   //          : ((word & 0xffff0000u) | (uint)as_type<ushort>(newLane))
   msl::Expr *newBitsU32 =
       ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U32),
-               asType(ctx.scalar(msl::Scalar::U16), ctx.var(newLane)));
+               astAsType(ctx.scalar(msl::Scalar::U16), ctx.var(newLane)));
   body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U32), newWord,
                               astPacked16Merge(word, isHigh, newBitsU32)));
 
@@ -271,7 +268,7 @@ msl::Block MSLEmitter::astFloat32CAS(StringRef p, StringRef c, StringRef v,
   LocalGen g{nextId};
   std::string exp = g.fresh(), cbits = g.fresh();
   auto asU32 = [&](msl::Expr *x) {
-    return ctx.cast(CS::AsType, ctx.scalar(msl::Scalar::U32), x);
+    return astAsType(ctx.scalar(msl::Scalar::U32), x);
   };
 
   msl::Type *auptr = ctx.named(("device " + std::string(ba::Uint) + " *"));
@@ -288,7 +285,7 @@ msl::Block MSLEmitter::astFloat32CAS(StringRef p, StringRef c, StringRef v,
       ctx.declStmt(ctx.scalar(msl::Scalar::U32), cbits, asU32(ctx.var(c))));
   block.push_back(ctx.whileScope(cond, msl::Block{}));
   msl::Expr *result =
-      ctx.cast(CS::AsType, ctx.scalar(msl::Scalar::F32), ctx.var(exp));
+      astAsType(ctx.scalar(msl::Scalar::F32), ctx.var(exp));
   if (declare)
     block.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::F32), id, result));
   else
@@ -306,7 +303,7 @@ msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
               newWord = g.fresh(), got = g.fresh();
   msl::Type *scTy = ctx.named(sc);
   auto asU16 = [&](msl::Expr *x) {
-    return ctx.cast(CS::AsType, ctx.scalar(msl::Scalar::U16), x);
+    return astAsType(ctx.scalar(msl::Scalar::U16), x);
   };
   // as_type<ushort>((sc)(x))
   auto asU16OfSc = [&](StringRef x) {
@@ -332,7 +329,7 @@ msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
                               ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U16),
                                        astPacked16Extract(word, isHigh))));
   body.push_back(
-      ctx.assignStmt(ctx.var(id), ctx.cast(CS::AsType, scTy, ctx.var(got))));
+      ctx.assignStmt(ctx.var(id), astAsType(scTy, ctx.var(got))));
   msl::Block brk;
   brk.push_back(ctx.breakStmt());
   body.push_back(ctx.ifScope(ctx.binary(B::Ne, ctx.var(got), ctx.var(cur)),

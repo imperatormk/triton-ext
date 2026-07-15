@@ -227,6 +227,11 @@ private:
   // msl::Block so the caller splices them at its own indent (no stray braces);
   // single-node builders return Stmt*/Expr*.
   msl::Expr *astInit0(StringRef sc);
+  // as_type<to>(x) - the raw bit-reinterpret used to punt values through the
+  // integer atomic word. Single site for every atomic reinterpret escape.
+  msl::Expr *astAsType(msl::Type *to, msl::Expr *x) {
+    return ctx.cast(msl::Cast::Style::AsType, to, x);
+  }
   msl::Expr *astDeviceAtomicPtr(StringRef atomicTy, StringRef p);
   msl::Expr *astCasWeak(msl::Expr *ptr, StringRef expVar, msl::Expr *newVal);
   msl::Expr *astPacked16Extract(StringRef word, StringRef isHigh);

@@ -135,7 +135,7 @@ msl::Stmt *MSLEmitter::astReturn(tt::ReturnOp op) {
       fields.push_back(ctx.var(nm));
   } else {
     for (Value v : op.getOperands())
-      fields.push_back(ctx.var(names(v)[0]));
+      fields.push_back(ctx.var(scalarName(v)));
   }
   return ctx.returnStmt(nullptr, fields);
 }

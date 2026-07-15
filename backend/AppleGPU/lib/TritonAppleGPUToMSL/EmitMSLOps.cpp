@@ -57,7 +57,7 @@ bool MSLEmitter::astCombineN(Region &region, ArrayRef<std::string> aVals,
     return false;
   Operation *term = blk.getTerminator();
   for (Value r : term->getOperands())
-    results.push_back(names(r)[0]);
+    results.push_back(scalarName(r).str());
   return true;
 }
 
@@ -239,10 +239,10 @@ void MSLEmitter::astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
   for (Block &blk : llvm::drop_begin(region))
     for (BlockArgument arg : blk.getArguments()) {
       if (isDatalessType(arg.getType())) {
-        valMap[arg] = SmallVector<std::string>{};
+        bindDataless(arg);
         continue;
       }
-      valMap[arg] = astDeclResultVars(arg, body);
+      bindRegs(arg, astDeclResultVars(arg, body));
     }
   llvm::DenseMap<Value, SmallVector<std::string>> hoist;
   for (Block &blk : region)
@@ -264,7 +264,7 @@ void MSLEmitter::astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
     Operation *term = blk.getTerminator();
     if (term->getName().getStringRef() == "tt.map_elementwise.return") {
       for (auto [i, operand] : llvm::enumerate(term->getOperands()))
-        caseBody.push_back(astMapReturnSpill(capture[i], names(operand)[0]));
+        caseBody.push_back(astMapReturnSpill(capture[i], scalarName(operand)));
       caseBody.push_back(ctx.breakStmt());
     } else {
       for (msl::Stmt *s : astTerminatorEdge(term, state))
@@ -286,8 +286,8 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
   for (auto [i, init, res] :
        llvm::enumerate(op.getInitArgs(), op.getResults())) {
     if (isDatalessType(res.getType())) {
-      valMap[op.getRegionIterArg(i)] = SmallVector<std::string>{};
-      valMap[res] = SmallVector<std::string>{};
+      bindDataless(op.getRegionIterArg(i));
+      bindDataless(res);
       carried.push_back({});
       continue;
     }
@@ -296,8 +296,8 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
       SmallVector<std::string> ids = astDeclResultVars(res, body);
       initBase.assign(initNames.begin(), initNames.end());
       fusedDot.ids = ids;
-      valMap[op.getRegionIterArg(i)] = ids;
-      valMap[res] = ids;
+      bindRegs(op.getRegionIterArg(i), ids);
+      bindRegs(res, ids);
       carried.push_back({});
       continue;
     }
@@ -305,8 +305,8 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
     for (size_t r = 0; r < vars.size(); ++r)
       body.push_back(ctx.assignStmt(
           ctx.var(vars[r]), ctx.var(initNames[initNames.size() == 1 ? 0 : r])));
-    valMap[op.getRegionIterArg(i)] = vars;
-    valMap[res] = vars;
+    bindRegs(op.getRegionIterArg(i), vars);
+    bindRegs(res, vars);
     carried.push_back(vars);
   }
 
@@ -350,13 +350,13 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
       cond = ctx.paren(ctx.binary(
           B::LAnd,
           ctx.binary(B::Le,
-                     ctx.binary(B::Add, ctx.var(names(ds->rowBase)[0]),
+                     ctx.binary(B::Add, ctx.var(scalarName(ds->rowBase)),
                                 ctx.lit(std::to_string(M))),
-                     ctx.var(names(ds->boundM)[0])),
+                     ctx.var(scalarName(ds->boundM))),
           ctx.binary(B::Le,
-                     ctx.binary(B::Add, ctx.var(names(ds->colBase)[0]),
+                     ctx.binary(B::Add, ctx.var(scalarName(ds->colBase)),
                                 ctx.lit(std::to_string(N))),
-                     ctx.var(names(ds->boundN)[0]))));
+                     ctx.var(scalarName(ds->boundN)))));
     } else {
       cond = ctx.lit("true");
     }
@@ -403,7 +403,7 @@ bool MSLEmitter::astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
     body.push_back(ctx.declStmt(declTy, id, mk(r)));
     ids.push_back(id);
   }
-  valMap[op->getResult(0)] = ids;
+  bindRegs(op->getResult(0), ids);
   return true;
 }
 
@@ -563,7 +563,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op)) {
     body.push_back(ctx.barrier(/*device=*/false));
     for (Value r : op->getResults())
-      valMap[r] = SmallVector<std::string>{};
+      bindDataless(r);
     return true;
   }
 
@@ -574,7 +574,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
     return true;
   if (isa<tt::AssertOp, tt::PrintOp>(op)) {
     for (Value r : op->getResults())
-      valMap[r] = SmallVector<std::string>{};
+      bindDataless(r);
     return true;
   }
 
@@ -1042,7 +1042,7 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
               ctx.var(srcNames[srcNames.size() == 1 ? 0 : r]));
         },
         [&](int r) { return astFlatTileOffset(resTy, r); });
-    valMap[res] = ids;
+    bindRegs(res, ids);
     return true;
   }
 
@@ -1076,7 +1076,7 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
               ctx.var(srcNames[srcNames.size() == 1 ? 0 : r]));
         },
         [&](int r) { return astFlatTileOffset(resTy, r); });
-    valMap[res] = outs;
+    bindRegs(res, outs);
     return true;
   }
 
@@ -1131,7 +1131,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
   // ttg.local_load: gather result registers from the memdesc buffer.
   if (auto ll = dyn_cast<ttg::LocalLoadOp>(op)) {
     if (localLoadIsDeadDotStage(ll)) {
-      valMap[ll.getResult()] = SmallVector<std::string>{};
+      bindDataless(ll.getResult());
       return true;
     }
     auto resTy = cast<RankedTensorType>(ll.getResult().getType());
@@ -1145,7 +1145,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
           ctx.subscript(ctx.var(src.buf), astMemdescElemAddr(src, resTy, r))));
       ids.push_back(id);
     }
-    valMap[ll.getResult()] = ids;
+    bindRegs(ll.getResult(), ids);
     return true;
   }
 
@@ -1169,7 +1169,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
         body.push_back(asn);
     }
     body.push_back(ctx.barrier(false));
-    valMap[ac.getResult()] = SmallVector<std::string>{};
+    bindDataless(ac.getResult());
     return true;
   }
 
@@ -1177,7 +1177,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
   if (auto cl = dyn_cast<ttg::ConvertLayoutOp>(op)) {
     if (convertLayoutIsDeadDotStage(cl) ||
         convertLayoutIsDeadDotStageSource(cl)) {
-      valMap[cl.getResult()] = SmallVector<std::string>{};
+      bindDataless(cl.getResult());
       return true;
     }
     Value src = cl.getSrc(), res = cl.getResult();
@@ -1273,7 +1273,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
               ctx.compactIf(cond, ctx.assignStmt(ctx.var(ids[r]), rd)));
         }
       }
-      valMap[res] = ids;
+      bindRegs(res, ids);
       return true;
     }
 
@@ -1319,7 +1319,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
           body.push_back(ctx.plainScope(std::move(b)));
         }
       }
-      valMap[res] = ids;
+      bindRegs(res, ids);
       return true;
     }
 
@@ -1337,7 +1337,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
       body.push_back(ctx.declStmt(ptrDeclTy, id, rd));
       ids.push_back(id);
     }
-    valMap[res] = ids;
+    bindRegs(res, ids);
     return true;
   }
 
@@ -1402,7 +1402,7 @@ std::optional<bool> MSLEmitter::astEmitDotMap(Operation *op, msl::Block &body) {
           resIds[k].push_back(names(term->getOperand(k * pack + p))[0]);
     }
     for (int k = 0; k < nRes; ++k)
-      valMap[mp->getResult(k)] = resIds[k];
+      bindRegs(mp->getResult(k), resIds[k]);
     return true;
   }
 
@@ -1491,7 +1491,7 @@ std::optional<bool> MSLEmitter::astEmitDotMap(Operation *op, msl::Block &body) {
       body.push_back(ctx.declStmt(resScTy, id, load));
       resIds.push_back(id);
     }
-    valMap[hg.getResult()] = resIds;
+    bindRegs(hg.getResult(), resIds);
     return true;
   }
 
@@ -1700,7 +1700,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
         ids[r] = bc;
       }
     }
-    valMap[res] = ids;
+    bindRegs(res, ids);
     return true;
   }
 
@@ -1768,7 +1768,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
       body.push_back(pollBarrier);
       body.push_back(
           ctx.declStmt(ctx.scalar(msl::Scalar::I1), result, ctx.lit("true")));
-      valMap[pl.getResult()] = {result};
+      bindRegs(pl.getResult(), {result});
       return true;
     }
     std::string flag = fresh();
@@ -1789,7 +1789,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
     body.push_back(pollBarrier);
     body.push_back(
         ctx.declStmt(ctx.scalar(msl::Scalar::I1), result, ctx.var(flag)));
-    valMap[pl.getResult()] = {result};
+    bindRegs(pl.getResult(), {result});
     return true;
   }
 
@@ -1856,7 +1856,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
       }
       ids.push_back(id);
     }
-    valMap[res] = ids;
+    bindRegs(res, ids);
     return true;
   }
 
@@ -2078,7 +2078,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
       }
     }
     for (int k = 0; k < nOp; ++k)
-      valMap[sn.getResult()[k]] = accs[k];
+      bindRegs(sn.getResult()[k], accs[k]);
     return true;
   }
 
@@ -2247,7 +2247,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
         resIds[k].push_back(it->second[k]);
     }
     for (int k = 0; k < nOp; ++k)
-      valMap[rd.getResult()[k]] = resIds[k];
+      bindRegs(rd.getResult()[k], resIds[k]);
     return true;
   }
 
@@ -2292,7 +2292,7 @@ std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
           scTy, id, ctx.subscript(ctx.var(buf), astFlatTileOffset(resTy, r))));
       ids.push_back(id);
     }
-    valMap[res] = ids;
+    bindRegs(res, ids);
     return true;
   }
 
@@ -2347,7 +2347,7 @@ std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
       body.push_back(ctx.declStmt(scTy, id, ctx.subscript(ctx.var(buf), off)));
       outs.push_back(id);
     }
-    valMap[res] = outs;
+    bindRegs(res, outs);
     return true;
   }
 
@@ -2397,7 +2397,7 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
             scTy, id, ctx.member(ctx.var(tmp), "f" + std::to_string(i))));
         idsV.push_back(id);
       }
-      valMap[res] = idsV;
+      bindRegs(res, idsV);
       return true;
     }
     if (nRes == 0) {
@@ -2486,7 +2486,7 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
         body.push_back(assign);
       ids.push_back(id);
     }
-    valMap[res] = ids;
+    bindRegs(res, ids);
     return true;
   }
 
@@ -2537,7 +2537,7 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
                                      std::move(thenB), std::move(elseB)));
     }
     for (auto [i, res] : llvm::enumerate(ifOp.getResults()))
-      valMap[res] = results[i];
+      bindRegs(res, results[i]);
     return true;
   }
 
@@ -2553,8 +2553,8 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
     for (auto [i, init, res] :
          llvm::enumerate(forOp.getInitArgs(), forOp.getResults())) {
       if (isDatalessType(res.getType())) {
-        valMap[forOp.getRegionIterArg(i)] = SmallVector<std::string>{};
-        valMap[res] = SmallVector<std::string>{};
+        bindDataless(forOp.getRegionIterArg(i));
+        bindDataless(res);
         carried.push_back({});
         continue;
       }
@@ -2564,8 +2564,8 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
         body.push_back(
             ctx.assignStmt(ctx.var(vars[r]),
                            ctx.var(initNames[initNames.size() == 1 ? 0 : r])));
-      valMap[forOp.getRegionIterArg(i)] = vars;
-      valMap[res] = vars;
+      bindRegs(forOp.getRegionIterArg(i), vars);
+      bindRegs(res, vars);
       carried.push_back(vars);
     }
 
@@ -2599,7 +2599,7 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
         body.push_back(
             ctx.assignStmt(ctx.var(vars[r]),
                            ctx.var(initNames[initNames.size() == 1 ? 0 : r])));
-      valMap[wh.getBeforeArguments()[i]] = vars;
+      bindRegs(wh.getBeforeArguments()[i], vars);
       carried.push_back(vars);
     }
     SmallVector<SmallVector<std::string>> results;
@@ -2619,11 +2619,11 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
     }
     brk.push_back(ctx.breakStmt());
     msl::Expr *guard = ctx.unary(
-        msl::UnOp::LNot, ctx.paren(ctx.var(names(cond.getCondition())[0])));
+        msl::UnOp::LNot, ctx.paren(ctx.var(scalarName(cond.getCondition()))));
     loopBody.push_back(ctx.ifScope(guard, std::move(brk)));
 
     for (auto [i, fwd] : llvm::enumerate(cond.getArgs()))
-      valMap[wh.getAfterArguments()[i]] = names(fwd);
+      bindAlias(wh.getAfterArguments()[i], fwd);
 
     for (msl::Stmt *s : astWalkBlock(wh.getAfter().front(), d))
       loopBody.push_back(s);
@@ -2633,7 +2633,7 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
 
     body.push_back(ctx.whileScope(nullptr, std::move(loopBody)));
     for (auto [i, res] : llvm::enumerate(wh.getResults()))
-      valMap[res] = results[i];
+      bindRegs(res, results[i]);
     return true;
   }
 
@@ -2646,7 +2646,7 @@ LogicalResult MSLEmitter::emitSplat(tt::SplatOp op) {
   SmallVector<std::string> ids;
   for (int r = 0; r < rc; ++r)
     ids.push_back(src);
-  valMap[op.getResult()] = ids;
+  bindRegs(op.getResult(), ids);
   return success();
 }
 
@@ -2689,7 +2689,7 @@ LogicalResult MSLEmitter::emitReshapeLike(Value res, Value src, int axis,
     }
     ids.push_back(srcNames[srcNames.size() == 1 ? 0 : it->second]);
   }
-  valMap[res] = ids;
+  bindRegs(res, ids);
   return success();
 }
 
@@ -2727,7 +2727,7 @@ LogicalResult MSLEmitter::emitJoin(tt::JoinOp op) {
     auto &sn = *srcNames[t];
     ids[r] = sn[sn.size() == 1 ? 0 : it->second];
   }
-  valMap[res] = ids;
+  bindRegs(res, ids);
   return success();
 }
 
@@ -2758,7 +2758,7 @@ LogicalResult MSLEmitter::emitSplit(tt::SplitOp op) {
       (void)trailing;
       ids[r] = srcNames[srcNames.size() == 1 ? 0 : it->second];
     }
-    valMap[res] = ids;
+    bindRegs(res, ids);
   }
   return success();
 }

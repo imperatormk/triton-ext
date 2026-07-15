@@ -102,7 +102,7 @@ msl::Block MSLEmitter::astBranchEdge(Block *succ, Operation::operand_range args,
 // are built by astBranchEdge.
 msl::Stmt *MSLEmitter::astCondBranch(Value cond, msl::Block thenB,
                                      msl::Block elseB) {
-  return ctx.ifElseScope(ctx.var(names(cond)[0]), std::move(thenB),
+  return ctx.ifElseScope(ctx.var(scalarName(cond)), std::move(thenB),
                          std::move(elseB));
 }
 
@@ -132,10 +132,10 @@ msl::Block MSLEmitter::astEmitBlockCFG(Region &region) {
   for (Block &blk : llvm::drop_begin(region))
     for (BlockArgument arg : blk.getArguments()) {
       if (isDatalessType(arg.getType())) {
-        valMap[arg] = SmallVector<std::string>{};
+        bindDataless(arg);
         continue;
       }
-      valMap[arg] = astDeclResultVars(arg, out);
+      bindRegs(arg, astDeclResultVars(arg, out));
     }
   llvm::DenseMap<Value, SmallVector<std::string>> hoist;
   for (Block &blk : region)
@@ -187,7 +187,7 @@ msl::Block MSLEmitter::astWalkBlock2(
       for (size_t r = 0; r < it->second.size(); ++r)
         body.push_back(ctx.assignStmt(ctx.var(it->second[r]),
                                       ctx.var(cur[cur.size() == 1 ? 0 : r])));
-      valMap[res] = it->second;
+      bindRegs(res, it->second);
     }
   }
   indent = savedIndent;

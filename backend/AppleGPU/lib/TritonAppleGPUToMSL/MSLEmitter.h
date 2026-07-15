@@ -432,6 +432,9 @@ private:
 
   SmallVector<std::string> &names(Value v) { return valMap[v]; }
 
+  // The single register name of a scalar / single-register value.
+  StringRef scalarName(Value v) { return valMap[v][0]; }
+
   // Broadcast-aware per-register operand pick: a splat has 1 name, a tensor
   // has regCount names.
   StringRef reg(Value v, int r) {
@@ -442,6 +445,17 @@ private:
   void bindScalar(Value v, std::string name) {
     valMap[v] = SmallVector<std::string>{std::move(name)};
   }
+
+  // Bind a value to its per-register name vector.
+  void bindRegs(Value v, SmallVector<std::string> regs) {
+    valMap[v] = std::move(regs);
+  }
+
+  // Bind a value carrying no materialized register (memdesc / dataless).
+  void bindDataless(Value v) { valMap[v] = SmallVector<std::string>{}; }
+
+  // Bind dst to the same register names as src.
+  void bindAlias(Value dst, Value src) { valMap[dst] = valMap[src]; }
 
   LogicalResult emitFunc(tt::FuncOp func);
 

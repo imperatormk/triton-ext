@@ -218,7 +218,7 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
                          M, N, K, Bd, rank, opFrag, opScalar, numWarps, rowDim,
                          colDim))
       return false;
-    valMap[op.getResult()] = ids;
+    bindRegs(op.getResult(), ids);
     return true;
   }
 
@@ -227,7 +227,7 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
                          tgC, ids, M, N, K, mT, nT, kT, nFrag, numWarps,
                          aInPlace, bInPlace, opFrag, accFragTy, readbackInto))
       return false;
-    valMap[op.getResult()] = ids;
+    bindRegs(op.getResult(), ids);
     return true;
   }
 
@@ -305,7 +305,7 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
     }
   }
   barrier();
-  valMap[op.getResult()] = ids;
+  bindRegs(op.getResult(), ids);
   return true;
 }
 
@@ -410,15 +410,15 @@ bool MSLEmitter::astEmitDotFused(
     }
     if (!stagesHere)
       barrier();
-    valMap[op.getResult()] = SmallVector<std::string>(ids.begin(), ids.end());
+    bindRegs(op.getResult(), SmallVector<std::string>(ids.begin(), ids.end()));
     return true;
   }
 
   // Readback.
   if (fusedDot.direct) {
     const DirectStore &d = *fusedDot.direct;
-    std::string base = names(d.basePtr)[0], ldc = names(d.ldc)[0];
-    std::string rowB = names(d.rowBase)[0], colB = names(d.colBase)[0];
+    std::string base = scalarName(d.basePtr).str(), ldc = scalarName(d.ldc).str();
+    std::string rowB = scalarName(d.rowBase).str(), colB = scalarName(d.colBase).str();
     msl::Block ifBody;
     for (int64_t w = 0; w < numWarps; ++w) {
       msl::Block inner;
@@ -750,7 +750,7 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
     }
   }
   body.push_back(ctx.hardBarrier(false));
-  valMap[op.getResult()] = ids;
+  bindRegs(op.getResult(), ids);
   return true;
 }
 

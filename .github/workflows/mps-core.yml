@@ -1,0 +1,51 @@
+name: MPS core tests (self-hosted Apple GPU)
+
+# Manual-trigger only: runs on the self-hosted M1 Mini runner against the
+# deployed AppleGPU plugin + MPS torch stack. Proves the backend runs Triton
+# core tests on real Apple GPU hardware.
+on:
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        description: "pytest -k filter for the core-test slice"
+        required: false
+        default: "test_scalar_overflow or test_where or test_broadcast or test_split or test_join or test_abs"
+
+jobs:
+  mps-core:
+    runs-on: [self-hosted, mini-mps]
+    timeout-minutes: 30
+    env:
+      DEPS: /Users/Shared/playground/deps
+      TRITON_SRC: /Users/zimski/projects/oss/triton-main
+    steps:
+      - name: Report host + GPU
+        run: |
+          echo "host: $(hostname)  arch: $(uname -m)  macOS: $(sw_vers -productVersion)"
+          "$DEPS/.venv/bin/python" - <<'PY'
+          import triton, torch
+          print("triton", triton.__version__, "torch", torch.__version__)
+          print("mps available:", torch.backends.mps.is_available())
+          PY
+
+      - name: Run Triton core tests on MPS
+        run: |
+          export TRITON_PLUGIN_PATHS="$DEPS/lib/libapplegpu_backend.dylib"
+          export TRITON_PASS_PLUGIN_PATH="$DEPS/lib/libapplegpu_backend.dylib"
+          export PYTHONPATH="$DEPS/triton_apple_backend_pkg"
+          rm -rf "$HOME/.triton/cache"
+          cd "$TRITON_SRC/python/test"
+          "$DEPS/.venv/bin/python" -m pytest unit/language/test_core.py \
+            -k "${{ github.event.inputs.test_filter }}" \
+            --device mps \
+            -p no:cacheprovider \
+            -v --no-header --timeout=300 \
+            --junitxml="$RUNNER_TEMP/mps-core-results.xml"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mps-core-results
+          path: ${{ runner.temp }}/mps-core-results.xml
+          if-no-files-found: warn

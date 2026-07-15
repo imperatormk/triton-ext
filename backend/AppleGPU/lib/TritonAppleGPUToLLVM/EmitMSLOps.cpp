@@ -640,12 +640,12 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
       if (!dense)
         return false; // unsupported: caller emits the error
-      msl::Type *sc = astScalarType(rt.getElementType());
-      bool isFloat = isa<FloatType>(rt.getElementType());
-      std::string scStr = mslScalarType(rt.getElementType());
+      Type elemTy = rt.getElementType();
+      msl::Type *sc = astScalarType(elemTy);
+      bool isFloat = isa<FloatType>(elemTy);
       if (dense.isSplat()) {
         std::string lit =
-            isFloat ? floatLit(dense.getSplatValue<APFloat>(), scStr)
+            isFloat ? floatLit(dense.getSplatValue<APFloat>(), elemTy)
                     : std::to_string(dense.getSplatValue<APInt>().getSExtValue());
         return astDeclBind(op, sc, body,
                            [&](int) { return ctx.lit(lit); });
@@ -654,7 +654,7 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       SmallVector<msl::Expr *> init;
       if (isFloat)
         for (const APFloat &v : dense.getValues<APFloat>())
-          init.push_back(astFloatLit(v, scStr));
+          init.push_back(astFloatLit(v, elemTy));
       else
         for (const APInt &v : dense.getValues<APInt>())
           init.push_back(ctx.lit(std::to_string(v.getSExtValue())));
@@ -665,10 +665,9 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
       });
     }
     msl::Type *sc = astScalarType(res.getType());
-    std::string scStr = mslScalarType(res.getType());
     msl::Expr *lit;
     if (auto fa = dyn_cast<FloatAttr>(cst.getValue()))
-      lit = astFloatLit(fa.getValue(), scStr);
+      lit = astFloatLit(fa.getValue(), res.getType());
     else if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
       lit = ctx.lit(std::to_string(ia.getInt()));
     else

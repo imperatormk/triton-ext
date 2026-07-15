@@ -972,8 +972,8 @@ private:
 
 
   std::string floatLit(const APFloat &v);
-  std::string floatLit(const APFloat &v, StringRef sc);
-  msl::Expr *astFloatLit(const APFloat &v, StringRef sc);
+  std::string floatLit(const APFloat &v, Type ty);
+  msl::Expr *astFloatLit(const APFloat &v, Type ty);
 
 
 

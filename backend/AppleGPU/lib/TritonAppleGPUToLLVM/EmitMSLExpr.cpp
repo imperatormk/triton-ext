@@ -28,17 +28,21 @@ std::string MSLEmitter::floatLit(const APFloat &v) {
   return buf;
 }
 
-std::string MSLEmitter::floatLit(const APFloat &v, StringRef sc) {
+std::string MSLEmitter::floatLit(const APFloat &v, Type ty) {
   std::string lit = floatLit(v);
-  if (sc == "bfloat" || sc == "half")
-    return sc.str() + "(" + lit + ")";
+  if (ty.isBF16())
+    return "bfloat(" + lit + ")";
+  if (ty.isF16())
+    return "half(" + lit + ")";
   return lit;
 }
 
-msl::Expr *MSLEmitter::astFloatLit(const APFloat &v, StringRef sc) {
+msl::Expr *MSLEmitter::astFloatLit(const APFloat &v, Type ty) {
   msl::Expr *lit = ctx.lit(floatLit(v));
-  if (sc == "bfloat" || sc == "half")
-    return ctx.call(sc, {lit});
+  if (ty.isBF16())
+    return ctx.call("bfloat", {lit});
+  if (ty.isF16())
+    return ctx.call("half", {lit});
   return lit;
 }
 

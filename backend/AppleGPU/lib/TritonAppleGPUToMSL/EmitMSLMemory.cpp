@@ -181,10 +181,9 @@ msl::Expr *MSLEmitter::astMemdescElemAddr(const MemDescInfo &info,
     if (!off)
       off = ctx.lit("0");
   }
-  if (info.baseOffset == "0")
+  if (!info.baseOffset)
     return off;
-  // baseOffset is a std::string on MemDescInfo, bridged here via ctx.raw.
-  return ctx.paren(ctx.binary(msl::BinOp::Add, ctx.raw(info.baseOffset), off));
+  return ctx.paren(ctx.binary(msl::BinOp::Add, info.baseOffset, off));
 }
 
 std::string MSLEmitter::layoutOffsetExpr(RankedTensorType rt, int reg) {
@@ -469,11 +468,12 @@ LogicalResult MSLEmitter::emitMemDescIndex(ttg::MemDescIndexOp op) {
   int64_t sliceSize = memdescFlatSize(resMt);
   (void)srcMt;
   const std::string &idx = names(op.getIndex())[0];
-  std::string base = parent.baseOffset == "0"
-                         ? ("(" + idx + " * " + std::to_string(sliceSize) +
-                            ")")
-                         : ("(" + parent.baseOffset + " + " + idx + " * " +
-                            std::to_string(sliceSize) + ")");
+  msl::Expr *scaled = ctx.binary(msl::BinOp::Mul, ctx.var(idx),
+                                 ctx.lit(std::to_string(sliceSize)));
+  msl::Expr *base =
+      parent.baseOffset
+          ? ctx.paren(ctx.binary(msl::BinOp::Add, parent.baseOffset, scaled))
+          : ctx.paren(scaled);
   memdescMap[op.getResult()] = {parent.buf, base};
   return success();
 }
@@ -501,39 +501,17 @@ LogicalResult MSLEmitter::emitMemDescSubslice(ttg::MemDescSubsliceOp op) {
   for (int d = 0; d < (int)offsets.size(); ++d)
     constOff += (int64_t)offsets[d] * strides[d];
 
-  std::string base;
-  if (parent.baseOffset == "0")
-    base = std::to_string(constOff);
+  msl::Expr *base;
+  if (!parent.baseOffset)
+    base = ctx.lit(std::to_string(constOff));
   else
-    base = constOff == 0 ? parent.baseOffset
-                         : ("(" + parent.baseOffset + " + " +
-                            std::to_string(constOff) + ")");
+    base = constOff == 0
+               ? parent.baseOffset
+               : ctx.paren(ctx.binary(msl::BinOp::Add, parent.baseOffset,
+                                      ctx.lit(std::to_string(constOff))));
 
   memdescMap[op.getResult()] = {parent.buf, base, strides};
   return success();
-}
-
-std::string MSLEmitter::memdescElemAddr(const MemDescInfo &info,
-                                        RankedTensorType tileTy, int reg) {
-  std::string off;
-  if (info.bufStrides.empty()) {
-    off = flatTileOffset(tileTy, reg);
-  } else {
-    tt::LinearLayout ll = ttg::toLinearLayout(tileTy);
-    auto outNames = llvm::to_vector(ll.getOutDimNames());
-    for (int d = 0; d < (int)outNames.size(); ++d) {
-      std::string c = layoutCoordExpr(tileTy, reg, outNames[d]);
-      int64_t s = info.bufStrides[d];
-      std::string term =
-          s == 1 ? c : ("(" + c + " * " + std::to_string(s) + ")");
-      off = off.empty() ? term : ("(" + off + " + " + term + ")");
-    }
-    if (off.empty())
-      off = "0";
-  }
-  if (info.baseOffset == "0")
-    return off;
-  return "(" + info.baseOffset + " + " + off + ")";
 }
 
 } // namespace mlir::triton::applegpu

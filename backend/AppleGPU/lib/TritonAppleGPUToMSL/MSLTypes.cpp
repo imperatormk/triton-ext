@@ -95,10 +95,11 @@ std::string MSLEmitter::init0(const std::string &sc) {
   return sc == "float" || sc == "half" ? "0.0" : "0";
 }
 
-std::string MSLEmitter::inPlaceBase(const InPlaceOperand &op) {
-  if (op.baseOffset == "0")
-    return op.buf;
-  return "(" + op.buf + " + " + op.baseOffset + ")";
+msl::Expr *MSLEmitter::astInPlaceBase(const InPlaceOperand &op) {
+  if (!op.baseOffset)
+    return ctx.var(op.buf);
+  return ctx.paren(
+      ctx.binary(msl::BinOp::Add, ctx.var(op.buf), op.baseOffset));
 }
 
 } // namespace mlir::triton::applegpu

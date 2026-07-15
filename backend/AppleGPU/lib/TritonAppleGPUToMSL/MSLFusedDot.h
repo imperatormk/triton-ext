@@ -3,6 +3,7 @@
 #ifndef MSL_FUSED_DOT_H
 #define MSL_FUSED_DOT_H
 
+#include "MSLAst.h"
 #include "mlir/IR/Value.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/SmallVector.h"
@@ -13,15 +14,16 @@ namespace mlir::triton::applegpu {
 
 namespace tt = mlir::triton;
 
+// baseOffset is a typed offset node into `buf`; nullptr means no base offset.
 struct MemDescInfo {
   std::string buf;
-  std::string baseOffset;
+  msl::Expr *baseOffset = nullptr;
   SmallVector<int64_t> bufStrides;
 };
 
 struct InPlaceOperand {
   std::string buf;
-  std::string baseOffset;
+  msl::Expr *baseOffset = nullptr;
 };
 
 // Register-resident C GEMM fusion. When the scf.for handler recognises an

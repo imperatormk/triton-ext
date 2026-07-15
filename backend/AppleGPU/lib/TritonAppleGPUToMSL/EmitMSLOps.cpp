@@ -1061,7 +1061,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op, msl::Block &body) 
     msl::Type *scTy = ctx.named("threadgroup " + mslScalarType(mt.getElementType()));
     std::string buf = "__tg_buf_" + std::to_string(tgScratchId++);
     body.push_back(ctx.arrayDeclStmt(scTy, buf, memdescFlatSize(mt)));
-    memdescMap[la.getResult()] = {buf, "0"};
+    memdescMap[la.getResult()] = {buf, nullptr};
     if (Value init = la.getSrc()) {
       auto srcTy = cast<RankedTensorType>(init.getType());
       auto &vals = names(init);

@@ -697,9 +697,6 @@ private:
 
   LogicalResult emitMemDescSubslice(ttg::MemDescSubsliceOp op);
 
-  std::string memdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
-                              int reg);
-
 
 
 
@@ -719,7 +716,7 @@ private:
   std::optional<InPlaceOperand> dotOperandInPlaceBuf(Value operand, int64_t rows,
                                                      int64_t cols);
 
-  static std::string inPlaceBase(const InPlaceOperand &op);
+  msl::Expr *astInPlaceBase(const InPlaceOperand &op);
 
   // A dot operand reached through a convert_layout of a rank-2 distributed
   // tensor. The dot stages its operand into threadgroup memory by row-major

@@ -119,11 +119,11 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
   if (needAB) {
     body.push_back(ctx.declStmt(
         tgPtr(opScalar), tgA,
-        aInPlace ? ctx.raw(inPlaceBase(*aInPlace))
+        aInPlace ? astInPlaceBase(*aInPlace)
                  : astPoolRegion(0, opScalar)));
     body.push_back(ctx.declStmt(
         tgPtr(opScalar), tgB,
-        bInPlace ? ctx.raw(inPlaceBase(*bInPlace))
+        bInPlace ? astInPlaceBase(*bInPlace)
                  : astPoolRegion(stagedA, opScalar)));
   }
   if (needC)

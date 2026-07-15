@@ -24,6 +24,10 @@ namespace mlir::triton::applegpu {
 namespace {
 using B = msl::BinOp;
 using CS = msl::Cast::Style;
+
+template <typename T> T definingOp(Value v) {
+  return dyn_cast_or_null<T>(v.getDefiningOp());
+}
 } // namespace
 
 // Stage one dot operand's registers into its threadgroup pool:
@@ -829,20 +833,20 @@ Value MSLEmitter::peelBroadcastExpand(Value v) {
 
 Value MSLEmitter::matchTileIndex(Value v) {
   v = peelBroadcastExpand(v);
-  auto add = dyn_cast_or_null<arith::AddIOp>(v.getDefiningOp());
+  auto add = definingOp<arith::AddIOp>(v);
   if (!add)
     return Value();
   Value a = peelBroadcastExpand(add.getLhs());
   Value b = peelBroadcastExpand(add.getRhs());
   auto isIota = [](Value x) {
-    auto sp = dyn_cast_or_null<tt::SplatOp>(x.getDefiningOp());
+    auto sp = definingOp<tt::SplatOp>(x);
     Value base = sp ? sp.getSrc() : x;
     auto mr = dyn_cast_or_null<tt::MakeRangeOp>(
         peelBroadcastExpand(base).getDefiningOp());
     return mr && mr.getStart() == 0;
   };
   auto splatScalar = [](Value x) -> Value {
-    auto sp = dyn_cast_or_null<tt::SplatOp>(x.getDefiningOp());
+    auto sp = definingOp<tt::SplatOp>(x);
     return sp ? sp.getSrc() : Value();
   };
   if (isIota(b))
@@ -856,7 +860,7 @@ Value MSLEmitter::matchTileIndex(Value v) {
 
 bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
                                      Value &colBase) {
-  auto add = dyn_cast_or_null<arith::AddIOp>(off.getDefiningOp());
+  auto add = definingOp<arith::AddIOp>(off);
   if (!add)
     return false;
   auto tryTerm = [&](Value rowT, Value colT) {
@@ -864,7 +868,7 @@ bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
     if (!cb)
       return false;
     Value rowScaled = peelBroadcastExpand(rowT);
-    auto mul = dyn_cast_or_null<arith::MulIOp>(rowScaled.getDefiningOp());
+    auto mul = definingOp<arith::MulIOp>(rowScaled);
     if (!mul)
       return false;
     auto scalarSrc = [](Value x) -> Value {
@@ -891,12 +895,12 @@ bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
 }
 
 bool MSLEmitter::matchBoundaryMask(Value m, Value &boundM, Value &boundN) {
-  auto conj = dyn_cast_or_null<arith::AndIOp>(m.getDefiningOp());
+  auto conj = definingOp<arith::AndIOp>(m);
   if (!conj)
     return false;
   auto cmpBound = [&](Value side, bool wantRow) -> Value {
     Value c = peelBroadcastExpand(side);
-    auto cmp = dyn_cast_or_null<arith::CmpIOp>(c.getDefiningOp());
+    auto cmp = definingOp<arith::CmpIOp>(c);
     if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt)
       return Value();
     if (!matchTileIndex(cmp.getLhs()))
@@ -934,10 +938,10 @@ bool MSLEmitter::matchDirectStore(Value forResult, DirectStore &ds) {
   auto cTy = dyn_cast<RankedTensorType>(cvt.getResult().getType());
   if (!cTy || !cTy.getElementType().isF32())
     return false;
-  auto ptr = dyn_cast_or_null<tt::AddPtrOp>(store.getPtr().getDefiningOp());
+  auto ptr = definingOp<tt::AddPtrOp>(store.getPtr());
   if (!ptr)
     return false;
-  auto splat = dyn_cast_or_null<tt::SplatOp>(ptr.getPtr().getDefiningOp());
+  auto splat = definingOp<tt::SplatOp>(ptr.getPtr());
   if (!splat || !isa<BlockArgument>(splat.getSrc()))
     return false;
   Value rowBase, ldc, colBase;
@@ -1085,9 +1089,9 @@ MSLEmitter::axisBits(const tt::LinearLayout &ll, StringAttr inDim,
 ttg::LocalLoadOp MSLEmitter::dotOperandLocalLoad(Value operand, int64_t rows,
                                                  int64_t cols) {
   Value v = operand;
-  while (auto cvt = dyn_cast_or_null<ttg::ConvertLayoutOp>(v.getDefiningOp()))
+  while (auto cvt = definingOp<ttg::ConvertLayoutOp>(v))
     v = cvt.getSrc();
-  auto ll = dyn_cast_or_null<ttg::LocalLoadOp>(v.getDefiningOp());
+  auto ll = definingOp<ttg::LocalLoadOp>(v);
   if (!ll)
     return nullptr;
   auto mt = cast<ttg::MemDescType>(ll.getSrc().getType());
@@ -1168,7 +1172,7 @@ MSLEmitter::dotOperandInPlaceBuf(Value operand, int64_t rows, int64_t cols) {
 }
 
 Value MSLEmitter::dotOperandConvertSource(tt::DotOp d, Value operand) {
-  auto cvt = dyn_cast_or_null<ttg::ConvertLayoutOp>(operand.getDefiningOp());
+  auto cvt = definingOp<ttg::ConvertLayoutOp>(operand);
   if (!cvt)
     return nullptr;
   Value src = cvt.getSrc();

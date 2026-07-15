@@ -138,16 +138,21 @@ print("vecadd ok")
 
 ## Test Status
 
-- 71/72 backend-specific tests passing (1 xfail for shared memory limit)
-- Upstream test_core.py: remaining failures are float64, FP8, int64 atomics,
-  NVIDIA-specific tests
-- 3 backend bugs tracked: phi(undef,ptr) crash, LICM metadata, multi-return
-  noinline
+`test_core.py` passes on the MPS device; the residual failures are the known
+limitations below (float64, fp8, 64-bit atomics, tf32/bf16xN dot precision,
+acquire/release atomics). Tests that assert LLVM-IR markers (`llvm.assume`,
+`llvm.licm.disable`, poison) also fail: the MSL path emits no LLVM IR, so those
+inspections are not applicable.
 
 ## Known Limitations
 
-- `float64` — MPS doesn't support double precision
-- `float8` (e4m3, e5m2) — NVIDIA-specific hardware types
-- `int64` atomics — Metal doesn't support 64-bit atomic operations
-- `num_warps >= 16` — exceeds Apple GPU max threads per threadgroup (384)
-- Cross-threadgroup spinlocks — Apple GPU has no forward progress guarantee
+- `float64` — MPS has no double precision.
+- `float8` (e4m3, e5m2) — the torch MPS backend has no fp8 dtype, and the
+  emitter has no fp8 conversion path yet. A capability gap, not a hardware wall.
+- `int64`/`uint64` atomics — Metal has no 64-bit device atomics.
+- acquire/release atomics — Metal device atomics are relaxed-only; ordered
+  variants lower to relaxed.
+- `tf32` / `bf16xN` dot input precision — split-precision emulation modes with
+  no Metal equivalent (rejected at compile).
+- `num_warps >= 16` — exceeds the Apple GPU max threads per threadgroup (384).
+- Cross-threadgroup spinlocks — Apple GPU has no forward-progress guarantee.

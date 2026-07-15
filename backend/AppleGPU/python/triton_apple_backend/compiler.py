@@ -14,7 +14,6 @@ import threading
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes
 
-
 # Libdevice patching: see _LibdevicePatchFinder in __init__.py
 _plugin = getattr(passes, 'plugin', None)
 

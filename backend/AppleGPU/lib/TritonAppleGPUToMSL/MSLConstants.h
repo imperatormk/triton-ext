@@ -1,9 +1,10 @@
 // MSLConstants.h - named MSL builtin identifiers.
 //
 // The exhaustive set of Metal Shading Language builtin names the emitter spells
-// (math, simd, simdgroup-matrix, atomics, memory ordering). Call sites use these
-// constants instead of bare string literals so a typo is a compile error and the
-// full builtin surface is greppable in one place. Flat named constants by design
+// (math, simd, simdgroup-matrix, atomics, memory ordering). Call sites use
+// these constants instead of bare string literals so a typo is a compile error
+// and the full builtin surface is greppable in one place. Flat named constants
+// by design
 // - no registry framework.
 #ifndef MSL_CONSTANTS_H
 #define MSL_CONSTANTS_H
@@ -31,8 +32,8 @@ inline constexpr llvm::StringRef Round = "metal::round";
 inline constexpr llvm::StringRef Trunc = "metal::trunc";
 } // namespace math
 
-// metal::precise:: transcendentals (accuracy-sensitive; safe-math never controls
-// transcendental accuracy, only the namespace does).
+// metal::precise:: transcendentals (accuracy-sensitive; safe-math never
+// controls transcendental accuracy, only the namespace does).
 namespace precise {
 inline constexpr llvm::StringRef Acos = "metal::precise::acos";
 inline constexpr llvm::StringRef Asin = "metal::precise::asin";

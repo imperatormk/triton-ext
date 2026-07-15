@@ -11,51 +11,79 @@ namespace mlir::triton::applegpu::msl {
 
 static llvm::StringRef scalarName(Scalar s) {
   switch (s) {
-  case Scalar::F32: return "float";
-  case Scalar::F16: return "half";
-  case Scalar::BF16: return "bfloat";
-  case Scalar::I1: return "bool";
-  case Scalar::I8: return "char";
-  case Scalar::I16: return "short";
-  case Scalar::I32: return "int";
-  case Scalar::I64: return "long";
-  case Scalar::U8: return "uchar";
-  case Scalar::U16: return "ushort";
-  case Scalar::U32: return "uint";
-  case Scalar::U64: return "ulong";
-  case Scalar::Void: return "void";
-  case Scalar::SizeT: return "size_t";
+  case Scalar::F32:
+    return "float";
+  case Scalar::F16:
+    return "half";
+  case Scalar::BF16:
+    return "bfloat";
+  case Scalar::I1:
+    return "bool";
+  case Scalar::I8:
+    return "char";
+  case Scalar::I16:
+    return "short";
+  case Scalar::I32:
+    return "int";
+  case Scalar::I64:
+    return "long";
+  case Scalar::U8:
+    return "uchar";
+  case Scalar::U16:
+    return "ushort";
+  case Scalar::U32:
+    return "uint";
+  case Scalar::U64:
+    return "ulong";
+  case Scalar::Void:
+    return "void";
+  case Scalar::SizeT:
+    return "size_t";
   }
   llvm_unreachable("bad Scalar");
 }
 
 static llvm::StringRef atomicName(Scalar s) {
   switch (s) {
-  case Scalar::F32: return "atomic_float";
-  case Scalar::I32: return "atomic_int";
-  case Scalar::U32: return "atomic_uint";
-  case Scalar::I64: return "atomic_long";
-  case Scalar::U64: return "atomic_ulong";
-  default: return "atomic_int";
+  case Scalar::F32:
+    return "atomic_float";
+  case Scalar::I32:
+    return "atomic_int";
+  case Scalar::U32:
+    return "atomic_uint";
+  case Scalar::I64:
+    return "atomic_long";
+  case Scalar::U64:
+    return "atomic_ulong";
+  default:
+    return "atomic_int";
   }
 }
 
 static llvm::StringRef matrixName(MatrixType::Elem e) {
   switch (e) {
-  case MatrixType::Elem::Half: return "simdgroup_half8x8";
-  case MatrixType::Elem::Bfloat: return "simdgroup_bfloat8x8";
-  case MatrixType::Elem::Float: return "simdgroup_float8x8";
+  case MatrixType::Elem::Half:
+    return "simdgroup_half8x8";
+  case MatrixType::Elem::Bfloat:
+    return "simdgroup_bfloat8x8";
+  case MatrixType::Elem::Float:
+    return "simdgroup_float8x8";
   }
   llvm_unreachable("bad Matrix elem");
 }
 
 static llvm::StringRef addrSpaceName(AddrSpace as) {
   switch (as) {
-  case AddrSpace::None: return "";
-  case AddrSpace::Device: return "device ";
-  case AddrSpace::Threadgroup: return "threadgroup ";
-  case AddrSpace::Constant: return "constant ";
-  case AddrSpace::Thread: return "thread ";
+  case AddrSpace::None:
+    return "";
+  case AddrSpace::Device:
+    return "device ";
+  case AddrSpace::Threadgroup:
+    return "threadgroup ";
+  case AddrSpace::Constant:
+    return "constant ";
+  case AddrSpace::Thread:
+    return "thread ";
   }
   llvm_unreachable("bad AddrSpace");
 }
@@ -101,24 +129,42 @@ void MSLPrinter::printType(const Type *t) {
 
 static llvm::StringRef binOpText(BinOp op) {
   switch (op) {
-  case BinOp::Add: return " + ";
-  case BinOp::Sub: return " - ";
-  case BinOp::Mul: return " * ";
-  case BinOp::Div: return " / ";
-  case BinOp::Rem: return " % ";
-  case BinOp::And: return " & ";
-  case BinOp::Or: return " | ";
-  case BinOp::Xor: return " ^ ";
-  case BinOp::Shl: return " << ";
-  case BinOp::Shr: return " >> ";
-  case BinOp::Lt: return " < ";
-  case BinOp::Le: return " <= ";
-  case BinOp::Gt: return " > ";
-  case BinOp::Ge: return " >= ";
-  case BinOp::Eq: return " == ";
-  case BinOp::Ne: return " != ";
-  case BinOp::LAnd: return " && ";
-  case BinOp::LOr: return " || ";
+  case BinOp::Add:
+    return " + ";
+  case BinOp::Sub:
+    return " - ";
+  case BinOp::Mul:
+    return " * ";
+  case BinOp::Div:
+    return " / ";
+  case BinOp::Rem:
+    return " % ";
+  case BinOp::And:
+    return " & ";
+  case BinOp::Or:
+    return " | ";
+  case BinOp::Xor:
+    return " ^ ";
+  case BinOp::Shl:
+    return " << ";
+  case BinOp::Shr:
+    return " >> ";
+  case BinOp::Lt:
+    return " < ";
+  case BinOp::Le:
+    return " <= ";
+  case BinOp::Gt:
+    return " > ";
+  case BinOp::Ge:
+    return " >= ";
+  case BinOp::Eq:
+    return " == ";
+  case BinOp::Ne:
+    return " != ";
+  case BinOp::LAnd:
+    return " && ";
+  case BinOp::LOr:
+    return " || ";
   }
   llvm_unreachable("bad BinOp");
 }
@@ -141,9 +187,15 @@ void MSLPrinter::printExpr(const Expr *e) {
   case Expr::Kind::Unary: {
     auto *u = llvm::cast<Unary>(e);
     switch (u->op) {
-    case UnOp::Neg: os << "-"; break;
-    case UnOp::Not: os << "~"; break;
-    case UnOp::LNot: os << "!"; break;
+    case UnOp::Neg:
+      os << "-";
+      break;
+    case UnOp::Not:
+      os << "~";
+      break;
+    case UnOp::LNot:
+      os << "!";
+      break;
     }
     printExpr(u->x);
     return;
@@ -612,7 +664,8 @@ void MSLPrinter::printPreamble() {
   os << "using namespace metal;\n\n";
   os << "static inline float tt_erf(float x){\n"
         "  float t = 1.0f/(1.0f+0.5f*metal::fabs(x));\n"
-        "  float y = t*metal::exp(-x*x-1.26551223f+t*(1.00002368f+t*(0.37409196f"
+        "  float y = "
+        "t*metal::exp(-x*x-1.26551223f+t*(1.00002368f+t*(0.37409196f"
         "+t*(0.09678418f+t*(-0.18628806f+t*(0.27886807f+t*(-1.13520398f"
         "+t*(1.48851587f+t*(-0.82215223f+t*0.17087277f)))))))));\n"
         "  float r = 1.0f - y;\n"

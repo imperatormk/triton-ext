@@ -60,9 +60,7 @@ msl::Type *MSLEmitter::astStorageType(Type t) {
   return astScalarType(t);
 }
 
-bool MSLEmitter::isDatalessType(Type t) {
-  return isa<ttg::AsyncTokenType>(t);
-}
+bool MSLEmitter::isDatalessType(Type t) { return isa<ttg::AsyncTokenType>(t); }
 
 int64_t MSLEmitter::bitsOf(Type t) {
   if (isa<tt::PointerType>(t))
@@ -90,8 +88,7 @@ std::string MSLEmitter::init0(const std::string &sc) {
 msl::Expr *MSLEmitter::astInPlaceBase(const InPlaceOperand &op) {
   if (!op.baseOffset)
     return ctx.var(op.buf);
-  return ctx.paren(
-      ctx.binary(msl::BinOp::Add, ctx.var(op.buf), op.baseOffset));
+  return ctx.paren(ctx.binary(msl::BinOp::Add, ctx.var(op.buf), op.baseOffset));
 }
 
 } // namespace mlir::triton::applegpu

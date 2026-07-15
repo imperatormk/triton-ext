@@ -42,8 +42,8 @@ std::string MSLEmitter::emitRoundedHalfValueFull(const std::string &sc,
     os << ind() << "int " << ex << " = " << e32 << " - 112;\n";
     os << ind() << "if (" << e32 << " == 0xff) {\n";
     ++indent;
-    os << ind() << bits << " = (ushort)(" << sgn << " | 0x7c00u | ("
-       << mant << " ? 0x200u : 0u));\n";
+    os << ind() << bits << " = (ushort)(" << sgn << " | 0x7c00u | (" << mant
+       << " ? 0x200u : 0u));\n";
     --indent;
     os << ind() << "} else if (" << ex << " >= 31) {\n";
     ++indent;
@@ -51,8 +51,8 @@ std::string MSLEmitter::emitRoundedHalfValueFull(const std::string &sc,
     --indent;
     os << ind() << "} else if (" << ex << " <= 0) {\n";
     ++indent;
-    os << ind() << "if (" << ex << " < -10) { " << bits << " = (ushort)"
-       << sgn << "; }\n";
+    os << ind() << "if (" << ex << " < -10) { " << bits << " = (ushort)" << sgn
+       << "; }\n";
     os << ind() << "else {\n";
     ++indent;
     os << ind() << "uint __fm = " << mant << " | 0x800000u;\n";
@@ -101,8 +101,8 @@ std::string MSLEmitter::emitTruncatedFloatValue(const std::string &sc,
     os << ind() << "uint " << mant << " = " << u << " & 0x7fffffu;\n";
     os << ind() << "if (((" << u << " >> 23) & 0xffu) == 0xffu) {\n";
     ++indent;
-    os << ind() << bits << " = (ushort)(" << sgn << " | 0x7c00u | ("
-       << mant << " ? 0x200u : 0u));\n";
+    os << ind() << bits << " = (ushort)(" << sgn << " | 0x7c00u | (" << mant
+       << " ? 0x200u : 0u));\n";
     --indent;
     os << ind() << "} else if (" << ex << " >= 31) {\n";
     ++indent;
@@ -110,11 +110,10 @@ std::string MSLEmitter::emitTruncatedFloatValue(const std::string &sc,
     --indent;
     os << ind() << "} else if (" << ex << " <= 0) {\n";
     ++indent;
-    os << ind() << "if (" << ex << " < -10) { " << bits << " = (ushort)"
-       << sgn << "; }\n";
-    os << ind() << "else { uint __m = (" << mant
-       << " | 0x800000u) >> (14 - " << ex << "); " << bits
-       << " = (ushort)(" << sgn << " | __m); }\n";
+    os << ind() << "if (" << ex << " < -10) { " << bits << " = (ushort)" << sgn
+       << "; }\n";
+    os << ind() << "else { uint __m = (" << mant << " | 0x800000u) >> (14 - "
+       << ex << "); " << bits << " = (ushort)(" << sgn << " | __m); }\n";
     --indent;
     os << ind() << "} else {\n";
     ++indent;
@@ -181,8 +180,8 @@ std::pair<std::string, std::string>
 MSLEmitter::emitPacked16Base(const std::string &p, const std::string &sc) {
   std::string bytePtr = fresh(), wordAddr = fresh(), isHigh = fresh(),
               wordPtr = fresh();
-  os << ind() << "device uchar *" << bytePtr
-     << " = (device uchar *)(" << p << ");\n";
+  os << ind() << "device uchar *" << bytePtr << " = (device uchar *)(" << p
+     << ");\n";
   os << ind() << "size_t " << wordAddr << " = (size_t)" << bytePtr
      << " & ~(size_t)3;\n";
   os << ind() << "bool " << isHigh << " = ((size_t)" << bytePtr
@@ -204,8 +203,8 @@ void MSLEmitter::emitPacked16CASLoop(const std::string &wordPtr,
                                      const std::string &id) {
   std::string word = fresh(), lane = fresh(), newLane = fresh(),
               newWord = fresh();
-  os << ind() << "uint " << word
-     << " = atomic_load_explicit(" << wordPtr << ", memory_order_relaxed);\n";
+  os << ind() << "uint " << word << " = atomic_load_explicit(" << wordPtr
+     << ", memory_order_relaxed);\n";
   os << ind() << "while (true) {\n";
   ++indent;
   os << ind() << "ushort " << lane << " = (ushort)((" << isHigh << ") ? ("
@@ -214,10 +213,10 @@ void MSLEmitter::emitPacked16CASLoop(const std::string &wordPtr,
   os << ind() << sc << " " << curId << " = as_type<" << sc << ">(" << lane
      << ");\n";
   os << ind() << sc << " " << newLane << " = " << newHalfExpr << ";\n";
-  os << ind() << "uint " << newWord << " = (" << isHigh
-     << ") ? ((" << word << " & 0x0000ffffu) | ((uint)as_type<ushort>("
-     << newLane << ") << 16)) : ((" << word
-     << " & 0xffff0000u) | (uint)as_type<ushort>(" << newLane << "));\n";
+  os << ind() << "uint " << newWord << " = (" << isHigh << ") ? ((" << word
+     << " & 0x0000ffffu) | ((uint)as_type<ushort>(" << newLane
+     << ") << 16)) : ((" << word << " & 0xffff0000u) | (uint)as_type<ushort>("
+     << newLane << "));\n";
   os << ind() << "if (atomic_compare_exchange_weak_explicit(" << wordPtr
      << ", &" << word << ", " << newWord
      << ", memory_order_relaxed, memory_order_relaxed)) break;\n";
@@ -234,8 +233,8 @@ void MSLEmitter::emitFloat32CASLoop(const std::string &p,
   std::string wordPtr = fresh(), word = fresh(), newWord = fresh();
   os << ind() << "device atomic_uint *" << wordPtr
      << " = (device atomic_uint *)(" << p << ");\n";
-  os << ind() << "uint " << word
-     << " = atomic_load_explicit(" << wordPtr << ", memory_order_relaxed);\n";
+  os << ind() << "uint " << word << " = atomic_load_explicit(" << wordPtr
+     << ", memory_order_relaxed);\n";
   os << ind() << "while (true) {\n";
   ++indent;
   os << ind() << id << " = as_type<float>(" << word << ");\n";

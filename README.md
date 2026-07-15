@@ -63,8 +63,8 @@ extensions.
   automatically register extensions with Triton.
 
 - **[`backend/AppleGPU/`](./backend/AppleGPU/)**: Apple GPU backend plugin.
-  Lowers Triton kernels from TTGIR directly to Metal Shading Language (MSL) text,
-  compiles that to a `.metallib` in-process via the Metal framework, and
+  Lowers Triton kernels from TTGIR directly to Metal Shading Language (MSL)
+  text, compiles that to a `.metallib` in-process via the Metal framework, and
   dispatches via `MTLComputeCommandEncoder`. See
   [`backend/AppleGPU/README.md`](./backend/AppleGPU/README.md) for details.
 

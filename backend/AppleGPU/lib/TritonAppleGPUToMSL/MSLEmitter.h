@@ -198,7 +198,8 @@ private:
 
   // AST forms of the offset/address helpers (defs in EmitMSLMemory.cpp);
   // insert explicit parens where a subexpression needs precedence grouping.
-  msl::Expr *astLayoutCoordExpr(RankedTensorType rt, int reg, StringAttr outDim);
+  msl::Expr *astLayoutCoordExpr(RankedTensorType rt, int reg,
+                                StringAttr outDim);
   msl::Expr *astLayoutOffsetExpr(RankedTensorType rt, int reg);
   msl::Expr *astPoolRegion(int64_t byteOffset, StringRef sc);
   msl::Expr *astFlatTileOffset(RankedTensorType rt, int reg);
@@ -206,8 +207,8 @@ private:
   msl::Expr *astBatchCoordExpr(RankedTensorType rt, int reg);
   msl::Expr *astTransFlatOffset(RankedTensorType srcTy, ArrayRef<int32_t> perm,
                                 ArrayRef<int64_t> resShape, int reg);
-  msl::Expr *astMemdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
-                                int reg);
+  msl::Expr *astMemdescElemAddr(const MemDescInfo &info,
+                                RankedTensorType tileTy, int reg);
 
   // AST builders for the dot/GEMM simdgroup-matrix lowering (defs in
   // EmitMSLDot.cpp).
@@ -288,16 +289,17 @@ private:
   msl::Stmt *astMapCaptureDecl(StringRef sc, StringRef name);
   msl::Stmt *astMapReturnSpill(StringRef capture, StringRef operand);
   msl::Stmt *astMapHoistCopy(StringRef dst, StringRef src);
-  msl::Stmt *astMapCFGStateMachine(
-      StringRef state,
-      ArrayRef<std::pair<std::string, msl::Block>> cases);
+  msl::Stmt *
+  astMapCFGStateMachine(StringRef state,
+                        ArrayRef<std::pair<std::string, msl::Block>> cases);
 
   // function / scope / control-flow builders (EmitMSLFunc.cpp). Each takes a
   // pre-built body Block and returns the scope node: astEmitOp walks the ops
   // into the body, then wraps it here.
   msl::DeviceFn *astDeviceProto(tt::FuncOp func);
   msl::NamedType *astRetStructType(tt::FuncOp func);
-  msl::Stmt *astRetStructDecl(tt::FuncOp func); // ArrayDecl-less; RawStmt struct
+  msl::Stmt *
+  astRetStructDecl(tt::FuncOp func); // ArrayDecl-less; RawStmt struct
   msl::Type *astDeviceRetType(tt::FuncOp func);
   msl::Stmt *astReturn(tt::ReturnOp op);
   msl::ForScope *astForScope(scf::ForOp op, msl::Block body, StringRef iv,
@@ -327,8 +329,8 @@ private:
   bool astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
                    llvm::function_ref<msl::Expr *(int)> mk);
   // Dispatch spine: appends the nodes for `op` to `body`. Returns true when the
-  // op is handled (nodes appended, or nothing for alias/dataless ops); false for
-  // an unsupported op, which astWalkBlock turns into a hard error.
+  // op is handled (nodes appended, or nothing for alias/dataless ops); false
+  // for an unsupported op, which astWalkBlock turns into a hard error.
   bool astEmitOp(Operation *op, msl::Block &body);
   std::optional<bool> astEmitArithBinop(Operation *op, msl::Block &body);
   std::optional<bool> astEmitConstGrid(Operation *op, msl::Block &body);
@@ -348,8 +350,9 @@ private:
   msl::Block astEmitBlockCFG(Region &region);
   void astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
                      msl::Block &body);
-  msl::Block astWalkBlock2(Block &blk,
-                           llvm::DenseMap<Value, SmallVector<std::string>> &hoist);
+  msl::Block
+  astWalkBlock2(Block &blk,
+                llvm::DenseMap<Value, SmallVector<std::string>> &hoist);
   msl::Block astTerminatorEdge(Operation *term, StringRef state);
   SmallVector<std::string> astDeclResultVars(Value v, msl::Block &body);
   msl::Expr *astDerefPtr(Value ptr, StringRef name, StringRef scName);
@@ -366,11 +369,11 @@ private:
                        bool skip, llvm::function_ref<msl::Expr *(int)> guard);
   bool astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
                        Value bStage, ArrayRef<std::string> aNames,
-                       ArrayRef<std::string> bNames, ArrayRef<std::string> cInit,
-                       ArrayRef<std::string> ids, int64_t M, int64_t N, int64_t K,
-                       int64_t Bd, int rank, msl::MatrixType *opFrag,
-                       StringRef opScalar, int64_t numWarps, StringAttr rowDim,
-                       StringAttr colDim);
+                       ArrayRef<std::string> bNames,
+                       ArrayRef<std::string> cInit, ArrayRef<std::string> ids,
+                       int64_t M, int64_t N, int64_t K, int64_t Bd, int rank,
+                       msl::MatrixType *opFrag, StringRef opScalar,
+                       int64_t numWarps, StringAttr rowDim, StringAttr colDim);
   bool astEmitDotFused(
       tt::DotOp op, msl::Block &body, Value aStage, Value bStage,
       ArrayRef<std::string> aNames, ArrayRef<std::string> bNames, StringRef tgA,
@@ -475,11 +478,6 @@ private:
   tt::FuncOp curDevFunc;
   std::string devPoolPtr;
 
-
-
-
-
-
   std::string tgposId, tidId, numTgId, laneId, warpId;
   bool scalarSpinlock = false;
 
@@ -510,8 +508,8 @@ private:
   bool matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
                            Value &colBase);
 
-  // The store boundary mask `(row < boundM) && (col < boundN)`, with row/col the
-  // same per-tile indices as the address. Extracts the two scalar bounds.
+  // The store boundary mask `(row < boundM) && (col < boundN)`, with row/col
+  // the same per-tile indices as the address. Extracts the two scalar bounds.
   bool matchBoundaryMask(Value m, Value &boundM, Value &boundN);
 
   // Recognise `acc(#mma) -> convert_layout -> tt.store(rowmajor)` as the sole
@@ -522,14 +520,9 @@ private:
 
   static bool isPureBarrierOp(Operation *op);
 
-
   std::string floatLit(const APFloat &v);
   std::string floatLit(const APFloat &v, Type ty);
   msl::Expr *astFloatLit(const APFloat &v, Type ty);
-
-
-
-
 
   LogicalResult emitSplat(tt::SplatOp op);
 
@@ -571,9 +564,6 @@ private:
                           StringRef hi);
   msl::Expr *astSelectExpr(StringRef c, StringRef t, StringRef f);
 
-
-
-
   static bool isDatalessType(Type t);
 
   // Recognise the register-resident GEMM shape: a loop-carried #mma iter-arg
@@ -582,14 +572,6 @@ private:
   // accumulating `acc = tl.dot(a, b, acc)` K-loop). Returns the dot and the
   // iter-arg index, or nullopt.
   std::optional<std::pair<tt::DotOp, unsigned>> matchGemmDotLoop(scf::ForOp op);
-
-
-
-
-
-
-
-
 
   // Bitmask over lane (or warp) bits that reduce the given axis: a bit reduces
   // if its LinearLayout basis maps to a nonzero coordinate on the reduced
@@ -603,21 +585,16 @@ private:
   // that hold different output elements.
   SmallVector<int> subsetsOf(unsigned mask, int numWarps);
 
-
-
-  // Ordered (bit, axisStride) pairs for an inDim (lane/warp), only for bits that
-  // move along the scanned axis. Sorted by ascending axis stride.
-  SmallVector<std::pair<int, int32_t>> axisBits(const tt::LinearLayout &ll,
-                                                StringAttr inDim,
-                                                StringAttr outDim);
+  // Ordered (bit, axisStride) pairs for an inDim (lane/warp), only for bits
+  // that move along the scanned axis. Sorted by ascending axis stride.
+  SmallVector<std::pair<int, int32_t>>
+  axisBits(const tt::LinearLayout &ll, StringAttr inDim, StringAttr outDim);
 
   // Single-expression form of the warp shuffle (no temporaries): the
   // bitcast-through wrapper collapsed into one nested Expr. `sc` picks the
   // reinterpret path (64-bit/bfloat scalars reject the intrinsic directly).
   msl::Expr *astShuffleExpr(StringRef op, StringRef sc, StringRef val,
                             StringRef arg);
-
-
 
   int tgScratchId = 0;
 
@@ -660,23 +637,15 @@ private:
   // Peak byte footprint of a single transient scratch site.
   void scanPool(Operation *op);
 
-
-
-
   // Pipelined (software-pipeliner) ops lower to SYNCHRONOUS threadgroup
   // staging: MSL has no async copy and M3+ dropped the DMA hardware, so the
   // rotating multi-buffer collapses to a plain threadgroup buffer written by a
   // masked per-thread copy and read back with a barrier between.
   static int64_t memdescFlatSize(ttg::MemDescType mt);
 
-
   LogicalResult emitMemDescIndex(ttg::MemDescIndexOp op);
 
   LogicalResult emitMemDescSubslice(ttg::MemDescSubsliceOp op);
-
-
-
-
 
   // A local_load of a contiguous row-major [rows][cols] threadgroup buffer
   // (local_alloc, optionally memdesc_index'd, never subsliced) reached through
@@ -690,8 +659,8 @@ private:
 
   static bool localLoadIsDeadDotStage(ttg::LocalLoadOp ll);
 
-  std::optional<InPlaceOperand> dotOperandInPlaceBuf(Value operand, int64_t rows,
-                                                     int64_t cols);
+  std::optional<InPlaceOperand>
+  dotOperandInPlaceBuf(Value operand, int64_t rows, int64_t cols);
 
   msl::Expr *astInPlaceBase(const InPlaceOperand &op);
 
@@ -735,12 +704,6 @@ private:
   static int64_t dotCBandRows(int64_t M, int64_t N, int64_t cBudget,
                               int64_t accBytes);
 
-
-
-
-
-
-
   // Design-sanctioned Raw escape-hatch leaves (see EmitMSLRawLeaves.cpp): the
   // fp32->half/bfloat narrowing (rtne full / rtz / rtne integer) and the
   // emulated fp32 / packed-fp16 CAS loops.
@@ -751,8 +714,9 @@ private:
   std::string emitRoundedHalfValue(const std::string &sc, const std::string &v);
   std::pair<std::string, std::string> emitPacked16Base(const std::string &p,
                                                        const std::string &sc);
-  void emitPacked16CASLoop(const std::string &wordPtr, const std::string &isHigh,
-                           const std::string &sc, const std::string &curId,
+  void emitPacked16CASLoop(const std::string &wordPtr,
+                           const std::string &isHigh, const std::string &sc,
+                           const std::string &curId,
                            const std::string &newHalfExpr,
                            const std::string &id);
   void emitFloat32CASLoop(const std::string &p, const std::string &curId,
@@ -775,11 +739,6 @@ private:
       return v;
     }
   }
-
-
-
-
-
 
   static std::string init0(const std::string &sc);
 };

@@ -20,9 +20,9 @@
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <set>
-#include "llvm/Support/raw_ostream.h"
 
 #include <string>
 
@@ -31,8 +31,7 @@ using namespace mlir;
 namespace mlir::triton::applegpu {
 
 namespace {
-class EmitMSLPass
-    : public PassWrapper<EmitMSLPass, OperationPass<ModuleOp>> {
+class EmitMSLPass : public PassWrapper<EmitMSLPass, OperationPass<ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EmitMSLPass)
 

@@ -40,8 +40,9 @@ private:
   unsigned indent = 0;
 
   // Barrier peephole: a BarrierStmt is held pending rather than printed, so
-  // adjacent barriers collapse into one keeping the stronger scope. flushBarrier
-  // MUST run before any non-barrier output and at every scope boundary.
+  // adjacent barriers collapse into one keeping the stronger scope.
+  // flushBarrier MUST run before any non-barrier output and at every scope
+  // boundary.
   bool barrierPending = false;
   bool barrierPendingDevice = false;
   void flushBarrier();
@@ -52,7 +53,8 @@ private:
     return os;
   }
 
-  void printStmtInline(const Stmt *s); // decl/assign without newline (for-header)
+  void
+  printStmtInline(const Stmt *s); // decl/assign without newline (for-header)
 };
 
 } // namespace mlir::triton::applegpu::msl

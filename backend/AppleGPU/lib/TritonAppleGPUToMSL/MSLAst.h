@@ -27,7 +27,20 @@ struct Type {
 };
 
 enum class Scalar {
-  F32, F16, BF16, I1, I8, I16, I32, I64, U8, U16, U32, U64, Void, SizeT
+  F32,
+  F16,
+  BF16,
+  I1,
+  I8,
+  I16,
+  I32,
+  I64,
+  U8,
+  U16,
+  U32,
+  U64,
+  Void,
+  SizeT
 };
 
 struct ScalarType : Type {
@@ -81,8 +94,19 @@ struct NamedType : Type {
 
 struct Expr {
   enum class Kind {
-    VarRef, Literal, Binary, Unary, Cast, Call, Ternary, Subscript, Member,
-    Deref, AddrOf, Paren, Raw
+    VarRef,
+    Literal,
+    Binary,
+    Unary,
+    Cast,
+    Call,
+    Ternary,
+    Subscript,
+    Member,
+    Deref,
+    AddrOf,
+    Paren,
+    Raw
   };
   const Kind kind;
   explicit Expr(Kind k) : kind(k) {}
@@ -101,8 +125,24 @@ struct Literal : Expr {
 };
 
 enum class BinOp {
-  Add, Sub, Mul, Div, Rem, And, Or, Xor, Shl, Shr,
-  Lt, Le, Gt, Ge, Eq, Ne, LAnd, LOr
+  Add,
+  Sub,
+  Mul,
+  Div,
+  Rem,
+  And,
+  Or,
+  Xor,
+  Shl,
+  Shr,
+  Lt,
+  Le,
+  Gt,
+  Ge,
+  Eq,
+  Ne,
+  LAnd,
+  LOr
 };
 
 struct Binary : Expr {
@@ -145,8 +185,7 @@ struct Ternary : Expr {
   Expr *c;
   Expr *a;
   Expr *b;
-  Ternary(Expr *c, Expr *a, Expr *b)
-      : Expr(Kind::Ternary), c(c), a(a), b(b) {}
+  Ternary(Expr *c, Expr *a, Expr *b) : Expr(Kind::Ternary), c(c), a(a), b(b) {}
   static bool classof(const Expr *e) { return e->kind == Kind::Ternary; }
 };
 
@@ -194,11 +233,25 @@ struct Raw : Expr {
 
 struct Stmt {
   enum class Kind {
-    Decl, ArrayDecl, Assign, Expr, Return, Break, Continue, Barrier, CompactIf,
+    Decl,
+    ArrayDecl,
+    Assign,
+    Expr,
+    Return,
+    Break,
+    Continue,
+    Barrier,
+    CompactIf,
     Raw,
     // scopes
-    KernelFn, DeviceFn, ForScope, TripCountForScope, IfScope, WhileScope,
-    StateMachineScope, PlainScope
+    KernelFn,
+    DeviceFn,
+    ForScope,
+    TripCountForScope,
+    IfScope,
+    WhileScope,
+    StateMachineScope,
+    PlainScope
   };
   const Kind kind;
   explicit Stmt(Kind k) : kind(k) {}
@@ -300,7 +353,10 @@ struct RawStmt : Stmt {
 
 struct Attr {
   enum class Kind {
-    Buffer, ThreadgroupPosInGrid, ThreadPosInThreadgroup, ThreadgroupsPerGrid,
+    Buffer,
+    ThreadgroupPosInGrid,
+    ThreadPosInThreadgroup,
+    ThreadgroupsPerGrid,
     MaxTotalThreads
   };
   const Kind kind;
@@ -355,19 +411,19 @@ struct ForScope : Stmt {
   static bool classof(const Stmt *s) { return s->kind == Kind::ForScope; }
 };
 
-// Wide-IV i64 loop: `for (long tc = 0; ; tc += 1) { <ivDecl> if(!(...)) break; }`
-// The iv decl MUST be the first Stmt of body (never floated into the header) so
-// the AGX i65 Gauss-sum fold can't fire.
+// Wide-IV i64 loop: `for (long tc = 0; ; tc += 1) { <ivDecl> if(!(...)) break;
+// }` The iv decl MUST be the first Stmt of body (never floated into the header)
+// so the AGX i65 Gauss-sum fold can't fire.
 struct TripCountForScope : Stmt {
   Type *counterTy;
   llvm::StringRef counter;
-  Stmt *ivDecl;  // `ivTy iv = lo + tc*st;` (first body stmt; i65 dodge)
-  Expr *guard;   // rendered compactly: `if (!(guard)) break;`
+  Stmt *ivDecl; // `ivTy iv = lo + tc*st;` (first body stmt; i65 dodge)
+  Expr *guard;  // rendered compactly: `if (!(guard)) break;`
   Block body;
   TripCountForScope(Type *ct, llvm::StringRef c, Stmt *ivDecl, Expr *guard,
                     Block b)
-      : Stmt(Kind::TripCountForScope), counterTy(ct), counter(c), ivDecl(ivDecl),
-        guard(guard), body(std::move(b)) {}
+      : Stmt(Kind::TripCountForScope), counterTy(ct), counter(c),
+        ivDecl(ivDecl), guard(guard), body(std::move(b)) {}
   static bool classof(const Stmt *s) {
     return s->kind == Kind::TripCountForScope;
   }
@@ -392,7 +448,8 @@ struct WhileScope : Stmt {
   static bool classof(const Stmt *s) { return s->kind == Kind::WhileScope; }
 };
 
-// `int <state> = 0; while (true) { if (state==L0){..} else if (state==L1){..} }`
+// `int <state> = 0; while (true) { if (state==L0){..} else if (state==L1){..}
+// }`
 struct StateMachineScope : Stmt {
   Type *stateTy;
   llvm::StringRef stateVar;
@@ -470,9 +527,7 @@ public:
   Call *call(llvm::StringRef c, llvm::ArrayRef<Expr *> a) {
     return make<Call>(save(c), llvm::ArrayRef<Type *>{}, a);
   }
-  Ternary *ternary(Expr *c, Expr *a, Expr *b) {
-    return make<Ternary>(c, a, b);
-  }
+  Ternary *ternary(Expr *c, Expr *a, Expr *b) { return make<Ternary>(c, a, b); }
   Subscript *subscript(Expr *b, Expr *i) { return make<Subscript>(b, i); }
   Member *member(Expr *b, llvm::StringRef f) {
     return make<Member>(b, save(f));
@@ -503,9 +558,7 @@ public:
   }
   BreakStmt *breakStmt() { return make<BreakStmt>(); }
   ContinueStmt *continueStmt() { return make<ContinueStmt>(); }
-  BarrierStmt *barrier(bool device) {
-    return make<BarrierStmt>(device, false);
-  }
+  BarrierStmt *barrier(bool device) { return make<BarrierStmt>(device, false); }
   BarrierStmt *hardBarrier(bool device) {
     return make<BarrierStmt>(device, true);
   }
@@ -523,9 +576,7 @@ public:
 
   // --- Attrs / Params ---
   Attr *bufferAttr(unsigned n) { return make<Attr>(Attr::Kind::Buffer, n); }
-  Attr *tgPosAttr() {
-    return make<Attr>(Attr::Kind::ThreadgroupPosInGrid, 0);
-  }
+  Attr *tgPosAttr() { return make<Attr>(Attr::Kind::ThreadgroupPosInGrid, 0); }
   Attr *threadPosAttr() {
     return make<Attr>(Attr::Kind::ThreadPosInThreadgroup, 0);
   }
@@ -556,8 +607,8 @@ public:
     b.push_back(bodyStmt);
     return make<ForScope>(init, c, step, std::move(b), true);
   }
-  TripCountForScope *tripCountForScope(Type *ct, llvm::StringRef c, Stmt *ivDecl,
-                                       Expr *guard, Block b) {
+  TripCountForScope *tripCountForScope(Type *ct, llvm::StringRef c,
+                                       Stmt *ivDecl, Expr *guard, Block b) {
     return make<TripCountForScope>(ct, save(c), ivDecl, guard, std::move(b));
   }
   IfScope *ifScope(Expr *c, Block t) {
@@ -569,9 +620,9 @@ public:
   WhileScope *whileScope(Expr *c, Block b) {
     return make<WhileScope>(c, std::move(b));
   }
-  StateMachineScope *stateMachineScope(
-      Type *st, llvm::StringRef sv,
-      llvm::SmallVector<StateMachineScope::Case, 4> cases) {
+  StateMachineScope *
+  stateMachineScope(Type *st, llvm::StringRef sv,
+                    llvm::SmallVector<StateMachineScope::Case, 4> cases) {
     return make<StateMachineScope>(st, save(sv), std::move(cases));
   }
   PlainScope *plainScope(Block b) { return make<PlainScope>(std::move(b)); }

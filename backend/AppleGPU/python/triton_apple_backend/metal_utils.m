@@ -281,7 +281,8 @@ static PyObject *py_compile_source(PyObject *self, PyObject *args) {
     MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
     // Safe math is load-bearing: fast-math assumes no NaN/Inf and reassociates
     // FP, silently miscompiling kernels over Inf/NaN or relying on RTNE. Match
-    // the old xcrun -fmetal-math-mode=safe (safe mode + precise transcendentals).
+    // the old xcrun -fmetal-math-mode=safe (safe mode + precise
+    // transcendentals).
     if (strcmp(math_mode, "safe") == 0) {
       if ([opt respondsToSelector:@selector(setMathMode:)]) {
         opt.mathMode = MTLMathModeSafe;
@@ -293,8 +294,9 @@ static PyObject *py_compile_source(PyObject *self, PyObject *args) {
 
     NSString *source = [NSString stringWithUTF8String:src];
     NSError *error = nil;
-    id<MTLLibrary> lib =
-        [get_device() newLibraryWithSource:source options:opt error:&error];
+    id<MTLLibrary> lib = [get_device() newLibraryWithSource:source
+                                                    options:opt
+                                                      error:&error];
     if (!lib) {
       NSMutableString *full = [NSMutableString string];
       [full appendFormat:@"%@", [error localizedDescription]];
@@ -313,8 +315,8 @@ static PyObject *py_compile_source(PyObject *self, PyObject *args) {
     }
 
     NSString *tmp = [NSTemporaryDirectory()
-        stringByAppendingPathComponent:
-            [[NSProcessInfo processInfo] globallyUniqueString]];
+        stringByAppendingPathComponent:[[NSProcessInfo processInfo]
+                                           globallyUniqueString]];
     tmp = [tmp stringByAppendingPathExtension:@"metallib"];
     NSURL *url = [NSURL fileURLWithPath:tmp];
 

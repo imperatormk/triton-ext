@@ -40,12 +40,12 @@ enum class FusedDotPhase { None, Decl, MMA, Readback };
 // gather). Populated when matchDirectStore succeeds; empty otherwise.
 struct DirectStore {
   tt::StoreOp store;
-  Value basePtr; // C matrix base pointer (scalar kernel arg)
-  Value ldc;     // row stride (scalar), col stride is 1 (row-major)
-  Value rowBase; // global row of the tile's top-left element (scalar)
-  Value colBase; // global col of the tile's top-left element (scalar)
-  Value boundM;  // store-mask row bound, or null when unmasked
-  Value boundN;  // store-mask col bound, or null when unmasked
+  Value basePtr;           // C matrix base pointer (scalar kernel arg)
+  Value ldc;               // row stride (scalar), col stride is 1 (row-major)
+  Value rowBase;           // global row of the tile's top-left element (scalar)
+  Value colBase;           // global col of the tile's top-left element (scalar)
+  Value boundM;            // store-mask row bound, or null when unmasked
+  Value boundN;            // store-mask col bound, or null when unmasked
   std::string fullTileVar; // runtime "whole tile in bounds" predicate
 };
 

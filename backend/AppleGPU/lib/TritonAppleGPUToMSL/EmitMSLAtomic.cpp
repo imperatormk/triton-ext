@@ -30,10 +30,10 @@ msl::Expr *MSLEmitter::astInit0(StringRef sc) {
   return ctx.lit(sc == "float" || sc == "half" ? "0.0" : "0");
 }
 
-// (device <atomicTy>*)p - the atomic-typed device pointer the RMW/poll casts to.
-// atomicTy is spelled by name (atomic_int/atomic_uint/atomic_float/...) so the
-// pointee is a NamedType, keeping the builder agnostic to the scalar->atomic
-// choice.
+// (device <atomicTy>*)p - the atomic-typed device pointer the RMW/poll casts
+// to. atomicTy is spelled by name (atomic_int/atomic_uint/atomic_float/...) so
+// the pointee is a NamedType, keeping the builder agnostic to the
+// scalar->atomic choice.
 msl::Expr *MSLEmitter::astDeviceAtomicPtr(StringRef atomicTy, StringRef p) {
   msl::Type *ptr = ctx.ptr(ctx.named(atomicTy), msl::AddrSpace::Device);
   return ctx.cast(CS::CStyle, ptr, ctx.var(p));
@@ -82,17 +82,18 @@ msl::Block MSLEmitter::astPacked16Base(StringRef p, std::string &wordPtrOut,
   LocalGen g{nextId};
   std::string bytePtr = g.fresh(), wordAddr = g.fresh(), isHigh = g.fresh(),
               wordPtr = g.fresh();
-  msl::Type *ucptr = ctx.ptr(ctx.scalar(msl::Scalar::U8), msl::AddrSpace::Device);
+  msl::Type *ucptr =
+      ctx.ptr(ctx.scalar(msl::Scalar::U8), msl::AddrSpace::Device);
   msl::Type *auptr = ctx.ptr(ctx.named(ba::Uint), msl::AddrSpace::Device);
   auto szOf = [&](StringRef x) {
     return ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::SizeT), ctx.var(x));
   };
   // (size_t)bytePtr & ~(size_t)3
-  msl::Expr *addr = ctx.binary(
-      B::And, szOf(bytePtr),
-      ctx.unary(msl::UnOp::Not,
-                ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::SizeT),
-                         ctx.lit("3"))));
+  msl::Expr *addr =
+      ctx.binary(B::And, szOf(bytePtr),
+                 ctx.unary(msl::UnOp::Not,
+                           ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::SizeT),
+                                    ctx.lit("3"))));
   // ((size_t)bytePtr & 2u) != 0u
   msl::Expr *hi = ctx.binary(
       B::Ne, ctx.paren(ctx.binary(B::And, szOf(bytePtr), ctx.lit("2u"))),
@@ -103,8 +104,8 @@ msl::Block MSLEmitter::astPacked16Base(StringRef p, std::string &wordPtrOut,
       ucptr, bytePtr, ctx.cast(CS::CStyle, ucptr, ctx.paren(ctx.var(p)))));
   block.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::SizeT), wordAddr, addr));
   block.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), isHigh, hi));
-  block.push_back(ctx.declStmt(
-      auptr, wordPtr, ctx.cast(CS::CStyle, auptr, ctx.var(wordAddr))));
+  block.push_back(ctx.declStmt(auptr, wordPtr,
+                               ctx.cast(CS::CStyle, auptr, ctx.var(wordAddr))));
   wordPtrOut = wordPtr;
   isHighOut = isHigh;
   return block;
@@ -128,7 +129,8 @@ msl::Expr *MSLEmitter::astAtomicRmwCall(StringRef fn, StringRef atomicTy,
 }
 
 //===----------------------------------------------------------------------===//
-// astFloat32CASLoop / astPacked16CASLoop - fp32 / packed-fp16 emulated CAS loops
+// astFloat32CASLoop / astPacked16CASLoop - fp32 / packed-fp16 emulated CAS
+// loops
 //===----------------------------------------------------------------------===//
 
 // device atomic_uint *wordPtr = (device atomic_uint *)(p);
@@ -141,7 +143,8 @@ msl::Expr *MSLEmitter::astAtomicRmwCall(StringRef fn, StringRef atomicTy,
 //         memory_order_relaxed, memory_order_relaxed)) break;
 // }
 msl::Block MSLEmitter::astFloat32CASLoop(StringRef p, StringRef curId,
-                                         msl::Expr *newFloatExpr, StringRef id) {
+                                         msl::Expr *newFloatExpr,
+                                         StringRef id) {
   LocalGen g{nextId};
   std::string wordPtr = g.fresh(), word = g.fresh(), newWord = g.fresh();
 
@@ -159,10 +162,10 @@ msl::Block MSLEmitter::astFloat32CASLoop(StringRef p, StringRef curId,
   body.push_back(ctx.assignStmt(ctx.var(id), asF32(ctx.var(word))));
   body.push_back(
       ctx.declStmt(ctx.scalar(msl::Scalar::F32), curId, asF32(ctx.var(word))));
-  msl::Expr *repacked = ctx.cast(
-      CS::AsType, ctx.scalar(msl::Scalar::U32),
-      ctx.paren(ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::F32),
-                         ctx.paren(newFloatExpr))));
+  msl::Expr *repacked =
+      ctx.cast(CS::AsType, ctx.scalar(msl::Scalar::U32),
+               ctx.paren(ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::F32),
+                                  ctx.paren(newFloatExpr))));
   body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U32), newWord, repacked));
   msl::Expr *cas = astCasWeak(ctx.var(wordPtr), word, ctx.var(newWord));
   msl::Block casThen;
@@ -180,7 +183,8 @@ msl::Block MSLEmitter::astFloat32CASLoop(StringRef p, StringRef curId,
 // pointer and the isHigh selector; newHalfExpr references curId.
 msl::Block MSLEmitter::astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
                                           StringRef sc, StringRef curId,
-                                          msl::Expr *newHalfExpr, StringRef id) {
+                                          msl::Expr *newHalfExpr,
+                                          StringRef id) {
   LocalGen g{nextId};
   std::string word = g.fresh(), lane = g.fresh(), newLane = g.fresh(),
               newWord = g.fresh();
@@ -205,9 +209,9 @@ msl::Block MSLEmitter::astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
 
   // (isHigh) ? ((word & 0x0000ffffu) | ((uint)as_type<ushort>(newLane) << 16))
   //          : ((word & 0xffff0000u) | (uint)as_type<ushort>(newLane))
-  msl::Expr *newBitsU32 = ctx.cast(
-      CS::CStyle, ctx.scalar(msl::Scalar::U32),
-      asType(ctx.scalar(msl::Scalar::U16), ctx.var(newLane)));
+  msl::Expr *newBitsU32 =
+      ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U32),
+               asType(ctx.scalar(msl::Scalar::U16), ctx.var(newLane)));
   body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U32), newWord,
                               astPacked16Merge(word, isHigh, newBitsU32)));
 
@@ -223,7 +227,8 @@ msl::Block MSLEmitter::astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
 }
 
 //===----------------------------------------------------------------------===//
-// astInt32CAS / astFloat32CAS / astPacked16CAS - int32 / float32 / packed16 compare-exchange
+// astInt32CAS / astFloat32CAS / astPacked16CAS - int32 / float32 / packed16
+// compare-exchange
 //===----------------------------------------------------------------------===//
 
 // sc exp = c;
@@ -231,7 +236,8 @@ msl::Block MSLEmitter::astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
 //          (device atomic_int *)p, &exp, v, memory_order_relaxed,
 //          memory_order_relaxed))) {}
 // [sc ]id = exp;
-// Metal device atomics are relaxed-only; acquire/release orders are invalid MSL.
+// Metal device atomics are relaxed-only; acquire/release orders are invalid
+// MSL.
 msl::Block MSLEmitter::astInt32CAS(StringRef p, StringRef c, StringRef v,
                                    StringRef sc, StringRef id, bool declare) {
   LocalGen g{nextId};
@@ -239,8 +245,8 @@ msl::Block MSLEmitter::astInt32CAS(StringRef p, StringRef c, StringRef v,
   msl::Type *scTy = ctx.named(sc);
 
   msl::Type *aiptr = ctx.named(("device " + std::string(ba::Int) + " *"));
-  msl::Expr *cas = astCasWeak(ctx.cast(CS::CStyle, aiptr, ctx.var(p)), exp,
-                              ctx.var(v));
+  msl::Expr *cas =
+      astCasWeak(ctx.cast(CS::CStyle, aiptr, ctx.var(p)), exp, ctx.var(v));
   msl::Expr *cond =
       ctx.binary(B::LAnd, ctx.binary(B::Eq, ctx.var(exp), ctx.var(c)),
                  ctx.unary(msl::UnOp::LNot, ctx.paren(cas)));
@@ -308,7 +314,8 @@ msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
   };
 
   msl::Block outer;
-  outer.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U16), cur, asU16OfSc(c)));
+  outer.push_back(
+      ctx.declStmt(ctx.scalar(msl::Scalar::U16), cur, asU16OfSc(c)));
   outer.push_back(
       ctx.declStmt(ctx.scalar(msl::Scalar::U16), lane, asU16OfSc(v)));
   outer.push_back(ctx.declStmt(
@@ -321,12 +328,11 @@ msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
 
   // ushort got = (ushort)((isHigh) ? (word >> 16) : (word & 0xffffu));
   msl::Block body;
-  body.push_back(ctx.declStmt(
-      ctx.scalar(msl::Scalar::U16), got,
-      ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U16),
-               astPacked16Extract(word, isHigh))));
-  body.push_back(ctx.assignStmt(
-      ctx.var(id), ctx.cast(CS::AsType, scTy, ctx.var(got))));
+  body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::U16), got,
+                              ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::U16),
+                                       astPacked16Extract(word, isHigh))));
+  body.push_back(
+      ctx.assignStmt(ctx.var(id), ctx.cast(CS::AsType, scTy, ctx.var(got))));
   msl::Block brk;
   brk.push_back(ctx.breakStmt());
   body.push_back(ctx.ifScope(ctx.binary(B::Ne, ctx.var(got), ctx.var(cur)),
@@ -371,9 +377,11 @@ msl::Stmt *MSLEmitter::astPollSpin(msl::Expr *loadExpr, StringRef want) {
 // into `out`.
 msl::Expr *MSLEmitter::astPoll64Load(StringRef p, StringRef wordPtr,
                                      msl::Stmt *&out) {
-  msl::Type *vptr = ctx.ptr(ctx.scalar(msl::Scalar::U64), msl::AddrSpace::Device,
-                            /*coherent=*/false, /*vol=*/true);
-  out = ctx.declStmt(vptr, wordPtr, ctx.cast(CS::CStyle, vptr, ctx.paren(ctx.var(p))));
+  msl::Type *vptr =
+      ctx.ptr(ctx.scalar(msl::Scalar::U64), msl::AddrSpace::Device,
+              /*coherent=*/false, /*vol=*/true);
+  out = ctx.declStmt(vptr, wordPtr,
+                     ctx.cast(CS::CStyle, vptr, ctx.paren(ctx.var(p))));
   return ctx.paren(ctx.deref(ctx.var(wordPtr)));
 }
 
@@ -383,8 +391,7 @@ msl::Expr *MSLEmitter::astPoll64Load(StringRef p, StringRef wordPtr,
 
 // threadgroup atomic_uint* bins = ((threadgroup atomic_uint*)poolBuf);
 msl::Stmt *MSLEmitter::astHistBinsDecl(StringRef bins) {
-  msl::Type *tgptr =
-      ctx.ptr(ctx.named(ba::Uint), msl::AddrSpace::Threadgroup);
+  msl::Type *tgptr = ctx.ptr(ctx.named(ba::Uint), msl::AddrSpace::Threadgroup);
   return ctx.declStmt(tgptr, bins, astPoolRegion(0, ba::Uint));
 }
 

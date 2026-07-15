@@ -84,7 +84,7 @@ msl::Expr *MSLEmitter::astPoolRegion(int64_t byteOffset, StringRef sc) {
       byteOffset == 0
           ? static_cast<msl::Expr *>(ctx.var(poolBuf))
           : ctx.paren(ctx.binary(msl::BinOp::Add, ctx.var(poolBuf),
-                                  ctx.lit(std::to_string(byteOffset))));
+                                 ctx.lit(std::to_string(byteOffset))));
   msl::Type *ptr = ctx.ptr(ctx.named(sc), msl::AddrSpace::Threadgroup);
   return ctx.paren(ctx.cast(msl::Cast::Style::CStyle, ptr, base));
 }
@@ -95,19 +95,18 @@ msl::Expr *MSLEmitter::astPoolRegion(int64_t byteOffset, StringRef sc) {
 
 // Shared row-major fold over out-dims [lo, hi], using `coord(d)` for the
 // per-dim coordinate expr and `stride[d]` accumulated from `shape`.
-static msl::Expr *
-foldRowMajor(msl::MSLContext &ctx, int hi, int lo,
-             llvm::function_ref<msl::Expr *(int)> coord,
-             llvm::function_ref<int64_t(int)> shapeAt, int64_t &stride) {
+static msl::Expr *foldRowMajor(msl::MSLContext &ctx, int hi, int lo,
+                               llvm::function_ref<msl::Expr *(int)> coord,
+                               llvm::function_ref<int64_t(int)> shapeAt,
+                               int64_t &stride) {
   stride = 1;
   msl::Expr *expr = nullptr;
   for (int d = hi; d >= lo; --d) {
     msl::Expr *c = coord(d);
     msl::Expr *term =
-        stride == 1
-            ? c
-            : ctx.paren(ctx.binary(msl::BinOp::Mul, c,
-                                   ctx.lit(std::to_string(stride))));
+        stride == 1 ? c
+                    : ctx.paren(ctx.binary(msl::BinOp::Mul, c,
+                                           ctx.lit(std::to_string(stride))));
     expr = expr ? ctx.paren(ctx.binary(msl::BinOp::Add, expr, term)) : term;
     stride *= shapeAt(d);
   }
@@ -172,10 +171,10 @@ msl::Expr *MSLEmitter::astMemdescElemAddr(const MemDescInfo &info,
     for (int d = 0; d < (int)outNames.size(); ++d) {
       msl::Expr *c = astLayoutCoordExpr(tileTy, reg, outNames[d]);
       int64_t s = info.bufStrides[d];
-      msl::Expr *term =
-          s == 1 ? c
-                 : ctx.paren(ctx.binary(msl::BinOp::Mul, c,
-                                        ctx.lit(std::to_string(s))));
+      msl::Expr *term = s == 1
+                            ? c
+                            : ctx.paren(ctx.binary(msl::BinOp::Mul, c,
+                                                   ctx.lit(std::to_string(s))));
       off = off ? ctx.paren(ctx.binary(msl::BinOp::Add, off, term)) : term;
     }
     if (!off)
@@ -271,7 +270,8 @@ void MSLEmitter::scanPool(Operation *op) {
       }
       int64_t stagedAB = stagedA + stagedB;
       int64_t cFull = M * N * accBytes;
-      if (stagedAB == aBy + bBy && dotNeedsPanel(M, N, Kd, elemBytes, accBytes)) {
+      if (stagedAB == aBy + bBy &&
+          dotNeedsPanel(M, N, Kd, elemBytes, accBytes)) {
         int64_t mp, np;
         dotPanelDims(M, N, Kd, elemBytes, accBytes, mp, np);
         need = mp * Kd * elemBytes + Kd * np * elemBytes + mp * np * accBytes;
@@ -291,9 +291,9 @@ void MSLEmitter::scanPool(Operation *op) {
       int64_t nw = ll.getInDimSize(kWarp);
       int64_t bytes = 0;
       for (Value res : r.getResult())
-        bytes += nw * 32 *
-                 std::max<int64_t>(
-                     1, byteWidth(elementScalarType(res.getType())));
+        bytes +=
+            nw * 32 *
+            std::max<int64_t>(1, byteWidth(elementScalarType(res.getType())));
       poolBytes = std::max(poolBytes, bytes);
     }
   } else if (auto h = dyn_cast<tt::HistogramOp>(op)) {

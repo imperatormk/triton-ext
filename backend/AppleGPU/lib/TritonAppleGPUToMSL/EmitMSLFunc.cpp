@@ -70,28 +70,26 @@ msl::Type *MSLEmitter::astDeviceRetType(tt::FuncOp func) {
 // Kernel / device-function signatures
 //===----------------------------------------------------------------------===//
 
-
 // `int lane = (int)(tid.x & 31u); int warp = (int)(tid.x >> 5);` using the
 // already-minted laneId/warpId/tidId members (kernel + device-fn prologues).
 llvm::SmallVector<msl::Stmt *, 2> MSLEmitter::laneWarpProlog() {
   msl::Type *i32 = ctx.scalar(msl::Scalar::I32);
-  msl::Expr *lane = ctx.cast(
-      CS::CStyle, i32,
-      ctx.paren(ctx.binary(B::And, ctx.member(ctx.var(tidId), "x"),
-                           ctx.lit("31u"))));
-  msl::Expr *warp = ctx.cast(
-      CS::CStyle, i32,
-      ctx.paren(ctx.binary(B::Shr, ctx.member(ctx.var(tidId), "x"),
-                           ctx.lit("5"))));
+  msl::Expr *lane =
+      ctx.cast(CS::CStyle, i32,
+               ctx.paren(ctx.binary(B::And, ctx.member(ctx.var(tidId), "x"),
+                                    ctx.lit("31u"))));
+  msl::Expr *warp =
+      ctx.cast(CS::CStyle, i32,
+               ctx.paren(ctx.binary(B::Shr, ctx.member(ctx.var(tidId), "x"),
+                                    ctx.lit("5"))));
   return {ctx.declStmt(i32, laneId, lane), ctx.declStmt(i32, warpId, warp)};
 }
-
 
 // Build the device-fn param list. `bind`:
 // true mints fresh() names (the definition), false uses aN/__tgpos/... (the
 // prototype). Trailing thread-context uint3s + optional threadgroup pool ptr.
-llvm::SmallVector<msl::Param, 8>
-MSLEmitter::deviceParams(tt::FuncOp func, int &id, bool bind) {
+llvm::SmallVector<msl::Param, 8> MSLEmitter::deviceParams(tt::FuncOp func,
+                                                          int &id, bool bind) {
   LocalGen g{id};
   auto fnTy = func.getFunctionType();
   llvm::SmallVector<msl::Param, 8> params;
@@ -120,7 +118,6 @@ msl::DeviceFn *MSLEmitter::astDeviceProto(tt::FuncOp func) {
   return ctx.deviceFn(astDeviceRetType(func), mslDeviceFuncName(func.getName()),
                       deviceParams(func, id, /*bind=*/false), msl::Block{});
 }
-
 
 //===----------------------------------------------------------------------===//
 // Return
@@ -169,8 +166,7 @@ LogicalResult MSLEmitter::emit() {
     liveTgBytes = 0;
     func.walk([&](ttg::LocalAllocOp la) {
       auto mt = cast<ttg::MemDescType>(la.getResult().getType());
-      liveTgBytes += memdescFlatSize(mt) *
-                     byteWidth(mt.getElementType());
+      liveTgBytes += memdescFlatSize(mt) * byteWidth(mt.getElementType());
     });
     for (Block &blk : func.getBody())
       for (Operation &op : blk)
@@ -247,9 +243,8 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     msl::Type *sc = astScalarType(ty);
     std::string id = fresh();
     // *(constant sc*)(argbuf + off)
-    msl::Expr *addr = ctx.paren(
-        ctx.binary(msl::BinOp::Add, ctx.var(argbufId),
-                   ctx.lit(std::to_string(off))));
+    msl::Expr *addr = ctx.paren(ctx.binary(msl::BinOp::Add, ctx.var(argbufId),
+                                           ctx.lit(std::to_string(off))));
     prologue.push_back(ctx.declStmt(
         sc, id,
         ctx.deref(ctx.cast(msl::Cast::Style::CStyle,
@@ -282,8 +277,8 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
   int64_t kernelPool = moduleHasDevFuncs ? globalPoolBytes : poolBytes;
   if (kernelPool > 0) {
     poolBuf = "__pool";
-    prologue.push_back(ctx.arrayDeclStmt(ctx.named("threadgroup char"),
-                                         poolBuf, kernelPool));
+    prologue.push_back(
+        ctx.arrayDeclStmt(ctx.named("threadgroup char"), poolBuf, kernelPool));
   }
 
   Region &region = func.getBody();
@@ -370,9 +365,9 @@ LogicalResult MSLEmitter::emitDeviceFunc(tt::FuncOp func) {
   curDevFunc = nullptr;
   for (msl::Stmt *s : body)
     prologue.push_back(s);
-  msl::DeviceFn *fn = ctx.deviceFn(astDeviceRetType(func),
-                                   mslDeviceFuncName(func.getName()), params,
-                                   std::move(prologue));
+  msl::DeviceFn *fn =
+      ctx.deviceFn(astDeviceRetType(func), mslDeviceFuncName(func.getName()),
+                   params, std::move(prologue));
   msl::MSLPrinter printer(os);
   printer.print(fn);
   return success();

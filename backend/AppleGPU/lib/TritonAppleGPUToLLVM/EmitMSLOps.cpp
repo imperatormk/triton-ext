@@ -570,12 +570,9 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   if (isa<arith::AddFOp, arith::MulFOp, arith::SubFOp, arith::DivFOp,
           tt::PreciseDivFOp>(op))
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astElementwiseExpr(
-          isa<arith::AddFOp>(op)   ? B::Add
-          : isa<arith::SubFOp>(op) ? B::Sub
-          : isa<arith::MulFOp>(op) ? B::Mul
-                                   : B::Div,
-          nullptr, opnd(op->getOperand(0), r), opnd(op->getOperand(1), r));
+      return astElementwiseExpr(arithBinOp(op), nullptr,
+                                opnd(op->getOperand(0), r),
+                                opnd(op->getOperand(1), r));
     });
 
   // Integer add/sub/mul/div/rem (astIntBinaryExpr handles the i1 and unsigned
@@ -595,11 +592,9 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
 
   // Bitwise/logical and/or/xor.
   if (isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op)) {
-    B bo = isa<arith::AndIOp>(op) ? B::And
-           : isa<arith::OrIOp>(op) ? B::Or
-                                   : B::Xor;
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astElementwiseExpr(bo, nullptr, opnd(op->getOperand(0), r),
+      return astElementwiseExpr(arithBinOp(op), nullptr,
+                                opnd(op->getOperand(0), r),
                                 opnd(op->getOperand(1), r));
     });
   }

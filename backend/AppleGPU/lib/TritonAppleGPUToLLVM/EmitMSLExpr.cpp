@@ -50,16 +50,22 @@ msl::Expr *MSLEmitter::astFloatLit(const APFloat &v, StringRef sc) {
 // AST sub-expression builders (binary / minmax / unary / ternary)
 //===----------------------------------------------------------------------===//
 
-static msl::BinOp intBinOp(Operation *op) {
-  if (isa<arith::AddIOp>(op))
+msl::BinOp arithBinOp(Operation *op) {
+  if (isa<arith::AddFOp, arith::AddIOp>(op))
     return msl::BinOp::Add;
-  if (isa<arith::SubIOp>(op))
+  if (isa<arith::SubFOp, arith::SubIOp>(op))
     return msl::BinOp::Sub;
-  if (isa<arith::MulIOp>(op))
+  if (isa<arith::MulFOp, arith::MulIOp>(op))
     return msl::BinOp::Mul;
-  if (isa<arith::DivSIOp, arith::DivUIOp>(op))
+  if (isa<arith::DivFOp, tt::PreciseDivFOp, arith::DivSIOp, arith::DivUIOp>(op))
     return msl::BinOp::Div;
-  return msl::BinOp::Rem;
+  if (isa<arith::RemSIOp, arith::RemUIOp>(op))
+    return msl::BinOp::Rem;
+  if (isa<arith::AndIOp>(op))
+    return msl::BinOp::And;
+  if (isa<arith::OrIOp>(op))
+    return msl::BinOp::Or;
+  return msl::BinOp::Xor;
 }
 
 msl::Expr *MSLEmitter::astElementwiseExpr(msl::BinOp op, msl::Type *opCast,
@@ -73,7 +79,7 @@ msl::Expr *MSLEmitter::astElementwiseExpr(msl::BinOp op, msl::Type *opCast,
 
 msl::Expr *MSLEmitter::astIntBinaryExpr(Operation *op, StringRef a,
                                         StringRef b) {
-  msl::BinOp o = intBinOp(op);
+  msl::BinOp o = arithBinOp(op);
   Type resElem = elementScalarType(op->getResult(0).getType());
   if (auto it = dyn_cast<IntegerType>(resElem); it && it.getWidth() == 1) {
     // (bool)((((int)a) o ((int)b)) & 1)

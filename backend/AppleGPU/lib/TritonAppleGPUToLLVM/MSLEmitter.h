@@ -124,6 +124,9 @@ inline Type elementScalarType(Type t) {
   return t;
 }
 
+// arith add/sub/mul/div/rem/and/or/xor op -> msl::BinOp.
+msl::BinOp arithBinOp(Operation *op);
+
 // Forwarding stream: `os` writes here, and the sink can be retargeted so a
 // design-sanctioned raw leaf's text can be captured into a buffer (RawStmt).
 class ForwardOStream : public llvm::raw_ostream {

@@ -164,18 +164,6 @@ private:
   ForwardOStream fwd;
   raw_ostream &os;
 
-  // Capture the text `fn` writes to `os` into a verbatim RawStmt. Used for the
-  // design-sanctioned raw leaves (fp-emulated CAS, fp-narrowing) that have no
-  // dedicated node kind.
-  template <typename Fn> msl::Stmt *captureRaw(Fn &&fn) {
-    std::string buf;
-    llvm::raw_string_ostream ss(buf);
-    llvm::raw_ostream *prev = fwd.swap(&ss);
-    fn();
-    ss.flush();
-    fwd.swap(prev);
-    return ctx.rawVerbatim(buf);
-  }
   // AST arena. Builders allocate nodes into it and the printer renders them.
   msl::MSLContext ctx;
 
@@ -703,42 +691,6 @@ private:
 
   static int64_t dotCBandRows(int64_t M, int64_t N, int64_t cBudget,
                               int64_t accBytes);
-
-  // Design-sanctioned Raw escape-hatch leaves (see EmitMSLRawLeaves.cpp): the
-  // fp32->half/bfloat narrowing (rtne full / rtz / rtne integer) and the
-  // emulated fp32 / packed-fp16 CAS loops.
-  std::string emitRoundedHalfValueFull(const std::string &sc,
-                                       const std::string &v);
-  std::string emitTruncatedFloatValue(const std::string &sc,
-                                      const std::string &v);
-  std::string emitRoundedHalfValue(const std::string &sc, const std::string &v);
-  std::pair<std::string, std::string> emitPacked16Base(const std::string &p,
-                                                       const std::string &sc);
-  void emitPacked16CASLoop(const std::string &wordPtr,
-                           const std::string &isHigh, const std::string &sc,
-                           const std::string &curId,
-                           const std::string &newHalfExpr,
-                           const std::string &id);
-  void emitFloat32CASLoop(const std::string &p, const std::string &curId,
-                          const std::string &newFloatExpr,
-                          const std::string &id);
-
-  static std::string floatRmwExpr(tt::RMWOp kind, const std::string &cur,
-                                  const std::string &v) {
-    switch (kind) {
-    case tt::RMWOp::ADD:
-    case tt::RMWOp::FADD:
-      return cur + " + " + v;
-    case tt::RMWOp::MAX:
-      return "fmax(" + cur + ", " + v + ")";
-    case tt::RMWOp::MIN:
-      return "fmin(" + cur + ", " + v + ")";
-    case tt::RMWOp::XCHG:
-      return v;
-    default:
-      return v;
-    }
-  }
 
   static std::string init0(const std::string &sc);
 };

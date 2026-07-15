@@ -830,10 +830,8 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
       return astCastExpr(op, reg(op->getOperand(0), r));
     });
-  // TruncF / FpToFp: f32->half/bfloat narrowing emits a self-contained
-  // multi-line block (RTZ or RTNE); other float casts are a plain static_cast.
-  // The narrowing block is a captureRaw leaf (imperative multi-stmt) that still
-  // advances the real nextId + binds valMap.
+  // TruncF / FpToFp: f32->half/bfloat narrowing calls a preamble helper
+  // (tt_rtz_* / tt_rtne_*); other float casts are a plain static_cast.
   if (isa<arith::TruncFOp, tt::FpToFpOp>(op)) {
     std::string dst =
         mslScalarType(elementScalarType(op->getResult(0).getType()));
@@ -849,20 +847,14 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
       narrow = true;
     }
     if (narrow) {
-      auto &a = names(op->getOperand(0));
-      int rc = regCount(op->getResult(0));
-      SmallVector<std::string> ids;
-      for (int r = 0; r < rc; ++r) {
-        const std::string &v = a[a.size() == 1 ? 0 : r];
-        std::string out;
-        body.push_back(captureRaw([&] {
-          out = rtz ? emitTruncatedFloatValue(dst, v)
-                    : emitRoundedHalfValueFull(dst, v);
-        }));
-        ids.push_back(out);
-      }
-      valMap[op->getResult(0)] = ids;
-      return true;
+      std::string fn = std::string(rtz ? "tt_rtz_" : "tt_rtne_") + dst;
+      msl::Type *dstTy = astScalarType(resElem);
+      return astDeclBind(op, dstTy, body, [&](int r) {
+        msl::Expr *f = ctx.cast(msl::Cast::Style::CStyle,
+                                ctx.scalar(msl::Scalar::F32),
+                                ctx.var(reg(op->getOperand(0), r)));
+        return ctx.call(fn, {f});
+      });
     }
     // Non-narrowing float cast: static_cast<dst>(v).
     return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
@@ -1614,25 +1606,37 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
       }
       msl::Block inner;
       if (floatEmulated) {
-        // Self-contained emulated CAS loop: captured verbatim (advances
-        // nextId). Bake indentation for the guard-body depth (inner nests
-        // inside ifScope).
-        int savedInd = indent;
-        if (guard)
-          ++indent;
-        inner.push_back(captureRaw([&] {
-          std::string cur = fresh();
-          if (bw == 16) {
-            std::string vh = emitRoundedHalfValue(sc, v);
-            std::string newExpr = floatRmwExpr(kind, cur, vh);
-            auto base = emitPacked16Base(p, sc);
-            emitPacked16CASLoop(base.first, base.second, sc, cur, newExpr, id);
-          } else {
-            std::string newExpr = floatRmwExpr(kind, cur, "(float)(" + v + ")");
-            emitFloat32CASLoop(p, cur, newExpr, id);
-          }
-        }));
-        indent = savedInd;
+        int rmwOp = kind == tt::RMWOp::MAX  ? 1
+                    : kind == tt::RMWOp::MIN ? 2
+                    : (kind == tt::RMWOp::ADD || kind == tt::RMWOp::FADD)
+                        ? 0
+                        : 3;
+        msl::Expr *fv = ctx.cast(msl::Cast::Style::CStyle,
+                                 ctx.scalar(msl::Scalar::F32), ctx.var(v));
+        msl::Expr *call;
+        if (bw == 16) {
+          std::string bytePtr = fresh(), wordPtr = fresh(), isHigh = fresh();
+          inner.push_back(ctx.declStmt(ctx.named("device uchar *"), bytePtr,
+                                       ctx.raw("(device uchar *)(" + p + ")")));
+          inner.push_back(
+              ctx.declStmt(ctx.scalar(msl::Scalar::I1), isHigh,
+                           ctx.raw("((size_t)" + bytePtr + " & 2u) != 0u")));
+          inner.push_back(ctx.declStmt(
+              ctx.named("device atomic_uint *"), wordPtr,
+              ctx.raw("(device atomic_uint *)((size_t)" + bytePtr +
+                      " & ~(size_t)3)")));
+          call = ctx.call("tt_atomic_rmw_packed16_" + sc,
+                          {ctx.var(wordPtr), ctx.var(isHigh), fv,
+                           ctx.i32lit(rmwOp)});
+        } else {
+          std::string wordPtr = fresh();
+          inner.push_back(
+              ctx.declStmt(ctx.named("device atomic_uint *"), wordPtr,
+                           ctx.raw("(device atomic_uint *)(" + p + ")")));
+          call = ctx.call("tt_atomic_rmw_f32",
+                          {ctx.var(wordPtr), fv, ctx.i32lit(rmwOp)});
+        }
+        inner.push_back(ctx.assignStmt(ctx.var(id), call));
       } else {
         // Metal device atomics are relaxed-only; acquire/release/acq_rel are
         // not valid MSL memory orders (the acq_rel form fails to compile).

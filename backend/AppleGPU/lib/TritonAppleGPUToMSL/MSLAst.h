@@ -339,11 +339,7 @@ struct CompactIfStmt : Stmt {
 
 struct RawStmt : Stmt {
   llvm::StringRef text;
-  // verbatim => print text exactly (no indent, no trailing newline); used by
-  // captureRaw, where `text` already carries indentation+newlines.
-  bool verbatim;
-  RawStmt(llvm::StringRef t, bool verbatim)
-      : Stmt(Kind::Raw), text(t), verbatim(verbatim) {}
+  RawStmt(llvm::StringRef t) : Stmt(Kind::Raw), text(t) {}
   static bool classof(const Stmt *s) { return s->kind == Kind::Raw; }
 };
 
@@ -569,10 +565,7 @@ public:
   CompactIfStmt *compactIfBare(Expr *c, Stmt *t) {
     return make<CompactIfStmt>(c, t, false);
   }
-  RawStmt *rawStmt(llvm::StringRef t) { return make<RawStmt>(save(t), false); }
-  RawStmt *rawVerbatim(llvm::StringRef t) {
-    return make<RawStmt>(save(t), true);
-  }
+  RawStmt *rawStmt(llvm::StringRef t) { return make<RawStmt>(save(t)); }
 
   // --- Attrs / Params ---
   Attr *bufferAttr(unsigned n) { return make<Attr>(Attr::Kind::Buffer, n); }

@@ -15,6 +15,8 @@ public:
   explicit MSLPrinter(llvm::raw_ostream &os) : os(os) {}
 
   void printPreamble();
+  void printNarrowingHelpers();
+  void printAtomicHelpers();
   void printType(const Type *t);
   void printExpr(const Expr *e);
   void printStmt(const Stmt *s);

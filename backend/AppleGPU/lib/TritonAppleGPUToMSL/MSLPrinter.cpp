@@ -485,11 +485,7 @@ void MSLPrinter::printStmt(const Stmt *s) {
     return;
   }
   case Stmt::Kind::Raw: {
-    auto *r = llvm::cast<RawStmt>(s);
-    if (r->verbatim)
-      os << r->text;
-    else
-      ind() << r->text << "\n";
+    ind() << llvm::cast<RawStmt>(s)->text << "\n";
     return;
   }
   case Stmt::Kind::KernelFn: {
@@ -662,15 +658,168 @@ void MSLPrinter::printPreamble() {
   os << "#include <metal_stdlib>\n";
   os << "#include <metal_simdgroup_matrix>\n";
   os << "using namespace metal;\n\n";
-  os << "static inline float tt_erf(float x){\n"
-        "  float t = 1.0f/(1.0f+0.5f*metal::fabs(x));\n"
-        "  float y = "
-        "t*metal::exp(-x*x-1.26551223f+t*(1.00002368f+t*(0.37409196f"
-        "+t*(0.09678418f+t*(-0.18628806f+t*(0.27886807f+t*(-1.13520398f"
-        "+t*(1.48851587f+t*(-0.82215223f+t*0.17087277f)))))))));\n"
-        "  float r = 1.0f - y;\n"
-        "  return x >= 0.0f ? r : -r;\n"
-        "}\n\n";
+  os << R"MSL(static inline float tt_erf(float x){
+  float t = 1.0f/(1.0f+0.5f*metal::fabs(x));
+  float y = t*metal::exp(-x*x-1.26551223f+t*(1.00002368f+t*(0.37409196f+t*(0.09678418f+t*(-0.18628806f+t*(0.27886807f+t*(-1.13520398f+t*(1.48851587f+t*(-0.82215223f+t*0.17087277f)))))))));
+  float r = 1.0f - y;
+  return x >= 0.0f ? r : -r;
+}
+
+)MSL";
+  printNarrowingHelpers();
+  printAtomicHelpers();
+}
+
+//===----------------------------------------------------------------------===//
+// fp32 -> half/bfloat narrowing helpers (IEEE-exact; used by fp_to_fp and the
+// emulated fp atomics). tt_rtne_* is round-to-nearest-even with full
+// NaN/Inf/overflow/subnormal handling; tt_rtz_* is round-toward-zero;
+// tt_rtne_int_* is the integer round variant the CAS loops narrow with (an
+// (half)/(bfloat) cast whose only consumer re-widens gets folded away by Metal
+// fast-math, dropping the round).
+//===----------------------------------------------------------------------===//
+
+void MSLPrinter::printNarrowingHelpers() {
+  os << R"MSL(static inline half tt_rtne_half(float v){
+  uint u = as_type<uint>(v);
+  ushort bits;
+  uint sgn = (u >> 16) & 0x8000u;
+  int e32 = (int)((u >> 23) & 0xffu);
+  uint mant = u & 0x7fffffu;
+  int ex = e32 - 112;
+  if (e32 == 0xff) {
+    bits = (ushort)(sgn | 0x7c00u | (mant ? 0x200u : 0u));
+  } else if (ex >= 31) {
+    bits = (ushort)(sgn | 0x7c00u);
+  } else if (ex <= 0) {
+    if (ex < -10) { bits = (ushort)sgn; }
+    else {
+      uint fm = mant | 0x800000u;
+      int sh = 14 - ex;
+      uint m = fm >> sh;
+      uint rem = fm & ((1u << sh) - 1u);
+      uint half_ = 1u << (sh - 1);
+      if (rem > half_ || (rem == half_ && (m & 1u))) m += 1;
+      bits = (ushort)(sgn | m);
+    }
+  } else {
+    uint m = mant >> 13;
+    uint rem = mant & 0x1fffu;
+    bits = (ushort)(sgn | ((uint)ex << 10) | m);
+    if (rem > 0x1000u || (rem == 0x1000u && (m & 1u))) bits += 1;
+  }
+  return as_type<half>(bits);
+}
+
+static inline bfloat tt_rtne_bfloat(float v){
+  uint u = as_type<uint>(v);
+  ushort bits;
+  int e32 = (int)((u >> 23) & 0xffu);
+  uint mant = u & 0x7fffffu;
+  if (e32 == 0xff) {
+    bits = (ushort)(((u >> 16) & 0xffffu) | (mant ? 0x40u : 0u));
+  } else {
+    uint r = (u >> 16) & 1u;
+    uint t = (u + 0x7fffu + r);
+    bits = (ushort)((t >> 16) & 0xffffu);
+  }
+  return as_type<bfloat>(bits);
+}
+
+static inline half tt_rtz_half(float v){
+  uint u = as_type<uint>(v);
+  ushort bits;
+  uint sgn = (u >> 16) & 0x8000u;
+  int ex = (int)((u >> 23) & 0xffu) - 112;
+  uint mant = u & 0x7fffffu;
+  if (((u >> 23) & 0xffu) == 0xffu) {
+    bits = (ushort)(sgn | 0x7c00u | (mant ? 0x200u : 0u));
+  } else if (ex >= 31) {
+    bits = (ushort)(sgn | 0x7bffu);
+  } else if (ex <= 0) {
+    if (ex < -10) { bits = (ushort)sgn; }
+    else { uint m = (mant | 0x800000u) >> (14 - ex); bits = (ushort)(sgn | m); }
+  } else {
+    bits = (ushort)(sgn | ((uint)ex << 10) | (mant >> 13));
+  }
+  return as_type<half>(bits);
+}
+
+static inline bfloat tt_rtz_bfloat(float v){
+  uint u = as_type<uint>(v);
+  return as_type<bfloat>((ushort)((u >> 16) & 0xffffu));
+}
+
+static inline half tt_rtne_int_half(float v){
+  uint u = as_type<uint>(v);
+  ushort bits;
+  uint sgn = (u >> 16) & 0x8000u;
+  int ex = (int)((u >> 23) & 0xffu) - 112;
+  uint mant = u & 0x7fffffu;
+  if (ex <= 0) {
+    bits = (ushort)sgn;
+  } else if (ex >= 31) {
+    bits = (ushort)(sgn | 0x7c00u);
+  } else {
+    uint m = mant >> 13;
+    uint rem = mant & 0x1fffu;
+    bits = (ushort)(sgn | ((uint)ex << 10) | m);
+    if (rem > 0x1000u || (rem == 0x1000u && (m & 1u))) bits += 1;
+  }
+  return as_type<half>(bits);
+}
+
+static inline bfloat tt_rtne_int_bfloat(float v){
+  uint u = as_type<uint>(v);
+  uint r = (u >> 16) & 1u;
+  return as_type<bfloat>((ushort)(((u + 0x7fffu + r) >> 16) & 0xffffu));
+}
+
+)MSL";
+}
+
+//===----------------------------------------------------------------------===//
+// Emulated fp atomic RMW helpers (Metal's atomic_float is fetch_add-only;
+// max/min/xchg and all packed-fp16 RMW need CAS emulation). `op`: 0=add,
+// 1=max, 2=min, 3=xchg. Each returns the pre-op value.
+//===----------------------------------------------------------------------===//
+
+void MSLPrinter::printAtomicHelpers() {
+  os << R"MSL(static inline float tt_atomic_rmw_f32(device atomic_uint *p, float v, int op){
+  uint word = atomic_load_explicit(p, memory_order_relaxed);
+  while (true) {
+    float cur = as_type<float>(word);
+    float nv = (op == 0) ? (cur + v) : (op == 1) ? fmax(cur, v) : (op == 2) ? fmin(cur, v) : v;
+    uint nw = as_type<uint>(nv);
+    if (atomic_compare_exchange_weak_explicit(p, &word, nw, memory_order_relaxed, memory_order_relaxed)) return cur;
+  }
+}
+
+static inline half tt_atomic_rmw_packed16_half(device atomic_uint *word, bool isHigh, float v, int op){
+  half vh = tt_rtne_int_half(v);
+  uint w = atomic_load_explicit(word, memory_order_relaxed);
+  while (true) {
+    ushort lane = (ushort)((isHigh) ? (w >> 16) : (w & 0xffffu));
+    half cur = as_type<half>(lane);
+    half nl = (half)((op == 0) ? (cur + vh) : (op == 1) ? fmax(cur, vh) : (op == 2) ? fmin(cur, vh) : vh);
+    uint nw = (isHigh) ? ((w & 0x0000ffffu) | ((uint)as_type<ushort>(nl) << 16)) : ((w & 0xffff0000u) | (uint)as_type<ushort>(nl));
+    if (atomic_compare_exchange_weak_explicit(word, &w, nw, memory_order_relaxed, memory_order_relaxed)) return cur;
+  }
+}
+
+static inline bfloat tt_atomic_rmw_packed16_bfloat(device atomic_uint *word, bool isHigh, float v, int op){
+  bfloat vh = tt_rtne_int_bfloat(v);
+  uint w = atomic_load_explicit(word, memory_order_relaxed);
+  while (true) {
+    ushort lane = (ushort)((isHigh) ? (w >> 16) : (w & 0xffffu));
+    bfloat cur = as_type<bfloat>(lane);
+    bfloat nl = (bfloat)((op == 0) ? (cur + vh) : (op == 1) ? fmax(cur, vh) : (op == 2) ? fmin(cur, vh) : vh);
+    uint nw = (isHigh) ? ((w & 0x0000ffffu) | ((uint)as_type<ushort>(nl) << 16)) : ((w & 0xffff0000u) | (uint)as_type<ushort>(nl));
+    if (atomic_compare_exchange_weak_explicit(word, &w, nw, memory_order_relaxed, memory_order_relaxed)) return cur;
+  }
+}
+
+)MSL";
 }
 
 } // namespace mlir::triton::applegpu::msl

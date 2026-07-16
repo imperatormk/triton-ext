@@ -41,12 +41,14 @@ jobs:
           # (Blackwell/CDNA silicon) with no Apple equivalent so all 1728 cases
           # fail by construction; and the 100000-element rand/randn statistical
           # variants, which are slow and single-worker for no added coverage.
+          # test_matmul.py is omitted: its skipif decorators call
+          # torch.cuda.get_device_capability() at import, which aborts
+          # collection for the whole run on a machine without CUDA.
           "$VENV/bin/python" -m pytest \
             unit/language/test_core.py \
             unit/language/test_standard.py \
             unit/language/test_conversions.py \
             unit/language/test_random.py \
-            unit/language/test_matmul.py \
             unit/language/test_block_pointer.py \
             unit/language/test_tuple.py \
             unit/language/test_annotations.py \
@@ -54,7 +56,7 @@ jobs:
             unit/language/test_libdevice.py \
             unit/language/test_compile_errors.py \
             unit/language/test_compile_only.py \
-            --device mps -n 8 \
+            --device mps -n 4 \
             --deselect unit/language/test_core.py::test_scaled_dot \
             -k "not (100000 and (test_rand or test_randn))" \
             -p applegpu_conftest \

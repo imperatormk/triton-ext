@@ -35,10 +35,14 @@ jobs:
           export PYTHONPATH="$GITHUB_WORKSPACE/ci:$DEPS/triton_apple_backend_pkg"
           rm -rf "$HOME/.triton/cache"
           cd "$TRITON_SRC/python/test"
-          # Nothing is deselected; the known baseline is xfailed instead, so
-          # anything red here is new. -n 4 matches the Mini's 4 perf cores.
+          # The known baseline is xfailed rather than filtered, so anything red
+          # here is new. test_scaled_dot is the exception: tt.dot_scaled is
+          # block-scaled MMA (Blackwell/CDNA silicon) with no Apple equivalent,
+          # so all 1728 cases fail by construction; deselect rather than carry
+          # them as xfails. -n 4 matches the Mini's 4 performance cores.
           "$VENV/bin/python" -m pytest unit/language/test_core.py \
             --device mps -n 4 \
+            --deselect unit/language/test_core.py::test_scaled_dot \
             -p applegpu_conftest \
             -p no:cacheprovider -p no:warnings \
             -o markers=interpreter \

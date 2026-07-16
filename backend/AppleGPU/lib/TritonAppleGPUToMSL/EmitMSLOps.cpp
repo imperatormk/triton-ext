@@ -407,10 +407,19 @@ bool MSLEmitter::astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
   return true;
 }
 
+bool MSLEmitter::needsCoherentDeref(Value ptr) const {
+  if (coherentScalarPtrs.empty() || !ptr)
+    return false;
+  if (isa<RankedTensorType>(ptr.getType()))
+    return false;
+  Value base = traceToKernelArg(ptr);
+  return base && coherentScalarPtrs.contains(base);
+}
+
 // `*p`, or the coherent-cast deref `*(device coherent(device) sc*)p` when a
-// scalar spinlock forces a coherent access.
-msl::Expr *MSLEmitter::astDerefPtr(Value, StringRef name, StringRef scName) {
-  if (scalarSpinlock) {
+// scalar spinlock or a loop-carried scalar RMW forces a coherent access.
+msl::Expr *MSLEmitter::astDerefPtr(Value ptr, StringRef name, StringRef scName) {
+  if (scalarSpinlock || needsCoherentDeref(ptr)) {
     // Exact `device coherent(device) sc*` cast form used by the load/store path
     // (the printer's plain coherent-ptr form omits the leading `device`).
     msl::Type *cp = ctx.named("device coherent(device) " + scName.str() + "*");

@@ -330,6 +330,26 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
       scalarSpinlock = true;
   });
 
+  coherentScalarPtrs.clear();
+  func.walk([&](LoopLikeOpInterface loop) {
+    DenseSet<Value> stored;
+    loop->walk([&](tt::StoreOp st) {
+      if (isa<RankedTensorType>(st.getPtr().getType()))
+        return;
+      if (Value base = traceToKernelArg(st.getPtr()))
+        stored.insert(base);
+    });
+    if (stored.empty())
+      return;
+    loop->walk([&](tt::LoadOp ld) {
+      if (isa<RankedTensorType>(ld.getPtr().getType()))
+        return;
+      Value base = traceToKernelArg(ld.getPtr());
+      if (base && stored.contains(base))
+        coherentScalarPtrs.insert(base);
+    });
+  });
+
   poolBytes = 0;
   liveTgBytes = 0;
   func.walk([&](ttg::LocalAllocOp la) {

@@ -18,6 +18,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -466,6 +467,12 @@ private:
 
   std::string tgposId, tidId, numTgId, laneId, warpId;
   bool scalarSpinlock = false;
+  // Scalar kernel-arg pointers a loop both loads and thread-predicates a store
+  // to. The macOS 26 Metal compiler forwards a stale value into such a load
+  // across the guarded store, dropping an iteration's update; a coherent deref
+  // blocks the forwarding. Keyed by the traced-to base kernel argument.
+  DenseSet<Value> coherentScalarPtrs;
+  bool needsCoherentDeref(Value ptr) const;
 
   LayoutExprBuilder layout{ctx, laneId, warpId, tgposId};
 
@@ -482,6 +489,8 @@ private:
   DenseMap<Operation *, std::string> directStoreHandled;
 
   static bool tracesToKernelArg(Value v);
+
+  static Value traceToKernelArg(Value v);
 
   static Value peelBroadcastExpand(Value v);
 

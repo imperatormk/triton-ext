@@ -823,10 +823,12 @@ msl::Expr *MSLEmitter::astReadbackValue(StringRef buf, msl::Expr *off,
                     ctx.var(base));
 }
 
-bool MSLEmitter::tracesToKernelArg(Value v) {
+// Walk back through addptr/splat/bitcast to the underlying pointer; returns the
+// base BlockArgument, or null when the chain leaves kernel-arg territory.
+Value MSLEmitter::traceToKernelArg(Value v) {
   while (v) {
     if (isa<BlockArgument>(v))
-      return true;
+      return v;
     Operation *def = v.getDefiningOp();
     if (auto ap = dyn_cast_or_null<tt::AddPtrOp>(def)) {
       v = ap.getPtr();
@@ -840,9 +842,13 @@ bool MSLEmitter::tracesToKernelArg(Value v) {
       v = bc.getSrc();
       continue;
     }
-    return false;
+    return Value();
   }
-  return false;
+  return Value();
+}
+
+bool MSLEmitter::tracesToKernelArg(Value v) {
+  return static_cast<bool>(traceToKernelArg(v));
 }
 
 Value MSLEmitter::peelBroadcastExpand(Value v) {

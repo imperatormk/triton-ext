@@ -1,0 +1,4 @@
+FAILED python/test/unit/language/test_core.py::test_dot3d[8-16-64-64-64-32-32-int8-int8] - triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 49156, Hardware limit: 32768. Reducing block sizes or `num_stages` may help.
+FAILED python/test/unit/language/test_core.py::test_dot3d[8-16-32-32-32-32-32-int8-int8] - triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 40964, Hardware limit: 32768. Reducing block sizes or `num_stages` may help.
+FAILED python/test/unit/language/test_core.py::test_dot3d[8-16-32-32-32-32-32-float16-float32] - triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 40964, Hardware limit: 32768. Reducing block sizes or `num_stages` may help.
+FAILED python/test/unit/language/test_core.py::test_tl_range_num_stages - triton.runtime.errors.OutOfResources: shared memory exceeds 32KB with num_stages=5

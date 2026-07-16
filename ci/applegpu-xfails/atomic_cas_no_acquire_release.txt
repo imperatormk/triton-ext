@@ -1,0 +1,5 @@
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-None] - Metal lacks acquire/release atomics + no int64 atomics
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-acquire] - Metal lacks acquire/release atomics + no int64 atomics
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-release] - Metal lacks acquire/release atomics + no int64 atomics
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-acq_rel] - Metal lacks acquire/release atomics + no int64 atomics
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-relaxed] - Metal lacks acquire/release atomics + no int64 atomics

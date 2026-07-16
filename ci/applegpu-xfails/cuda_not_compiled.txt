@@ -1,0 +1,3 @@
+FAILED python/test/unit/language/test_core.py::test_no_rematerialization_op - AssertionError: Torch not compiled with CUDA enabled
+FAILED python/test/unit/language/test_core.py::test_pointer_arguments[cuda] - AssertionError: Torch not compiled with CUDA enabled
+FAILED python/test/unit/language/test_core.py::test_zero_strided_tensors - RuntimeError: PyTorch was compiled without CUDA support

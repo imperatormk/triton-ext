@@ -15,6 +15,8 @@ jobs:
       DEPS: /Users/Shared/playground/deps
       TRITON_SRC: /Users/zimski/projects/oss/triton-main
     steps:
+      - uses: actions/checkout@v4
+
       - name: Report host + GPU
         run: |
           echo "host: $(hostname)  arch: $(uname -m)  macOS: $(sw_vers -productVersion)"
@@ -28,18 +30,21 @@ jobs:
         run: |
           export TRITON_PLUGIN_PATHS="$DEPS/lib/libapplegpu_backend.dylib"
           export TRITON_PASS_PLUGIN_PATH="$DEPS/lib/libapplegpu_backend.dylib"
-          export PYTHONPATH="$DEPS/triton_apple_backend_pkg"
+          # ci/ carries applegpu_conftest, loaded as a plugin rather than
+          # dropped in as conftest.py: the upstream suite has its own.
+          export PYTHONPATH="$GITHUB_WORKSPACE/ci:$DEPS/triton_apple_backend_pkg"
           rm -rf "$HOME/.triton/cache"
           cd "$TRITON_SRC/python/test"
-          # Nothing is deselected: the whole suite runs and the failures are the
-          # report. They get triaged into xfails, not filtered out of sight.
+          # Nothing is deselected; the known baseline is xfailed instead, so
+          # anything red here is new. -n 4 matches the Mini's 4 perf cores.
           "$VENV/bin/python" -m pytest unit/language/test_core.py \
-            --device mps \
+            --device mps -n 4 \
+            -p applegpu_conftest \
             -p no:cacheprovider -p no:warnings \
             -o markers=interpreter \
             -q --no-header --timeout=600 \
             --junitxml="$RUNNER_TEMP/applegpu-core-results.xml" \
-            || echo "PYTEST_EXIT=$? (failures expected until triaged into xfails)"
+            || echo "PYTEST_EXIT=$?"
 
       - name: Summarize
         if: always()

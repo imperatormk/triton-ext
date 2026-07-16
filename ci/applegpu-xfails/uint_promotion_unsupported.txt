@@ -1,0 +1,9 @@
+FAILED python/test/unit/language/test_core.py::test_full[shape0-uint16] - RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt16 and Long
+FAILED python/test/unit/language/test_core.py::test_full[shape0-uint32] - RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt32 and Long
+FAILED python/test/unit/language/test_core.py::test_full[shape0-uint64] - RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt64 and Long
+FAILED python/test/unit/language/test_core.py::test_full[shape1-uint16] - RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt16 and Long
+FAILED python/test/unit/language/test_core.py::test_full[shape1-uint32] - RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt32 and Long
+FAILED python/test/unit/language/test_core.py::test_full[shape1-uint64] - RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt64 and Long
+FAILED python/test/unit/language/test_core.py::test_full[shape2-uint16] - RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt16 and Long
+FAILED python/test/unit/language/test_core.py::test_full[shape2-uint32] - RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt32 and Long
+FAILED python/test/unit/language/test_core.py::test_full[shape2-uint64] - RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt64 and Long

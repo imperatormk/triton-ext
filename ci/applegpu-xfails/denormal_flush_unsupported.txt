@@ -1,0 +1,1 @@
+FAILED python/test/unit/language/test_conversions.py::test_typeconvert_upcast[float16-float32] - AssertionError: Metal flushes float32 denormals to zero (FTZ); the test emulated reference relies on denormal arithmetic, so subnormal f16 upcasts mismatch. Hardware limit.

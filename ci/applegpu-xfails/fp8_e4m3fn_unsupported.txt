@@ -1,0 +1,13 @@
+FAILED python/test/unit/language/test_core.py::test_cast[1-float8_e4m3fn-float16-False-1024] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-float8_e4m3fn-float16-False-32] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-float8_e4m3fn-float32-False-1024] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-float8_e4m3fn-float32-False-32] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-float8_e4m3fn-bfloat16-False-1024] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-float8_e4m3fn-bfloat16-False-32] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-float16-float8_e4m3fn-False-1024] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-float16-float8_e4m3fn-False-32] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-float32-float8_e4m3fn-False-1024] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-float32-float8_e4m3fn-False-32] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-bfloat16-float8_e4m3fn-False-1024] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_cast[1-bfloat16-float8_e4m3fn-False-32] - TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype.
+FAILED python/test/unit/language/test_core.py::test_atomic_unsupported_type[float8_e4m3fn] - RuntimeError: Undefined type Float8_e4m3fn (torch.zeros float8 on MPS, before triton runs)

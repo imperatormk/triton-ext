@@ -4,6 +4,9 @@
 Reads ci/applegpu-xfails/<reason>.txt (raw `FAILED <nodeid> - <msg>` pytest
 lines, one file per failure category) and writes ci/applegpu_xfails.txt as
 `<nodeid> <reason>` rows, so the conftest does no parsing at collection time.
+
+Entries listed in ci/applegpu-fixed.txt are dropped: those are baseline
+failures that now pass (run_mps_tests.sh emits the list as results/fixed.txt).
 """
 
 import pathlib
@@ -11,25 +14,36 @@ import sys
 
 HERE = pathlib.Path(__file__).parent
 SRC = HERE / "applegpu-xfails"
+FIXED = HERE / "applegpu-fixed.txt"
 OUT = HERE / "applegpu_xfails.txt"
 
 
+def _key(nodeid):
+    # pytest's nodeid is rootdir-relative and the rootdir differs between a
+    # collect-only pass and a run, so key on the file-and-test tail. Only the
+    # directories are stripped; test params can contain '/'.
+    file_part, sep, rest = nodeid.partition("::")
+    return f"{file_part.split('/')[-1]}{sep}{rest}"
+
+
+def _nodeids(path):
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line.startswith("FAILED "):
+            continue
+        nodeid = line[len("FAILED "):].split(" - ", 1)[0].strip()
+        if "::" in nodeid:
+            yield _key(nodeid)
+
+
 def main():
+    fixed = set(_nodeids(FIXED)) if FIXED.is_file() else set()
+
     rows = {}
     for path in sorted(SRC.glob("*.txt")):
-        reason = path.stem
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line.startswith("FAILED "):
-                continue
-            nodeid = line[len("FAILED "):].split(" - ", 1)[0].strip()
-            if "::" not in nodeid:
-                continue
-            # Key on the file-and-test tail: pytest's nodeid is rootdir-relative
-            # and the rootdir differs between collection and run. Only the
-            # directories are stripped; test params can contain '/'.
-            file_part, rest = nodeid.split("::", 1)
-            rows.setdefault(f"{file_part.split('/')[-1]}::{rest}", reason)
+        for nodeid in _nodeids(path):
+            if nodeid not in fixed:
+                rows.setdefault(nodeid, path.stem)
 
     with OUT.open("w") as f:
         f.write("# AppleGPU known-failure baseline: <nodeid> <reason>\n")
@@ -37,7 +51,7 @@ def main():
         for nodeid in sorted(rows):
             f.write(f"{nodeid} {rows[nodeid]}\n")
 
-    print(f"wrote {OUT} ({len(rows)} nodeids)")
+    print(f"wrote {OUT} ({len(rows)} nodeids, {len(fixed)} fixed dropped)")
     return 0
 
 

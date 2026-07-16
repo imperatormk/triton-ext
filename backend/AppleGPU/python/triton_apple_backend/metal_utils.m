@@ -63,11 +63,13 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
   // Pre-extract before the dispatch block: Python API calls are not safe
   // inside dispatch_sync.
   struct ArgInfo {
-    enum Kind { TENSOR, INT, FLOAT } kind;
+    enum Kind { TENSOR, INT, FLOAT, BYTES } kind;
     id<MTLBuffer> buf;
     NSUInteger offset;
     int64_t intVal;
     float floatVal;
+    const void *bytesPtr;
+    Py_ssize_t bytesLen;
   };
   std::vector<ArgInfo> argInfos(nargs);
   for (Py_ssize_t i = 0; i < nargs; i++) {
@@ -92,6 +94,13 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
       argInfos[i].kind = ArgInfo::TENSOR;
       argInfos[i].buf = getMTLBufferStorage(t);
       argInfos[i].offset = t.storage_offset() * t.element_size();
+    } else if (PyBytes_Check(arg)) {
+      // Packed scalar blob: bound inline via setBytes. The args tuple keeps the
+      // object alive for the duration of the call, so borrowing its buffer is
+      // safe across the dispatch_sync below.
+      argInfos[i].kind = ArgInfo::BYTES;
+      argInfos[i].bytesPtr = PyBytes_AS_STRING(arg);
+      argInfos[i].bytesLen = PyBytes_GET_SIZE(arg);
     } else if (PyLong_Check(arg)) {
       argInfos[i].kind = ArgInfo::INT;
       argInfos[i].intVal = PyLong_AsLongLong(arg);
@@ -99,8 +108,8 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
       argInfos[i].kind = ArgInfo::FLOAT;
       argInfos[i].floatVal = (float)PyFloat_AsDouble(arg);
     } else {
-      PyErr_Format(PyExc_TypeError, "Arg %zd: expected tensor, int, or float",
-                   i);
+      PyErr_Format(PyExc_TypeError,
+                   "Arg %zd: expected tensor, int, float, or bytes", i);
       return NULL;
     }
   }
@@ -131,6 +140,9 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
             break;
           case ArgInfo::FLOAT:
             [enc setBytes:&info.floatVal length:sizeof(float) atIndex:i];
+            break;
+          case ArgInfo::BYTES:
+            [enc setBytes:info.bytesPtr length:(NSUInteger)info.bytesLen atIndex:i];
             break;
           }
         }

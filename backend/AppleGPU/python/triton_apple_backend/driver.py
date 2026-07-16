@@ -65,6 +65,8 @@ _SCALAR_PACK_INFO = {
     "fp64": ("f", 8, 8),
 }
 
+_SETBYTES_LIMIT = 4096
+
 
 def _is_pointer_type(ty):
     """Check if a type string represents a pointer (tensor) argument."""
@@ -237,6 +239,10 @@ class MPSLauncher:
         if self.scalar_types:
             self.total_size, self.field_offsets = _compute_scalar_layout(
                 self.scalar_types)
+            if self.total_size > _SETBYTES_LIMIT:
+                raise RuntimeError(
+                    f"packed scalar args are {self.total_size} bytes, over "
+                    f"Metal's {_SETBYTES_LIMIT}-byte setBytes limit")
         else:
             self.total_size = 0
             self.field_offsets = []
@@ -311,12 +317,12 @@ class MPSLauncher:
         scalar_values = [flat_args[i] for i in self.scalar_indices]
 
         if scalar_values:
-            # Pack all scalars into a small MPS tensor (acts as device buffer)
+            # Bind the packed scalars inline via setBytes. Staging them through
+            # an MPS tensor instead costs a device alloc + H2D copy on every
+            # launch, which dominates runtime for short kernels.
             packed_bytes = _pack_scalars(self.scalar_types, scalar_values,
                                          self.total_size, self.field_offsets)
-            scalar_buf = torch.frombuffer(bytearray(packed_bytes),
-                                          dtype=torch.uint8).to('mps')
-            reordered_args = tuple(ptr_args) + (scalar_buf, )
+            reordered_args = tuple(ptr_args) + (packed_bytes, )
         else:
             reordered_args = tuple(ptr_args)
 

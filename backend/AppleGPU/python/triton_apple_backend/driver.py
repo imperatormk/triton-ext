@@ -38,7 +38,7 @@ def ty_to_cpp(ty):
         "fp16": "float",
         "bf16": "float",
         "fp32": "float",
-        "fp64": "double",
+        "fp64": "float",
     }[ty]
 
 
@@ -60,7 +60,9 @@ _SCALAR_PACK_INFO = {
     # only used for its size/alignment (2), never for struct.pack of bf16.
     "bf16": ("e", 2, 2),
     "fp32": ("f", 4, 4),
-    "fp64": ("d", 8, 8),
+    # MSL has no double: the emitter reads fp64 args as a 4-byte float but still
+    # advances the layout cursor by 8, so pack a narrowed float into an 8-byte slot.
+    "fp64": ("f", 8, 8),
 }
 
 

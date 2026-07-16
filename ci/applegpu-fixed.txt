@@ -1,5 +1,6 @@
 FAILED python/test/unit/language/test_annotations.py::test_float_annotation[dtype12-0.0]
 FAILED python/test/unit/language/test_compile_errors.py::test_dot_scaled_shape_verification
+FAILED python/test/unit/language/test_compile_errors.py::test_fp8_support[dtype0]
 FAILED python/test/unit/language/test_compile_errors.py::test_max_num_imprecise_acc_limit
 FAILED python/test/unit/language/test_conversions.py::test_typeconvert_downcast[bfloat16-float8e4nv-rtne-17376]
 FAILED python/test/unit/language/test_conversions.py::test_typeconvert_downcast[bfloat16-float8e5-rtne-18272]
@@ -7,6 +8,8 @@ FAILED python/test/unit/language/test_conversions.py::test_typeconvert_downcast[
 FAILED python/test/unit/language/test_conversions.py::test_typeconvert_downcast[float16-float8e5-rtne-31488]
 FAILED python/test/unit/language/test_conversions.py::test_typeconvert_downcast[float32-float8e4nv-rtne-1138753536]
 FAILED python/test/unit/language/test_conversions.py::test_typeconvert_downcast[float32-float8e5-rtne-1197473792]
+FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype1]
+FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype2]
 FAILED python/test/unit/language/test_core.py::test_dot[1-32-32-128-16-False-False-none-ieee-int8-int8-1-None0]
 FAILED python/test/unit/language/test_core.py::test_dot[1-32-32-128-16-False-False-none-ieee-int8-int8-1-None1]
 FAILED python/test/unit/language/test_core.py::test_dot[1-32-32-128-16-False-True-none-ieee-int8-int8-1-None0]

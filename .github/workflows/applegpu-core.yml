@@ -40,7 +40,9 @@ jobs:
           # test_scaled_dot, because tt.dot_scaled is block-scaled MMA
           # (Blackwell/CDNA silicon) with no Apple equivalent so all 1728 cases
           # fail by construction; and the 100000-element rand/randn statistical
-          # variants, which are slow and single-worker for no added coverage.
+          # variants, which are slow and single-worker for no added coverage;
+          # and the hip compile test, which needs the amd backend registered --
+          # the runner's triton only has apple, so it cannot pass there.
           # test_matmul.py is omitted: its skipif decorators call
           # torch.cuda.get_device_capability() at import, which aborts
           # collection for the whole run on a machine without CUDA.
@@ -58,6 +60,7 @@ jobs:
             unit/language/test_compile_only.py \
             --device mps -n 4 \
             --deselect unit/language/test_core.py::test_scaled_dot \
+            --deselect unit/language/test_compile_only.py::test_fp8_compiles_for_multiple_architectures_hip \
             -k "not (100000 and (test_rand or test_randn))" \
             -p applegpu_conftest \
             -p no:cacheprovider -p no:warnings \

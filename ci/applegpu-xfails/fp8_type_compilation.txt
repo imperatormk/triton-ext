@@ -1,6 +1,4 @@
 FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype0] - triton.compiler.errors.CompilationError: at 1:0:
-FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype1] - triton.compiler.errors.CompilationError: at 1:0:
-FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype2] - triton.compiler.errors.CompilationError: at 1:0:
 FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype3] - triton.compiler.errors.CompilationError: at 1:0:
 FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype4] - triton.compiler.errors.CompilationError: at 1:0:
 FAILED python/test/unit/language/test_core.py::test_permute[1-float8e4b15-shape0-perm0] - triton.compiler.errors.CompilationError: at 1:0:

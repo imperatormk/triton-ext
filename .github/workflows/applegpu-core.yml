@@ -67,7 +67,11 @@ jobs:
             -o markers=interpreter \
             -q -rX --no-header --timeout=600 \
             --junitxml="$RUNNER_TEMP/applegpu-core-results.xml" \
-            || echo "PYTEST_EXIT=$?"
+            && rc=0 || rc=$?
+          # Deferred so Summarize and the artifact upload still run on failure;
+          # the Gate step re-raises this at the end.
+          echo "$rc" > "$RUNNER_TEMP/pytest-exit"
+          echo "PYTEST_EXIT=$rc"
 
       - name: Summarize
         if: always()
@@ -98,3 +102,13 @@ jobs:
           name: applegpu-core-results
           path: ${{ runner.temp }}/applegpu-core-results.xml
           if-no-files-found: warn
+
+      - name: Gate on test result
+        if: always()
+        run: |
+          rc="$(cat "$RUNNER_TEMP/pytest-exit" 2>/dev/null || echo 1)"
+          if [ "$rc" != "0" ]; then
+            echo "::error::pytest exited $rc; see the Summarize step for the failures"
+            exit "$rc"
+          fi
+          echo "pytest exited 0"

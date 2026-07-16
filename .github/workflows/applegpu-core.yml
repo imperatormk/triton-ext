@@ -1,0 +1,72 @@
+name: AppleGPU core tests (self-hosted)
+
+# Manual-trigger only: runs the full Triton core suite on the self-hosted M1
+# Mini against the deployed AppleGPU plugin. torch's device is still called
+# "mps"; the backend under test is AppleGPU.
+on:
+  workflow_dispatch:
+
+jobs:
+  applegpu-core:
+    runs-on: [self-hosted, mini-mps]
+    timeout-minutes: 180
+    env:
+      VENV: /Users/Shared/playground/.venv
+      DEPS: /Users/Shared/playground/deps
+      TRITON_SRC: /Users/zimski/projects/oss/triton-main
+    steps:
+      - name: Report host + GPU
+        run: |
+          echo "host: $(hostname)  arch: $(uname -m)  macOS: $(sw_vers -productVersion)"
+          "$VENV/bin/python" - <<'PY'
+          import triton, torch
+          print("triton", triton.__version__, "torch", torch.__version__)
+          print("mps available:", torch.backends.mps.is_available())
+          PY
+
+      - name: Run Triton core tests
+        run: |
+          export TRITON_PLUGIN_PATHS="$DEPS/lib/libapplegpu_backend.dylib"
+          export TRITON_PASS_PLUGIN_PATH="$DEPS/lib/libapplegpu_backend.dylib"
+          export PYTHONPATH="$DEPS/triton_apple_backend_pkg"
+          rm -rf "$HOME/.triton/cache"
+          cd "$TRITON_SRC/python/test"
+          # Nothing is deselected: the whole suite runs and the failures are the
+          # report. They get triaged into xfails, not filtered out of sight.
+          "$VENV/bin/python" -m pytest unit/language/test_core.py \
+            --device mps \
+            -p no:cacheprovider -p no:warnings \
+            -o markers=interpreter \
+            -q --no-header --timeout=600 \
+            --junitxml="$RUNNER_TEMP/applegpu-core-results.xml" \
+            || echo "PYTEST_EXIT=$? (failures expected until triaged into xfails)"
+
+      - name: Summarize
+        if: always()
+        run: |
+          "$VENV/bin/python" - "$RUNNER_TEMP/applegpu-core-results.xml" <<'PY'
+          import sys, collections, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          ts = root if root.tag == "testsuite" else root[0]
+          print(f"tests={ts.get('tests')} failures={ts.get('failures')} "
+                f"errors={ts.get('errors')} skipped={ts.get('skipped')}")
+          buckets = collections.Counter()
+          for tc in ts.iter("testcase"):
+              for kind in ("failure", "error"):
+                  el = tc.find(kind)
+                  if el is None:
+                      continue
+                  msg = (el.get("message") or "").splitlines()[0][:90]
+                  buckets[msg] += 1
+          print("\ntop failure signatures:")
+          for msg, n in buckets.most_common(25):
+              print(f"{n:5d}  {msg}")
+          PY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: applegpu-core-results
+          path: ${{ runner.temp }}/applegpu-core-results.xml
+          if-no-files-found: warn

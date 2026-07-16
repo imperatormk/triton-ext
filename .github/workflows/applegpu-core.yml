@@ -26,7 +26,7 @@ jobs:
           print("mps available:", torch.backends.mps.is_available())
           PY
 
-      - name: Run Triton core tests
+      - name: Run Triton language tests
         run: |
           export TRITON_PLUGIN_PATHS="$DEPS/lib/libapplegpu_backend.dylib"
           export TRITON_PASS_PLUGIN_PATH="$DEPS/lib/libapplegpu_backend.dylib"
@@ -36,13 +36,27 @@ jobs:
           rm -rf "$HOME/.triton/cache"
           cd "$TRITON_SRC/python/test"
           # The known baseline is xfailed rather than filtered, so anything red
-          # here is new. test_scaled_dot is the exception: tt.dot_scaled is
-          # block-scaled MMA (Blackwell/CDNA silicon) with no Apple equivalent,
-          # so all 1728 cases fail by construction; deselect rather than carry
-          # them as xfails. -n 4 matches the Mini's 4 performance cores.
-          "$VENV/bin/python" -m pytest unit/language/test_core.py \
-            --device mps -n 4 \
+          # here is new. Two exceptions are deselected instead of xfailed:
+          # test_scaled_dot, because tt.dot_scaled is block-scaled MMA
+          # (Blackwell/CDNA silicon) with no Apple equivalent so all 1728 cases
+          # fail by construction; and the 100000-element rand/randn statistical
+          # variants, which are slow and single-worker for no added coverage.
+          "$VENV/bin/python" -m pytest \
+            unit/language/test_core.py \
+            unit/language/test_standard.py \
+            unit/language/test_conversions.py \
+            unit/language/test_random.py \
+            unit/language/test_matmul.py \
+            unit/language/test_block_pointer.py \
+            unit/language/test_tuple.py \
+            unit/language/test_annotations.py \
+            unit/language/test_decorator.py \
+            unit/language/test_libdevice.py \
+            unit/language/test_compile_errors.py \
+            unit/language/test_compile_only.py \
+            --device mps -n 8 \
             --deselect unit/language/test_core.py::test_scaled_dot \
+            -k "not (100000 and (test_rand or test_randn))" \
             -p applegpu_conftest \
             -p no:cacheprovider -p no:warnings \
             -o markers=interpreter \

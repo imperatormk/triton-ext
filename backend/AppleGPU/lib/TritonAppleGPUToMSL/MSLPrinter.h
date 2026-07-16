@@ -10,14 +10,32 @@
 
 namespace mlir::triton::applegpu::msl {
 
+// Which preamble helper groups a module actually needs. Computed by an IR
+// pre-scan (MSLEmitter::emit) so only referenced helpers are emitted.
+// Dependency: the packed16 atomics call tt_rtne_int_half/bfloat, so requesting
+// an fp16/bf16 atomic implies the matching narrowing helper.
+struct HelperSet {
+  bool erf = false;
+  bool rtneHalf = false;
+  bool rtneBfloat = false;
+  bool rtzHalf = false;
+  bool rtzBfloat = false;
+  bool rtneIntHalf = false;
+  bool rtneIntBfloat = false;
+  bool atomicF32 = false;
+  bool atomicPacked16Half = false;
+  bool atomicPacked16Bfloat = false;
+  bool fp8 = false;
+};
+
 class MSLPrinter {
 public:
   explicit MSLPrinter(llvm::raw_ostream &os) : os(os) {}
 
-  void printPreamble(bool usesFp8 = false);
-  void printNarrowingHelpers();
+  void printPreamble(const HelperSet &h = HelperSet{});
+  void printNarrowingHelpers(const HelperSet &h);
   void printFp8Helpers();
-  void printAtomicHelpers();
+  void printAtomicHelpers(const HelperSet &h);
   void printType(const Type *t);
   void printExpr(const Expr *e);
   void printStmt(const Stmt *s);

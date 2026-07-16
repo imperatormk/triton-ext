@@ -654,11 +654,12 @@ void MSLPrinter::printProto(const DeviceFn *fn) {
 // Preamble (fixed; verbatim from EmitMSL L126-136)
 //===----------------------------------------------------------------------===//
 
-void MSLPrinter::printPreamble(bool usesFp8) {
+void MSLPrinter::printPreamble(const HelperSet &h) {
   os << "#include <metal_stdlib>\n";
   os << "#include <metal_simdgroup_matrix>\n";
   os << "using namespace metal;\n\n";
-  os << R"MSL(static inline float tt_erf(float x){
+  if (h.erf)
+    os << R"MSL(static inline float tt_erf(float x){
   float t = 1.0f/(1.0f+0.5f*metal::fabs(x));
   float y = t*metal::exp(-x*x-1.26551223f+t*(1.00002368f+t*(0.37409196f+t*(0.09678418f+t*(-0.18628806f+t*(0.27886807f+t*(-1.13520398f+t*(1.48851587f+t*(-0.82215223f+t*0.17087277f)))))))));
   float r = 1.0f - y;
@@ -666,10 +667,10 @@ void MSLPrinter::printPreamble(bool usesFp8) {
 }
 
 )MSL";
-  printNarrowingHelpers();
-  if (usesFp8)
+  printNarrowingHelpers(h);
+  if (h.fp8)
     printFp8Helpers();
-  printAtomicHelpers();
+  printAtomicHelpers(h);
 }
 
 //===----------------------------------------------------------------------===//
@@ -681,8 +682,9 @@ void MSLPrinter::printPreamble(bool usesFp8) {
 // fast-math, dropping the round).
 //===----------------------------------------------------------------------===//
 
-void MSLPrinter::printNarrowingHelpers() {
-  os << R"MSL(static inline half tt_rtne_half(float v){
+void MSLPrinter::printNarrowingHelpers(const HelperSet &h) {
+  if (h.rtneHalf)
+    os << R"MSL(static inline half tt_rtne_half(float v){
   uint u = as_type<uint>(v);
   ushort bits;
   uint sgn = (u >> 16) & 0x8000u;
@@ -713,7 +715,9 @@ void MSLPrinter::printNarrowingHelpers() {
   return as_type<half>(bits);
 }
 
-static inline bfloat tt_rtne_bfloat(float v){
+)MSL";
+  if (h.rtneBfloat)
+    os << R"MSL(static inline bfloat tt_rtne_bfloat(float v){
   uint u = as_type<uint>(v);
   ushort bits;
   int e32 = (int)((u >> 23) & 0xffu);
@@ -728,7 +732,9 @@ static inline bfloat tt_rtne_bfloat(float v){
   return as_type<bfloat>(bits);
 }
 
-static inline half tt_rtz_half(float v){
+)MSL";
+  if (h.rtzHalf)
+    os << R"MSL(static inline half tt_rtz_half(float v){
   uint u = as_type<uint>(v);
   ushort bits;
   uint sgn = (u >> 16) & 0x8000u;
@@ -747,12 +753,16 @@ static inline half tt_rtz_half(float v){
   return as_type<half>(bits);
 }
 
-static inline bfloat tt_rtz_bfloat(float v){
+)MSL";
+  if (h.rtzBfloat)
+    os << R"MSL(static inline bfloat tt_rtz_bfloat(float v){
   uint u = as_type<uint>(v);
   return as_type<bfloat>((ushort)((u >> 16) & 0xffffu));
 }
 
-static inline half tt_rtne_int_half(float v){
+)MSL";
+  if (h.rtneIntHalf)
+    os << R"MSL(static inline half tt_rtne_int_half(float v){
   uint u = as_type<uint>(v);
   ushort bits;
   uint sgn = (u >> 16) & 0x8000u;
@@ -771,7 +781,9 @@ static inline half tt_rtne_int_half(float v){
   return as_type<half>(bits);
 }
 
-static inline bfloat tt_rtne_int_bfloat(float v){
+)MSL";
+  if (h.rtneIntBfloat)
+    os << R"MSL(static inline bfloat tt_rtne_int_bfloat(float v){
   uint u = as_type<uint>(v);
   uint r = (u >> 16) & 1u;
   return as_type<bfloat>((ushort)(((u + 0x7fffu + r) >> 16) & 0xffffu));
@@ -880,8 +892,9 @@ static inline float tt_fp8e5m2_to_f32(uchar b){
 // 1=max, 2=min, 3=xchg. Each returns the pre-op value.
 //===----------------------------------------------------------------------===//
 
-void MSLPrinter::printAtomicHelpers() {
-  os << R"MSL(static inline float tt_atomic_rmw_f32(device atomic_uint *p, float v, int op){
+void MSLPrinter::printAtomicHelpers(const HelperSet &h) {
+  if (h.atomicF32)
+    os << R"MSL(static inline float tt_atomic_rmw_f32(device atomic_uint *p, float v, int op){
   uint word = atomic_load_explicit(p, memory_order_relaxed);
   while (true) {
     float cur = as_type<float>(word);
@@ -891,7 +904,9 @@ void MSLPrinter::printAtomicHelpers() {
   }
 }
 
-static inline half tt_atomic_rmw_packed16_half(device atomic_uint *word, bool isHigh, float v, int op){
+)MSL";
+  if (h.atomicPacked16Half)
+    os << R"MSL(static inline half tt_atomic_rmw_packed16_half(device atomic_uint *word, bool isHigh, float v, int op){
   half vh = tt_rtne_int_half(v);
   uint w = atomic_load_explicit(word, memory_order_relaxed);
   while (true) {
@@ -903,7 +918,9 @@ static inline half tt_atomic_rmw_packed16_half(device atomic_uint *word, bool is
   }
 }
 
-static inline bfloat tt_atomic_rmw_packed16_bfloat(device atomic_uint *word, bool isHigh, float v, int op){
+)MSL";
+  if (h.atomicPacked16Bfloat)
+    os << R"MSL(static inline bfloat tt_atomic_rmw_packed16_bfloat(device atomic_uint *word, bool isHigh, float v, int op){
   bfloat vh = tt_rtne_int_bfloat(v);
   uint w = atomic_load_explicit(word, memory_order_relaxed);
   while (true) {

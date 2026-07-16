@@ -140,22 +140,74 @@ msl::Stmt *MSLEmitter::astReturn(tt::ReturnOp op) {
   return ctx.returnStmt(nullptr, fields);
 }
 
-LogicalResult MSLEmitter::emit() {
-  bool usesFp8 = false;
+// Mirrors the conditions under which astEmitMath / the fp_to_fp narrowing path
+// / astEmitAtomic emit a call to each preamble helper. Must stay in lockstep
+// with those emit sites: a missed helper is a compile error in the MSL.
+msl::HelperSet MSLEmitter::scanHelpers() {
+  msl::HelperSet h;
+  auto elemOf = [](Type t) {
+    if (auto rt = dyn_cast<RankedTensorType>(t))
+      t = rt.getElementType();
+    return t;
+  };
   mod.walk([&](Operation *op) {
-    auto isFp8Ty = [](Type t) {
-      if (auto rt = dyn_cast<RankedTensorType>(t))
-        t = rt.getElementType();
-      return isFp8Type(t);
-    };
     for (Type t : op->getOperandTypes())
-      usesFp8 |= isFp8Ty(t);
+      h.fp8 |= isFp8Type(elemOf(t));
     for (Type t : op->getResultTypes())
-      usesFp8 |= isFp8Ty(t);
+      h.fp8 |= isFp8Type(elemOf(t));
+
+    if (op->getName().getStringRef() == "math.erf")
+      h.erf = true;
+
+    if (isa<arith::TruncFOp, tt::FpToFpOp>(op)) {
+      Type dstE = elementScalarType(op->getResult(0).getType());
+      Type srcE = elementScalarType(op->getOperand(0).getType());
+      bool toHalf = dstE.isF16() || dstE.isBF16();
+      if (srcE.isF32() && toHalf && !isFp8Type(dstE) && !isFp8Type(srcE)) {
+        bool rtz = false, narrow = !isa<tt::FpToFpOp>(op);
+        if (auto f = dyn_cast<tt::FpToFpOp>(op))
+          if (auto rnd = f.getRounding()) {
+            narrow = true;
+            rtz = *rnd == tt::RoundingMode::RTZ;
+          }
+        if (narrow) {
+          if (rtz)
+            (dstE.isF16() ? h.rtzHalf : h.rtzBfloat) = true;
+          else
+            (dstE.isF16() ? h.rtneHalf : h.rtneBfloat) = true;
+        }
+      }
+    }
+
+    if (auto ar = dyn_cast<tt::AtomicRMWOp>(op)) {
+      Type sTy = elementScalarType(ar.getResult().getType());
+      if (isa<FloatType>(sTy)) {
+        unsigned bw = sTy.getIntOrFloatBitWidth();
+        tt::RMWOp kind = ar.getAtomicRmwOp();
+        bool native =
+            bw == 32 && (kind == tt::RMWOp::ADD || kind == tt::RMWOp::FADD);
+        if (!native) {
+          if (bw == 32)
+            h.atomicF32 = true;
+          else if (bw == 16) {
+            // The packed16 CAS loops narrow through tt_rtne_int_*.
+            if (sTy.isF16())
+              h.atomicPacked16Half = h.rtneIntHalf = true;
+            else
+              h.atomicPacked16Bfloat = h.rtneIntBfloat = true;
+          }
+        }
+      }
+    }
   });
+  return h;
+}
+
+LogicalResult MSLEmitter::emit() {
+  msl::HelperSet helpers = scanHelpers();
 
   msl::MSLPrinter preamblePrinter(os);
-  preamblePrinter.printPreamble(usesFp8);
+  preamblePrinter.printPreamble(helpers);
 
   llvm::DenseSet<StringRef> callTargets;
   mod.walk([&](tt::CallOp call) {

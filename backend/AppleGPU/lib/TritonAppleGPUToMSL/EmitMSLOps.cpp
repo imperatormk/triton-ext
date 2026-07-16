@@ -1005,6 +1005,14 @@ std::optional<bool> MSLEmitter::astEmitMath(Operation *op, msl::Block &body) {
         {"math.absi", bi::math::Abs},       {"math.erf", "tt_erf"},
         {"math.round", bi::math::Round},    {"math.trunc", bi::math::Trunc},
         {"math.roundeven", bi::math::Rint}};
+    // fp8 is uchar storage, so fabs would be ambiguous (and meaningless on the
+    // raw byte). Both OCP formats are sign-magnitude with the sign in bit 7,
+    // so clearing it is abs for e4m3 and e5m2 alike.
+    if (n == "math.absf" && isFp8Type(resElem))
+      return astDeclBind(op, sc, body, [&](int r) {
+        return ctx.paren(ctx.binary(B::And, ctx.var(reg(op->getOperand(0), r)),
+                                    ctx.lit("0x7f")));
+      });
     if (auto it = unary.find(n); it != unary.end()) {
       StringRef fn = it->second;
       return astDeclBind(op, sc, body, [&](int r) {

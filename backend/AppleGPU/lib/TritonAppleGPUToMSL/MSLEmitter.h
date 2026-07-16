@@ -167,6 +167,8 @@ public:
   LogicalResult emit();
 
 private:
+  msl::HelperSet scanHelpers();
+
   ModuleOp mod;
   ForwardOStream fwd;
   raw_ostream &os;

@@ -1,3 +1,4 @@
+FAILED python/test/unit/language/test_compile_errors.py::test_fp8_support[dtype2] - upstream test has no MPS branch (supported_dtypes widens only under is_cuda()/is_hip()) so it expects float8e4nv to raise; we support fp8e4nv (OCP e4m3), so it compiles and DID NOT RAISE
 FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype0] - triton.compiler.errors.CompilationError: at 1:0:
 FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype3] - triton.compiler.errors.CompilationError: at 1:0:
 FAILED python/test/unit/language/test_core.py::test_abs_fp8[in_dtype4] - triton.compiler.errors.CompilationError: at 1:0:

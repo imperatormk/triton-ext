@@ -1,5 +1,5 @@
-FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-None] - Metal lacks acquire/release atomics + no int64 atomics
-FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-acquire] - Metal lacks acquire/release atomics + no int64 atomics
-FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-release] - Metal lacks acquire/release atomics + no int64 atomics
-FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-acq_rel] - Metal lacks acquire/release atomics + no int64 atomics
-FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-relaxed] - Metal lacks acquire/release atomics + no int64 atomics
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-None] - no int64 atomics in Metal (EmitMSLPass cannot lower 64-bit tt.atomic_cas)
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-acquire] - no int64 atomics in Metal (EmitMSLPass cannot lower 64-bit tt.atomic_cas)
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-release] - no int64 atomics in Metal (EmitMSLPass cannot lower 64-bit tt.atomic_cas)
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-acq_rel] - no int64 atomics in Metal (EmitMSLPass cannot lower 64-bit tt.atomic_cas)
+FAILED python/test/unit/language/test_core.py::test_atomic_cas[int64-1-relaxed] - no int64 atomics in Metal (EmitMSLPass cannot lower 64-bit tt.atomic_cas)

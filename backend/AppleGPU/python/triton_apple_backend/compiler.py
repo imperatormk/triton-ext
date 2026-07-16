@@ -53,6 +53,8 @@ class MPSOptions:
     allowed_dot_input_precisions: tuple = ("ieee", )
     default_dot_input_precision: str = "ieee"
     supported_fp8_dtypes: tuple = ("fp8e4nv", "fp8e5")
+    # Hopper-only imprecise fp8 accumulation; 0 means never, as on AMD.
+    max_num_imprecise_acc_default: int = 0
     extern_libs: tuple = ()
 
     def hash(self):

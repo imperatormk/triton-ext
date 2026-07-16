@@ -62,7 +62,7 @@ jobs:
             -p applegpu_conftest \
             -p no:cacheprovider -p no:warnings \
             -o markers=interpreter \
-            -q --no-header --timeout=600 \
+            -q -rX --no-header --timeout=600 \
             --junitxml="$RUNNER_TEMP/applegpu-core-results.xml" \
             || echo "PYTEST_EXIT=$?"
 

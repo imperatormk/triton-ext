@@ -262,7 +262,7 @@ private:
   msl::Block astPacked16CAS(StringRef wordPtr, StringRef isHigh, StringRef c,
                             StringRef v, StringRef sc, StringRef id,
                             bool declare);
-  msl::Stmt *astAcquireFence();
+  msl::Stmt *astDeviceFence();
   msl::Stmt *astPollSpin(msl::Expr *loadExpr, StringRef want);
   msl::Expr *astPoll64Load(StringRef p, StringRef wordPtr, msl::Stmt *&out);
   msl::Stmt *astHistBinsDecl(StringRef bins);

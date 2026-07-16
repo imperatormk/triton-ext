@@ -351,8 +351,8 @@ msl::Block MSLEmitter::astPacked16CAS(StringRef wordPtr, StringRef isHigh,
 
 // atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
 // Metal fences accept only relaxed or seq_cst; seq_cst is the valid
-// stronger-than-acquire order.
-msl::Stmt *MSLEmitter::astAcquireFence() {
+// stronger-than-acquire/release order.
+msl::Stmt *MSLEmitter::astDeviceFence() {
   return ctx.exprStmt(ctx.call(
       ba::ThreadFence, {ctx.lit(bmem::Device), ctx.lit(border::SeqCst)}));
 }

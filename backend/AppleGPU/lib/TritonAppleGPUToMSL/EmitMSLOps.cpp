@@ -1668,12 +1668,18 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
         inner.push_back(ctx.assignStmt(ctx.var(id), call));
       } else {
         // Metal device atomics are relaxed-only; acquire/release/acq_rel are
-        // not valid MSL memory orders (the acq_rel form fails to compile).
-        (void)sem;
+        // not valid MSL memory orders, so the requested order is carried by
+        // device-scope fences around the relaxed op instead.
+        if (sem == tt::MemSemantic::RELEASE ||
+            sem == tt::MemSemantic::ACQUIRE_RELEASE)
+          inner.push_back(astDeviceFence());
         inner.push_back(
             ctx.assignStmt(ctx.var(id), astAtomicRmwCall(fn, atomicTy, p, v,
                                                          "memory_order_relaxed",
                                                          /*memFlags=*/false)));
+        if (sem == tt::MemSemantic::ACQUIRE ||
+            sem == tt::MemSemantic::ACQUIRE_RELEASE)
+          inner.push_back(astDeviceFence());
       }
       if (guard)
         body.push_back(ctx.ifScope(guard, std::move(inner)));
@@ -1840,7 +1846,11 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
     auto &cmps = names(ca.getCmp());
     auto &vals = names(ca.getVal());
     bool uniform = !isa<RankedTensorType>(ca.getPtr().getType());
+    tt::MemSemantic casSem = ca.getSem();
     int rc = ptrs.size();
+    if (casSem == tt::MemSemantic::RELEASE ||
+        casSem == tt::MemSemantic::ACQUIRE_RELEASE)
+      body.push_back(astDeviceFence());
     SmallVector<std::string> ids;
     for (int r = 0; r < rc; ++r) {
       const std::string &p = ptrs[r];
@@ -1876,17 +1886,24 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
             ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0")),
             ctx.assignStmt(ctx.subscript(ctx.var(bcast), ctx.lit("0")),
                            ctx.var(id))));
-        body.push_back(astAcquireFence());
         body.push_back(ctx.hardBarrier(false));
         body.push_back(ctx.assignStmt(
             ctx.var(id), ctx.subscript(ctx.var(bcast), ctx.lit("0"))));
         body.push_back(ctx.hardBarrier(false));
+        // Every lane (not just the CAS lane) must see the winner's device
+        // writes, so the acquire fence follows the broadcast.
+        if (casSem == tt::MemSemantic::ACQUIRE ||
+            casSem == tt::MemSemantic::ACQUIRE_RELEASE)
+          body.push_back(astDeviceFence());
       } else {
         for (msl::Stmt *s : casBody)
           body.push_back(s);
       }
       ids.push_back(id);
     }
+    if (!uniform && (casSem == tt::MemSemantic::ACQUIRE ||
+                     casSem == tt::MemSemantic::ACQUIRE_RELEASE))
+      body.push_back(astDeviceFence());
     bindRegs(res, ids);
     return true;
   }

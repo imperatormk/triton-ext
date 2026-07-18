@@ -47,18 +47,37 @@ msl::Expr *LayoutExprBuilder::layoutCoordExpr(RankedTensorType rt, int reg,
   auto runtimeDim = [&](StringAttr in, StringRef idExpr) {
     if (!ll.hasInDim(in))
       return;
-    for (int b = 0, n = ll.getInDimSizeLog2(in); b < n; ++b) {
+    int n = ll.getInDimSizeLog2(in);
+    for (int b = 0; b < n;) {
       int32_t basis = ll.getBasis(in, b, outDim);
-      if (basis == 0)
+      if (basis == 0) {
+        ++b;
         continue;
+      }
+      // A maximal run of consecutive bits whose basis is the identity
+      // (basis(k) == 1<<k) collapses to one masked shift instead of a per-bit
+      // (((id >> k) & 1) * basis) xor chain. The bases are powers of two, so the
+      // xor over a disjoint run is an or, i.e. a contiguous bitfield of idExpr.
+      if (basis == (1 << b)) {
+        int e = b;
+        while (e < n && ll.getBasis(in, e, outDim) == (1 << e))
+          ++e;
+        int len = e - b;
+        int32_t mask = ((1 << len) - 1) << b;
+        // (idExpr & mask)  -- b is already the field's low bit, so no reshift.
+        terms.push_back(ctx.paren(ctx.binary(
+            msl::BinOp::And, ctx.var(idExpr), ctx.lit(std::to_string(mask)))));
+        b = e;
+        continue;
+      }
       // (((idExpr >> b) & 1) * basis)
       msl::Expr *shifted = ctx.paren(
           ctx.binary(msl::BinOp::Shr, ctx.var(idExpr), ctx.i32lit(b)));
       msl::Expr *bit =
           ctx.paren(ctx.binary(msl::BinOp::And, shifted, ctx.lit("1")));
-      msl::Expr *term = ctx.paren(
-          ctx.binary(msl::BinOp::Mul, bit, ctx.lit(std::to_string(basis))));
-      terms.push_back(term);
+      terms.push_back(ctx.paren(
+          ctx.binary(msl::BinOp::Mul, bit, ctx.lit(std::to_string(basis)))));
+      ++b;
     }
   };
   runtimeDim(kLane, laneId);

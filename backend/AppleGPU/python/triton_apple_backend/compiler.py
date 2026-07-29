@@ -196,7 +196,6 @@ class MPSBackend(BaseBackend):
         if os.environ.get('TRITON_MPS_DEBUG'):
             print("=== emitted MSL ===")
             print(msl)
-        metadata["_msl_src"] = msl
         dump = os.environ.get('TRITON_MSL_DUMP')
         if dump:
             with open(dump, 'w') as df:
@@ -206,10 +205,9 @@ class MPSBackend(BaseBackend):
             raise RuntimeError("no 'kernel void' entry found in emitted MSL")
         metadata["name"] = m.group(1)
         metadata["shared"] = 0
-        return mod
+        return msl
 
-    def make_msl_metallib(self, mod, metadata, options):
-        msl = metadata.pop("_msl_src")
+    def make_msl_metallib(self, msl, metadata, options):
         # Safe math globally. Metal fast-math assumes no NaN/Inf and reassociates
         # FP, silently miscompiling any kernel that produces or consumes Inf/NaN
         # or relies on RTNE. Which kernels see Inf/NaN is a runtime property, so

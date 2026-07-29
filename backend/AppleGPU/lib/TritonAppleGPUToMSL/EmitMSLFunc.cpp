@@ -141,7 +141,8 @@ msl::Stmt *MSLEmitter::emitReturn(tt::ReturnOp op) {
 }
 
 // Mirrors the conditions under which emitMath / the fp_to_fp narrowing path
-// / emitAtomic emit a call to each preamble helper. Must stay in lockstep
+// / the emitAtomic* families emit a call to each preamble helper. Must stay in
+// lockstep
 // with those emit sites: a missed helper is a compile error in the MSL.
 msl::HelperSet MSLEmitter::scanHelpers() {
   msl::HelperSet h;
@@ -190,11 +191,14 @@ msl::HelperSet MSLEmitter::scanHelpers() {
           if (bw == 32)
             h.atomicF32 = true;
           else if (bw == 16) {
-            // The packed16 CAS loops narrow through tt_rtne_int_*.
+            // The packed16 CAS loop narrows through tt_rtne_int_*, passed as a
+            // template argument, so the matching narrowing helper must be
+            // emitted alongside the shared template.
+            h.atomicPacked16 = true;
             if (sTy.isF16())
-              h.atomicPacked16Half = h.rtneIntHalf = true;
+              h.rtneIntHalf = true;
             else
-              h.atomicPacked16Bfloat = h.rtneIntBfloat = true;
+              h.rtneIntBfloat = true;
           }
         }
       }

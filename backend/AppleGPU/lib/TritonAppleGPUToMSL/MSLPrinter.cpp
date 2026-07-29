@@ -905,28 +905,15 @@ void MSLPrinter::printAtomicHelpers(const HelperSet &h) {
 }
 
 )MSL";
-  if (h.atomicPacked16Half)
-    os << R"MSL(static inline half tt_atomic_rmw_packed16_half(device atomic_uint *word, bool isHigh, float v, int op){
-  half vh = tt_rtne_int_half(v);
+  if (h.atomicPacked16)
+    os << R"MSL(template <typename T, T (*Narrow)(float)>
+static inline T tt_atomic_rmw_packed16(device atomic_uint *word, bool isHigh, float v, int op){
+  T vh = Narrow(v);
   uint w = atomic_load_explicit(word, memory_order_relaxed);
   while (true) {
     ushort lane = (ushort)((isHigh) ? (w >> 16) : (w & 0xffffu));
-    half cur = as_type<half>(lane);
-    half nl = (half)((op == 0) ? (cur + vh) : (op == 1) ? fmax(cur, vh) : (op == 2) ? fmin(cur, vh) : vh);
-    uint nw = (isHigh) ? ((w & 0x0000ffffu) | ((uint)as_type<ushort>(nl) << 16)) : ((w & 0xffff0000u) | (uint)as_type<ushort>(nl));
-    if (atomic_compare_exchange_weak_explicit(word, &w, nw, memory_order_relaxed, memory_order_relaxed)) return cur;
-  }
-}
-
-)MSL";
-  if (h.atomicPacked16Bfloat)
-    os << R"MSL(static inline bfloat tt_atomic_rmw_packed16_bfloat(device atomic_uint *word, bool isHigh, float v, int op){
-  bfloat vh = tt_rtne_int_bfloat(v);
-  uint w = atomic_load_explicit(word, memory_order_relaxed);
-  while (true) {
-    ushort lane = (ushort)((isHigh) ? (w >> 16) : (w & 0xffffu));
-    bfloat cur = as_type<bfloat>(lane);
-    bfloat nl = (bfloat)((op == 0) ? (cur + vh) : (op == 1) ? fmax(cur, vh) : (op == 2) ? fmin(cur, vh) : vh);
+    T cur = as_type<T>(lane);
+    T nl = (T)((op == 0) ? (cur + vh) : (op == 1) ? fmax(cur, vh) : (op == 2) ? fmin(cur, vh) : vh);
     uint nw = (isHigh) ? ((w & 0x0000ffffu) | ((uint)as_type<ushort>(nl) << 16)) : ((w & 0xffff0000u) | (uint)as_type<ushort>(nl));
     if (atomic_compare_exchange_weak_explicit(word, &w, nw, memory_order_relaxed, memory_order_relaxed)) return cur;
   }

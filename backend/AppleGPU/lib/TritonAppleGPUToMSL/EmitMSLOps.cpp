@@ -619,9 +619,11 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
       &MSLEmitter::emitArithBinop, &MSLEmitter::emitConstGrid,
       &MSLEmitter::emitArithMisc,  &MSLEmitter::emitMath,
       &MSLEmitter::emitReshape,    &MSLEmitter::emitMemDesc,
-      &MSLEmitter::emitDotMap,     &MSLEmitter::emitAtomic,
-      &MSLEmitter::emitScanReduce, &MSLEmitter::emitTensorMove,
-      &MSLEmitter::emitCallReturn, &MSLEmitter::emitControlFlow};
+      &MSLEmitter::emitDotMap,     &MSLEmitter::emitAtomicRMW,
+      &MSLEmitter::emitAtomicPoll, &MSLEmitter::emitAtomicCAS,
+      &MSLEmitter::emitScan,       &MSLEmitter::emitReduce,
+      &MSLEmitter::emitTensorMove, &MSLEmitter::emitCallReturn,
+      &MSLEmitter::emitControlFlow};
   for (Family f : families)
     if (std::optional<bool> r = (this->*f)(op, body))
       return *r;
@@ -1545,10 +1547,9 @@ std::optional<bool> MSLEmitter::emitDotMap(Operation *op, msl::Block &body) {
   return std::nullopt;
 }
 
-// tt.atomic_rmw / tt.atomic_poll / tt.atomic_cas.
-std::optional<bool> MSLEmitter::emitAtomic(Operation *op, msl::Block &body) {
-  // tt.atomic_rmw: native fetch_* (AST) or fp-emulated CAS loop (captured),
-  // with redundant-thread guard + lane/warp replica broadcast.
+// tt.atomic_rmw: native fetch_* (AST) or fp-emulated CAS loop (captured),
+// with redundant-thread guard + lane/warp replica broadcast.
+std::optional<bool> MSLEmitter::emitAtomicRMW(Operation *op, msl::Block &body) {
   if (auto ar = dyn_cast<tt::AtomicRMWOp>(op)) {
     Value res = ar.getResult();
     Type scalarTy = elementScalarType(res.getType());
@@ -1663,7 +1664,7 @@ std::optional<bool> MSLEmitter::emitAtomic(Operation *op, msl::Block &body) {
           for (msl::Stmt *s : atomic.packed16Base(p, wordPtr, isHigh))
             inner.push_back(s);
           call = ctx.call(
-              "tt_atomic_rmw_packed16_" + sc,
+              "tt_atomic_rmw_packed16<" + sc + ", tt_rtne_int_" + sc + ">",
               {ctx.var(wordPtr), ctx.var(isHigh), fv, ctx.i32lit(rmwOp)});
         } else {
           std::string wordPtr = fresh();
@@ -1749,7 +1750,12 @@ std::optional<bool> MSLEmitter::emitAtomic(Operation *op, msl::Block &body) {
     return true;
   }
 
-  // tt.atomic_poll: elected-thread spin/probe on the aligned word + broadcast.
+  return std::nullopt;
+}
+
+// tt.atomic_poll: elected-thread spin/probe on the aligned word + broadcast.
+std::optional<bool> MSLEmitter::emitAtomicPoll(Operation *op,
+                                               msl::Block &body) {
   if (auto pl = dyn_cast<tt::AtomicPollOp>(op)) {
     Type expTy = pl.getExpected().getType();
     unsigned bw = expTy.getIntOrFloatBitWidth();
@@ -1836,7 +1842,11 @@ std::optional<bool> MSLEmitter::emitAtomic(Operation *op, msl::Block &body) {
     return true;
   }
 
-  // tt.atomic_cas: int32/float32/packed16 compare-exchange + uniform spinlock.
+  return std::nullopt;
+}
+
+// tt.atomic_cas: int32/float32/packed16 compare-exchange + uniform spinlock.
+std::optional<bool> MSLEmitter::emitAtomicCAS(Operation *op, msl::Block &body) {
   if (auto ca = dyn_cast<tt::AtomicCASOp>(op)) {
     Value res = ca.getResult();
     Type scalarTy = elementScalarType(res.getType());
@@ -1918,10 +1928,9 @@ std::optional<bool> MSLEmitter::emitAtomic(Operation *op, msl::Block &body) {
 }
 
 // tt.scan / tt.reduce: cross-lane/warp fold + prefix.
-std::optional<bool> MSLEmitter::emitScanReduce(Operation *op,
-                                               msl::Block &body) {
-  // tt.scan: per-run register fold + lane shuffle prefix + cross-warp carry +
-  // cross-run carry.
+// tt.scan: per-run register fold + lane shuffle prefix + cross-warp carry +
+// cross-run carry.
+std::optional<bool> MSLEmitter::emitScan(Operation *op, msl::Block &body) {
   if (auto sn = dyn_cast<tt::ScanOp>(op)) {
     bool rev = sn.getReverse();
     int nOp = sn.getNumOperands();
@@ -2135,8 +2144,12 @@ std::optional<bool> MSLEmitter::emitScanReduce(Operation *op,
     return true;
   }
 
-  // tt.reduce: per-group register fold + lane-shuffle xor + optional cross-warp
-  // threadgroup combine.
+  return std::nullopt;
+}
+
+// tt.reduce: per-group register fold + lane-shuffle xor + optional cross-warp
+// threadgroup combine.
+std::optional<bool> MSLEmitter::emitReduce(Operation *op, msl::Block &body) {
   if (auto rd = dyn_cast<tt::ReduceOp>(op)) {
     int nOp = rd.getNumOperands();
     auto srcTy = cast<RankedTensorType>(rd.getOperand(0).getType());

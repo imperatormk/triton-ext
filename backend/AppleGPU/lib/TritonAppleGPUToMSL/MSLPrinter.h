@@ -23,8 +23,7 @@ struct HelperSet {
   bool rtneIntHalf = false;
   bool rtneIntBfloat = false;
   bool atomicF32 = false;
-  bool atomicPacked16Half = false;
-  bool atomicPacked16Bfloat = false;
+  bool atomicPacked16 = false;
   bool fp8 = false;
 };
 

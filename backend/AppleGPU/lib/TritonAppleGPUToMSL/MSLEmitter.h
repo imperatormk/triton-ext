@@ -271,8 +271,11 @@ private:
   std::optional<bool> emitReshape(Operation *op, msl::Block &body);
   std::optional<bool> emitMemDesc(Operation *op, msl::Block &body);
   std::optional<bool> emitDotMap(Operation *op, msl::Block &body);
-  std::optional<bool> emitAtomic(Operation *op, msl::Block &body);
-  std::optional<bool> emitScanReduce(Operation *op, msl::Block &body);
+  std::optional<bool> emitAtomicRMW(Operation *op, msl::Block &body);
+  std::optional<bool> emitAtomicPoll(Operation *op, msl::Block &body);
+  std::optional<bool> emitAtomicCAS(Operation *op, msl::Block &body);
+  std::optional<bool> emitScan(Operation *op, msl::Block &body);
+  std::optional<bool> emitReduce(Operation *op, msl::Block &body);
   std::optional<bool> emitTensorMove(Operation *op, msl::Block &body);
   std::optional<bool> emitCallReturn(Operation *op, msl::Block &body);
   std::optional<bool> emitControlFlow(Operation *op, msl::Block &body);
@@ -652,7 +655,6 @@ private:
 
   static int64_t dotCBandRows(int64_t M, int64_t N, int64_t cBudget,
                               int64_t accBytes);
-
 };
 
 } // namespace mlir::triton::applegpu

@@ -76,8 +76,8 @@ bool MSLEmitter::scanWarpCarry(
 
   if (warpBits.empty()) {
     for (int k = 0; k < nOp; ++k) {
-      std::string s =
-          shuffle("simd_shuffle", scTys[k], laneScan[k], axisTopLane, body);
+      std::string s = shuffle(msl::builtin::simd::Shuffle, scTys[k],
+                              laneScan[k], axisTopLane, body);
       body.push_back(ctx.assignStmt(ctx.var(runTotalOut[k]), ctx.var(s)));
     }
     return true;
@@ -418,9 +418,8 @@ bool MSLEmitter::needsCoherentDeref(Value ptr) const {
 // scalar spinlock or a loop-carried scalar RMW forces a coherent access.
 msl::Expr *MSLEmitter::derefPtr(Value ptr, StringRef name, StringRef scName) {
   if (scalarSpinlock || needsCoherentDeref(ptr)) {
-    // Exact `device coherent(device) sc*` cast form used by the load/store path
-    // (the printer's plain coherent-ptr form omits the leading `device`).
-    msl::Type *cp = ctx.named("device coherent(device) " + scName.str() + "*");
+    msl::Type *cp = ctx.ptr(ctx.named(scName), msl::AddrSpace::Device,
+                            /*coherent=*/true);
     return ctx.deref(ctx.cast(CS::CStyle, cp, ctx.var(name)));
   }
   return ctx.deref(ctx.var(name));
@@ -987,7 +986,7 @@ std::optional<bool> MSLEmitter::emitArithMisc(Operation *op, msl::Block &body) {
     else if (isa<arith::MinNumFOp, arith::MinSIOp>(op))
       fn = "min";
     else if (isa<arith::RemFOp>(op))
-      fn = "metal::fmod";
+      fn = msl::builtin::math::Fmod;
     else if (isa<tt::MulhiUIOp>(op)) {
       fn = "mulhi";
       opCast = unsignedType(resElem);
@@ -1565,37 +1564,37 @@ std::optional<bool> MSLEmitter::emitAtomicRMW(Operation *op, msl::Block &body) {
     bool floatEmulated = isFloat && !floatNative;
     if (floatEmulated && bw != 16 && bw != 32)
       return false;
-    std::string atomicTy =
-        isFloat ? "atomic_float"
+    msl::Scalar atomicTy =
+        isFloat ? msl::Scalar::F32
         : (kind == tt::RMWOp::UMAX || kind == tt::RMWOp::UMIN)
-            ? "atomic_uint"
-            : (bw == 64 ? "atomic_long" : "atomic_int");
-    const char *fn = nullptr;
+            ? msl::Scalar::U32
+            : (bw == 64 ? msl::Scalar::I64 : msl::Scalar::I32);
+    StringRef fn;
     if (!floatEmulated) {
       switch (kind) {
       case tt::RMWOp::ADD:
       case tt::RMWOp::FADD:
-        fn = "atomic_fetch_add_explicit";
+        fn = msl::builtin::atomic::FetchAdd;
         break;
       case tt::RMWOp::MAX:
       case tt::RMWOp::UMAX:
-        fn = "atomic_fetch_max_explicit";
+        fn = msl::builtin::atomic::FetchMax;
         break;
       case tt::RMWOp::MIN:
       case tt::RMWOp::UMIN:
-        fn = "atomic_fetch_min_explicit";
+        fn = msl::builtin::atomic::FetchMin;
         break;
       case tt::RMWOp::AND:
-        fn = "atomic_fetch_and_explicit";
+        fn = msl::builtin::atomic::FetchAnd;
         break;
       case tt::RMWOp::OR:
-        fn = "atomic_fetch_or_explicit";
+        fn = msl::builtin::atomic::FetchOr;
         break;
       case tt::RMWOp::XOR:
-        fn = "atomic_fetch_xor_explicit";
+        fn = msl::builtin::atomic::FetchXor;
         break;
       case tt::RMWOp::XCHG:
-        fn = "atomic_exchange_explicit";
+        fn = msl::builtin::atomic::Exchange;
         break;
       default:
         return false;
@@ -1668,9 +1667,9 @@ std::optional<bool> MSLEmitter::emitAtomicRMW(Operation *op, msl::Block &body) {
               {ctx.var(wordPtr), ctx.var(isHigh), fv, ctx.i32lit(rmwOp)});
         } else {
           std::string wordPtr = fresh();
-          inner.push_back(
-              ctx.declStmt(ctx.named("device atomic_uint *"), wordPtr,
-                           ctx.raw("(device atomic_uint *)(" + p + ")")));
+          msl::Type *aup = ctx.deviceAtomicPtr(msl::Scalar::U32);
+          inner.push_back(ctx.declStmt(
+              aup, wordPtr, ctx.cast(CS::CStyle, aup, ctx.paren(ctx.var(p)))));
           call = ctx.call("tt_atomic_rmw_f32",
                           {ctx.var(wordPtr), fv, ctx.i32lit(rmwOp)});
         }
@@ -1698,7 +1697,7 @@ std::optional<bool> MSLEmitter::emitAtomicRMW(Operation *op, msl::Block &body) {
       if (!uniform && laneFree) {
         std::string src =
             "(uint)(" + laneId + " & " + std::to_string(~laneFree & 31) + ")";
-        id = shuffle("simd_shuffle", sc, id, src, body);
+        id = shuffle(msl::builtin::simd::Shuffle, sc, id, src, body);
       }
       ids[r] = id;
     }
@@ -1771,7 +1770,9 @@ std::optional<bool> MSLEmitter::emitAtomicPoll(Operation *op,
                 : "mem_flags::mem_threadgroup";
     msl::Stmt *pollBarrier =
         ctx.exprStmt(ctx.raw("threadgroup_barrier(" + barrierFlags + ")"));
-    std::string wordTy = bw == 16 ? "ushort" : (bw == 64 ? "ulong" : "uint");
+    msl::Scalar wordTy = bw == 16   ? msl::Scalar::U16
+                         : bw == 64 ? msl::Scalar::U64
+                                    : msl::Scalar::U32;
 
     // Bind wordPtr decls into `into`, returning the load-expr string.
     auto probe = [&](msl::Block &into) -> std::string {
@@ -1788,14 +1789,16 @@ std::optional<bool> MSLEmitter::emitAtomicPoll(Operation *op,
       }
       std::string wordPtr = fresh();
       if (bw == 64) {
-        into.push_back(
-            ctx.declStmt(ctx.named("volatile device ulong *"), wordPtr,
-                         ctx.raw("(volatile device ulong *)(" + p + ")")));
+        msl::Type *vup =
+            ctx.ptr(ctx.scalar(msl::Scalar::U64), msl::AddrSpace::Device,
+                    /*coherent=*/false, /*vol=*/true, /*spaceStar=*/true);
+        into.push_back(ctx.declStmt(
+            vup, wordPtr, ctx.cast(CS::CStyle, vup, ctx.paren(ctx.var(p)))));
         loadExpr = "(*" + wordPtr + ")";
       } else {
-        into.push_back(
-            ctx.declStmt(ctx.named("device atomic_uint *"), wordPtr,
-                         ctx.raw("(device atomic_uint *)(" + p + ")")));
+        msl::Type *aup = ctx.deviceAtomicPtr(msl::Scalar::U32);
+        into.push_back(ctx.declStmt(
+            aup, wordPtr, ctx.cast(CS::CStyle, aup, ctx.paren(ctx.var(p)))));
         loadExpr =
             "atomic_load_explicit(" + wordPtr + ", memory_order_relaxed)";
       }
@@ -1807,8 +1810,9 @@ std::optional<bool> MSLEmitter::emitAtomicPoll(Operation *op,
       msl::Block ifBody;
       std::string loadExpr = probe(ifBody);
       std::string want = fresh();
-      ifBody.push_back(ctx.declStmt(ctx.named(wordTy), want,
-                                    ctx.raw("(" + wordTy + ")" + exp)));
+      ifBody.push_back(
+          ctx.declStmt(ctx.scalar(wordTy), want,
+                       ctx.cast(CS::CStyle, ctx.scalar(wordTy), ctx.var(exp))));
       ifBody.push_back(ctx.whileScope(
           ctx.binary(B::Ne, ctx.raw(loadExpr), ctx.var(want)), msl::Block{}));
       body.push_back(ctx.ifScope(
@@ -1825,10 +1829,11 @@ std::optional<bool> MSLEmitter::emitAtomicPoll(Operation *op,
     msl::Block ifBody;
     std::string loadExpr = probe(ifBody);
     std::string want = fresh(), loaded = fresh();
-    ifBody.push_back(ctx.declStmt(ctx.named(wordTy), want,
-                                  ctx.raw("(" + wordTy + ")" + exp)));
     ifBody.push_back(
-        ctx.declStmt(ctx.named(wordTy), loaded, ctx.raw(loadExpr)));
+        ctx.declStmt(ctx.scalar(wordTy), want,
+                     ctx.cast(CS::CStyle, ctx.scalar(wordTy), ctx.var(exp))));
+    ifBody.push_back(
+        ctx.declStmt(ctx.scalar(wordTy), loaded, ctx.raw(loadExpr)));
     ifBody.push_back(ctx.assignStmt(
         ctx.var(flag),
         ctx.paren(ctx.binary(B::Eq, ctx.var(loaded), ctx.var(want)))));
@@ -2000,7 +2005,8 @@ std::optional<bool> MSLEmitter::emitScan(Operation *op, msl::Block &body) {
             ctx.declStmt(scTypes[k], accs[k][r], ctx.var(srcNames[k][r])));
       }
 
-    const char *shuf = rev ? "simd_shuffle_down" : "simd_shuffle_up";
+    StringRef shuf =
+        rev ? msl::builtin::simd::ShuffleDown : msl::builtin::simd::ShuffleUp;
     std::string axisTopLane =
         axisLaneMask == 0
             ? laneId
@@ -2224,7 +2230,7 @@ std::optional<bool> MSLEmitter::emitReduce(Operation *op, msl::Block &body) {
           continue;
         SmallVector<std::string> others(nOp);
         for (int k = 0; k < nOp; ++k)
-          others[k] = shuffle("simd_shuffle_xor", scTys[k], accs[k],
+          others[k] = shuffle(msl::builtin::simd::ShuffleXor, scTys[k], accs[k],
                               std::to_string(m) + "u", body);
         SmallVector<std::string> out;
         if (!combineN(region, accs, others, body, out))

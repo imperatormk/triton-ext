@@ -84,12 +84,9 @@ inline constexpr llvm::StringRef MultiplyAccumulate =
     "simdgroup_multiply_accumulate";
 } // namespace sg
 
-// atomic_* element types and explicit-ordering operations.
+// Explicit-ordering atomic operations. The atomic_* element type names are not
+// here: they are derived from msl::AtomicType by the printer's atomicName().
 namespace atomic {
-inline constexpr llvm::StringRef Int = "atomic_int";
-inline constexpr llvm::StringRef Uint = "atomic_uint";
-inline constexpr llvm::StringRef Long = "atomic_long";
-inline constexpr llvm::StringRef Float = "atomic_float";
 inline constexpr llvm::StringRef Load = "atomic_load_explicit";
 inline constexpr llvm::StringRef Store = "atomic_store_explicit";
 inline constexpr llvm::StringRef Exchange = "atomic_exchange_explicit";

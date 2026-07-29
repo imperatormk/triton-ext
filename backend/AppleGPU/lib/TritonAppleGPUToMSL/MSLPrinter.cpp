@@ -56,7 +56,7 @@ static llvm::StringRef atomicName(Scalar s) {
   case Scalar::U64:
     return "atomic_ulong";
   default:
-    return "atomic_int";
+    llvm_unreachable("no MSL atomic_* type for this Scalar");
   }
 }
 
@@ -106,14 +106,16 @@ void MSLPrinter::printType(const Type *t) {
     return;
   case Type::Kind::Pointer: {
     auto *p = llvm::cast<PointerType>(t);
-    if (p->coherent && p->as == AddrSpace::Device)
-      os << "coherent(device) ";
-    else
-      os << addrSpaceName(p->as);
+    // `volatile` qualifies the pointee and precedes the address space;
+    // `coherent(<as>)` is an address-space attribute and follows it. Both
+    // compose with the address space rather than replacing it.
     if (p->volatile_)
       os << "volatile ";
+    os << addrSpaceName(p->as);
+    if (p->coherent)
+      os << "coherent(" << addrSpaceName(p->as).rtrim() << ") ";
     printType(p->pointee);
-    os << "*";
+    os << (p->spaceBeforeStar ? " *" : "*");
     return;
   }
   case Type::Kind::Named:
@@ -363,9 +365,12 @@ void MSLPrinter::printStmtInline(const Stmt *s) {
     printExpr(e->e);
     return;
   }
-  if (auto *b = llvm::dyn_cast<BreakStmt>(s)) {
-    (void)b;
+  if (llvm::isa<BreakStmt>(s)) {
     os << "break";
+    return;
+  }
+  if (llvm::isa<ContinueStmt>(s)) {
+    os << "continue";
     return;
   }
   llvm_unreachable("printStmtInline: unsupported stmt");
@@ -464,11 +469,9 @@ void MSLPrinter::printStmt(const Stmt *s) {
     ind() << "continue;\n";
     return;
   case Stmt::Kind::Barrier:
-    // Barriers only ever go through printBlock's peephole.
-    barrierPending = true;
-    barrierPendingDevice =
-        barrierPendingDevice || llvm::cast<BarrierStmt>(s)->device;
-    return;
+    // printBlock intercepts every BarrierStmt before printStmt sees it. Setting
+    // barrierPending here without a flush would silently swallow the barrier.
+    llvm_unreachable("BarrierStmt must go through printBlock's peephole");
   case Stmt::Kind::CompactIf: {
     auto *c = llvm::cast<CompactIfStmt>(s);
     if (c->parenCond) {

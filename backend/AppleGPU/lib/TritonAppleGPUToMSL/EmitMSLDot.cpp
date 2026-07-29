@@ -192,9 +192,8 @@ bool MSLEmitter::emitDot(tt::DotOp op, msl::Block &body) {
 // every later name.
 void MSLEmitter::dotPoolPtrs(msl::Block &body, const DotPlan &plan,
                              DotEmitCtx &dc) {
-  // `threadgroup <scalar>* name` decl type (star attached, matches string).
   auto tgPtr = [&](StringRef scalar) {
-    return ctx.named(("threadgroup " + scalar.str() + "*"));
+    return ctx.ptr(ctx.named(scalar), msl::AddrSpace::Threadgroup);
   };
   dc.tgA = fresh();
   dc.tgB = fresh();
@@ -571,7 +570,7 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
   int nRes = regCount(op.getResult());
 
   auto tgPtr = [&](StringRef s) {
-    return ctx.named(("threadgroup " + s.str() + "*"));
+    return ctx.ptr(ctx.named(s), msl::AddrSpace::Threadgroup);
   };
   std::string pA = fresh(), pB = fresh(), pC = fresh();
   body.push_back(
@@ -743,7 +742,7 @@ bool MSLEmitter::emitDotScalar(tt::DotOp op, msl::Block &body) {
   int64_t aBytes = cTy.getShape()[rank - 2] * K * byteWidth(aElem);
 
   auto tgPtr = [&](StringRef s) {
-    return ctx.named(("threadgroup " + s.str() + "*"));
+    return ctx.ptr(ctx.named(s), msl::AddrSpace::Threadgroup);
   };
   std::string tgA = fresh(), tgB = fresh();
   body.push_back(ctx.declStmt(tgPtr(aScalar), tgA, poolRegion(0, aScalar)));

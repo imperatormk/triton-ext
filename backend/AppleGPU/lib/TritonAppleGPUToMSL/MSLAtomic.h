@@ -28,14 +28,14 @@ public:
   msl::Expr *asType(msl::Type *to, msl::Expr *x) {
     return ctx.cast(msl::Cast::Style::AsType, to, x);
   }
-  msl::Expr *deviceAtomicPtr(llvm::StringRef atomicTy, llvm::StringRef p);
+  msl::Expr *deviceAtomicPtr(msl::Scalar elem, llvm::StringRef p);
   msl::Expr *casWeak(msl::Expr *ptr, llvm::StringRef expVar, msl::Expr *newVal);
   msl::Expr *packed16Extract(llvm::StringRef word, llvm::StringRef isHigh);
   msl::Expr *packed16Merge(llvm::StringRef word, llvm::StringRef isHigh,
                            msl::Expr *newBitsU32);
   msl::Block packed16Base(llvm::StringRef p, std::string &wordPtrOut,
                           std::string &isHighOut);
-  msl::Expr *rmwCall(llvm::StringRef fn, llvm::StringRef atomicTy,
+  msl::Expr *rmwCall(llvm::StringRef fn, msl::Scalar atomicElem,
                      llvm::StringRef p, llvm::StringRef v,
                      llvm::StringRef order, bool memFlags);
   msl::Block int32CAS(llvm::StringRef p, llvm::StringRef c, llvm::StringRef v,

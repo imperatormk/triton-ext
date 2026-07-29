@@ -12,6 +12,8 @@
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <tuple>
+
 #define GEN_PASS_DEF_ACCELERATEAPPLEMATMUL
 #include "TritonAppleGPUTransforms/Passes.h.inc"
 
@@ -22,15 +24,31 @@ using namespace mlir::triton::applegpu;
 
 namespace {
 // warpsPerCTA for a dot shape and warp count. Apple simdgroup tile = 8x8.
+//
+// The wm|tilesM && wn|tilesN divisibility filter can in principle leave warps
+// idle, but not for any shape Triton can actually produce: tensor dims are
+// powers of two, so tilesM/tilesN/nFrag are too, and the search then always
+// reaches product == min(nFrag, numWarps) (verified exhaustively over all
+// power-of-two M,N up to 2048 and numWarps up to 64). The residual idleness is
+// nFrag < numWarps - fewer 8x8 fragments than warps - which no choice of split
+// can fix; planDot clamps its warp count to nFrag for exactly this reason.
 SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps) {
   unsigned tilesM = std::max<int64_t>(1, M / 8);
   unsigned tilesN = std::max<int64_t>(1, N / 8);
 
+  // Ranking key, compared lexicographically and maximized: prefer the most
+  // warps used, then the smallest per-warp A/B working set (negated so bigger
+  // wins), then the most balanced ownership, then the squarest warp grid.
+  auto rank = [](unsigned product, unsigned operandFrags, unsigned balance,
+                 unsigned warpBalance) {
+    return std::tuple<unsigned, int, int, unsigned>(
+        product, -static_cast<int>(operandFrags), -static_cast<int>(balance),
+        warpBalance);
+  };
+
   unsigned bestM = 1, bestN = 1;
-  unsigned bestProduct = 1;
-  unsigned bestOperandFrags = tilesM + tilesN;
-  unsigned bestBalance = std::max(tilesM, tilesN) - std::min(tilesM, tilesN);
-  unsigned bestWarpBalance = 1;
+  auto best = rank(1, tilesM + tilesN,
+                   std::max(tilesM, tilesN) - std::min(tilesM, tilesN), 1);
 
   // Use as many warps as legally tile the CTA, then pick the split with the
   // smallest per-warp A/B working set (the split changes how many A/B simdgroup
@@ -47,27 +65,15 @@ SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps) {
 
       unsigned ownM = tilesM / wm;
       unsigned ownN = tilesN / wn;
-      unsigned operandFrags = ownM + ownN;
-      unsigned balance = std::max(ownM, ownN) - std::min(ownM, ownN);
-      unsigned warpBalance = std::min(wm, wn);
-
-      bool better = product > bestProduct;
-      if (!better && product == bestProduct)
-        better = operandFrags < bestOperandFrags;
-      if (!better && product == bestProduct && operandFrags == bestOperandFrags)
-        better = balance < bestBalance;
-      if (!better && product == bestProduct &&
-          operandFrags == bestOperandFrags && balance == bestBalance)
-        better = warpBalance > bestWarpBalance;
-      if (!better)
+      auto key =
+          rank(product, ownM + ownN,
+               std::max(ownM, ownN) - std::min(ownM, ownN), std::min(wm, wn));
+      if (key <= best)
         continue;
 
+      best = key;
       bestM = wm;
       bestN = wn;
-      bestProduct = product;
-      bestOperandFrags = operandFrags;
-      bestBalance = balance;
-      bestWarpBalance = warpBalance;
     }
   }
 

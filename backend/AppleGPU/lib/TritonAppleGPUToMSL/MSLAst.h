@@ -76,9 +76,12 @@ struct PointerType : Type {
   AddrSpace as;
   bool coherent;
   bool volatile_;
-  PointerType(Type *p, AddrSpace as, bool coherent, bool vol)
+  // Emit `T *` rather than `T*`. Both spellings are already present in the
+  // emitted output; this preserves each site's existing form.
+  bool spaceBeforeStar;
+  PointerType(Type *p, AddrSpace as, bool coherent, bool vol, bool spaceStar)
       : Type(Kind::Pointer), pointee(p), as(as), coherent(coherent),
-        volatile_(vol) {}
+        volatile_(vol), spaceBeforeStar(spaceStar) {}
   static bool classof(const Type *t) { return t->kind == Kind::Pointer; }
 };
 
@@ -490,8 +493,14 @@ public:
   MatrixType *matrix(MatrixType::Elem e) { return make<MatrixType>(e); }
   AtomicType *atomic(Scalar e) { return make<AtomicType>(e); }
   PointerType *ptr(Type *p, AddrSpace as, bool coherent = false,
-                   bool vol = false) {
-    return make<PointerType>(p, as, coherent, vol);
+                   bool vol = false, bool spaceStar = false) {
+    return make<PointerType>(p, as, coherent, vol, spaceStar);
+  }
+  // `device atomic_<elem> *` - the atomic-typed device pointer every RMW/CAS
+  // and poll site casts to.
+  PointerType *deviceAtomicPtr(Scalar e) {
+    return ptr(atomic(e), AddrSpace::Device, /*coherent=*/false, /*vol=*/false,
+               /*spaceStar=*/true);
   }
   NamedType *named(llvm::StringRef n) { return make<NamedType>(save(n)); }
 

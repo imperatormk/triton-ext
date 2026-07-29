@@ -31,12 +31,10 @@ msl::Expr *AtomicEmitter::init0(StringRef sc) {
   return ctx.lit(sc == "float" || sc == "half" ? "0.0" : "0");
 }
 
-// (device <atomicTy>*)p - the atomic-typed device pointer the RMW/poll casts
-// to. atomicTy is spelled by name (atomic_int/atomic_uint/atomic_float/...) so
-// the pointee is a NamedType, keeping the builder agnostic to the
-// scalar->atomic choice.
-msl::Expr *AtomicEmitter::deviceAtomicPtr(StringRef atomicTy, StringRef p) {
-  msl::Type *ptr = ctx.ptr(ctx.named(atomicTy), msl::AddrSpace::Device);
+// (device atomic_<elem>*)p - the atomic-typed device pointer the RMW/poll
+// casts to.
+msl::Expr *AtomicEmitter::deviceAtomicPtr(msl::Scalar elem, StringRef p) {
+  msl::Type *ptr = ctx.ptr(ctx.atomic(elem), msl::AddrSpace::Device);
   return ctx.cast(CS::CStyle, ptr, ctx.var(p));
 }
 
@@ -80,7 +78,8 @@ msl::Expr *AtomicEmitter::packed16Merge(StringRef word, StringRef isHigh,
 msl::Block AtomicEmitter::packed16Base(StringRef p, std::string &wordPtrOut,
                                        std::string &isHighOut) {
   std::string isHigh = fresh(), wordPtr = fresh();
-  msl::Type *auptr = ctx.ptr(ctx.named(ba::Uint), msl::AddrSpace::Device);
+  msl::Type *auptr =
+      ctx.ptr(ctx.atomic(msl::Scalar::U32), msl::AddrSpace::Device);
   auto szOf = [&] {
     return ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::SizeT),
                     ctx.paren(ctx.var(p)));
@@ -109,13 +108,14 @@ msl::Block AtomicEmitter::packed16Base(StringRef p, std::string &wordPtrOut,
 // rmwCall - native atomic_fetch_*_explicit call
 //===----------------------------------------------------------------------===//
 
-// fn((device atomicTy*)p, v, order[, mem_flags::mem_device]).
+// fn((device atomic_<elem>*)p, v, order[, mem_flags::mem_device]).
 // `order` / `memflags` come from MSLConstants so the ordering surface stays
 // greppable; the memflags arg is present iff `tail` is set.
-msl::Expr *AtomicEmitter::rmwCall(StringRef fn, StringRef atomicTy, StringRef p,
-                                  StringRef v, StringRef order, bool memFlags) {
-  llvm::SmallVector<msl::Expr *> args{deviceAtomicPtr(atomicTy, p), ctx.var(v),
-                                      ctx.lit(order)};
+msl::Expr *AtomicEmitter::rmwCall(StringRef fn, msl::Scalar atomicElem,
+                                  StringRef p, StringRef v, StringRef order,
+                                  bool memFlags) {
+  llvm::SmallVector<msl::Expr *> args{deviceAtomicPtr(atomicElem, p),
+                                      ctx.var(v), ctx.lit(order)};
   if (memFlags)
     args.push_back(ctx.lit(bmem::Device));
   return ctx.call(fn, args);
@@ -138,7 +138,7 @@ msl::Block AtomicEmitter::int32CAS(StringRef p, StringRef c, StringRef v,
   std::string exp = fresh();
   msl::Type *scTy = ctx.named(sc);
 
-  msl::Type *aiptr = ctx.named(("device " + std::string(ba::Int) + " *"));
+  msl::Type *aiptr = ctx.deviceAtomicPtr(msl::Scalar::I32);
   msl::Expr *cas =
       casWeak(ctx.cast(CS::CStyle, aiptr, ctx.var(p)), exp, ctx.var(v));
   msl::Expr *cond =
@@ -167,7 +167,7 @@ msl::Block AtomicEmitter::float32CAS(StringRef p, StringRef c, StringRef v,
     return asType(ctx.scalar(msl::Scalar::U32), x);
   };
 
-  msl::Type *auptr = ctx.named(("device " + std::string(ba::Uint) + " *"));
+  msl::Type *auptr = ctx.deviceAtomicPtr(msl::Scalar::U32);
   msl::Expr *cas =
       casWeak(ctx.cast(CS::CStyle, auptr, ctx.var(p)), exp, asU32(ctx.var(v)));
   msl::Expr *cond =
@@ -258,7 +258,8 @@ msl::Stmt *AtomicEmitter::deviceFence() {
 
 // threadgroup atomic_uint* bins = ((threadgroup atomic_uint*)poolBuf);
 msl::Stmt *AtomicEmitter::histBinsDecl(StringRef bins) {
-  msl::Type *tgptr = ctx.ptr(ctx.named(ba::Uint), msl::AddrSpace::Threadgroup);
+  msl::Type *tgptr =
+      ctx.ptr(ctx.atomic(msl::Scalar::U32), msl::AddrSpace::Threadgroup);
   msl::Expr *region = ctx.paren(ctx.cast(CS::CStyle, tgptr, ctx.var(poolBuf)));
   return ctx.declStmt(tgptr, bins, region);
 }

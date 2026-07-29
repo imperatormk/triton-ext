@@ -58,6 +58,64 @@ struct FusedDotCtx {
   std::optional<DirectStore> direct;
 };
 
+// The lowering strategy for one tt.dot plus every derived quantity the
+// emitters need. Produced by MSLEmitter::planDot as a pure function of the op
+// and the emitter's budget state - no emission, no name allocation - so the
+// choice is one inspectable value instead of six interacting flags.
+struct DotPlan {
+  enum class Kind {
+    Unsupported, // shape/element type outside the simdgroup-matrix path
+    Scalar,      // integer operands: per-thread scalar K-loop
+    Panel,       // A+B alone overflow the budget: walk (mp x np) panels
+    Fused,       // register-resident C across a K-loop (3-phase)
+    Direct       // single dot; C either disjoint from A/B or row-banded
+  };
+
+  Kind kind = Kind::Unsupported;
+
+  int rank = 0;
+  int64_t Bd = 1, M = 0, N = 0, K = 0;
+  // Fragment counts: M/8, N/8, K/8 and the mT*nT fragment grid.
+  int64_t mT = 0, nT = 0, kT = 0, nFrag = 0;
+  int64_t numWarps = 1;
+
+  // Operands already resident in a threadgroup buffer; staging is skipped and
+  // the tg pointer aliases that buffer.
+  std::optional<InPlaceOperand> aInPlace, bInPlace;
+  // The value whose registers get staged - the operand itself, or the source
+  // of a convert_layout the staging makes redundant.
+  Value aStage, bStage;
+
+  // Pool layout: A at 0, B at stagedA, C at stagedAB (disjoint) or 0 (aliased
+  // over A/B, which forces the banded C round-trip).
+  int64_t stagedA = 0, stagedB = 0, stagedAB = 0;
+  bool disjointC = false;
+  int64_t bandRows = 0;
+
+  // Fused three-phase state, mirrored from FusedDotCtx::phase.
+  FusedDotPhase phase = FusedDotPhase::None;
+  bool needAB = true, needC = true;
+};
+
+// Everything emitDot's prologue derives once and hands down to whichever
+// strategy emitter it dispatches to: the fragment types, the staged operand
+// values and their register name lists, the threadgroup pool pointer names,
+// the result register ids, and the C row/col layout dims. Every field is
+// already-computed state - constructing one mints no names and emits nothing.
+struct DotEmitCtx {
+  std::string opScalar;
+  msl::MatrixType *opFrag = nullptr;
+  msl::MatrixType *accFragTy = nullptr;
+
+  Value aStage, bStage;
+  ArrayRef<std::string> aNames, bNames, cInit;
+
+  std::string tgA, tgB, tgC;
+  SmallVector<std::string> ids;
+
+  StringAttr rowDim, colDim;
+};
+
 } // namespace mlir::triton::applegpu
 
 #endif // MSL_FUSED_DOT_H

@@ -1,6 +1,6 @@
 // EmitMSLMemory.cpp - memory / offset-expression lowering.
 //
-// AST builders (astXxx) that build the runtime offset/address expressions as
+// AST builders that build the runtime offset/address expressions as
 // typed msl::Expr nodes for the printer to emit.
 //
 // INVARIANT: the printer inserts no grouping parens; a builder inserts an
@@ -22,7 +22,7 @@ namespace mlir::triton::applegpu {
 
 // ((threadgroup sc*)base), base = poolBuf or (poolBuf + off). `sc` may be a
 // scalar or an atomic type name, so the pointee is a NamedType.
-msl::Expr *MSLEmitter::astPoolRegion(int64_t byteOffset, StringRef sc) {
+msl::Expr *MSLEmitter::poolRegion(int64_t byteOffset, StringRef sc) {
   msl::Expr *base =
       byteOffset == 0
           ? static_cast<msl::Expr *>(ctx.var(poolBuf))
@@ -36,17 +36,17 @@ msl::Expr *MSLEmitter::astPoolRegion(int64_t byteOffset, StringRef sc) {
 // Memdesc element address
 //===----------------------------------------------------------------------===//
 
-msl::Expr *MSLEmitter::astMemdescElemAddr(const MemDescInfo &info,
-                                          RankedTensorType tileTy, int reg) {
+msl::Expr *MSLEmitter::memdescElemAddr(const MemDescInfo &info,
+                                       RankedTensorType tileTy, int reg) {
   msl::Expr *off;
   if (info.bufStrides.empty()) {
-    off = astFlatTileOffset(tileTy, reg);
+    off = layout.flatTileOffset(tileTy, reg);
   } else {
     tt::LinearLayout ll = ttg::toLinearLayout(tileTy);
     auto outNames = llvm::to_vector(ll.getOutDimNames());
     off = nullptr;
     for (int d = 0; d < (int)outNames.size(); ++d) {
-      msl::Expr *c = astLayoutCoordExpr(tileTy, reg, outNames[d]);
+      msl::Expr *c = layout.layoutCoordExpr(tileTy, reg, outNames[d]);
       int64_t s = info.bufStrides[d];
       msl::Expr *term = s == 1
                             ? c

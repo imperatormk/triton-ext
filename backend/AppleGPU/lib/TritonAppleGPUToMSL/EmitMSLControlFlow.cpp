@@ -1,10 +1,10 @@
 // EmitMSLControlFlow.cpp - region / CFG-walk + scope-builder AST builders.
 //
-// The structured-control-flow scope builders (astForScope/astTripCountForScope/
-// astForNode/astIfScope/astWhileScope), the unstructured-CFG -> state-machine
-// dispatch (astEmitBlockCFG/astWalkBlock/astWalkBlock2/
-// astBranchEdge/astCondBranch/astTerminatorEdge) and the loop-carried /
-// if-result yield resolution (astYieldAssign). astEmitOp drives these.
+// The structured-control-flow scope builders (forScope/tripCountForScope/
+// forNode/ifScope/whileScope), the unstructured-CFG -> state-machine
+// dispatch (emitBlockCFG/walkBlock/walkBlock2/
+// branchEdge/condBranch/terminatorEdge) and the loop-carried /
+// if-result yield resolution (yieldAssign). emitOp drives these.
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
@@ -20,8 +20,8 @@ using CS = msl::Cast::Style;
 // Structured control flow: for / if / while
 //===----------------------------------------------------------------------===//
 
-msl::ForScope *MSLEmitter::astForScope(scf::ForOp op, msl::Block body,
-                                       StringRef iv, StringRef ivTy) {
+msl::ForScope *MSLEmitter::forScope(scf::ForOp op, msl::Block body,
+                                    StringRef iv, StringRef ivTy) {
   std::string lo = names(op.getLowerBound())[0];
   std::string hi = names(op.getUpperBound())[0];
   std::string st = names(op.getStep())[0];
@@ -34,11 +34,9 @@ msl::ForScope *MSLEmitter::astForScope(scf::ForOp op, msl::Block body,
 
 // Wide-IV i64 form. The `iv = lo + tc*st` decl and `if(!(iv<hi)) break;` guard
 // are the FIRST body stmts (the i65 dodge); `body` is spliced after them.
-msl::TripCountForScope *MSLEmitter::astTripCountForScope(scf::ForOp op,
-                                                         msl::Block body,
-                                                         StringRef counter,
-                                                         StringRef iv,
-                                                         StringRef ivTy) {
+msl::TripCountForScope *
+MSLEmitter::tripCountForScope(scf::ForOp op, msl::Block body, StringRef counter,
+                              StringRef iv, StringRef ivTy) {
   std::string lo = names(op.getLowerBound())[0];
   std::string hi = names(op.getUpperBound())[0];
   std::string st = names(op.getStep())[0];
@@ -52,15 +50,15 @@ msl::TripCountForScope *MSLEmitter::astTripCountForScope(scf::ForOp op,
   return ctx.tripCountForScope(ty, counter, ivDecl, guard, std::move(body));
 }
 
-msl::Stmt *MSLEmitter::astForNode(scf::ForOp op, msl::Block body, StringRef iv,
-                                  StringRef tc, StringRef ivTy, bool wideIv) {
+msl::Stmt *MSLEmitter::forNode(scf::ForOp op, msl::Block body, StringRef iv,
+                               StringRef tc, StringRef ivTy, bool wideIv) {
   if (wideIv)
-    return astTripCountForScope(op, std::move(body), tc, iv, ivTy);
-  return astForScope(op, std::move(body), iv, ivTy);
+    return tripCountForScope(op, std::move(body), tc, iv, ivTy);
+  return forScope(op, std::move(body), iv, ivTy);
 }
 
-msl::IfScope *MSLEmitter::astIfScope(scf::IfOp op, msl::Block thenB,
-                                     msl::Block elseB) {
+msl::IfScope *MSLEmitter::ifScope(scf::IfOp op, msl::Block thenB,
+                                  msl::Block elseB) {
   msl::Expr *c = ctx.var(names(op.getCondition())[0]);
   if (op.getElseRegion().empty())
     return ctx.ifScope(c, std::move(thenB));
@@ -70,7 +68,7 @@ msl::IfScope *MSLEmitter::astIfScope(scf::IfOp op, msl::Block thenB,
 // while(true){ <before> if(!(c)){<fwd> break;} <after-forwarded body via body>
 // } The before-region ops + condition-forward + after-region ops are all in
 // `body`; the caller assembles them in order.
-msl::WhileScope *MSLEmitter::astWhileScope(scf::WhileOp op, msl::Block body) {
+msl::WhileScope *MSLEmitter::whileScope(scf::WhileOp op, msl::Block body) {
   return ctx.whileScope(/*cond=*/nullptr, std::move(body));
 }
 
@@ -81,27 +79,27 @@ msl::WhileScope *MSLEmitter::astWhileScope(scf::WhileOp op, msl::Block body) {
 // phi-assign the successor's arg vars from the branch operands, set the state
 // var, and continue. Returned as a Block the caller splices into the case body.
 // Per-register `dst[r] = src[bcast]` with the size==1 splat broadcast.
-void MSLEmitter::astCopyRegs(msl::Block &out, ArrayRef<std::string> dst,
-                             ArrayRef<std::string> src) {
+void MSLEmitter::copyRegs(msl::Block &out, ArrayRef<std::string> dst,
+                          ArrayRef<std::string> src) {
   for (size_t r = 0; r < dst.size(); ++r)
     out.push_back(
         ctx.assignStmt(ctx.var(dst[r]), ctx.var(src[src.size() == 1 ? 0 : r])));
 }
 
-msl::Block MSLEmitter::astBranchEdge(Block *succ, Operation::operand_range args,
-                                     StringRef state) {
+msl::Block MSLEmitter::branchEdge(Block *succ, Operation::operand_range args,
+                                  StringRef state) {
   msl::Block out;
   for (auto [i, operand] : llvm::enumerate(args))
-    astCopyRegs(out, valMap[succ->getArgument(i)], names(operand));
+    copyRegs(out, valMap[succ->getArgument(i)], names(operand));
   out.push_back(ctx.assignStmt(ctx.var(state), ctx.lit(blockLabel[succ])));
   out.push_back(ctx.continueStmt());
   return out;
 }
 
 // cond_branch -> if(cond){<trueEdge>} else {<falseEdge>}; the two edge Blocks
-// are built by astBranchEdge.
-msl::Stmt *MSLEmitter::astCondBranch(Value cond, msl::Block thenB,
-                                     msl::Block elseB) {
+// are built by branchEdge.
+msl::Stmt *MSLEmitter::condBranch(Value cond, msl::Block thenB,
+                                  msl::Block elseB) {
   return ctx.ifElseScope(ctx.var(scalarName(cond)), std::move(thenB),
                          std::move(elseB));
 }
@@ -110,11 +108,11 @@ msl::Stmt *MSLEmitter::astCondBranch(Value cond, msl::Block thenB,
 // Loop-carried / if-result yield resolution
 //===----------------------------------------------------------------------===//
 
-msl::Block MSLEmitter::astYieldAssign(Operation *term,
-                                      ArrayRef<SmallVector<std::string>> dsts) {
+msl::Block MSLEmitter::yieldAssign(Operation *term,
+                                   ArrayRef<SmallVector<std::string>> dsts) {
   msl::Block out;
   for (auto [i, operand] : llvm::enumerate(term->getOperands()))
-    astCopyRegs(out, dsts[i], names(operand));
+    copyRegs(out, dsts[i], names(operand));
   return out;
 }
 
@@ -122,7 +120,7 @@ msl::Block MSLEmitter::astYieldAssign(Operation *term,
 // vars
 // + cross-block hoisted vars, then a StateMachineScope with per-block cases
 // (walked ops + hoist spills + terminator edge).
-msl::Block MSLEmitter::astEmitBlockCFG(Region &region) {
+msl::Block MSLEmitter::emitBlockCFG(Region &region) {
   msl::Block out;
   blockLabel.clear();
   int idx = 0;
@@ -135,7 +133,7 @@ msl::Block MSLEmitter::astEmitBlockCFG(Region &region) {
         bindDataless(arg);
         continue;
       }
-      bindRegs(arg, astDeclResultVars(arg, out));
+      bindRegs(arg, declResultVars(arg, out));
     }
   llvm::DenseMap<Value, SmallVector<std::string>> hoist;
   for (Block &blk : region)
@@ -147,34 +145,35 @@ msl::Block MSLEmitter::astEmitBlockCFG(Region &region) {
           return u->getBlock() != &blk;
         });
         if (crosses)
-          hoist[res] = astDeclResultVars(res, out);
+          hoist[res] = declResultVars(res, out);
       }
 
   std::string state = fresh();
   cfgState = state;
   llvm::SmallVector<std::pair<std::string, msl::Block>> cases;
   for (Block &blk : region) {
-    msl::Block caseBody = astWalkBlock2(blk, hoist);
+    msl::Block caseBody = walkBlock2(blk, hoist);
     // terminator edge
-    for (msl::Stmt *s : astTerminatorEdge(blk.getTerminator(), state))
+    for (msl::Stmt *s : terminatorEdge(blk.getTerminator(), state))
       caseBody.push_back(s);
     cases.push_back({blockLabel[&blk], std::move(caseBody)});
   }
   cfgState.clear();
-  out.push_back(astMapCFGStateMachine(state, cases));
+  out.push_back(mapCFGStateMachine(state, cases));
   return out;
 }
 
 // Walk a CFG block's non-terminator ops, spilling cross-block results into
 // their hoisted vars (and rebinding) after each defining op.
-msl::Block MSLEmitter::astWalkBlock2(
-    Block &blk, llvm::DenseMap<Value, SmallVector<std::string>> &hoist) {
+msl::Block
+MSLEmitter::walkBlock2(Block &blk,
+                       llvm::DenseMap<Value, SmallVector<std::string>> &hoist) {
   msl::Block body;
   int savedIndent = indent;
   ++indent; // state-machine case body prints one level deeper
   ++indent;
   for (Operation &op : blk.without_terminator()) {
-    if (!astEmitOp(&op, body)) {
+    if (!emitOp(&op, body)) {
       op.emitError("EmitMSL: unhandled CFG op '" + op.getName().getStringRef() +
                    "'");
       emitFailed = true;
@@ -195,26 +194,25 @@ msl::Block MSLEmitter::astWalkBlock2(
 }
 
 // Terminator -> state transition: branch (edge), cond_branch (if/else edges),
-// or a normal op (return, walked via astEmitOp).
-msl::Block MSLEmitter::astTerminatorEdge(Operation *term, StringRef state) {
+// or a normal op (return, walked via emitOp).
+msl::Block MSLEmitter::terminatorEdge(Operation *term, StringRef state) {
   msl::Block out;
   if (auto br = dyn_cast<cf::BranchOp>(term)) {
-    for (msl::Stmt *s :
-         astBranchEdge(br.getDest(), br.getDestOperands(), state))
+    for (msl::Stmt *s : branchEdge(br.getDest(), br.getDestOperands(), state))
       out.push_back(s);
     return out;
   }
   if (auto cbr = dyn_cast<cf::CondBranchOp>(term)) {
     msl::Block thenB =
-        astBranchEdge(cbr.getTrueDest(), cbr.getTrueDestOperands(), state);
+        branchEdge(cbr.getTrueDest(), cbr.getTrueDestOperands(), state);
     msl::Block elseB =
-        astBranchEdge(cbr.getFalseDest(), cbr.getFalseDestOperands(), state);
+        branchEdge(cbr.getFalseDest(), cbr.getFalseDestOperands(), state);
     out.push_back(
-        astCondBranch(cbr.getCondition(), std::move(thenB), std::move(elseB)));
+        condBranch(cbr.getCondition(), std::move(thenB), std::move(elseB)));
     return out;
   }
-  // return / other terminator through astEmitOp.
-  if (!astEmitOp(term, out)) {
+  // return / other terminator through emitOp.
+  if (!emitOp(term, out)) {
     term->emitError("EmitMSL: unhandled CFG terminator '" +
                     term->getName().getStringRef() + "'");
     emitFailed = true;
@@ -223,16 +221,16 @@ msl::Block MSLEmitter::astTerminatorEdge(Operation *term, StringRef state) {
 }
 
 // Walk a single-block region's ops into a Block: each op goes through
-// astEmitOp. `depth` is the printer nesting the Block prints at. Terminators
-// (yield/return/branch) are walked too; astEmitOp handles the dataless ones.
-msl::Block MSLEmitter::astWalkBlock(Block &blk, unsigned depth) {
+// emitOp. `depth` is the printer nesting the Block prints at. Terminators
+// (yield/return/branch) are walked too; emitOp handles the dataless ones.
+msl::Block MSLEmitter::walkBlock(Block &blk, unsigned depth) {
   msl::Block body;
   int savedIndent = indent;
   indent = depth;
   for (Operation &op : blk) {
-    if (astEmitOp(&op, body))
+    if (emitOp(&op, body))
       continue;
-    // No real-kernel op family falls through: astEmitOp is exhaustive. An
+    // No real-kernel op family falls through: emitOp is exhaustive. An
     // unhandled op is a hard error.
     op.emitError("EmitMSL: unhandled op '" + op.getName().getStringRef() + "'");
     emitFailed = true;

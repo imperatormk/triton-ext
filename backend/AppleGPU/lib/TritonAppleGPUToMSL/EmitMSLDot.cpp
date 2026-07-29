@@ -1,7 +1,7 @@
 // EmitMSLDot.cpp - dot/GEMM simdgroup-matrix + fp-narrowing lowering.
 //
-// AST builders for the simdgroup-matrix fragment MMA (astEmitDot /
-// astEmitDotScalar / astEmitFusedGemm), plus the fp_to_fp narrowing helpers.
+// AST builders for the simdgroup-matrix fragment MMA (emitDot /
+// emitDotScalar / emitFusedGemm), plus the fp_to_fp narrowing helpers.
 //
 // INVARIANT: the printer inserts no grouping parens; a builder inserts an
 // explicit ctx.paren(...) wherever a subexpression needs precedence grouping.
@@ -34,26 +34,28 @@ template <typename T> T definingOp(Value v) {
 // `tg[sliceFlatOffset] = name[r];` per register, optionally batch-guarded.
 // `skip` short-circuits (operand is already in-place). `guard(r)` returns the
 // per-register batch condition or nullptr (unguarded).
-void MSLEmitter::astStageOperand(msl::Block &body, StringRef tgName,
-                                 Value stage, RankedTensorType stageTy,
-                                 ArrayRef<std::string> names, bool skip,
-                                 llvm::function_ref<msl::Expr *(int)> guard) {
+void MSLEmitter::stageOperand(msl::Block &body, StringRef tgName, Value stage,
+                              RankedTensorType stageTy,
+                              ArrayRef<std::string> names, bool skip,
+                              llvm::function_ref<msl::Expr *(int)> guard) {
   if (skip)
     return;
   for (int r = 0, n = regCount(stage); r < n; ++r) {
     msl::Stmt *asn = ctx.assignStmt(
-        ctx.subscript(ctx.var(tgName), astSliceFlatOffset(stageTy, r)),
+        ctx.subscript(ctx.var(tgName), layout.sliceFlatOffset(stageTy, r)),
         ctx.var(names[r]));
     msl::Expr *g = guard ? guard(r) : nullptr;
     body.push_back(g ? ctx.compactIf(g, asn) : asn);
   }
 }
 
-// tt.dot -> simdgroup-matrix fragment MMA: panel / fused (Decl/MMA/Readback +
-// direct-store) / per-dot (disjoint / aliased-banded) paths. Guard/offset
-// compound exprs are ctx.raw leaves; the per-fragment MMA + readback are the
-// shared astSg* builders.
-bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
+// Strategy + budget arithmetic for one tt.dot. Pure: reads the op, the layout
+// and the emitter's pool/memdesc state, and touches nothing else. Kind is
+// decided in the same order emitDot used to fall through its guards:
+// integer operands -> Scalar, unsupported shape/type -> Unsupported, A+B alone
+// over budget -> Panel, an active fused-GEMM phase -> Fused, else Direct.
+DotPlan MSLEmitter::planDot(tt::DotOp op) {
+  DotPlan p;
   auto aTy = cast<RankedTensorType>(op.getA().getType());
   auto bTy = cast<RankedTensorType>(op.getB().getType());
   auto cTy = cast<RankedTensorType>(op.getResult().getType());
@@ -61,104 +63,225 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
   Type bElem = bTy.getElementType();
   Type cElem = cTy.getElementType();
   if (isa<IntegerType>(aElem) || isa<IntegerType>(bElem) ||
-      isa<IntegerType>(cElem))
-    return astEmitDotScalar(op, body);
-  int rank = aTy.getRank();
-  if ((rank != 2 && rank != 3) || !isDotOperandElem(aElem) ||
+      isa<IntegerType>(cElem)) {
+    p.kind = DotPlan::Kind::Scalar;
+    return p;
+  }
+  p.rank = aTy.getRank();
+  if ((p.rank != 2 && p.rank != 3) || !isDotOperandElem(aElem) ||
       !isDotOperandElem(bElem) || aElem != bElem ||
       !(cElem.isF32() || cElem.isF16()))
-    return false;
-  int64_t Bd = rank == 3 ? cTy.getShape()[0] : 1;
-  int64_t M = cTy.getShape()[rank - 2];
-  int64_t N = cTy.getShape()[rank - 1];
-  int64_t K = aTy.getShape()[rank - 1];
-  if (M % 8 || N % 8 || K % 8)
-    return false;
+    return p;
+  p.Bd = p.rank == 3 ? cTy.getShape()[0] : 1;
+  p.M = cTy.getShape()[p.rank - 2];
+  p.N = cTy.getShape()[p.rank - 1];
+  p.K = aTy.getShape()[p.rank - 1];
+  if (p.M % 8 || p.N % 8 || p.K % 8)
+    return p;
 
-  auto &cInit = names(op.getC());
-  std::string opScalar = sgOperandScalar(aElem);
-  msl::MatrixType *opFrag = astSgFragType(aElem);
-  msl::MatrixType *accFragTy = ctx.matrix(msl::MatrixType::Elem::Float);
-  msl::Type *accScalarTy = astScalarType(cElem);
-  std::string accScalar = mslScalarType(cElem);
-
-  int64_t aBytes = M * K * byteWidth(aElem);
-  int64_t bBytes = N * K * byteWidth(bElem);
+  int64_t aBytes = p.M * p.K * byteWidth(aElem);
+  int64_t bBytes = p.N * p.K * byteWidth(bElem);
   int64_t accBytes = 4;
-  int64_t cFull = M * N * accBytes;
 
-  std::optional<InPlaceOperand> aInPlace, bInPlace;
-  bool wholeTileFits =
-      M * K * byteWidth(aElem) + bBytes <= kTGResidentBudgetBytes;
-  if (rank == 2 && wholeTileFits) {
-    aInPlace = dotOperandInPlaceBuf(op.getA(), M, K);
-    bInPlace = dotOperandInPlaceBuf(op.getB(), K, N);
+  // In-place aliasing is only offered when the whole A+B tile is resident, so
+  // this tests the unstaged footprint against the hard 32KB cap, not the
+  // (smaller) live pool budget that sizes the staged regions below.
+  if (p.rank == 2 && aBytes + bBytes <= kTGResidentBudgetBytes) {
+    p.aInPlace = dotOperandInPlaceBuf(op.getA(), p.M, p.K);
+    p.bInPlace = dotOperandInPlaceBuf(op.getB(), p.K, p.N);
   }
-  Value aStage = op.getA(), bStage = op.getB();
-  if (!aInPlace)
+  p.aStage = op.getA();
+  p.bStage = op.getB();
+  if (!p.aInPlace)
     if (Value s = dotOperandConvertSource(op, op.getA()))
-      aStage = s;
-  if (!bInPlace)
+      p.aStage = s;
+  if (!p.bInPlace)
     if (Value s = dotOperandConvertSource(op, op.getB()))
-      bStage = s;
-  auto aStageTy = cast<RankedTensorType>(aStage.getType());
-  auto bStageTy = cast<RankedTensorType>(bStage.getType());
-  auto &aNames = names(aStage);
-  auto &bNames = names(bStage);
+      p.bStage = s;
 
-  int64_t stagedA = aInPlace ? 0 : aBytes;
-  int64_t stagedB = bInPlace ? 0 : bBytes;
-  int64_t stagedAB = stagedA + stagedB;
-  bool disjointC = stagedAB + cFull <= poolBudget();
-  int64_t bandRows = disjointC ? M : dotCBandRows(M, N, poolBudget(), accBytes);
+  p.stagedA = p.aInPlace ? 0 : aBytes;
+  p.stagedB = p.bInPlace ? 0 : bBytes;
+  p.stagedAB = p.stagedA + p.stagedB;
+  p.disjointC = p.stagedAB + p.M * p.N * accBytes <= poolBudget();
+  p.bandRows =
+      p.disjointC ? p.M : dotCBandRows(p.M, p.N, poolBudget(), accBytes);
 
-  FusedDotPhase phase = fusedDot.phase;
-  bool needAB = phase == FusedDotPhase::None || phase == FusedDotPhase::MMA;
-  bool needC = phase != FusedDotPhase::Decl;
+  p.phase = fusedDot.phase;
+  p.needAB = p.phase == FusedDotPhase::None || p.phase == FusedDotPhase::MMA;
+  p.needC = p.phase != FusedDotPhase::Decl;
 
+  p.mT = p.M / 8;
+  p.nT = p.N / 8;
+  p.kT = p.K / 8;
+  p.nFrag = p.mT * p.nT;
+  tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
+  auto kWarpDim = StringAttr::get(op.getContext(), "warp");
+  p.numWarps = cLL.hasInDim(kWarpDim) ? cLL.getInDimSize(kWarpDim) : 1;
+  if (p.numWarps > p.nFrag)
+    p.numWarps = p.nFrag;
+
+  p.kind = dotNeedsPanel(p.M, p.N, p.K, byteWidth(aElem), accBytes)
+               ? DotPlan::Kind::Panel
+           : p.phase != FusedDotPhase::None ? DotPlan::Kind::Fused
+                                            : DotPlan::Kind::Direct;
+  return p;
+}
+
+// tt.dot -> simdgroup-matrix fragment MMA: panel / fused (Decl/MMA/Readback +
+// direct-store) / per-dot (disjoint / aliased-banded) paths, dispatched over
+// planDot's DotPlan. Guard/offset compound exprs are ctx.raw leaves; the
+// per-fragment MMA + readback are the shared sg* builders.
+bool MSLEmitter::emitDot(tt::DotOp op, msl::Block &body) {
+  DotPlan plan = planDot(op);
+  if (plan.kind == DotPlan::Kind::Scalar)
+    return emitDotScalar(op, body);
+  if (plan.kind == DotPlan::Kind::Unsupported)
+    return false;
+
+  auto aTy = cast<RankedTensorType>(op.getA().getType());
+  auto cTy = cast<RankedTensorType>(op.getResult().getType());
+  Type aElem = aTy.getElementType();
+  const int rank = plan.rank;
+
+  DotEmitCtx dc;
+  dc.cInit = names(op.getC());
+  dc.opScalar = sgOperandScalar(aElem);
+  dc.opFrag = sgFragType(aElem);
+  dc.accFragTy = ctx.matrix(msl::MatrixType::Elem::Float);
+
+  dc.aStage = plan.aStage;
+  dc.bStage = plan.bStage;
+  dc.aNames = names(dc.aStage);
+  dc.bNames = names(dc.bStage);
+
+  dotPoolPtrs(body, plan, dc);
+  dc.ids = dotResultIds(body, op, plan);
+
+  auto outNames = llvm::to_vector(ttg::toLinearLayout(cTy).getOutDimNames());
+  dc.rowDim = outNames[rank - 2];
+  dc.colDim = outNames[rank - 1];
+
+  if (plan.kind == DotPlan::Kind::Panel) {
+    if (!emitDotPanel(op, body, plan, dc))
+      return false;
+    bindRegs(op.getResult(), dc.ids);
+    return true;
+  }
+
+  if (plan.kind == DotPlan::Kind::Fused) {
+    auto readbackInto = [&](msl::Block &tgt, int64_t bi, int64_t r0,
+                            int64_t r1) {
+      dotReadback(tgt, cTy, dc.tgC, dc.ids, fusedDot.baseNames, rank, plan.N,
+                  bi, r0, r1, dc.rowDim, dc.colDim);
+    };
+    if (!emitDotFused(op, body, plan, dc, readbackInto))
+      return false;
+    bindRegs(op.getResult(), dc.ids);
+    return true;
+  }
+
+  if (!emitDotDirect(op, body, plan, dc))
+    return false;
+  bindRegs(op.getResult(), dc.ids);
+  return true;
+}
+
+// Declare the three threadgroup pool pointers A/B/C. All three ids are minted
+// unconditionally even when a phase suppresses the matching decl - the fused
+// phases share one id numbering, so skipping a fresh() here would renumber
+// every later name.
+void MSLEmitter::dotPoolPtrs(msl::Block &body, const DotPlan &plan,
+                             DotEmitCtx &dc) {
   // `threadgroup <scalar>* name` decl type (star attached, matches string).
   auto tgPtr = [&](StringRef scalar) {
     return ctx.named(("threadgroup " + scalar.str() + "*"));
   };
-  auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
-
-  std::string tgA = fresh(), tgB = fresh(), tgC = fresh();
-  if (needAB) {
-    body.push_back(ctx.declStmt(tgPtr(opScalar), tgA,
-                                aInPlace ? astInPlaceBase(*aInPlace)
-                                         : astPoolRegion(0, opScalar)));
-    body.push_back(ctx.declStmt(tgPtr(opScalar), tgB,
-                                bInPlace ? astInPlaceBase(*bInPlace)
-                                         : astPoolRegion(stagedA, opScalar)));
+  dc.tgA = fresh();
+  dc.tgB = fresh();
+  dc.tgC = fresh();
+  if (plan.needAB) {
+    body.push_back(ctx.declStmt(tgPtr(dc.opScalar), dc.tgA,
+                                plan.aInPlace ? inPlaceBase(*plan.aInPlace)
+                                              : poolRegion(0, dc.opScalar)));
+    body.push_back(ctx.declStmt(tgPtr(dc.opScalar), dc.tgB,
+                                plan.bInPlace
+                                    ? inPlaceBase(*plan.bInPlace)
+                                    : poolRegion(plan.stagedA, dc.opScalar)));
   }
-  if (needC)
+  if (plan.needC)
+    body.push_back(
+        ctx.declStmt(tgPtr("float"), dc.tgC,
+                     poolRegion(plan.disjointC ? plan.stagedAB : 0, "float")));
+}
+
+// The per-register C result names: the fused path reuses the ids minted at its
+// Decl phase, every other path declares fresh zeroed accumulators.
+SmallVector<std::string>
+MSLEmitter::dotResultIds(msl::Block &body, tt::DotOp op, const DotPlan &plan) {
+  if (plan.phase != FusedDotPhase::None)
+    return fusedDot.ids;
+  auto cTy = cast<RankedTensorType>(op.getResult().getType());
+  msl::Type *accScalarTy = scalarType(cTy.getElementType());
+  SmallVector<std::string> ids(regCount(op.getResult()));
+  for (auto &id : ids) {
+    id = fresh();
     body.push_back(ctx.declStmt(
-        tgPtr("float"), tgC, astPoolRegion(disjointC ? stagedAB : 0, "float")));
-
-  int64_t mT = M / 8, nT = N / 8, kT = K / 8;
-  tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
-  auto kWarpDim = StringAttr::get(op.getContext(), "warp");
-  int64_t numWarps = cLL.hasInDim(kWarpDim) ? cLL.getInDimSize(kWarpDim) : 1;
-  int64_t nFrag = mT * nT;
-  if (numWarps > nFrag)
-    numWarps = nFrag;
-
-  int nRes = regCount(op.getResult());
-  bool fused = phase != FusedDotPhase::None;
-  SmallVector<std::string> ids(nRes);
-  if (fused) {
-    ids = fusedDot.ids;
-  } else {
-    for (int r = 0; r < nRes; ++r) {
-      ids[r] = fresh();
-      body.push_back(
-          ctx.declStmt(accScalarTy, ids[r],
-                       ctx.cast(CS::CStyle, accScalarTy, ctx.lit("0"))));
-    }
+        accScalarTy, id, ctx.cast(CS::CStyle, accScalarTy, ctx.lit("0"))));
   }
+  return ids;
+}
 
-  auto outNames = llvm::to_vector(cLL.getOutDimNames());
-  StringAttr rowDim = outNames[rank - 2], colDim = outNames[rank - 1];
+// Per-dot readback of one C row band: `if (guard) ids[r] = tgC[bandOff] +
+// base[r];`, batch-guarded at rank 3. `base` is the C-init name list (per-dot)
+// or the fused path's saved base names; a single-element list broadcasts.
+void MSLEmitter::dotReadback(msl::Block &tgt, RankedTensorType cTy,
+                             StringRef tgC, ArrayRef<std::string> ids,
+                             ArrayRef<std::string> base, int rank, int64_t N,
+                             int64_t bi, int64_t r0, int64_t r1,
+                             StringAttr rowDim, StringAttr colDim) {
+  for (int r = 0, nRes = ids.size(); r < nRes; ++r) {
+    std::string b = base[base.size() == 1 ? 0 : r];
+    // ((rowExpr - r0) * N + colExpr)
+    msl::Expr *bandOff = ctx.paren(ctx.add(
+        ctx.mul(
+            ctx.paren(ctx.binary(B::Sub, layout.layoutCoordExpr(cTy, r, rowDim),
+                                 ctx.i32lit(r0))),
+            ctx.i32lit(N)),
+        layout.layoutCoordExpr(cTy, r, colDim)));
+    // (rowExpr >= r0 && rowExpr < r1)
+    msl::Expr *guard = ctx.paren(
+        ctx.binary(B::LAnd,
+                   ctx.binary(B::Ge, layout.layoutCoordExpr(cTy, r, rowDim),
+                              ctx.i32lit(r0)),
+                   ctx.binary(B::Lt, layout.layoutCoordExpr(cTy, r, rowDim),
+                              ctx.i32lit(r1))));
+    if (rank == 3)
+      guard = ctx.paren(ctx.binary(
+          B::LAnd,
+          ctx.binary(B::Eq, layout.batchCoordExpr(cTy, r), ctx.i32lit(bi)),
+          guard));
+    tgt.push_back(ctx.compactIfBare(
+        guard,
+        ctx.assignStmt(ctx.var(ids[r]), readbackValue(tgC, bandOff, b))));
+  }
+}
+
+// Per-dot (non-fused, non-panel) simdgroup-matrix path: per batch slice, stage
+// A/B into the pool, run the fragment MMA grid, then round-trip C through tgC.
+// When C is disjoint from the staged A/B the accumulators are stored and read
+// back in one pass; otherwise tgC aliases A/B, so the accumulators stay live
+// across a per-band store/readback ladder.
+bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
+                               const DotPlan &plan, const DotEmitCtx &dc) {
+  auto cTy = cast<RankedTensorType>(op.getResult().getType());
+  auto aStageTy = cast<RankedTensorType>(dc.aStage.getType());
+  auto bStageTy = cast<RankedTensorType>(dc.bStage.getType());
+  const int rank = plan.rank;
+  const int64_t Bd = plan.Bd, M = plan.M, N = plan.N, K = plan.K;
+  const int64_t nT = plan.nT, kT = plan.kT;
+  const int64_t nFrag = plan.nFrag, numWarps = plan.numWarps;
+
+  auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
 
   // Wrap `inner` in `if (warpId == w) { ... }`.
   auto warpIf = [&](int64_t w, msl::Block inner) {
@@ -167,98 +290,49 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
         std::move(inner)));
   };
 
-  // Per-dot readback: `if (guard) ids[r] = tgC[bandOff] + base;`
-  ArrayRef<std::string> rbBase = fused
-                                     ? ArrayRef<std::string>(fusedDot.baseNames)
-                                     : ArrayRef<std::string>(cInit);
-  auto readbackInto = [&](msl::Block &tgt, int64_t bi, int64_t r0, int64_t r1) {
-    for (int r = 0; r < nRes; ++r) {
-      std::string base = rbBase[rbBase.size() == 1 ? 0 : r];
-      // ((rowExpr - r0) * N + colExpr)
-      msl::Expr *bandOff = ctx.paren(ctx.add(
-          ctx.mul(
-              ctx.paren(ctx.binary(B::Sub, astLayoutCoordExpr(cTy, r, rowDim),
-                                   ctx.i32lit(r0))),
-              ctx.i32lit(N)),
-          astLayoutCoordExpr(cTy, r, colDim)));
-      // (rowExpr >= r0 && rowExpr < r1)
-      msl::Expr *guard = ctx.paren(ctx.binary(
-          B::LAnd,
-          ctx.binary(B::Ge, astLayoutCoordExpr(cTy, r, rowDim), ctx.i32lit(r0)),
-          ctx.binary(B::Lt, astLayoutCoordExpr(cTy, r, rowDim),
-                     ctx.i32lit(r1))));
-      if (rank == 3)
-        guard = ctx.paren(ctx.binary(
-            B::LAnd,
-            ctx.binary(B::Eq, astBatchCoordExpr(cTy, r), ctx.i32lit(bi)),
-            guard));
-      tgt.push_back(ctx.compactIfBare(
-          guard, ctx.assignStmt(ctx.var(ids[r]),
-                                astReadbackValue(tgC, bandOff, base))));
-    }
-  };
   auto readback = [&](int64_t bi, int64_t r0, int64_t r1) {
-    readbackInto(body, bi, r0, r1);
+    dotReadback(body, cTy, dc.tgC, dc.ids, dc.cInit, rank, N, bi, r0, r1,
+                dc.rowDim, dc.colDim);
   };
 
-  // Shared per-fragment MMA into `acc` (disjoint/aliased/fused-Readback-less).
-  auto fragMMA = [&](StringRef tgAn, StringRef tgBn, int64_t mi, int64_t ni,
-                     StringRef acc, msl::Block &into) {
+  auto fragMMA = [&](int64_t mi, int64_t ni, StringRef acc, msl::Block &into) {
     for (int64_t ki = 0; ki < kT; ++ki) {
       std::string fa = fresh(), fb = fresh();
-      into.push_back(astFragDecl(opFrag, fa));
-      into.push_back(astSgLoad(fa, tgAn, mi * 8 * K + ki * 8, K));
-      into.push_back(astFragDecl(opFrag, fb));
-      into.push_back(astSgLoad(fb, tgBn, ki * 8 * N + ni * 8, N));
-      into.push_back(astSgMultiplyAccumulate(acc, fa, fb));
+      into.push_back(fragDecl(dc.opFrag, fa));
+      into.push_back(sgLoad(fa, dc.tgA, mi * 8 * K + ki * 8, K));
+      into.push_back(fragDecl(dc.opFrag, fb));
+      into.push_back(sgLoad(fb, dc.tgB, ki * 8 * N + ni * 8, N));
+      into.push_back(sgMultiplyAccumulate(acc, fa, fb));
     }
   };
 
-  if (dotNeedsPanel(M, N, K, byteWidth(aElem), accBytes)) {
-    if (!astEmitDotPanel(op, body, aStage, bStage, aNames, bNames, cInit, ids,
-                         M, N, K, Bd, rank, opFrag, opScalar, numWarps, rowDim,
-                         colDim))
-      return false;
-    bindRegs(op.getResult(), ids);
-    return true;
-  }
-
-  if (fused) {
-    if (!astEmitDotFused(op, body, aStage, bStage, aNames, bNames, tgA, tgB,
-                         tgC, ids, M, N, K, mT, nT, kT, nFrag, numWarps,
-                         aInPlace, bInPlace, opFrag, accFragTy, readbackInto))
-      return false;
-    bindRegs(op.getResult(), ids);
-    return true;
-  }
-
-  // Per-dot path. Batch guard condition `<batchCoord> == bi` (rank-3 only).
+  // Batch guard condition `<batchCoord> == bi` (rank-3 only).
   auto batchCond = [&](RankedTensorType rt, int reg,
                        int64_t bi) -> msl::Expr * {
-    return ctx.binary(B::Eq, astBatchCoordExpr(rt, reg),
+    return ctx.binary(B::Eq, layout.batchCoordExpr(rt, reg),
                       ctx.lit(std::to_string(bi)));
   };
   for (int64_t bi = 0; bi < Bd; ++bi) {
     barrier();
     auto guardA = [&](int r) { return batchCond(aStageTy, r, bi); };
     auto guardB = [&](int r) { return batchCond(bStageTy, r, bi); };
-    astStageOperand(body, tgA, aStage, aStageTy, aNames, (bool)aInPlace,
-                    rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardA)
-                              : nullptr);
-    astStageOperand(body, tgB, bStage, bStageTy, bNames, (bool)bInPlace,
-                    rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardB)
-                              : nullptr);
+    stageOperand(
+        body, dc.tgA, dc.aStage, aStageTy, dc.aNames, (bool)plan.aInPlace,
+        rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardA) : nullptr);
+    stageOperand(
+        body, dc.tgB, dc.bStage, bStageTy, dc.bNames, (bool)plan.bInPlace,
+        rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardB) : nullptr);
     barrier();
 
-    if (disjointC) {
+    if (plan.disjointC) {
       for (int64_t w = 0; w < numWarps; ++w) {
         msl::Block inner;
         for (int64_t f = w; f < nFrag; f += numWarps) {
           int64_t mi = f / nT, ni = f % nT;
           std::string acc = fresh();
-          inner.push_back(astAccFragDecl(accFragTy, acc));
-          fragMMA(tgA, tgB, mi, ni, acc, inner);
-          inner.push_back(astSgStore(acc, tgC, mi * 8 * N + ni * 8, N));
+          inner.push_back(accFragDecl(dc.accFragTy, acc));
+          fragMMA(mi, ni, acc, inner);
+          inner.push_back(sgStore(acc, dc.tgC, mi * 8 * N + ni * 8, N));
         }
         warpIf(w, std::move(inner));
       }
@@ -268,23 +342,19 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
     }
 
     std::string accBase = fresh() + "_" + std::to_string(bi) + "_";
-    for (int64_t f = 0; f < nFrag; ++f) {
-      int64_t mi = f / nT, ni = f % nT;
-      std::string acc = accBase + std::to_string(mi) + "_" + std::to_string(ni);
-      body.push_back(astAccFragDecl(accFragTy, acc));
-    }
+    auto accName = [&](int64_t mi, int64_t ni) {
+      return accBase + std::to_string(mi) + "_" + std::to_string(ni);
+    };
+    for (int64_t f = 0; f < nFrag; ++f)
+      body.push_back(accFragDecl(dc.accFragTy, accName(f / nT, f % nT)));
     for (int64_t w = 0; w < numWarps; ++w) {
       msl::Block inner;
-      for (int64_t f = w; f < nFrag; f += numWarps) {
-        int64_t mi = f / nT, ni = f % nT;
-        std::string acc =
-            accBase + std::to_string(mi) + "_" + std::to_string(ni);
-        fragMMA(tgA, tgB, mi, ni, acc, inner);
-      }
+      for (int64_t f = w; f < nFrag; f += numWarps)
+        fragMMA(f / nT, f % nT, accName(f / nT, f % nT), inner);
       warpIf(w, std::move(inner));
     }
-    for (int64_t r0 = 0; r0 < M; r0 += bandRows) {
-      int64_t r1 = std::min<int64_t>(r0 + bandRows, M);
+    for (int64_t r0 = 0; r0 < M; r0 += plan.bandRows) {
+      int64_t r1 = std::min<int64_t>(r0 + plan.bandRows, M);
       barrier();
       for (int64_t w = 0; w < numWarps; ++w) {
         msl::Block inner;
@@ -292,40 +362,31 @@ bool MSLEmitter::astEmitDot(tt::DotOp op, msl::Block &body) {
           int64_t mi = f / nT, ni = f % nT;
           if (mi * 8 < r0 || mi * 8 >= r1)
             continue;
-          std::string acc =
-              accBase + std::to_string(mi) + "_" + std::to_string(ni);
-          inner.push_back(astSgStore(acc, tgC, (mi * 8 - r0) * N + ni * 8, N));
+          inner.push_back(
+              sgStore(accName(mi, ni), dc.tgC, (mi * 8 - r0) * N + ni * 8, N));
         }
-        if (!inner.empty())
-          warpIf(w, std::move(inner));
-        else
-          warpIf(w, msl::Block{});
+        warpIf(w, std::move(inner));
       }
       barrier();
       readback(bi, r0, r1);
     }
   }
   barrier();
-  bindRegs(op.getResult(), ids);
   return true;
 }
 
 // Fused GEMM dot phases: Decl (declare/zero persistent frags), MMA (stage A/B +
 // accumulate, branchless or per-warp ladder), Readback (store frags + gather,
 // with optional direct-store to device C).
-bool MSLEmitter::astEmitDotFused(
-    tt::DotOp op, msl::Block &body, Value aStage, Value bStage,
-    ArrayRef<std::string> aNames, ArrayRef<std::string> bNames, StringRef tgA,
-    StringRef tgB, StringRef tgC, ArrayRef<std::string> ids, int64_t M,
-    int64_t N, int64_t K, int64_t mT, int64_t nT, int64_t kT, int64_t nFrag,
-    int64_t numWarps, std::optional<InPlaceOperand> aInPlace,
-    std::optional<InPlaceOperand> bInPlace, msl::MatrixType *opFrag,
-    msl::MatrixType *accFragTy,
+bool MSLEmitter::emitDotFused(
+    tt::DotOp op, msl::Block &body, const DotPlan &plan, const DotEmitCtx &dc,
     llvm::function_ref<void(msl::Block &, int64_t, int64_t, int64_t)>
         readbackInto) {
-  auto aStageTy = cast<RankedTensorType>(aStage.getType());
-  auto bStageTy = cast<RankedTensorType>(bStage.getType());
-  auto cTy = cast<RankedTensorType>(op.getResult().getType());
+  auto aStageTy = cast<RankedTensorType>(dc.aStage.getType());
+  auto bStageTy = cast<RankedTensorType>(dc.bStage.getType());
+  const int64_t M = plan.M, N = plan.N, K = plan.K;
+  const int64_t nT = plan.nT, kT = plan.kT;
+  const int64_t nFrag = plan.nFrag, numWarps = plan.numWarps;
   int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
   auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
 
@@ -334,19 +395,19 @@ bool MSLEmitter::astEmitDotFused(
     for (int64_t j = 0; j < fragsPerWarp; ++j) {
       std::string acc = fresh();
       fusedDot.accNames[j] = acc;
-      body.push_back(astAccFragDecl(accFragTy, acc));
+      body.push_back(accFragDecl(dc.accFragTy, acc));
     }
     return true;
   }
 
   if (fusedDot.phase == FusedDotPhase::MMA) {
-    bool stagesHere = !aInPlace || !bInPlace;
+    bool stagesHere = !plan.aInPlace || !plan.bInPlace;
     if (stagesHere)
       barrier();
-    astStageOperand(body, tgA, aStage, aStageTy, aNames, (bool)aInPlace,
-                    nullptr);
-    astStageOperand(body, tgB, bStage, bStageTy, bNames, (bool)bInPlace,
-                    nullptr);
+    stageOperand(body, dc.tgA, dc.aStage, aStageTy, dc.aNames,
+                 (bool)plan.aInPlace, nullptr);
+    stageOperand(body, dc.tgB, dc.bStage, bStageTy, dc.bNames,
+                 (bool)plan.bInPlace, nullptr);
     barrier();
     bool branchless = (numWarps == nT);
     // slots: (mi, niKey, niExpr); niKey dedups bFrag, niExpr is the typed
@@ -366,26 +427,26 @@ bool MSLEmitter::astEmitDotFused(
           if (!aFrag.count(mi)) {
             std::string fa = fresh();
             aFrag[mi] = fa;
-            into.push_back(astFragDecl(opFrag, fa));
-            into.push_back(astSgLoad(fa, tgA, mi * 8 * K + ki * 8, K));
+            into.push_back(fragDecl(dc.opFrag, fa));
+            into.push_back(sgLoad(fa, dc.tgA, mi * 8 * K + ki * 8, K));
           }
           if (!bFrag.count(niKey)) {
             std::string fb = fresh();
             bFrag[niKey] = fb;
-            into.push_back(astFragDecl(opFrag, fb));
+            into.push_back(fragDecl(dc.opFrag, fb));
             // simdgroup_load(fb, tgB + (ki*8*N + niExpr * 8), N);
             msl::Expr *off = ctx.paren(ctx.add(
                 ctx.i32lit(ki * 8 * N), ctx.mul(pr.niExpr, ctx.i32lit(8))));
             into.push_back(ctx.exprStmt(
                 ctx.call(msl::builtin::sg::Load,
-                         {ctx.var(fb), ctx.binary(B::Add, ctx.var(tgB), off),
+                         {ctx.var(fb), ctx.binary(B::Add, ctx.var(dc.tgB), off),
                           ctx.i32lit(N)})));
           }
         }
         for (auto [j, mn] : llvm::enumerate(slots)) {
           const std::string &acc = fusedDot.accNames[j];
           into.push_back(
-              astSgMultiplyAccumulate(acc, aFrag[mn.mi], bFrag[mn.niKey]));
+              sgMultiplyAccumulate(acc, aFrag[mn.mi], bFrag[mn.niKey]));
         }
       }
     };
@@ -411,7 +472,7 @@ bool MSLEmitter::astEmitDotFused(
     }
     if (!stagesHere)
       barrier();
-    bindRegs(op.getResult(), SmallVector<std::string>(ids.begin(), ids.end()));
+    bindRegs(op.getResult(), dc.ids);
     return true;
   }
 
@@ -453,7 +514,7 @@ bool MSLEmitter::astEmitDotFused(
         for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
           int64_t mi = f / nT, ni = f % nT;
           inner.push_back(
-              astSgStore(fusedDot.accNames[j], tgC, mi * 8 * N + ni * 8, N));
+              sgStore(fusedDot.accNames[j], dc.tgC, mi * 8 * N + ni * 8, N));
         }
         tgt.push_back(ctx.ifScope(
             ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
@@ -475,7 +536,7 @@ bool MSLEmitter::astEmitDotFused(
     for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
       int64_t mi = f / nT, ni = f % nT;
       inner.push_back(
-          astSgStore(fusedDot.accNames[j], tgC, mi * 8 * N + ni * 8, N));
+          sgStore(fusedDot.accNames[j], dc.tgC, mi * 8 * N + ni * 8, N));
     }
     body.push_back(ctx.ifScope(
         ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
@@ -489,20 +550,16 @@ bool MSLEmitter::astEmitDotFused(
 
 // Panel-tiled dot: A/B panels staged into the pool, MMA per (m0,n0) panel into
 // pC, then a guarded readback.
-bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
-                                 Value bStage, ArrayRef<std::string> aNames,
-                                 ArrayRef<std::string> bNames,
-                                 ArrayRef<std::string> cInit,
-                                 ArrayRef<std::string> ids, int64_t M,
-                                 int64_t N, int64_t K, int64_t Bd, int rank,
-                                 msl::MatrixType *opFrag, StringRef opScalar,
-                                 int64_t numWarps, StringAttr rowDim,
-                                 StringAttr colDim) {
+bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
+                              const DotPlan &plan, const DotEmitCtx &dc) {
   auto aTy = cast<RankedTensorType>(op.getA().getType());
   Type aElem = aTy.getElementType();
-  auto aStageTy = cast<RankedTensorType>(aStage.getType());
-  auto bStageTy = cast<RankedTensorType>(bStage.getType());
+  auto aStageTy = cast<RankedTensorType>(dc.aStage.getType());
+  auto bStageTy = cast<RankedTensorType>(dc.bStage.getType());
   auto cTy = cast<RankedTensorType>(op.getResult().getType());
+  const int rank = plan.rank;
+  const int64_t Bd = plan.Bd, M = plan.M, N = plan.N, K = plan.K;
+  const int64_t numWarps = plan.numWarps;
   int64_t elemBytes = byteWidth(aElem), accBytes = 4;
   int64_t mp, np;
   dotPanelDims(M, N, K, elemBytes, accBytes, mp, np);
@@ -517,12 +574,13 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
     return ctx.named(("threadgroup " + s.str() + "*"));
   };
   std::string pA = fresh(), pB = fresh(), pC = fresh();
-  body.push_back(ctx.declStmt(tgPtr(opScalar), pA, astPoolRegion(0, opScalar)));
   body.push_back(
-      ctx.declStmt(tgPtr(opScalar), pB, astPoolRegion(aPanelBytes, opScalar)));
-  body.push_back(ctx.declStmt(
-      tgPtr("float"), pC, astPoolRegion(aPanelBytes + bPanelBytes, "float")));
-  int nARegs = regCount(aStage), nBRegs = regCount(bStage);
+      ctx.declStmt(tgPtr(dc.opScalar), pA, poolRegion(0, dc.opScalar)));
+  body.push_back(ctx.declStmt(tgPtr(dc.opScalar), pB,
+                              poolRegion(aPanelBytes, dc.opScalar)));
+  body.push_back(ctx.declStmt(tgPtr("float"), pC,
+                              poolRegion(aPanelBytes + bPanelBytes, "float")));
+  int nARegs = regCount(dc.aStage), nBRegs = regCount(dc.bStage);
   auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
 
   for (int64_t bi = 0; bi < Bd; ++bi) {
@@ -533,25 +591,26 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
         // (row >= m0 && row < m1)
         msl::Expr *guard = ctx.paren(ctx.binary(
             B::LAnd,
-            ctx.binary(B::Ge, astLayoutCoordExpr(aStageTy, r, aRowDim),
+            ctx.binary(B::Ge, layout.layoutCoordExpr(aStageTy, r, aRowDim),
                        ctx.i32lit(m0)),
-            ctx.binary(B::Lt, astLayoutCoordExpr(aStageTy, r, aRowDim),
+            ctx.binary(B::Lt, layout.layoutCoordExpr(aStageTy, r, aRowDim),
                        ctx.i32lit(m1))));
         if (rank == 3)
-          guard = ctx.paren(ctx.binary(
-              B::LAnd,
-              ctx.binary(B::Eq, astBatchCoordExpr(aStageTy, r), ctx.i32lit(bi)),
-              guard));
+          guard = ctx.paren(
+              ctx.binary(B::LAnd,
+                         ctx.binary(B::Eq, layout.batchCoordExpr(aStageTy, r),
+                                    ctx.i32lit(bi)),
+                         guard));
         // ((row - m0) * K + col)
         msl::Expr *off = ctx.paren(ctx.add(
             ctx.mul(ctx.paren(ctx.binary(
-                        B::Sub, astLayoutCoordExpr(aStageTy, r, aRowDim),
+                        B::Sub, layout.layoutCoordExpr(aStageTy, r, aRowDim),
                         ctx.i32lit(m0))),
                     ctx.i32lit(K)),
-            astLayoutCoordExpr(aStageTy, r, aColDim)));
+            layout.layoutCoordExpr(aStageTy, r, aColDim)));
         body.push_back(ctx.compactIfBare(
             guard, ctx.assignStmt(ctx.subscript(ctx.var(pA), off),
-                                  ctx.var(aNames[r]))));
+                                  ctx.var(dc.aNames[r]))));
       }
       for (int64_t n0 = 0; n0 < N; n0 += np) {
         int64_t n1 = std::min<int64_t>(n0 + np, N), npCur = n1 - n0;
@@ -561,26 +620,26 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
           // (col >= n0 && col < n1)
           msl::Expr *guard = ctx.paren(ctx.binary(
               B::LAnd,
-              ctx.binary(B::Ge, astLayoutCoordExpr(bStageTy, r, bColDim),
+              ctx.binary(B::Ge, layout.layoutCoordExpr(bStageTy, r, bColDim),
                          ctx.i32lit(n0)),
-              ctx.binary(B::Lt, astLayoutCoordExpr(bStageTy, r, bColDim),
+              ctx.binary(B::Lt, layout.layoutCoordExpr(bStageTy, r, bColDim),
                          ctx.i32lit(n1))));
           if (rank == 3)
             guard = ctx.paren(
                 ctx.binary(B::LAnd,
-                           ctx.binary(B::Eq, astBatchCoordExpr(bStageTy, r),
+                           ctx.binary(B::Eq, layout.batchCoordExpr(bStageTy, r),
                                       ctx.i32lit(bi)),
                            guard));
           // (row * npCur + (col - n0))
           msl::Expr *off = ctx.paren(ctx.add(
-              ctx.mul(astLayoutCoordExpr(bStageTy, r, bRowDim),
+              ctx.mul(layout.layoutCoordExpr(bStageTy, r, bRowDim),
                       ctx.i32lit(npCur)),
               ctx.paren(ctx.binary(B::Sub,
-                                   astLayoutCoordExpr(bStageTy, r, bColDim),
+                                   layout.layoutCoordExpr(bStageTy, r, bColDim),
                                    ctx.i32lit(n0)))));
           body.push_back(ctx.compactIfBare(
               guard, ctx.assignStmt(ctx.subscript(ctx.var(pB), off),
-                                    ctx.var(bNames[r]))));
+                                    ctx.var(dc.bNames[r]))));
         }
         barrier();
         int64_t pnFrag = pmT * pnT;
@@ -591,18 +650,16 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
             int64_t mi = f / pnT, ni = f % pnT;
             std::string acc = fresh();
             inner.push_back(
-                astAccFragDecl(ctx.matrix(msl::MatrixType::Elem::Float), acc));
+                accFragDecl(ctx.matrix(msl::MatrixType::Elem::Float), acc));
             for (int64_t ki = 0; ki < (K / 8); ++ki) {
               std::string fa = fresh(), fb = fresh();
-              inner.push_back(astFragDecl(opFrag, fa));
-              inner.push_back(astSgLoad(fa, pA, mi * 8 * K + ki * 8, K));
-              inner.push_back(astFragDecl(opFrag, fb));
-              inner.push_back(
-                  astSgLoad(fb, pB, ki * 8 * npCur + ni * 8, npCur));
-              inner.push_back(astSgMultiplyAccumulate(acc, fa, fb));
+              inner.push_back(fragDecl(dc.opFrag, fa));
+              inner.push_back(sgLoad(fa, pA, mi * 8 * K + ki * 8, K));
+              inner.push_back(fragDecl(dc.opFrag, fb));
+              inner.push_back(sgLoad(fb, pB, ki * 8 * npCur + ni * 8, npCur));
+              inner.push_back(sgMultiplyAccumulate(acc, fa, fb));
             }
-            inner.push_back(
-                astSgStore(acc, pC, mi * 8 * npCur + ni * 8, npCur));
+            inner.push_back(sgStore(acc, pC, mi * 8 * npCur + ni * 8, npCur));
           }
           body.push_back(ctx.ifScope(
               ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
@@ -610,33 +667,36 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
         }
         barrier();
         for (int r = 0; r < nRes; ++r) {
-          std::string base = cInit[cInit.size() == 1 ? 0 : r];
+          std::string base = dc.cInit[dc.cInit.size() == 1 ? 0 : r];
           // ((rowExpr - m0) * npCur + (colExpr - n0))
           msl::Expr *off = ctx.paren(ctx.add(
-              ctx.mul(ctx.paren(ctx.binary(B::Sub,
-                                           astLayoutCoordExpr(cTy, r, rowDim),
-                                           ctx.i32lit(m0))),
+              ctx.mul(ctx.paren(ctx.binary(
+                          B::Sub, layout.layoutCoordExpr(cTy, r, dc.rowDim),
+                          ctx.i32lit(m0))),
                       ctx.i32lit(npCur)),
-              ctx.paren(ctx.binary(B::Sub, astLayoutCoordExpr(cTy, r, colDim),
+              ctx.paren(ctx.binary(B::Sub,
+                                   layout.layoutCoordExpr(cTy, r, dc.colDim),
                                    ctx.i32lit(n0)))));
           // (rowExpr >= m0 && rowExpr < m1 && colExpr >= n0 && colExpr < n1)
           msl::Expr *guard = ctx.paren(ctx.chain(
-              B::LAnd, {ctx.binary(B::Ge, astLayoutCoordExpr(cTy, r, rowDim),
-                                   ctx.i32lit(m0)),
-                        ctx.binary(B::Lt, astLayoutCoordExpr(cTy, r, rowDim),
-                                   ctx.i32lit(m1)),
-                        ctx.binary(B::Ge, astLayoutCoordExpr(cTy, r, colDim),
-                                   ctx.i32lit(n0)),
-                        ctx.binary(B::Lt, astLayoutCoordExpr(cTy, r, colDim),
-                                   ctx.i32lit(n1))}));
+              B::LAnd,
+              {ctx.binary(B::Ge, layout.layoutCoordExpr(cTy, r, dc.rowDim),
+                          ctx.i32lit(m0)),
+               ctx.binary(B::Lt, layout.layoutCoordExpr(cTy, r, dc.rowDim),
+                          ctx.i32lit(m1)),
+               ctx.binary(B::Ge, layout.layoutCoordExpr(cTy, r, dc.colDim),
+                          ctx.i32lit(n0)),
+               ctx.binary(B::Lt, layout.layoutCoordExpr(cTy, r, dc.colDim),
+                          ctx.i32lit(n1))}));
           if (rank == 3)
-            guard = ctx.paren(ctx.binary(
-                B::LAnd,
-                ctx.binary(B::Eq, astBatchCoordExpr(cTy, r), ctx.i32lit(bi)),
-                guard));
+            guard = ctx.paren(
+                ctx.binary(B::LAnd,
+                           ctx.binary(B::Eq, layout.batchCoordExpr(cTy, r),
+                                      ctx.i32lit(bi)),
+                           guard));
           body.push_back(ctx.compactIfBare(
               guard,
-              ctx.assignStmt(ctx.var(ids[r]),
+              ctx.assignStmt(ctx.var(dc.ids[r]),
                              ctx.binary(B::Add, ctx.subscript(ctx.var(pC), off),
                                         ctx.var(base)))));
         }
@@ -649,7 +709,7 @@ bool MSLEmitter::astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
 
 // Integer/scalar tt.dot: stage A/B into the pool, then each thread runs a
 // scalar K-loop for its owned C registers.
-bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
+bool MSLEmitter::emitDotScalar(tt::DotOp op, msl::Block &body) {
   auto aTy = cast<RankedTensorType>(op.getA().getType());
   auto bTy = cast<RankedTensorType>(op.getB().getType());
   auto cTy = cast<RankedTensorType>(op.getResult().getType());
@@ -666,7 +726,7 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
   std::string aScalar = mslScalarType(aElem);
   std::string bScalar = mslScalarType(bElem);
   std::string accScalar = mslScalarType(cElem);
-  msl::Type *accTy = astScalarType(cElem);
+  msl::Type *accTy = scalarType(cElem);
 
   Value aStage = op.getA(), bStage = op.getB();
   if (rank == 2) {
@@ -686,15 +746,15 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
     return ctx.named(("threadgroup " + s.str() + "*"));
   };
   std::string tgA = fresh(), tgB = fresh();
-  body.push_back(ctx.declStmt(tgPtr(aScalar), tgA, astPoolRegion(0, aScalar)));
+  body.push_back(ctx.declStmt(tgPtr(aScalar), tgA, poolRegion(0, aScalar)));
   body.push_back(
-      ctx.declStmt(tgPtr(bScalar), tgB, astPoolRegion(aBytes, bScalar)));
+      ctx.declStmt(tgPtr(bScalar), tgB, poolRegion(aBytes, bScalar)));
 
   tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
   auto outNames = llvm::to_vector(cLL.getOutDimNames());
   StringAttr dRow = outNames[rank - 2], dCol = outNames[rank - 1];
   auto batchCond = [&](RankedTensorType rt, int reg, int64_t bi) {
-    return ctx.binary(B::Eq, astBatchCoordExpr(rt, reg),
+    return ctx.binary(B::Eq, layout.batchCoordExpr(rt, reg),
                       ctx.lit(std::to_string(bi)));
   };
 
@@ -710,20 +770,20 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
     body.push_back(ctx.hardBarrier(false));
     auto guardA = [&](int r) { return batchCond(aStageTy, r, bi); };
     auto guardB = [&](int r) { return batchCond(bStageTy, r, bi); };
-    astStageOperand(body, tgA, aStage, aStageTy, aNames, false,
-                    rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardA)
-                              : nullptr);
-    astStageOperand(body, tgB, bStage, bStageTy, bNames, false,
-                    rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardB)
-                              : nullptr);
+    stageOperand(body, tgA, aStage, aStageTy, aNames, false,
+                 rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardA)
+                           : nullptr);
+    stageOperand(body, tgB, bStage, bStageTy, bNames, false,
+                 rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardB)
+                           : nullptr);
     body.push_back(ctx.hardBarrier(false));
 
     for (int r = 0; r < nRes; ++r) {
       std::string mrow = fresh(), ncol = fresh(), acc = fresh(), kv = fresh();
       body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), mrow,
-                                  astLayoutCoordExpr(cTy, r, dRow)));
+                                  layout.layoutCoordExpr(cTy, r, dRow)));
       body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), ncol,
-                                  astLayoutCoordExpr(cTy, r, dCol)));
+                                  layout.layoutCoordExpr(cTy, r, dCol)));
       body.push_back(
           ctx.declStmt(accTy, acc, ctx.cast(CS::CStyle, accTy, ctx.lit("0"))));
       // for (int kv = 0; kv < K; ++kv) { acc += (acc)tgA[mrow*K+kv] *
@@ -761,7 +821,7 @@ bool MSLEmitter::astEmitDotScalar(tt::DotOp op, msl::Block &body) {
 // simdgroup-matrix fragment MMA sub-builders
 //===----------------------------------------------------------------------===//
 
-msl::MatrixType *MSLEmitter::astSgFragType(Type t) {
+msl::MatrixType *MSLEmitter::sgFragType(Type t) {
   if (t.isF16())
     return ctx.matrix(msl::MatrixType::Elem::Half);
   if (t.isBF16())
@@ -770,20 +830,20 @@ msl::MatrixType *MSLEmitter::astSgFragType(Type t) {
 }
 
 // `base + off` (no outer paren - emitted bare inside the call).
-msl::Expr *MSLEmitter::astFragAddr(StringRef base, int64_t off) {
+msl::Expr *MSLEmitter::fragAddr(StringRef base, int64_t off) {
   return ctx.binary(msl::BinOp::Add, ctx.var(base),
                     ctx.lit(std::to_string(off)));
 }
 
 // `frag name;` - uninitialized operand fragment decl.
-msl::Stmt *MSLEmitter::astFragDecl(msl::MatrixType *frag, StringRef name) {
+msl::Stmt *MSLEmitter::fragDecl(msl::MatrixType *frag, StringRef name) {
   return ctx.declStmt(frag, name);
 }
 
 // `frag name = frag(0.0f);` - zeroed accumulator fragment. The type name
 // doubles as the ctor callee (simdgroup_float8x8(0.0f)); read the printed name
 // back off the MatrixType so the call callee matches the decl type exactly.
-msl::Stmt *MSLEmitter::astAccFragDecl(msl::MatrixType *frag, StringRef name) {
+msl::Stmt *MSLEmitter::accFragDecl(msl::MatrixType *frag, StringRef name) {
   StringRef ctorName = frag->elem == msl::MatrixType::Elem::Half
                            ? msl::builtin::sg::Half8x8
                        : frag->elem == msl::MatrixType::Elem::Bfloat
@@ -793,32 +853,39 @@ msl::Stmt *MSLEmitter::astAccFragDecl(msl::MatrixType *frag, StringRef name) {
 }
 
 // `simdgroup_load(frag, base + off, ld);`
-msl::Stmt *MSLEmitter::astSgLoad(StringRef frag, StringRef base, int64_t off,
-                                 int64_t ld) {
+//
+// The trailing `transpose` parameter is deliberately never passed:
+// stageOperand always writes operands into threadgroup memory row-major, so
+// the fragment layout is canonical by construction. A column-major B is
+// transposed on the store into TG, not by flagging the load - and note Metal's
+// flag means "memory is transposed relative to the matrix's canonical layout",
+// so row_major maps to transpose=false.
+msl::Stmt *MSLEmitter::sgLoad(StringRef frag, StringRef base, int64_t off,
+                              int64_t ld) {
   return ctx.exprStmt(
-      ctx.call(msl::builtin::sg::Load, {ctx.var(frag), astFragAddr(base, off),
+      ctx.call(msl::builtin::sg::Load, {ctx.var(frag), fragAddr(base, off),
                                         ctx.lit(std::to_string(ld))}));
 }
 
 // `simdgroup_store(acc, base + off, ld);`
-msl::Stmt *MSLEmitter::astSgStore(StringRef acc, StringRef base, int64_t off,
-                                  int64_t ld) {
+msl::Stmt *MSLEmitter::sgStore(StringRef acc, StringRef base, int64_t off,
+                               int64_t ld) {
   return ctx.exprStmt(
-      ctx.call(msl::builtin::sg::Store, {ctx.var(acc), astFragAddr(base, off),
+      ctx.call(msl::builtin::sg::Store, {ctx.var(acc), fragAddr(base, off),
                                          ctx.lit(std::to_string(ld))}));
 }
 
 // `simdgroup_multiply_accumulate(acc, a, b, acc);`
-msl::Stmt *MSLEmitter::astSgMultiplyAccumulate(StringRef acc, StringRef a,
-                                               StringRef b) {
+msl::Stmt *MSLEmitter::sgMultiplyAccumulate(StringRef acc, StringRef a,
+                                            StringRef b) {
   return ctx.exprStmt(
       ctx.call(msl::builtin::sg::MultiplyAccumulate,
                {ctx.var(acc), ctx.var(a), ctx.var(b), ctx.var(acc)}));
 }
 
 // C readback value: `buf[off] + base` (off already carries its outer parens).
-msl::Expr *MSLEmitter::astReadbackValue(StringRef buf, msl::Expr *off,
-                                        StringRef base) {
+msl::Expr *MSLEmitter::readbackValue(StringRef buf, msl::Expr *off,
+                                     StringRef base) {
   return ctx.binary(msl::BinOp::Add, ctx.subscript(ctx.var(buf), off),
                     ctx.var(base));
 }
@@ -1051,7 +1118,7 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   int64_t cFull = M * N * 4;
   bool wholeTileFits = aBytes + bBytes <= kTGResidentBudgetBytes;
   // A/B that structurally resolve to a local_alloc buffer are loaded in place
-  // by astEmitDot (stage 0). The precise in-place base lives in memdescMap,
+  // by emitDot (stage 0). The precise in-place base lives in memdescMap,
   // which is only populated once the enclosing memdesc_index is emitted inside
   // the loop; here (pre-loop) the structural walk is the reliable signal.
   int64_t stagedA = aBytes, stagedB = bBytes;

@@ -8,7 +8,7 @@
 
 namespace mlir::triton::applegpu {
 
-msl::Type *MSLEmitter::astScalarType(Type t) {
+msl::Type *MSLEmitter::scalarType(Type t) {
   if (t.isF32() || t.isF64())
     return ctx.scalar(msl::Scalar::F32);
   if (t.isF16())
@@ -36,7 +36,7 @@ msl::Type *MSLEmitter::astScalarType(Type t) {
   return nullptr;
 }
 
-msl::Type *MSLEmitter::astUnsignedType(Type t) {
+msl::Type *MSLEmitter::unsignedType(Type t) {
   if (auto it = dyn_cast<IntegerType>(t)) {
     switch (it.getWidth()) {
     case 8:
@@ -54,12 +54,12 @@ msl::Type *MSLEmitter::astUnsignedType(Type t) {
   return nullptr;
 }
 
-msl::Type *MSLEmitter::astStorageType(Type t) {
+msl::Type *MSLEmitter::storageType(Type t) {
   if (auto rt = dyn_cast<RankedTensorType>(t))
     t = rt.getElementType();
   if (auto pt = dyn_cast<tt::PointerType>(t))
-    return ctx.ptr(astScalarType(pt.getPointeeType()), msl::AddrSpace::Device);
-  return astScalarType(t);
+    return ctx.ptr(scalarType(pt.getPointeeType()), msl::AddrSpace::Device);
+  return scalarType(t);
 }
 
 bool MSLEmitter::isDatalessType(Type t) { return isa<ttg::AsyncTokenType>(t); }
@@ -83,11 +83,7 @@ std::string MSLEmitter::sgOperandScalar(Type t) {
   return "float";
 }
 
-std::string MSLEmitter::init0(const std::string &sc) {
-  return sc == "float" || sc == "half" ? "0.0" : "0";
-}
-
-msl::Expr *MSLEmitter::astInPlaceBase(const InPlaceOperand &op) {
+msl::Expr *MSLEmitter::inPlaceBase(const InPlaceOperand &op) {
   if (!op.baseOffset)
     return ctx.var(op.buf);
   return ctx.paren(ctx.binary(msl::BinOp::Add, ctx.var(op.buf), op.baseOffset));

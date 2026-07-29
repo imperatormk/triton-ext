@@ -1,8 +1,8 @@
 // EmitMSLOps.cpp - op-dispatch spine + its AST lowering helpers.
 //
-// The astEmitOp waterfall and the per-family helpers it calls
-// (astElemwiseDecls/astCombineN/astScanWarpCarry/astEmitMapCFG/astEmitFusedGemm/
-// astDeclResultVars/astDeclBind/astDerefPtr/astBandRoundTrip/astStoreBody) plus
+// The emitOp waterfall and the per-family helpers it calls
+// (elemwiseDecls/combineN/scanWarpCarry/emitMapCFG/emitFusedGemm/
+// declResultVars/declBind/derefPtr/bandRoundTrip/storeBody) plus
 // the local cmpBinOp string->BinOp map.
 
 #include "MSLConstants.h"
@@ -20,10 +20,10 @@ using CS = msl::Cast::Style;
 //===----------------------------------------------------------------------===//
 
 // Append the nodes for a single elementwise/expr op's per-register DeclStmts,
-// using the expr-builder `mk(r)` per register. astEmitOp mints the real names.
-bool MSLEmitter::astElemwiseDecls(Operation *op, msl::Type *declTy, int &id,
-                                  msl::Block &body,
-                                  llvm::function_ref<msl::Expr *(int)> mk) {
+// using the expr-builder `mk(r)` per register. emitOp mints the real names.
+bool MSLEmitter::elemwiseDecls(Operation *op, msl::Type *declTy, int &id,
+                               msl::Block &body,
+                               llvm::function_ref<msl::Expr *(int)> mk) {
   LocalGen g{id};
   int rc = regCount(op->getResult(0));
   for (int r = 0; r < rc; ++r)
@@ -35,9 +35,9 @@ bool MSLEmitter::astElemwiseDecls(Operation *op, msl::Type *declTy, int &id,
 // args to the operand names, AST-walk the region (its ops - arith/math/select),
 // and return the N terminator result names. The combiner ops are all
 // single-block, so a plain walk suffices.
-bool MSLEmitter::astCombineN(Region &region, ArrayRef<std::string> aVals,
-                             ArrayRef<std::string> bVals, msl::Block &body,
-                             SmallVectorImpl<std::string> &results) {
+bool MSLEmitter::combineN(Region &region, ArrayRef<std::string> aVals,
+                          ArrayRef<std::string> bVals, msl::Block &body,
+                          SmallVectorImpl<std::string> &results) {
   Block &blk = region.front();
   int n = aVals.size();
   for (int i = 0; i < n; ++i) {
@@ -46,7 +46,7 @@ bool MSLEmitter::astCombineN(Region &region, ArrayRef<std::string> aVals,
   }
   int savedIndent = indent;
   for (Operation &o : blk.without_terminator()) {
-    if (astEmitOp(&o, body))
+    if (emitOp(&o, body))
       continue;
     o.emitError("EmitMSL: unhandled combiner op '" +
                 o.getName().getStringRef() + "'");
@@ -63,7 +63,7 @@ bool MSLEmitter::astCombineN(Region &region, ArrayRef<std::string> aVals,
 
 // Cross-warp inclusive-carry for one register group. Compound guard/index exprs
 // are ctx.raw leaves.
-bool MSLEmitter::astScanWarpCarry(
+bool MSLEmitter::scanWarpCarry(
     Region &region, int nOp, ArrayRef<std::string> scTys,
     ArrayRef<int64_t> byteWidths, ArrayRef<std::pair<int, int32_t>> warpBits,
     ArrayRef<int> regs, SmallVector<SmallVector<std::string>> &accs,
@@ -77,7 +77,7 @@ bool MSLEmitter::astScanWarpCarry(
   if (warpBits.empty()) {
     for (int k = 0; k < nOp; ++k) {
       std::string s =
-          astShuffle("simd_shuffle", scTys[k], laneScan[k], axisTopLane, body);
+          shuffle("simd_shuffle", scTys[k], laneScan[k], axisTopLane, body);
       body.push_back(ctx.assignStmt(ctx.var(runTotalOut[k]), ctx.var(s)));
     }
     return true;
@@ -88,7 +88,7 @@ bool MSLEmitter::astScanWarpCarry(
   for (int k = 0; k < nOp; ++k) {
     scratch[k] = fresh();
     body.push_back(ctx.declStmt(ctx.ptr(scT[k], msl::AddrSpace::Threadgroup),
-                                scratch[k], astPoolRegion(byteOff, scTys[k])));
+                                scratch[k], poolRegion(byteOff, scTys[k])));
     byteOff += (int64_t)numWarps * 32 * byteWidths[k];
   }
   body.push_back(ctx.hardBarrier(false));
@@ -166,7 +166,7 @@ bool MSLEmitter::astScanWarpCarry(
       body.push_back(ctx.declStmt(scT[k], pv[k], slot(k, order[idx])));
     }
     SmallVector<std::string> out;
-    if (!astCombineN(region, grand, pv, body, out))
+    if (!combineN(region, grand, pv, body, out))
       return false;
     for (int k = 0; k < nOp; ++k)
       body.push_back(ctx.assignStmt(ctx.var(grand[k]), ctx.var(out[k])));
@@ -197,7 +197,7 @@ bool MSLEmitter::astScanWarpCarry(
     msl::Block thenB, elseB;
     {
       SmallVector<std::string> out;
-      if (!astCombineN(region, carry, pv, thenB, out))
+      if (!combineN(region, carry, pv, thenB, out))
         return false;
       for (int k = 0; k < nOp; ++k)
         thenB.push_back(ctx.assignStmt(ctx.var(carry[k]), ctx.var(out[k])));
@@ -214,7 +214,7 @@ bool MSLEmitter::astScanWarpCarry(
     for (int k = 0; k < nOp; ++k)
       ar[k] = accs[k][r];
     SmallVector<std::string> out;
-    if (!astCombineN(region, carry, ar, body, out))
+    if (!combineN(region, carry, ar, body, out))
       return false;
     for (int k = 0; k < nOp; ++k)
       // accs[k][r] = (init ? out[k] : accs[k][r]);
@@ -227,11 +227,11 @@ bool MSLEmitter::astScanWarpCarry(
   return true;
 }
 
-// Multi-block map_elementwise region -> state machine. Like astEmitBlockCFG but
+// Multi-block map_elementwise region -> state machine. Like emitBlockCFG but
 // the map_elementwise.return terminator spills operands into caller `capture`
 // slots then breaks. Appends the predeclarations + state machine to `body`.
-void MSLEmitter::astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
-                               msl::Block &body) {
+void MSLEmitter::emitMapCFG(Region &region, ArrayRef<std::string> capture,
+                            msl::Block &body) {
   blockLabel.clear();
   int idx = 0;
   for (Block &blk : region)
@@ -242,7 +242,7 @@ void MSLEmitter::astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
         bindDataless(arg);
         continue;
       }
-      bindRegs(arg, astDeclResultVars(arg, body));
+      bindRegs(arg, declResultVars(arg, body));
     }
   llvm::DenseMap<Value, SmallVector<std::string>> hoist;
   for (Block &blk : region)
@@ -254,33 +254,33 @@ void MSLEmitter::astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
           return u->getBlock() != &blk;
         });
         if (crosses)
-          hoist[res] = astDeclResultVars(res, body);
+          hoist[res] = declResultVars(res, body);
       }
   std::string state = fresh();
   cfgState = state;
   llvm::SmallVector<std::pair<std::string, msl::Block>> cases;
   for (Block &blk : region) {
-    msl::Block caseBody = astWalkBlock2(blk, hoist);
+    msl::Block caseBody = walkBlock2(blk, hoist);
     Operation *term = blk.getTerminator();
     if (term->getName().getStringRef() == "tt.map_elementwise.return") {
       for (auto [i, operand] : llvm::enumerate(term->getOperands()))
-        caseBody.push_back(astMapReturnSpill(capture[i], scalarName(operand)));
+        caseBody.push_back(mapReturnSpill(capture[i], scalarName(operand)));
       caseBody.push_back(ctx.breakStmt());
     } else {
-      for (msl::Stmt *s : astTerminatorEdge(term, state))
+      for (msl::Stmt *s : terminatorEdge(term, state))
         caseBody.push_back(s);
     }
     cases.push_back({blockLabel[&blk], std::move(caseBody)});
   }
   cfgState.clear();
-  body.push_back(astMapCFGStateMachine(state, cases));
+  body.push_back(mapCFGStateMachine(state, cases));
 }
 
 // Fused GEMM K-loop: carry iter-args, run the dot Decl phase, the K-loop with
 // the MMA-phase dot in its body, the non-acc carry, direct-store setup, then
 // the Readback-phase dot.
-bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
-                                  unsigned iterIdx, msl::Block &body) {
+bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
+                               msl::Block &body) {
   SmallVector<SmallVector<std::string>> carried;
   SmallVector<std::string> initBase;
   for (auto [i, init, res] :
@@ -293,7 +293,7 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
     }
     auto &initNames = names(init);
     if (i == iterIdx) {
-      SmallVector<std::string> ids = astDeclResultVars(res, body);
+      SmallVector<std::string> ids = declResultVars(res, body);
       initBase.assign(initNames.begin(), initNames.end());
       fusedDot.ids = ids;
       bindRegs(op.getRegionIterArg(i), ids);
@@ -301,7 +301,7 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
       carried.push_back({});
       continue;
     }
-    SmallVector<std::string> vars = astDeclResultVars(res, body);
+    SmallVector<std::string> vars = declResultVars(res, body);
     for (size_t r = 0; r < vars.size(); ++r)
       body.push_back(ctx.assignStmt(
           ctx.var(vars[r]), ctx.var(initNames[initNames.size() == 1 ? 0 : r])));
@@ -312,7 +312,7 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
 
   fusedDot.baseNames = initBase;
   fusedDot.phase = FusedDotPhase::Decl;
-  if (!astEmitDot(dot, body))
+  if (!emitDot(dot, body))
     return false;
 
   std::string iv = fresh();
@@ -323,8 +323,7 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
 
   // Loop body: MMA-phase dot (walked) + non-acc carry.
   fusedDot.phase = FusedDotPhase::MMA;
-  msl::Block loopBody =
-      astWalkBlock(op.getRegion().front(), (unsigned)indent + 1);
+  msl::Block loopBody = walkBlock(op.getRegion().front(), (unsigned)indent + 1);
   if (emitFailed)
     return false;
   fusedDot.phase = FusedDotPhase::None;
@@ -337,7 +336,7 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
       loopBody.push_back(ctx.assignStmt(ctx.var(carried[i][r]),
                                         ctx.var(src[src.size() == 1 ? 0 : r])));
   }
-  body.push_back(astForScope(op, std::move(loopBody), iv, ivTy));
+  body.push_back(forScope(op, std::move(loopBody), iv, ivTy));
 
   if (auto ds = matchDirectStore(op.getResult(iterIdx))) {
     int64_t M = cast<RankedTensorType>(dot.getResult().getType()).getShape()[0];
@@ -366,7 +365,7 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
   }
 
   fusedDot.phase = FusedDotPhase::Readback;
-  if (!astEmitDot(dot, body))
+  if (!emitDot(dot, body))
     return false;
   fusedDot = FusedDotCtx{};
   return true;
@@ -374,14 +373,13 @@ bool MSLEmitter::astEmitFusedGemm(scf::ForOp op, tt::DotOp dot,
 
 // Predeclare a value's per-register result variables (`sc id;`) with no init,
 // mirroring declResultVars; returns the minted names (caller binds valMap).
-SmallVector<std::string> MSLEmitter::astDeclResultVars(Value v,
-                                                       msl::Block &body) {
+SmallVector<std::string> MSLEmitter::declResultVars(Value v, msl::Block &body) {
   Type elem = v.getType();
   if (auto rt = dyn_cast<RankedTensorType>(elem))
     elem = rt.getElementType();
   msl::Type *sc = isa<tt::PointerType>(elem)
-                      ? astStorageType(v.getType())
-                      : astScalarType(elementScalarType(v.getType()));
+                      ? storageType(v.getType())
+                      : scalarType(elementScalarType(v.getType()));
   int rc = regCount(v);
   SmallVector<std::string> ids;
   for (int r = 0; r < rc; ++r) {
@@ -394,8 +392,8 @@ SmallVector<std::string> MSLEmitter::astDeclResultVars(Value v,
 
 // Per-register decls: mints fresh() names (advancing nextId so downstream ops
 // stay in lockstep) and binds valMap[result].
-bool MSLEmitter::astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
-                             llvm::function_ref<msl::Expr *(int)> mk) {
+bool MSLEmitter::declBind(Operation *op, msl::Type *declTy, msl::Block &body,
+                          llvm::function_ref<msl::Expr *(int)> mk) {
   int rc = regCount(op->getResult(0));
   SmallVector<std::string> ids;
   for (int r = 0; r < rc; ++r) {
@@ -418,7 +416,7 @@ bool MSLEmitter::needsCoherentDeref(Value ptr) const {
 
 // `*p`, or the coherent-cast deref `*(device coherent(device) sc*)p` when a
 // scalar spinlock or a loop-carried scalar RMW forces a coherent access.
-msl::Expr *MSLEmitter::astDerefPtr(Value ptr, StringRef name, StringRef scName) {
+msl::Expr *MSLEmitter::derefPtr(Value ptr, StringRef name, StringRef scName) {
   if (scalarSpinlock || needsCoherentDeref(ptr)) {
     // Exact `device coherent(device) sc*` cast form used by the load/store path
     // (the printer's plain coherent-ptr form omits the leading `device`).
@@ -433,12 +431,12 @@ msl::Expr *MSLEmitter::astDerefPtr(Value ptr, StringRef name, StringRef scName) 
 // register from buf[resOff]. `band == total` uses the direct `buf[off]=v;`
 // form; a smaller band wraps each in `{ int __f=off; if (__f>=lo && __f<hi)
 // buf[__f-lo]=v; }`.
-void MSLEmitter::astBandRoundTrip(msl::Block &body, StringRef buf,
-                                  int64_t total, int64_t band, int srcRc,
-                                  int resRc, ArrayRef<std::string> outs,
-                                  llvm::function_ref<msl::Expr *(int)> srcOff,
-                                  llvm::function_ref<msl::Expr *(int)> srcVal,
-                                  llvm::function_ref<msl::Expr *(int)> resOff) {
+void MSLEmitter::bandRoundTrip(msl::Block &body, StringRef buf, int64_t total,
+                               int64_t band, int srcRc, int resRc,
+                               ArrayRef<std::string> outs,
+                               llvm::function_ref<msl::Expr *(int)> srcOff,
+                               llvm::function_ref<msl::Expr *(int)> srcVal,
+                               llvm::function_ref<msl::Expr *(int)> resOff) {
   auto banded = [&](msl::Expr *off, int64_t lo, int64_t hi, bool toBuf,
                     msl::Expr *reg) -> msl::Stmt * {
     msl::Block b;
@@ -480,7 +478,7 @@ void MSLEmitter::astBandRoundTrip(msl::Block &body, StringRef buf,
 void MSLEmitter::emitTileRoundTrip(
     Value res, Value src, RankedTensorType srcTy, RankedTensorType resTy,
     msl::Block &body, llvm::function_ref<msl::Expr *(int)> srcOff) {
-  msl::Type *scTy = astScalarType(resTy.getElementType());
+  msl::Type *scTy = scalarType(resTy.getElementType());
   std::string sc = mslScalarType(resTy.getElementType());
   auto &srcNames = names(src);
   int srcRc = regCount(src);
@@ -490,22 +488,22 @@ void MSLEmitter::emitTileRoundTrip(
 
   std::string buf = fresh();
   body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
-                              astPoolRegion(0, sc)));
+                              poolRegion(0, sc)));
   int64_t band = reshapeBand(total, elemBytes);
-  SmallVector<std::string> ids = astDeclResultVars(res, body);
-  astBandRoundTrip(
+  SmallVector<std::string> ids = declResultVars(res, body);
+  bandRoundTrip(
       body, buf, total, band, srcRc, resRc, ids, srcOff,
       [&](int r) {
         return static_cast<msl::Expr *>(
             ctx.var(srcNames[srcNames.size() == 1 ? 0 : r]));
       },
-      [&](int r) { return astFlatTileOffset(resTy, r); });
+      [&](int r) { return layout.flatTileOffset(resTy, r); });
   bindRegs(res, ids);
 }
 
 // Per-register store: `[if (guard)] *p = v;` with the thread predicate + mask
 // guard.
-void MSLEmitter::astStoreBody(tt::StoreOp op, msl::Block &body) {
+void MSLEmitter::storeBody(tt::StoreOp op, msl::Block &body) {
   auto &ptrs = names(op.getPtr());
   auto &vals = names(op.getValue());
   bool hasMask = op.getMask() != nullptr;
@@ -547,7 +545,7 @@ void MSLEmitter::astStoreBody(tt::StoreOp op, msl::Block &body) {
   std::string scName =
       mslScalarType(elementScalarType(op.getValue().getType()));
   for (int r = 0; r < rc; ++r) {
-    msl::Expr *lhs = astDerefPtr(op.getPtr(), ptrs[r], scName);
+    msl::Expr *lhs = derefPtr(op.getPtr(), ptrs[r], scName);
     msl::Expr *v = ctx.var(vals[vals.size() == 1 ? 0 : r]);
     msl::Stmt *assign = ctx.assignStmt(lhs, v);
     msl::Expr *guard = threadPred;
@@ -569,8 +567,8 @@ static const char *axisComp(tt::ProgramIDDim axis) {
 }
 
 // `int id = (int)(builtinVar.comp);` and bind the result.
-void MSLEmitter::astProgramDim(Operation *op, StringRef builtinVar,
-                               tt::ProgramIDDim axis, msl::Block &body) {
+void MSLEmitter::programDim(Operation *op, StringRef builtinVar,
+                            tt::ProgramIDDim axis, msl::Block &body) {
   msl::Expr *e =
       ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::I32),
                ctx.paren(ctx.member(ctx.var(builtinVar), axisComp(axis))));
@@ -582,7 +580,7 @@ void MSLEmitter::astProgramDim(Operation *op, StringRef builtinVar,
 // Route `op` to its builder(s), appending nodes to `body`. Returns true when
 // handled (including alias/dataless ops that append nothing); false for an
 // unsupported op, which the caller turns into a hard error.
-bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
+bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
   // Barriers: BarrierStmt nodes (printer peephole collapses adjacent ones).
   if (auto b = dyn_cast<ttg::BarrierOp>(op)) {
     uint32_t bits = static_cast<uint32_t>(b.getAddrSpace());
@@ -618,23 +616,23 @@ bool MSLEmitter::astEmitOp(Operation *op, msl::Block &body) {
   // handled/failed bool. Unmatched by all -> false (a hard error upstream).
   using Family = std::optional<bool> (MSLEmitter::*)(Operation *, msl::Block &);
   static constexpr Family families[] = {
-      &MSLEmitter::astEmitArithBinop, &MSLEmitter::astEmitConstGrid,
-      &MSLEmitter::astEmitArithMisc,  &MSLEmitter::astEmitMath,
-      &MSLEmitter::astEmitReshape,    &MSLEmitter::astEmitMemDesc,
-      &MSLEmitter::astEmitDotMap,     &MSLEmitter::astEmitAtomic,
-      &MSLEmitter::astEmitScanReduce, &MSLEmitter::astEmitTensorMove,
-      &MSLEmitter::astEmitCallReturn, &MSLEmitter::astEmitControlFlow};
+      &MSLEmitter::emitArithBinop, &MSLEmitter::emitConstGrid,
+      &MSLEmitter::emitArithMisc,  &MSLEmitter::emitMath,
+      &MSLEmitter::emitReshape,    &MSLEmitter::emitMemDesc,
+      &MSLEmitter::emitDotMap,     &MSLEmitter::emitAtomic,
+      &MSLEmitter::emitScanReduce, &MSLEmitter::emitTensorMove,
+      &MSLEmitter::emitCallReturn, &MSLEmitter::emitControlFlow};
   for (Family f : families)
     if (std::optional<bool> r = (this->*f)(op, body))
       return *r;
 
-  // Unsupported op: astWalkBlock turns this false into a hard error.
+  // Unsupported op: walkBlock turns this false into a hard error.
   return false;
 }
 
 // float / int / bitwise / shift binops.
-std::optional<bool> MSLEmitter::astEmitArithBinop(Operation *op,
-                                                  msl::Block &body) {
+std::optional<bool> MSLEmitter::emitArithBinop(Operation *op,
+                                               msl::Block &body) {
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
@@ -642,56 +640,53 @@ std::optional<bool> MSLEmitter::astEmitArithBinop(Operation *op,
   // Float binaries: `sc id = (a o b);`
   if (isa<arith::AddFOp, arith::MulFOp, arith::SubFOp, arith::DivFOp,
           tt::PreciseDivFOp>(op))
-    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astElementwiseExpr(arithBinOp(op), nullptr,
-                                reg(op->getOperand(0), r),
-                                reg(op->getOperand(1), r));
+    return declBind(op, scalarType(resElem), body, [&](int r) {
+      return elementwiseExpr(arithBinOp(op), nullptr, reg(op->getOperand(0), r),
+                             reg(op->getOperand(1), r));
     });
 
-  // Integer add/sub/mul/div/rem (astIntBinaryExpr handles the i1 and unsigned
+  // Integer add/sub/mul/div/rem (intBinaryExpr handles the i1 and unsigned
   // paths; the decl type must match the unsigned promotion).
   if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp, arith::DivSIOp,
           arith::DivUIOp, arith::RemSIOp, arith::RemUIOp>(op)) {
-    msl::Type *declTy = astScalarType(resElem);
+    msl::Type *declTy = scalarType(resElem);
     if (auto it = dyn_cast<IntegerType>(resElem); it && it.getWidth() == 1)
       declTy = ctx.scalar(msl::Scalar::I1);
     else if (isa<arith::DivUIOp, arith::RemUIOp>(op))
-      declTy = astUnsignedType(resElem);
-    return astDeclBind(op, declTy, body, [&](int r) {
-      return astIntBinaryExpr(op, reg(op->getOperand(0), r),
-                              reg(op->getOperand(1), r));
+      declTy = unsignedType(resElem);
+    return declBind(op, declTy, body, [&](int r) {
+      return intBinaryExpr(op, reg(op->getOperand(0), r),
+                           reg(op->getOperand(1), r));
     });
   }
 
   // Bitwise/logical and/or/xor.
   if (isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op)) {
-    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astElementwiseExpr(arithBinOp(op), nullptr,
-                                reg(op->getOperand(0), r),
-                                reg(op->getOperand(1), r));
+    return declBind(op, scalarType(resElem), body, [&](int r) {
+      return elementwiseExpr(arithBinOp(op), nullptr, reg(op->getOperand(0), r),
+                             reg(op->getOperand(1), r));
     });
   }
 
   // Shifts.
   if (isa<arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp>(op))
-    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astShiftExpr(op, reg(op->getOperand(0), r),
-                          reg(op->getOperand(1), r));
+    return declBind(op, scalarType(resElem), body, [&](int r) {
+      return shiftExpr(op, reg(op->getOperand(0), r),
+                       reg(op->getOperand(1), r));
     });
 
   return std::nullopt;
 }
 
 // program_id / num_programs / arith.constant / make_range.
-std::optional<bool> MSLEmitter::astEmitConstGrid(Operation *op,
-                                                 msl::Block &body) {
+std::optional<bool> MSLEmitter::emitConstGrid(Operation *op, msl::Block &body) {
   // Program-id / num-programs: `int id = (int)(builtin.comp);`
   if (auto p = dyn_cast<tt::GetProgramIdOp>(op)) {
-    astProgramDim(op, tgposId, p.getAxis(), body);
+    programDim(op, tgposId, p.getAxis(), body);
     return true;
   }
   if (auto n = dyn_cast<tt::GetNumProgramsOp>(op)) {
-    astProgramDim(op, numTgId, n.getAxis(), body);
+    programDim(op, numTgId, n.getAxis(), body);
     return true;
   }
 
@@ -703,33 +698,33 @@ std::optional<bool> MSLEmitter::astEmitConstGrid(Operation *op,
       if (!dense)
         return false; // unsupported: caller emits the error
       Type elemTy = rt.getElementType();
-      msl::Type *sc = astScalarType(elemTy);
+      msl::Type *sc = scalarType(elemTy);
       bool isFloat = isa<FloatType>(elemTy);
       if (dense.isSplat()) {
         std::string lit =
             isFloat
                 ? floatLit(dense.getSplatValue<APFloat>(), elemTy)
                 : std::to_string(dense.getSplatValue<APInt>().getSExtValue());
-        return astDeclBind(op, sc, body, [&](int) { return ctx.lit(lit); });
+        return declBind(op, sc, body, [&](int) { return ctx.lit(lit); });
       }
       // Dense table: `sc tbl[N] = {..}; sc id = tbl[flatTileOffset];`
       SmallVector<msl::Expr *> init;
       if (isFloat)
         for (const APFloat &v : dense.getValues<APFloat>())
-          init.push_back(astFloatLit(v, elemTy));
+          init.push_back(floatLitExpr(v, elemTy));
       else
         for (const APInt &v : dense.getValues<APInt>())
           init.push_back(ctx.lit(std::to_string(v.getSExtValue())));
       std::string tbl = fresh();
       body.push_back(ctx.arrayDeclStmt(sc, tbl, dense.getNumElements(), init));
-      return astDeclBind(op, sc, body, [&](int r) {
-        return ctx.subscript(ctx.var(tbl), astFlatTileOffset(rt, r));
+      return declBind(op, sc, body, [&](int r) {
+        return ctx.subscript(ctx.var(tbl), layout.flatTileOffset(rt, r));
       });
     }
-    msl::Type *sc = astScalarType(res.getType());
+    msl::Type *sc = scalarType(res.getType());
     msl::Expr *lit;
     if (auto fa = dyn_cast<FloatAttr>(cst.getValue()))
-      lit = astFloatLit(fa.getValue(), res.getType());
+      lit = floatLitExpr(fa.getValue(), res.getType());
     else if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
       lit = ctx.lit(std::to_string(ia.getInt()));
     else
@@ -744,8 +739,8 @@ std::optional<bool> MSLEmitter::astEmitConstGrid(Operation *op,
   if (auto mr = dyn_cast<tt::MakeRangeOp>(op)) {
     auto rt = cast<RankedTensorType>(mr.getResult().getType());
     int start = mr.getStart();
-    return astDeclBind(op, ctx.scalar(msl::Scalar::I32), body, [&](int r) {
-      return astMakeRangeElem(start, astLayoutOffsetExpr(rt, r));
+    return declBind(op, ctx.scalar(msl::Scalar::I32), body, [&](int r) {
+      return makeRangeElem(start, layout.layoutOffsetExpr(rt, r));
     });
   }
 
@@ -753,8 +748,7 @@ std::optional<bool> MSLEmitter::astEmitConstGrid(Operation *op,
 }
 
 // cmp / select / clamp / casts / negf / min-max family / precise_sqrt.
-std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
-                                                 msl::Block &body) {
+std::optional<bool> MSLEmitter::emitArithMisc(Operation *op, msl::Block &body) {
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
@@ -795,46 +789,73 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
       break;
     }
     msl::Type *opCast =
-        uns ? astUnsignedType(elementScalarType(ci.getLhs().getType()))
-            : nullptr;
-    return astDeclBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
-      return astElementwiseExpr(bo, opCast, reg(op->getOperand(0), r),
-                                reg(op->getOperand(1), r));
+        uns ? unsignedType(elementScalarType(ci.getLhs().getType())) : nullptr;
+    return declBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
+      return elementwiseExpr(bo, opCast, reg(op->getOperand(0), r),
+                             reg(op->getOperand(1), r));
     });
   }
   if (auto cf = dyn_cast<arith::CmpFOp>(op)) {
     msl::BinOp bo;
+    // MSL's relational operators are the ORDERED comparisons (false if either
+    // operand is NaN) except `!=`, which is unordered. `unordered` marks the
+    // predicates whose sense therefore differs from the bare operator and needs
+    // an explicit isnan() guard: an unordered form ORs the NaN cases in, the
+    // lone ordered form (ONE) ANDs them out.
+    bool unordered = false;
     switch (cf.getPredicate()) {
     case arith::CmpFPredicate::OLT:
-    case arith::CmpFPredicate::ULT:
       bo = B::Lt;
       break;
     case arith::CmpFPredicate::OLE:
-    case arith::CmpFPredicate::ULE:
       bo = B::Le;
       break;
     case arith::CmpFPredicate::OGT:
-    case arith::CmpFPredicate::UGT:
       bo = B::Gt;
       break;
     case arith::CmpFPredicate::OGE:
-    case arith::CmpFPredicate::UGE:
       bo = B::Ge;
       break;
     case arith::CmpFPredicate::OEQ:
-    case arith::CmpFPredicate::UEQ:
       bo = B::Eq;
       break;
-    case arith::CmpFPredicate::ONE:
     case arith::CmpFPredicate::UNE:
       bo = B::Ne;
+      break;
+    case arith::CmpFPredicate::ULT:
+      bo = B::Lt;
+      unordered = true;
+      break;
+    case arith::CmpFPredicate::ULE:
+      bo = B::Le;
+      unordered = true;
+      break;
+    case arith::CmpFPredicate::UGT:
+      bo = B::Gt;
+      unordered = true;
+      break;
+    case arith::CmpFPredicate::UGE:
+      bo = B::Ge;
+      unordered = true;
+      break;
+    case arith::CmpFPredicate::UEQ:
+      bo = B::Eq;
+      unordered = true;
+      break;
+    case arith::CmpFPredicate::ONE:
+      bo = B::Ne;
+      unordered = true;
       break;
     default:
       return false; // unsupported predicate: caller emits the error
     }
-    return astDeclBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
-      return astElementwiseExpr(bo, nullptr, reg(op->getOperand(0), r),
-                                reg(op->getOperand(1), r));
+    bool ordered = cf.getPredicate() == arith::CmpFPredicate::ONE;
+    return declBind(op, ctx.scalar(msl::Scalar::I1), body, [&](int r) {
+      StringRef a = reg(op->getOperand(0), r), b = reg(op->getOperand(1), r);
+      msl::Expr *cmp = elementwiseExpr(bo, nullptr, a, b);
+      if (!unordered)
+        return cmp;
+      return cmpFNaNGuard(cmp, a, b, ordered);
     });
   }
 
@@ -844,19 +865,19 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
     if (auto rt = dyn_cast<RankedTensorType>(re))
       re = rt.getElementType();
     msl::Type *declTy = isa<tt::PointerType>(re)
-                            ? astStorageType(op->getResult(0).getType())
-                            : astScalarType(elementScalarType(re));
-    return astDeclBind(op, declTy, body, [&](int r) {
-      return astSelectExpr(reg(s.getCondition(), r), reg(s.getTrueValue(), r),
-                           reg(s.getFalseValue(), r));
+                            ? storageType(op->getResult(0).getType())
+                            : scalarType(elementScalarType(re));
+    return declBind(op, declTy, body, [&](int r) {
+      return selectExpr(reg(s.getCondition(), r), reg(s.getTrueValue(), r),
+                        reg(s.getFalseValue(), r));
     });
   }
 
   // Clamp.
   if (auto c = dyn_cast<tt::ClampFOp>(op))
-    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astClampExpr(c, reg(c.getX(), r), reg(c.getMin(), r),
-                          reg(c.getMax(), r));
+    return declBind(op, scalarType(resElem), body, [&](int r) {
+      return clampExpr(c, reg(c.getX(), r), reg(c.getMin(), r),
+                       reg(c.getMax(), r));
     });
 
   // fp8 (e4m3/e5m2) has no native MSL scalar: it is uchar storage with
@@ -871,29 +892,28 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
         return toF8 ? std::string("tt_f32_to_fp8") + k + "_rtne"
                     : std::string("tt_fp8") + k + "_to_f32";
       };
-      return astDeclBind(
-          op, astScalarType(dstE), body, [&](int r) -> msl::Expr * {
-            msl::Expr *src = ctx.var(reg(op->getOperand(0), r));
-            if (srcFp8) {
-              msl::Expr *b = ctx.cast(msl::Cast::Style::CStyle,
-                                      ctx.scalar(msl::Scalar::U8), src);
-              msl::Expr *f = ctx.call(fp8Fn(srcE, false), {b});
-              if (dstE.isF32())
-                return f;
-              return ctx.cast(msl::Cast::Style::CStyle, astScalarType(dstE), f);
-            }
-            msl::Expr *f = ctx.cast(msl::Cast::Style::CStyle,
-                                    ctx.scalar(msl::Scalar::F32), src);
-            return ctx.call(fp8Fn(dstE, true), {f});
-          });
+      return declBind(op, scalarType(dstE), body, [&](int r) -> msl::Expr * {
+        msl::Expr *src = ctx.var(reg(op->getOperand(0), r));
+        if (srcFp8) {
+          msl::Expr *b = ctx.cast(msl::Cast::Style::CStyle,
+                                  ctx.scalar(msl::Scalar::U8), src);
+          msl::Expr *f = ctx.call(fp8Fn(srcE, false), {b});
+          if (dstE.isF32())
+            return f;
+          return ctx.cast(msl::Cast::Style::CStyle, scalarType(dstE), f);
+        }
+        msl::Expr *f = ctx.cast(msl::Cast::Style::CStyle,
+                                ctx.scalar(msl::Scalar::F32), src);
+        return ctx.call(fp8Fn(dstE, true), {f});
+      });
     }
   }
 
   // Casts (non fp-narrowing) / bitcast / ptr<->int.
   if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp,
           arith::ExtFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(op))
-    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astCastExpr(op, reg(op->getOperand(0), r));
+    return declBind(op, scalarType(resElem), body, [&](int r) {
+      return castExpr(op, reg(op->getOperand(0), r));
     });
   // TruncF / FpToFp: f32->half/bfloat narrowing calls a preamble helper
   // (tt_rtz_* / tt_rtne_*); other float casts are a plain static_cast.
@@ -913,8 +933,8 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
     }
     if (narrow) {
       std::string fn = std::string(rtz ? "tt_rtz_" : "tt_rtne_") + dst;
-      msl::Type *dstTy = astScalarType(resElem);
-      return astDeclBind(op, dstTy, body, [&](int r) {
+      msl::Type *dstTy = scalarType(resElem);
+      return declBind(op, dstTy, body, [&](int r) {
         msl::Expr *f =
             ctx.cast(msl::Cast::Style::CStyle, ctx.scalar(msl::Scalar::F32),
                      ctx.var(reg(op->getOperand(0), r)));
@@ -922,23 +942,22 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
       });
     }
     // Non-narrowing float cast: static_cast<dst>(v).
-    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astCastExpr(op, reg(op->getOperand(0), r));
+    return declBind(op, scalarType(resElem), body, [&](int r) {
+      return castExpr(op, reg(op->getOperand(0), r));
     });
   }
   if (isa<arith::BitcastOp, tt::BitcastOp>(op))
-    return astDeclBind(
-        op, astStorageType(op->getResult(0).getType()), body,
-        [&](int r) { return astBitcastExpr(op, reg(op->getOperand(0), r)); });
+    return declBind(
+        op, storageType(op->getResult(0).getType()), body,
+        [&](int r) { return bitcastExpr(op, reg(op->getOperand(0), r)); });
   if (isa<tt::IntToPtrOp, tt::PtrToIntOp>(op))
-    return astDeclBind(
-        op, astStorageType(op->getResult(0).getType()), body, [&](int r) {
-          return astPtrIntCastExpr(op, reg(op->getOperand(0), r));
-        });
+    return declBind(
+        op, storageType(op->getResult(0).getType()), body,
+        [&](int r) { return ptrIntCastExpr(op, reg(op->getOperand(0), r)); });
 
   // negf: `sc id = -a;`
   if (isa<arith::NegFOp>(op))
-    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
+    return declBind(op, scalarType(resElem), body, [&](int r) {
       return ctx.unary(msl::UnOp::Neg, ctx.var(reg(op->getOperand(0), r)));
     });
 
@@ -957,10 +976,10 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
       propagateNan = true;
     } else if (isa<arith::MaxUIOp>(op)) {
       fn = "max";
-      opCast = astUnsignedType(resElem);
+      opCast = unsignedType(resElem);
     } else if (isa<arith::MinUIOp>(op)) {
       fn = "min";
-      opCast = astUnsignedType(resElem);
+      opCast = unsignedType(resElem);
     } else if (isa<arith::MaxNumFOp, arith::MaxSIOp>(op))
       fn = "max";
     else if (isa<arith::MinNumFOp, arith::MinSIOp>(op))
@@ -969,35 +988,34 @@ std::optional<bool> MSLEmitter::astEmitArithMisc(Operation *op,
       fn = "metal::fmod";
     else if (isa<tt::MulhiUIOp>(op)) {
       fn = "mulhi";
-      opCast = astUnsignedType(resElem);
+      opCast = unsignedType(resElem);
     } else
       isMinMax = false;
     if (isMinMax)
-      return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-        return astMinMaxExpr(fn, opCast, propagateNan,
-                             reg(op->getOperand(0), r),
-                             reg(op->getOperand(1), r));
+      return declBind(op, scalarType(resElem), body, [&](int r) {
+        return minMaxExpr(fn, opCast, propagateNan, reg(op->getOperand(0), r),
+                          reg(op->getOperand(1), r));
       });
   }
 
   // precise_sqrt: `sc id = (sc)metal::precise::sqrt(a);`
   if (isa<tt::PreciseSqrtOp>(op))
-    return astDeclBind(op, astScalarType(resElem), body, [&](int r) {
-      return astUnaryExpr(msl::builtin::precise::Sqrt, astScalarType(resElem),
-                          reg(op->getOperand(0), r));
+    return declBind(op, scalarType(resElem), body, [&](int r) {
+      return unaryExpr(msl::builtin::precise::Sqrt, scalarType(resElem),
+                       reg(op->getOperand(0), r));
     });
 
   return std::nullopt;
 }
 
 // math.* dialect: unary/binary transcendentals, fma, exp10.
-std::optional<bool> MSLEmitter::astEmitMath(Operation *op, msl::Block &body) {
+std::optional<bool> MSLEmitter::emitMath(Operation *op, msl::Block &body) {
   Type resElem = op->getNumResults()
                      ? elementScalarType(op->getResult(0).getType())
                      : Type();
   if (op->getDialect() ==
       op->getContext()->getLoadedDialect<math::MathDialect>()) {
-    msl::Type *sc = astScalarType(resElem);
+    msl::Type *sc = scalarType(resElem);
     StringRef n = op->getName().getStringRef();
     namespace bi = msl::builtin;
     static const llvm::StringMap<StringRef> unary = {
@@ -1018,14 +1036,14 @@ std::optional<bool> MSLEmitter::astEmitMath(Operation *op, msl::Block &body) {
     // raw byte). Both OCP formats are sign-magnitude with the sign in bit 7,
     // so clearing it is abs for e4m3 and e5m2 alike.
     if (n == "math.absf" && isFp8Type(resElem))
-      return astDeclBind(op, sc, body, [&](int r) {
+      return declBind(op, sc, body, [&](int r) {
         return ctx.paren(ctx.binary(B::And, ctx.var(reg(op->getOperand(0), r)),
                                     ctx.lit("0x7f")));
       });
     if (auto it = unary.find(n); it != unary.end()) {
       StringRef fn = it->second;
-      return astDeclBind(op, sc, body, [&](int r) {
-        return astUnaryExpr(fn, sc, reg(op->getOperand(0), r));
+      return declBind(op, sc, body, [&](int r) {
+        return unaryExpr(fn, sc, reg(op->getOperand(0), r));
       });
     }
     static const llvm::StringMap<StringRef> binary = {
@@ -1035,19 +1053,19 @@ std::optional<bool> MSLEmitter::astEmitMath(Operation *op, msl::Block &body) {
         {"math.copysign", bi::math::Copysign}};
     if (auto it = binary.find(n); it != binary.end()) {
       StringRef fn = it->second;
-      return astDeclBind(op, sc, body, [&](int r) {
-        return astMinMaxExpr(fn, nullptr, false, reg(op->getOperand(0), r),
-                             reg(op->getOperand(1), r));
+      return declBind(op, sc, body, [&](int r) {
+        return minMaxExpr(fn, nullptr, false, reg(op->getOperand(0), r),
+                          reg(op->getOperand(1), r));
       });
     }
     if (n == "math.fma")
-      return astDeclBind(op, sc, body, [&](int r) {
-        return astTernaryCallExpr(bi::math::Fma, reg(op->getOperand(0), r),
-                                  reg(op->getOperand(1), r),
-                                  reg(op->getOperand(2), r));
+      return declBind(op, sc, body, [&](int r) {
+        return ternaryCallExpr(bi::math::Fma, reg(op->getOperand(0), r),
+                               reg(op->getOperand(1), r),
+                               reg(op->getOperand(2), r));
       });
     if (n == "math.exp10")
-      return astDeclBind(op, sc, body, [&](int r) {
+      return declBind(op, sc, body, [&](int r) {
         // pow((sc)10, a)
         msl::Expr *ten = ctx.cast(CS::CStyle, sc, ctx.lit("10"));
         return ctx.call(bi::precise::Pow,
@@ -1061,8 +1079,7 @@ std::optional<bool> MSLEmitter::astEmitMath(Operation *op, msl::Block &body) {
 
 // Shape ops: splat/unsplat/expand/broadcast/join/split (rebinds) +
 // trans/reshape.
-std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
-                                               msl::Block &body) {
+std::optional<bool> MSLEmitter::emitReshape(Operation *op, msl::Block &body) {
   // Pure register-rebind ops (no text emitted): splat / expand_dims / broadcast
   // / join / split / unsplat. Their handlers only rewrite valMap, so calling
   // them here writes nothing and keeps the symbol table correct.
@@ -1093,7 +1110,7 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
     auto resTy = cast<RankedTensorType>(res.getType());
     auto perm = tr.getOrder();
     emitTileRoundTrip(res, src, srcTy, resTy, body, [&](int r) {
-      return astTransFlatOffset(srcTy, perm, resTy.getShape(), r);
+      return layout.transFlatOffset(srcTy, perm, resTy.getShape(), r);
     });
     return true;
   }
@@ -1108,7 +1125,7 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
     emitTileRoundTrip(res, src, srcTy, resTy, body,
-                      [&](int r) { return astFlatTileOffset(srcTy, r); });
+                      [&](int r) { return layout.flatTileOffset(srcTy, r); });
     return true;
   }
 
@@ -1116,8 +1133,7 @@ std::optional<bool> MSLEmitter::astEmitReshape(Operation *op,
 }
 
 // memdesc index/subslice, local_alloc/store/load, async_copy, convert_layout.
-std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
-                                               msl::Block &body) {
+std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
   // memdesc_index / memdesc_subslice: pure memdescMap rebinds (no text).
   if (auto mi = dyn_cast<ttg::MemDescIndexOp>(op))
     return succeeded(emitMemDescIndex(mi));
@@ -1140,7 +1156,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
       body.push_back(ctx.hardBarrier(false));
       for (int r = 0, n = regCount(init); r < n; ++r)
         body.push_back(ctx.assignStmt(
-            ctx.subscript(ctx.var(buf), astFlatTileOffset(srcTy, r)),
+            ctx.subscript(ctx.var(buf), layout.flatTileOffset(srcTy, r)),
             ctx.var(vals[r])));
       body.push_back(ctx.hardBarrier(false));
     }
@@ -1154,7 +1170,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
     auto &vals = names(ls.getSrc());
     for (int r = 0, n = regCount(ls.getSrc()); r < n; ++r)
       body.push_back(ctx.assignStmt(
-          ctx.subscript(ctx.var(dst.buf), astMemdescElemAddr(dst, srcTy, r)),
+          ctx.subscript(ctx.var(dst.buf), memdescElemAddr(dst, srcTy, r)),
           ctx.var(vals[r])));
     body.push_back(ctx.barrier(false));
     return true;
@@ -1168,13 +1184,13 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
     }
     auto resTy = cast<RankedTensorType>(ll.getResult().getType());
     MemDescInfo src = memdescMap[ll.getSrc()];
-    msl::Type *scTy = astScalarType(resTy.getElementType());
+    msl::Type *scTy = scalarType(resTy.getElementType());
     SmallVector<std::string> ids;
     for (int r = 0, n = regCount(ll.getResult()); r < n; ++r) {
       std::string id = fresh();
       body.push_back(ctx.declStmt(
           scTy, id,
-          ctx.subscript(ctx.var(src.buf), astMemdescElemAddr(src, resTy, r))));
+          ctx.subscript(ctx.var(src.buf), memdescElemAddr(src, resTy, r))));
       ids.push_back(id);
     }
     bindRegs(ll.getResult(), ids);
@@ -1191,7 +1207,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
     SmallVector<std::string> *mask = hasMask ? &names(ac.getMask()) : nullptr;
     for (int r = 0, n = regCount(ac.getSrc()); r < n; ++r) {
       msl::Expr *addr =
-          ctx.subscript(ctx.var(dst.buf), astMemdescElemAddr(dst, srcTy, r));
+          ctx.subscript(ctx.var(dst.buf), memdescElemAddr(dst, srcTy, r));
       msl::Expr *load = ctx.deref(ctx.var(ptrs[r]));
       msl::Stmt *asn = ctx.assignStmt(addr, load);
       if (hasMask)
@@ -1219,9 +1235,8 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
     bool isPtr = isa<tt::PointerType>(elemTy);
     std::string ptrTyStr = mslStorageType(resTy);
     std::string scStr = isPtr ? "ulong" : ptrTyStr;
-    msl::Type *scTy =
-        isPtr ? ctx.scalar(msl::Scalar::U64) : astStorageType(resTy);
-    msl::Type *ptrDeclTy = astStorageType(resTy);
+    msl::Type *scTy = isPtr ? ctx.scalar(msl::Scalar::U64) : storageType(resTy);
+    msl::Type *ptrDeclTy = storageType(resTy);
     auto &srcNames = names(src);
     int64_t elemBytes = byteWidth(elemTy);
     int64_t tileBytes = tileSize(resTy) * elemBytes;
@@ -1230,7 +1245,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
 
     std::string buf = fresh();
     body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
-                                astPoolRegion(0, scStr)));
+                                poolRegion(0, scStr)));
     // scatter value expr: `(ulong)sv` when isPtr, else `sv`.
     auto scatterVal = [&](StringRef nm) -> msl::Expr * {
       msl::Expr *v = ctx.var(nm);
@@ -1262,7 +1277,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
         msl::Expr *expr = nullptr;
         int64_t stride = 1;
         for (int d = rank - 1; d >= 0; --d) {
-          msl::Expr *c = astLayoutCoordExpr(rt, reg, outN[d]);
+          msl::Expr *c = layout.layoutCoordExpr(rt, reg, outN[d]);
           if (d == rank - 2)
             c = ctx.paren(ctx.binary(B::Sub, c, ctx.lit(std::to_string(r0))));
           msl::Expr *term =
@@ -1278,10 +1293,10 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
         int64_t r1 = std::min<int64_t>(r0 + bandRows, rowsTotal);
         body.push_back(ctx.hardBarrier(false));
         for (int r = 0, n = regCount(src); r < n; ++r) {
-          msl::Expr *rowc = astLayoutCoordExpr(srcTy, r, srcRowDim);
+          msl::Expr *rowc = layout.layoutCoordExpr(srcTy, r, srcRowDim);
           msl::Expr *cond = ctx.binary(
               B::LAnd, ctx.binary(B::Ge, rowc, ctx.lit(std::to_string(r0))),
-              ctx.binary(B::Lt, astLayoutCoordExpr(srcTy, r, srcRowDim),
+              ctx.binary(B::Lt, layout.layoutCoordExpr(srcTy, r, srcRowDim),
                          ctx.lit(std::to_string(r1))));
           body.push_back(ctx.compactIf(
               cond, ctx.assignStmt(
@@ -1294,10 +1309,10 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
             ids[r] = fresh();
             body.push_back(ctx.declStmt(ptrDeclTy, ids[r], nullptr));
           }
-          msl::Expr *rowc = astLayoutCoordExpr(resTy, r, resRowDim);
+          msl::Expr *rowc = layout.layoutCoordExpr(resTy, r, resRowDim);
           msl::Expr *cond = ctx.binary(
               B::LAnd, ctx.binary(B::Ge, rowc, ctx.lit(std::to_string(r0))),
-              ctx.binary(B::Lt, astLayoutCoordExpr(resTy, r, resRowDim),
+              ctx.binary(B::Lt, layout.layoutCoordExpr(resTy, r, resRowDim),
                          ctx.lit(std::to_string(r1))));
           msl::Expr *rd =
               gatherVal(ctx.subscript(ctx.var(buf), bandOffset(resTy, r, r0)));
@@ -1323,7 +1338,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
         for (int r = 0, n = regCount(src); r < n; ++r) {
           msl::Block b;
           b.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), "__f",
-                                   astFlatTileOffset(srcTy, r)));
+                                   layout.flatTileOffset(srcTy, r)));
           msl::Expr *cond = ctx.binary(
               B::LAnd,
               ctx.binary(B::Ge, ctx.var("__f"), ctx.lit(std::to_string(lo))),
@@ -1339,7 +1354,7 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
         for (int r = 0, n = regCount(res); r < n; ++r) {
           msl::Block b;
           b.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), "__f",
-                                   astFlatTileOffset(resTy, r)));
+                                   layout.flatTileOffset(resTy, r)));
           msl::Expr *cond = ctx.binary(
               B::LAnd,
               ctx.binary(B::Ge, ctx.var("__f"), ctx.lit(std::to_string(lo))),
@@ -1358,14 +1373,14 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
     body.push_back(ctx.hardBarrier(false));
     for (int r = 0, n = regCount(src); r < n; ++r)
       body.push_back(ctx.assignStmt(
-          ctx.subscript(ctx.var(buf), astFlatTileOffset(srcTy, r)),
+          ctx.subscript(ctx.var(buf), layout.flatTileOffset(srcTy, r)),
           scatterVal(srcNames[r])));
     body.push_back(ctx.hardBarrier(false));
     SmallVector<std::string> ids;
     for (int r = 0, n = regCount(res); r < n; ++r) {
       std::string id = fresh();
-      msl::Expr *rd =
-          gatherVal(ctx.subscript(ctx.var(buf), astFlatTileOffset(resTy, r)));
+      msl::Expr *rd = gatherVal(
+          ctx.subscript(ctx.var(buf), layout.flatTileOffset(resTy, r)));
       body.push_back(ctx.declStmt(ptrDeclTy, id, rd));
       ids.push_back(id);
     }
@@ -1377,14 +1392,14 @@ std::optional<bool> MSLEmitter::astEmitMemDesc(Operation *op,
 }
 
 // tt.dot / tt.map_elementwise / tt.histogram.
-std::optional<bool> MSLEmitter::astEmitDotMap(Operation *op, msl::Block &body) {
+std::optional<bool> MSLEmitter::emitDotMap(Operation *op, msl::Block &body) {
   // tt.dot: simdgroup-matrix / scalar GEMM (all staging + fusion phases).
   if (auto dt = dyn_cast<tt::DotOp>(op))
-    return astEmitDot(dt, body);
+    return emitDot(dt, body);
 
   // tt.map_elementwise: per-group inline of the scalar region. Single-block
   // groups AST-walk the region; multi-block groups use the state-machine
-  // lowering (astEmitMapCFG).
+  // lowering (emitMapCFG).
   if (auto mp = dyn_cast<tt::MapElementwiseOp>(op)) {
     Region &region = mp.getScalarOp();
     Block &blk = region.front();
@@ -1408,10 +1423,10 @@ std::optional<bool> MSLEmitter::astEmitDotMap(Operation *op, msl::Block &body) {
         for (int i = 0; i < nRes * pack; ++i) {
           capture[i] = fresh();
           Value r = mp->getResult(i / pack);
-          body.push_back(astMapCaptureDecl(
+          body.push_back(mapCaptureDecl(
               mslScalarType(elementScalarType(r.getType())), capture[i]));
         }
-        astEmitMapCFG(region, capture, body);
+        emitMapCFG(region, capture, body);
         if (emitFailed)
           return false;
         for (int k = 0; k < nRes; ++k)
@@ -1420,7 +1435,7 @@ std::optional<bool> MSLEmitter::astEmitDotMap(Operation *op, msl::Block &body) {
         continue;
       }
       for (Operation &o : blk.without_terminator()) {
-        if (!astEmitOp(&o, body)) {
+        if (!emitOp(&o, body)) {
           o.emitError("EmitMSL: unhandled map op '" +
                       o.getName().getStringRef() + "'");
           emitFailed = true;
@@ -1449,9 +1464,9 @@ std::optional<bool> MSLEmitter::astEmitDotMap(Operation *op, msl::Block &body) {
       threads = nw.getInt() * 32;
 
     std::string bins = fresh();
-    body.push_back(astHistBinsDecl(bins));
+    body.push_back(atomic.histBinsDecl(bins));
     std::string zi = fresh();
-    body.push_back(astHistZeroInit(bins, zi, nBins, threads));
+    body.push_back(atomic.histZeroInit(bins, zi, nBins, threads));
     body.push_back(ctx.hardBarrier(false));
 
     auto &srcVals = names(hg.getSrc());
@@ -1502,17 +1517,17 @@ std::optional<bool> MSLEmitter::astEmitDotMap(Operation *op, msl::Block &body) {
             B::LAnd,
             ctx.paren(ctx.var((*maskVals)[maskVals->size() == 1 ? 0 : r])),
             ctx.paren(guard));
-      body.push_back(astHistFetchAdd(guard, bins, v));
+      body.push_back(atomic.histFetchAdd(guard, bins, v));
     }
     body.push_back(ctx.hardBarrier(false));
 
     auto outDims = llvm::to_vector(ttg::toLinearLayout(resTy).getOutDimNames());
-    msl::Type *resScTy = astScalarType(resTy.getElementType());
+    msl::Type *resScTy = scalarType(resTy.getElementType());
     std::string resSc = mslScalarType(resTy.getElementType());
     int nResReg = regCount(hg.getResult());
     SmallVector<std::string> resIds;
     for (int r = 0; r < nResReg; ++r) {
-      msl::Expr *idx = astLayoutCoordExpr(resTy, r, outDims[0]);
+      msl::Expr *idx = layout.layoutCoordExpr(resTy, r, outDims[0]);
       std::string id = fresh();
       // (resSc)atomic_load_explicit(&bins[idx], memory_order_relaxed)
       msl::Expr *load =
@@ -1531,14 +1546,14 @@ std::optional<bool> MSLEmitter::astEmitDotMap(Operation *op, msl::Block &body) {
 }
 
 // tt.atomic_rmw / tt.atomic_poll / tt.atomic_cas.
-std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
+std::optional<bool> MSLEmitter::emitAtomic(Operation *op, msl::Block &body) {
   // tt.atomic_rmw: native fetch_* (AST) or fp-emulated CAS loop (captured),
   // with redundant-thread guard + lane/warp replica broadcast.
   if (auto ar = dyn_cast<tt::AtomicRMWOp>(op)) {
     Value res = ar.getResult();
     Type scalarTy = elementScalarType(res.getType());
     std::string sc = mslScalarType(scalarTy);
-    msl::Type *scTy = astScalarType(scalarTy);
+    msl::Type *scTy = scalarType(scalarTy);
     bool isFloat = isa<FloatType>(scalarTy);
     unsigned bw = scalarTy.getIntOrFloatBitWidth();
     tt::RMWOp kind = ar.getAtomicRmwOp();
@@ -1621,7 +1636,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
       const std::string &p = ptrs[r];
       const std::string &v = vals[vals.size() == 1 ? 0 : r];
       std::string id = fresh();
-      body.push_back(ctx.declStmt(scTy, id, astInit0(sc)));
+      body.push_back(ctx.declStmt(scTy, id, atomic.init0(sc)));
       msl::Expr *guard = nullptr;
       if (uniform)
         guard =
@@ -1644,16 +1659,9 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
                                  ctx.scalar(msl::Scalar::F32), ctx.var(v));
         msl::Expr *call;
         if (bw == 16) {
-          std::string bytePtr = fresh(), wordPtr = fresh(), isHigh = fresh();
-          inner.push_back(ctx.declStmt(ctx.named("device uchar *"), bytePtr,
-                                       ctx.raw("(device uchar *)(" + p + ")")));
-          inner.push_back(
-              ctx.declStmt(ctx.scalar(msl::Scalar::I1), isHigh,
-                           ctx.raw("((size_t)" + bytePtr + " & 2u) != 0u")));
-          inner.push_back(
-              ctx.declStmt(ctx.named("device atomic_uint *"), wordPtr,
-                           ctx.raw("(device atomic_uint *)((size_t)" + bytePtr +
-                                   " & ~(size_t)3)")));
+          std::string wordPtr, isHigh;
+          for (msl::Stmt *s : atomic.packed16Base(p, wordPtr, isHigh))
+            inner.push_back(s);
           call = ctx.call(
               "tt_atomic_rmw_packed16_" + sc,
               {ctx.var(wordPtr), ctx.var(isHigh), fv, ctx.i32lit(rmwOp)});
@@ -1672,14 +1680,14 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
         // device-scope fences around the relaxed op instead.
         if (sem == tt::MemSemantic::RELEASE ||
             sem == tt::MemSemantic::ACQUIRE_RELEASE)
-          inner.push_back(astDeviceFence());
+          inner.push_back(atomic.deviceFence());
         inner.push_back(
-            ctx.assignStmt(ctx.var(id), astAtomicRmwCall(fn, atomicTy, p, v,
-                                                         "memory_order_relaxed",
-                                                         /*memFlags=*/false)));
+            ctx.assignStmt(ctx.var(id), atomic.rmwCall(fn, atomicTy, p, v,
+                                                       "memory_order_relaxed",
+                                                       /*memFlags=*/false)));
         if (sem == tt::MemSemantic::ACQUIRE ||
             sem == tt::MemSemantic::ACQUIRE_RELEASE)
-          inner.push_back(astDeviceFence());
+          inner.push_back(atomic.deviceFence());
       }
       if (guard)
         body.push_back(ctx.ifScope(guard, std::move(inner)));
@@ -1689,7 +1697,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
       if (!uniform && laneFree) {
         std::string src =
             "(uint)(" + laneId + " & " + std::to_string(~laneFree & 31) + ")";
-        id = astShuffle("simd_shuffle", sc, id, src, body);
+        id = shuffle("simd_shuffle", sc, id, src, body);
       }
       ids[r] = id;
     }
@@ -1703,7 +1711,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
                              : 1;
       std::string bcbuf = fresh();
       body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup),
-                                  bcbuf, astPoolRegion(0, sc)));
+                                  bcbuf, poolRegion(0, sc)));
       body.push_back(ctx.hardBarrier(false));
       // ((warpId & warpFree) == 0)
       msl::Expr *wcanon = ctx.paren(ctx.binary(
@@ -1761,21 +1769,19 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
 
     // Bind wordPtr decls into `into`, returning the load-expr string.
     auto probe = [&](msl::Block &into) -> std::string {
-      std::string wordPtr = fresh();
       std::string loadExpr;
       if (bw == 16) {
-        std::string isHigh = fresh();
-        into.push_back(
-            ctx.declStmt(ctx.scalar(msl::Scalar::I1), isHigh,
-                         ctx.raw("((size_t)(" + p + ") & 2u) != 0u")));
-        into.push_back(ctx.declStmt(ctx.named("device atomic_uint *"), wordPtr,
-                                    ctx.raw("(device atomic_uint *)((size_t)(" +
-                                            p + ") & ~(size_t)3)")));
+        std::string wordPtr, isHigh;
+        for (msl::Stmt *s : atomic.packed16Base(p, wordPtr, isHigh))
+          into.push_back(s);
         loadExpr = "(ushort)((" + isHigh + ") ? (atomic_load_explicit(" +
                    wordPtr +
                    ", memory_order_relaxed) >> 16) : (atomic_load_explicit(" +
                    wordPtr + ", memory_order_relaxed) & 0xffffu))";
-      } else if (bw == 64) {
+        return loadExpr;
+      }
+      std::string wordPtr = fresh();
+      if (bw == 64) {
         into.push_back(
             ctx.declStmt(ctx.named("volatile device ulong *"), wordPtr,
                          ctx.raw("(volatile device ulong *)(" + p + ")")));
@@ -1835,7 +1841,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
     Value res = ca.getResult();
     Type scalarTy = elementScalarType(res.getType());
     std::string sc = mslScalarType(scalarTy);
-    msl::Type *scTy = astScalarType(scalarTy);
+    msl::Type *scTy = scalarType(scalarTy);
     bool isFloat = isa<FloatType>(scalarTy);
     unsigned bw = scalarTy.getIntOrFloatBitWidth();
     bool packed16 = isFloat && bw == 16;
@@ -1850,7 +1856,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
     int rc = ptrs.size();
     if (casSem == tt::MemSemantic::RELEASE ||
         casSem == tt::MemSemantic::ACQUIRE_RELEASE)
-      body.push_back(astDeviceFence());
+      body.push_back(atomic.deviceFence());
     SmallVector<std::string> ids;
     for (int r = 0; r < rc; ++r) {
       const std::string &p = ptrs[r];
@@ -1862,15 +1868,15 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
       // it.
       if (packed16) {
         std::string wp, ih;
-        for (msl::Stmt *s : astPacked16Base(p, wp, ih))
+        for (msl::Stmt *s : atomic.packed16Base(p, wp, ih))
           casBody.push_back(s);
-        for (msl::Stmt *s : astPacked16CAS(wp, ih, c, v, sc, id, !uniform))
+        for (msl::Stmt *s : atomic.packed16CAS(wp, ih, c, v, sc, id, !uniform))
           casBody.push_back(s);
       } else if (isFloat)
-        for (msl::Stmt *s : astFloat32CAS(p, c, v, id, !uniform))
+        for (msl::Stmt *s : atomic.float32CAS(p, c, v, id, !uniform))
           casBody.push_back(s);
       else
-        for (msl::Stmt *s : astInt32CAS(p, c, v, sc, id, !uniform))
+        for (msl::Stmt *s : atomic.int32CAS(p, c, v, sc, id, !uniform))
           casBody.push_back(s);
 
       if (uniform) {
@@ -1881,7 +1887,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
         // Broadcast lane-0's result to every lane through a scratch slot.
         std::string bcast = fresh();
         body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup),
-                                    bcast, astPoolRegion(0, sc)));
+                                    bcast, poolRegion(0, sc)));
         body.push_back(ctx.compactIf(
             ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0")),
             ctx.assignStmt(ctx.subscript(ctx.var(bcast), ctx.lit("0")),
@@ -1894,7 +1900,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
         // writes, so the acquire fence follows the broadcast.
         if (casSem == tt::MemSemantic::ACQUIRE ||
             casSem == tt::MemSemantic::ACQUIRE_RELEASE)
-          body.push_back(astDeviceFence());
+          body.push_back(atomic.deviceFence());
       } else {
         for (msl::Stmt *s : casBody)
           body.push_back(s);
@@ -1903,7 +1909,7 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
     }
     if (!uniform && (casSem == tt::MemSemantic::ACQUIRE ||
                      casSem == tt::MemSemantic::ACQUIRE_RELEASE))
-      body.push_back(astDeviceFence());
+      body.push_back(atomic.deviceFence());
     bindRegs(res, ids);
     return true;
   }
@@ -1912,8 +1918,8 @@ std::optional<bool> MSLEmitter::astEmitAtomic(Operation *op, msl::Block &body) {
 }
 
 // tt.scan / tt.reduce: cross-lane/warp fold + prefix.
-std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
-                                                  msl::Block &body) {
+std::optional<bool> MSLEmitter::emitScanReduce(Operation *op,
+                                               msl::Block &body) {
   // tt.scan: per-run register fold + lane shuffle prefix + cross-warp carry +
   // cross-run carry.
   if (auto sn = dyn_cast<tt::ScanOp>(op)) {
@@ -1927,8 +1933,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
     SmallVector<int64_t> byteWidths(nOp);
     for (int k = 0; k < nOp; ++k) {
       scTys[k] = mslScalarType(elementScalarType(sn.getResult()[k].getType()));
-      scTypes[k] =
-          astScalarType(elementScalarType(sn.getResult()[k].getType()));
+      scTypes[k] = scalarType(elementScalarType(sn.getResult()[k].getType()));
       byteWidths[k] = byteWidth(elementScalarType(sn.getResult()[k].getType()));
     }
     SmallVector<SmallVector<std::string>> srcNames(nOp);
@@ -1964,7 +1969,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
       laneWarpReach = std::max(laneWarpReach, pr.second);
 
     auto keyOf = [&](int reg) {
-      SmallVector<int32_t> coords = registerCoords(srcTy, reg);
+      SmallVector<int32_t> coords = layout.registerCoords(srcTy, reg);
       std::string key;
       for (int d = 0; d < (int)coords.size(); ++d)
         if (d != axis)
@@ -1973,7 +1978,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
     };
     SmallVector<int> runId(nReg, 0);
     for (int r = 0; r < nReg; ++r) {
-      int32_t c = registerCoords(srcTy, r)[axis];
+      int32_t c = layout.registerCoords(srcTy, r)[axis];
       runId[r] = laneWarpReach ? (c / (2 * laneWarpReach)) : 0;
     }
 
@@ -2019,8 +2024,8 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
           if (runId[r] == run)
             regs.push_back(r);
         llvm::sort(regs, [&](int a, int b) {
-          int32_t ca = registerCoords(srcTy, a)[axis];
-          int32_t cb = registerCoords(srcTy, b)[axis];
+          int32_t ca = layout.registerCoords(srcTy, a)[axis];
+          int32_t cb = layout.registerCoords(srcTy, b)[axis];
           return rev ? ca > cb : ca < cb;
         });
 
@@ -2031,7 +2036,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
             b[k] = accs[k][regs[i]];
           }
           SmallVector<std::string> out;
-          if (!astCombineN(region, a, b, body, out))
+          if (!combineN(region, a, b, body, out))
             return false;
           for (int k = 0; k < nOp; ++k)
             body.push_back(
@@ -2048,10 +2053,10 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
           unsigned delta = 1u << pr.first;
           SmallVector<std::string> nb(nOp);
           for (int k = 0; k < nOp; ++k)
-            nb[k] = astShuffle(shuf, scTys[k], laneScan[k],
-                               std::to_string(delta) + "u", body);
+            nb[k] = shuffle(shuf, scTys[k], laneScan[k],
+                            std::to_string(delta) + "u", body);
           SmallVector<std::string> out;
-          if (!astCombineN(region, nb, laneScan, body, out))
+          if (!combineN(region, nb, laneScan, body, out))
             return false;
           // (laneId & axisLaneMask) [<= mask-delta | >= delta]
           msl::Expr *local = ctx.paren(
@@ -2068,8 +2073,8 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
         if (!laneBits.empty()) {
           SmallVector<std::string> lanePrefix(nOp);
           for (int k = 0; k < nOp; ++k)
-            lanePrefix[k] = astShuffle(shuf, scTys[k], laneScan[k],
-                                       std::to_string(axisLaneLow) + "u", body);
+            lanePrefix[k] = shuffle(shuf, scTys[k], laneScan[k],
+                                    std::to_string(axisLaneLow) + "u", body);
           // (laneId & axisLaneMask) [<= mask-low | >= low]
           msl::Expr *local = ctx.paren(
               ctx.binary(B::And, ctx.var(laneId), ctx.i32lit(axisLaneMask)));
@@ -2081,7 +2086,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
             SmallVector<std::string> out, ar(nOp);
             for (int k = 0; k < nOp; ++k)
               ar[k] = accs[k][r];
-            if (!astCombineN(region, lanePrefix, ar, body, out))
+            if (!combineN(region, lanePrefix, ar, body, out))
               return false;
             for (int k = 0; k < nOp; ++k)
               body.push_back(
@@ -2095,9 +2100,9 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
           runTotals[ri][k] = fresh();
           body.push_back(ctx.declStmt(scTypes[k], runTotals[ri][k], nullptr));
         }
-        if (!astScanWarpCarry(region, nOp, scTys, byteWidths, warpBits, regs,
-                              accs, laneScan, axisTopLane, axisWarpMask,
-                              numWarps, rev, runTotals[ri], body))
+        if (!scanWarpCarry(region, nOp, scTys, byteWidths, warpBits, regs, accs,
+                           laneScan, axisTopLane, axisWarpMask, numWarps, rev,
+                           runTotals[ri], body))
           return false;
       }
 
@@ -2105,7 +2110,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
         SmallVector<std::string> carry = runTotals[0];
         for (size_t j = 1; j < ri; ++j) {
           SmallVector<std::string> out;
-          if (!astCombineN(region, carry, runTotals[j], body, out))
+          if (!combineN(region, carry, runTotals[j], body, out))
             return false;
           carry = out;
         }
@@ -2117,7 +2122,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
           for (int k = 0; k < nOp; ++k)
             ar[k] = accs[k][r];
           SmallVector<std::string> out;
-          if (!astCombineN(region, carry, ar, body, out))
+          if (!combineN(region, carry, ar, body, out))
             return false;
           for (int k = 0; k < nOp; ++k)
             body.push_back(
@@ -2141,8 +2146,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
     SmallVector<msl::Type *> scTypes(nOp);
     for (int k = 0; k < nOp; ++k) {
       scTys[k] = mslScalarType(elementScalarType(rd.getResult()[k].getType()));
-      scTypes[k] =
-          astScalarType(elementScalarType(rd.getResult()[k].getType()));
+      scTypes[k] = scalarType(elementScalarType(rd.getResult()[k].getType()));
     }
     Region &region = rd.getCombineOp();
     SmallVector<SmallVector<std::string>> srcNames(nOp);
@@ -2158,7 +2162,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
     auto redDim = outDims[axis];
 
     auto survKey = [&](int reg) {
-      SmallVector<int32_t> coords = registerCoords(srcTy, reg);
+      SmallVector<int32_t> coords = layout.registerCoords(srcTy, reg);
       std::string key;
       for (int d = 0; d < (int)coords.size(); ++d)
         if (d != axis)
@@ -2166,7 +2170,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
       return key;
     };
     auto fullKey = [&](int reg) {
-      SmallVector<int32_t> coords = registerCoords(srcTy, reg);
+      SmallVector<int32_t> coords = layout.registerCoords(srcTy, reg);
       std::string key;
       for (int32_t c : coords)
         key += std::to_string(c) + ",";
@@ -2196,7 +2200,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
         for (int k = 0; k < nOp; ++k)
           bVals[k] = srcNames[k][regs[i]];
         SmallVector<std::string> out;
-        if (!astCombineN(region, accs, bVals, body, out))
+        if (!combineN(region, accs, bVals, body, out))
           return false;
         for (int k = 0; k < nOp; ++k)
           body.push_back(ctx.assignStmt(ctx.var(accs[k]), ctx.var(out[k])));
@@ -2207,10 +2211,10 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
           continue;
         SmallVector<std::string> others(nOp);
         for (int k = 0; k < nOp; ++k)
-          others[k] = astShuffle("simd_shuffle_xor", scTys[k], accs[k],
-                                 std::to_string(m) + "u", body);
+          others[k] = shuffle("simd_shuffle_xor", scTys[k], accs[k],
+                              std::to_string(m) + "u", body);
         SmallVector<std::string> out;
-        if (!astCombineN(region, accs, others, body, out))
+        if (!combineN(region, accs, others, body, out))
           return false;
         for (int k = 0; k < nOp; ++k)
           body.push_back(ctx.assignStmt(ctx.var(accs[k]), ctx.var(out[k])));
@@ -2222,7 +2226,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
           scratch[k] = fresh();
           body.push_back(
               ctx.declStmt(ctx.ptr(scTypes[k], msl::AddrSpace::Threadgroup),
-                           scratch[k], astPoolRegion(byteOff, scTys[k])));
+                           scratch[k], poolRegion(byteOff, scTys[k])));
           byteOff +=
               numWarps * 32 *
               std::max<int64_t>(
@@ -2265,7 +2269,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
                 scTypes[k], wv[k], ctx.subscript(ctx.var(scratch[k]), idx)));
           }
           SmallVector<std::string> out;
-          if (!astCombineN(region, wacc, wv, body, out))
+          if (!combineN(region, wacc, wv, body, out))
             return false;
           for (int k = 0; k < nOp; ++k)
             body.push_back(ctx.assignStmt(ctx.var(wacc[k]), ctx.var(out[k])));
@@ -2284,7 +2288,7 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
     int nResReg = regCount(rd.getResult()[0]);
     SmallVector<SmallVector<std::string>> resIds(nOp);
     for (int r = 0; r < nResReg; ++r) {
-      SmallVector<int32_t> rc = registerCoords(resTy, r);
+      SmallVector<int32_t> rc = layout.registerCoords(resTy, r);
       std::string key;
       for (int32_t c : rc)
         key += std::to_string(c) + ",";
@@ -2303,8 +2307,8 @@ std::optional<bool> MSLEmitter::astEmitScanReduce(Operation *op,
 }
 
 // tt.cat / tt.gather: threadgroup scatter/gather tile moves.
-std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
-                                                  msl::Block &body) {
+std::optional<bool> MSLEmitter::emitTensorMove(Operation *op,
+                                               msl::Block &body) {
   // tt.cat: scatter both halves (rhs shifted past lhs flat size), gather
   // result.
   if (auto ct = dyn_cast<tt::CatOp>(op)) {
@@ -2312,7 +2316,7 @@ std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
     auto lhsTy = cast<RankedTensorType>(lhs.getType());
     auto rhsTy = cast<RankedTensorType>(rhs.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
-    msl::Type *scTy = astScalarType(resTy.getElementType());
+    msl::Type *scTy = scalarType(resTy.getElementType());
     std::string sc = mslScalarType(resTy.getElementType());
     auto &lhsNames = names(lhs);
     auto &rhsNames = names(rhs);
@@ -2320,14 +2324,14 @@ std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
 
     std::string buf = fresh();
     body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
-                                astPoolRegion(0, sc)));
+                                poolRegion(0, sc)));
     body.push_back(ctx.hardBarrier(false));
     for (int r = 0, n = regCount(lhs); r < n; ++r)
       body.push_back(ctx.assignStmt(
-          ctx.subscript(ctx.var(buf), astFlatTileOffset(lhsTy, r)),
+          ctx.subscript(ctx.var(buf), layout.flatTileOffset(lhsTy, r)),
           ctx.var(lhsNames[r])));
     for (int r = 0, n = regCount(rhs); r < n; ++r) {
-      msl::Expr *off = ctx.binary(B::Add, astFlatTileOffset(rhsTy, r),
+      msl::Expr *off = ctx.binary(B::Add, layout.flatTileOffset(rhsTy, r),
                                   ctx.lit(std::to_string(lhsFlat)));
       body.push_back(ctx.assignStmt(ctx.subscript(ctx.var(buf), off),
                                     ctx.var(rhsNames[r])));
@@ -2337,7 +2341,8 @@ std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
     for (int r = 0, n = regCount(res); r < n; ++r) {
       std::string id = fresh();
       body.push_back(ctx.declStmt(
-          scTy, id, ctx.subscript(ctx.var(buf), astFlatTileOffset(resTy, r))));
+          scTy, id,
+          ctx.subscript(ctx.var(buf), layout.flatTileOffset(resTy, r))));
       ids.push_back(id);
     }
     bindRegs(res, ids);
@@ -2351,7 +2356,7 @@ std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
     int axis = ga.getAxis();
-    msl::Type *scTy = astScalarType(elementScalarType(resTy));
+    msl::Type *scTy = scalarType(elementScalarType(resTy));
     std::string sc = mslScalarType(elementScalarType(resTy));
     auto &srcNames = names(src);
     auto &idxNames = names(idx);
@@ -2363,11 +2368,11 @@ std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
 
     std::string buf = fresh();
     body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
-                                astPoolRegion(0, sc)));
+                                poolRegion(0, sc)));
     body.push_back(ctx.hardBarrier(false));
     for (int r = 0; r < srcRc; ++r)
       body.push_back(ctx.assignStmt(
-          ctx.subscript(ctx.var(buf), astFlatTileOffset(srcTy, r)),
+          ctx.subscript(ctx.var(buf), layout.flatTileOffset(srcTy, r)),
           ctx.var(srcNames[srcNames.size() == 1 ? 0 : r])));
     body.push_back(ctx.hardBarrier(false));
 
@@ -2381,7 +2386,7 @@ std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
                                  CS::CStyle, ctx.scalar(msl::Scalar::I32),
                                  ctx.paren(ctx.var(
                                      idxNames[idxNames.size() == 1 ? 0 : r]))))
-                           : astLayoutCoordExpr(resTy, r, resOut[d]);
+                           : layout.layoutCoordExpr(resTy, r, resOut[d]);
         msl::Expr *term =
             stride == 1 ? c
                         : ctx.paren(ctx.binary(
@@ -2403,11 +2408,11 @@ std::optional<bool> MSLEmitter::astEmitTensorMove(Operation *op,
 }
 
 // return / call / ub.poison / addptr / load / store.
-std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
-                                                  msl::Block &body) {
+std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
+                                               msl::Block &body) {
   // tt.return
   if (auto ret = dyn_cast<tt::ReturnOp>(op)) {
-    body.push_back(astReturn(ret));
+    body.push_back(emitReturn(ret));
     return true;
   }
 
@@ -2434,9 +2439,9 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
     if (nRes == 1 && isa<RankedTensorType>(cl.getResult(0).getType())) {
       Value res = cl.getResult(0);
       msl::Type *scTy =
-          astScalarType(cast<RankedTensorType>(res.getType()).getElementType());
+          scalarType(cast<RankedTensorType>(res.getType()).getElementType());
       std::string tmp = fresh();
-      body.push_back(ctx.declStmt(astDeviceRetType(callee), tmp, call));
+      body.push_back(ctx.declStmt(deviceRetType(callee), tmp, call));
       int rc = regCount(res);
       SmallVector<std::string> idsV;
       for (int i = 0; i < rc; ++i) {
@@ -2457,16 +2462,16 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
         return false;
       std::string id = fresh();
       body.push_back(
-          ctx.declStmt(astScalarType(cl.getResult(0).getType()), id, call));
+          ctx.declStmt(scalarType(cl.getResult(0).getType()), id, call));
       bindScalar(cl.getResult(0), id);
       return true;
     }
     std::string tmp = fresh();
-    body.push_back(ctx.declStmt(astDeviceRetType(callee), tmp, call));
+    body.push_back(ctx.declStmt(deviceRetType(callee), tmp, call));
     for (auto [i, res] : llvm::enumerate(cl.getResults())) {
       std::string id = fresh();
       body.push_back(
-          ctx.declStmt(astScalarType(res.getType()), id,
+          ctx.declStmt(scalarType(res.getType()), id,
                        ctx.member(ctx.var(tmp), "f" + std::to_string(i))));
       bindScalar(res, id);
     }
@@ -2480,14 +2485,14 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
     if (auto rt = dyn_cast<RankedTensorType>(elem))
       elem = rt.getElementType();
     bool isPtr = isa<tt::PointerType>(elem);
-    msl::Type *sc = isPtr ? astStorageType(res.getType())
-                          : astScalarType(elementScalarType(res.getType()));
+    msl::Type *sc = isPtr ? storageType(res.getType())
+                          : scalarType(elementScalarType(res.getType()));
     std::string scName = isPtr
                              ? mslStorageType(res.getType())
                              : mslScalarType(elementScalarType(res.getType()));
     if (scName.empty())
       return false;
-    return astDeclBind(op, sc, body, [&](int) -> msl::Expr * {
+    return declBind(op, sc, body, [&](int) -> msl::Expr * {
       if (isPtr)
         return ctx.lit("nullptr");
       return ctx.cast(CS::CStyle, sc, ctx.lit("0"));
@@ -2497,11 +2502,11 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
   // addptr: `device sc* id = b + o;`
   if (auto ap = dyn_cast<tt::AddPtrOp>(op)) {
     msl::Type *sc =
-        ctx.ptr(astScalarType(elementScalarType(op->getResult(0).getType())),
+        ctx.ptr(scalarType(elementScalarType(op->getResult(0).getType())),
                 msl::AddrSpace::Device);
     auto &base = names(ap.getPtr());
     auto &offs = names(ap.getOffset());
-    return astDeclBind(op, sc, body, [&](int r) {
+    return declBind(op, sc, body, [&](int r) {
       return ctx.binary(B::Add, ctx.var(base[base.size() == 1 ? 0 : r]),
                         ctx.var(offs[offs.size() == 1 ? 0 : r]));
     });
@@ -2510,7 +2515,7 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
   // load: `sc id = init; [if (m)] id = *p;`
   if (auto ld = dyn_cast<tt::LoadOp>(op)) {
     Value res = ld.getResult();
-    msl::Type *sc = astScalarType(elementScalarType(res.getType()));
+    msl::Type *sc = scalarType(elementScalarType(res.getType()));
     std::string scName = mslScalarType(elementScalarType(res.getType()));
     auto &ptrs = names(ld.getPtr());
     bool hasMask = ld.getMask() != nullptr;
@@ -2525,7 +2530,7 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
                                     (*other)[other->size() == 1 ? 0 : r]))
                               : static_cast<msl::Expr *>(ctx.lit("0"));
       body.push_back(ctx.declStmt(sc, id, init));
-      msl::Expr *deref = astDerefPtr(ld.getPtr(), ptrs[r], scName);
+      msl::Expr *deref = derefPtr(ld.getPtr(), ptrs[r], scName);
       msl::Stmt *assign = ctx.assignStmt(ctx.var(id), deref);
       if (hasMask)
         body.push_back(
@@ -2543,14 +2548,14 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
     auto handled = directStoreHandled.find(st.getOperation());
     if (handled != directStoreHandled.end()) {
       msl::Block inner;
-      astStoreBody(st, inner);
+      storeBody(st, inner);
       // if (!<fullTile>) { <store body> }
       body.push_back(
           ctx.ifScope(ctx.unary(msl::UnOp::LNot, ctx.var(handled->second)),
                       std::move(inner)));
       return true;
     }
-    astStoreBody(st, body);
+    storeBody(st, body);
     return true;
   }
 
@@ -2558,28 +2563,28 @@ std::optional<bool> MSLEmitter::astEmitCallReturn(Operation *op,
 }
 
 // scf.if / scf.for (+ fused-GEMM route) / scf.while.
-std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
-                                                   msl::Block &body) {
+std::optional<bool> MSLEmitter::emitControlFlow(Operation *op,
+                                                msl::Block &body) {
   // scf.if: predeclare result vars, then IfScope with then/else sub-blocks.
   if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
     SmallVector<SmallVector<std::string>> results;
     for (Value res : ifOp.getResults())
-      results.push_back(astDeclResultVars(res, body));
+      results.push_back(declResultVars(res, body));
 
     unsigned d = (unsigned)indent + 1;
-    msl::Block thenB = astWalkBlock(ifOp.getThenRegion().front(), d);
+    msl::Block thenB = walkBlock(ifOp.getThenRegion().front(), d);
     if (!results.empty())
       for (msl::Stmt *s :
-           astYieldAssign(ifOp.thenBlock()->getTerminator(), results))
+           yieldAssign(ifOp.thenBlock()->getTerminator(), results))
         thenB.push_back(s);
     if (ifOp.getElseRegion().empty()) {
       body.push_back(ctx.ifScope(ctx.var(names(ifOp.getCondition())[0]),
                                  std::move(thenB)));
     } else {
-      msl::Block elseB = astWalkBlock(ifOp.getElseRegion().front(), d);
+      msl::Block elseB = walkBlock(ifOp.getElseRegion().front(), d);
       if (!results.empty())
         for (msl::Stmt *s :
-             astYieldAssign(ifOp.elseBlock()->getTerminator(), results))
+             yieldAssign(ifOp.elseBlock()->getTerminator(), results))
           elseB.push_back(s);
       body.push_back(ctx.ifElseScope(ctx.var(names(ifOp.getCondition())[0]),
                                      std::move(thenB), std::move(elseB)));
@@ -2589,11 +2594,11 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
     return true;
   }
 
-  // scf.for. Fused GEMM K-loops route to astEmitFusedGemm; i64-IV loops take
+  // scf.for. Fused GEMM K-loops route to emitFusedGemm; i64-IV loops take
   // the wide-IV shape below.
   if (auto forOp = dyn_cast<scf::ForOp>(op)) {
     if (auto m = matchGemmDotLoop(forOp))
-      return astEmitFusedGemm(forOp, m->first, m->second, body);
+      return emitFusedGemm(forOp, m->first, m->second, body);
     Type ivType = forOp.getInductionVar().getType();
     bool wideIv = ivType.isInteger(64);
 
@@ -2607,7 +2612,7 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
         continue;
       }
       auto &initNames = names(init);
-      SmallVector<std::string> vars = astDeclResultVars(res, body);
+      SmallVector<std::string> vars = declResultVars(res, body);
       for (size_t r = 0; r < vars.size(); ++r)
         body.push_back(
             ctx.assignStmt(ctx.var(vars[r]),
@@ -2627,12 +2632,10 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
       ivTy = "int";
 
     unsigned d = (unsigned)indent + 1;
-    msl::Block loopBody = astWalkBlock(forOp.getRegion().front(), d);
-    for (msl::Stmt *s :
-         astYieldAssign(forOp.getBody()->getTerminator(), carried))
+    msl::Block loopBody = walkBlock(forOp.getRegion().front(), d);
+    for (msl::Stmt *s : yieldAssign(forOp.getBody()->getTerminator(), carried))
       loopBody.push_back(s);
-    body.push_back(
-        astForNode(forOp, std::move(loopBody), iv, tc, ivTy, wideIv));
+    body.push_back(forNode(forOp, std::move(loopBody), iv, tc, ivTy, wideIv));
     return true;
   }
 
@@ -2642,7 +2645,7 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
     SmallVector<SmallVector<std::string>> carried;
     for (auto [i, init] : llvm::enumerate(wh.getInits())) {
       auto &initNames = names(init);
-      SmallVector<std::string> vars = astDeclResultVars(init, body);
+      SmallVector<std::string> vars = declResultVars(init, body);
       for (size_t r = 0; r < vars.size(); ++r)
         body.push_back(
             ctx.assignStmt(ctx.var(vars[r]),
@@ -2652,10 +2655,10 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
     }
     SmallVector<SmallVector<std::string>> results;
     for (Value res : wh.getResults())
-      results.push_back(astDeclResultVars(res, body));
+      results.push_back(declResultVars(res, body));
 
     unsigned d = (unsigned)indent + 1;
-    msl::Block loopBody = astWalkBlock(wh.getBefore().front(), d);
+    msl::Block loopBody = walkBlock(wh.getBefore().front(), d);
     auto cond = cast<scf::ConditionOp>(wh.getBefore().front().getTerminator());
     // if (!(c)) { <forward results> break; }
     msl::Block brk;
@@ -2673,10 +2676,10 @@ std::optional<bool> MSLEmitter::astEmitControlFlow(Operation *op,
     for (auto [i, fwd] : llvm::enumerate(cond.getArgs()))
       bindAlias(wh.getAfterArguments()[i], fwd);
 
-    for (msl::Stmt *s : astWalkBlock(wh.getAfter().front(), d))
+    for (msl::Stmt *s : walkBlock(wh.getAfter().front(), d))
       loopBody.push_back(s);
     for (msl::Stmt *s :
-         astYieldAssign(wh.getAfter().front().getTerminator(), carried))
+         yieldAssign(wh.getAfter().front().getTerminator(), carried))
       loopBody.push_back(s);
 
     body.push_back(ctx.whileScope(nullptr, std::move(loopBody)));
@@ -2714,12 +2717,12 @@ LogicalResult MSLEmitter::emitReshapeLike(Value res, Value src, int axis,
     return k;
   };
   for (int r = 0; r < srcRc; ++r)
-    srcByCoord[keyOf(registerCoords(srcTy, r))] = r;
+    srcByCoord[keyOf(layout.registerCoords(srcTy, r))] = r;
 
   auto srcShape = srcTy.getShape();
   SmallVector<std::string> ids;
   for (int r = 0; r < resRc; ++r) {
-    SmallVector<int32_t> rc = registerCoords(resTy, r);
+    SmallVector<int32_t> rc = layout.registerCoords(resTy, r);
     SmallVector<int32_t> sc;
     if (isExpand) {
       for (int d = 0; d < (int)rc.size(); ++d)
@@ -2752,15 +2755,15 @@ LogicalResult MSLEmitter::emitJoin(tt::JoinOp op) {
 
   llvm::DenseMap<uint64_t, int> srcByCoord;
   for (int r = 0; r < srcRc; ++r)
-    srcByCoord[coordKey(registerCoords(srcTy, r))] = r;
+    srcByCoord[layout.coordKey(layout.registerCoords(srcTy, r))] = r;
 
   int resRc = regCount(res);
   SmallVector<std::string> ids(resRc);
   for (int r = 0; r < resRc; ++r) {
-    SmallVector<int32_t> rc = registerCoords(resTy, r);
+    SmallVector<int32_t> rc = layout.registerCoords(resTy, r);
     int t = rc[trailing];
     rc.pop_back();
-    auto it = srcByCoord.find(coordKey(rc));
+    auto it = srcByCoord.find(layout.coordKey(rc));
     if (it == srcByCoord.end() || t < 0 || t > 1) {
       op.emitError("EmitMSL: join register coordinate has no source");
       return failure();
@@ -2781,7 +2784,7 @@ LogicalResult MSLEmitter::emitSplit(tt::SplitOp op) {
 
   llvm::DenseMap<uint64_t, int> srcByCoord;
   for (int r = 0; r < srcRc; ++r)
-    srcByCoord[coordKey(registerCoords(srcTy, r))] = r;
+    srcByCoord[layout.coordKey(layout.registerCoords(srcTy, r))] = r;
 
   for (int k = 0; k < 2; ++k) {
     Value res = op.getResult(k);
@@ -2789,9 +2792,9 @@ LogicalResult MSLEmitter::emitSplit(tt::SplitOp op) {
     int resRc = regCount(res);
     SmallVector<std::string> ids(resRc);
     for (int r = 0; r < resRc; ++r) {
-      SmallVector<int32_t> rc = registerCoords(resTy, r);
+      SmallVector<int32_t> rc = layout.registerCoords(resTy, r);
       rc.push_back(k);
-      auto it = srcByCoord.find(coordKey(rc));
+      auto it = srcByCoord.find(layout.coordKey(rc));
       if (it == srcByCoord.end()) {
         op.emitError("EmitMSL: split register coordinate has no source");
         return failure();

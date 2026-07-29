@@ -1,6 +1,6 @@
 // EmitMSLReduce.cpp - map_elementwise lowering.
 //
-// AST builders for the map_elementwise family, dispatched from astEmitOp. The
+// AST builders for the map_elementwise family, dispatched from emitOp. The
 // unstructured region is modelled as a real StateMachineScope node (MSL forbids
 // goto).
 //
@@ -15,16 +15,16 @@ using namespace mlir;
 namespace mlir::triton::applegpu {
 
 //===----------------------------------------------------------------------===//
-// astMap* - state-machine dispatch of a CFG region
+// map* - state-machine dispatch of a CFG region
 //===----------------------------------------------------------------------===//
 
 // sc capture;  (predeclared multi-block result slot).
-msl::Stmt *MSLEmitter::astMapCaptureDecl(StringRef sc, StringRef name) {
+msl::Stmt *MSLEmitter::mapCaptureDecl(StringRef sc, StringRef name) {
   return ctx.declStmt(ctx.named(sc), name);
 }
 
 // capture = operand;  the map_elementwise.return spill into a caller slot.
-msl::Stmt *MSLEmitter::astMapReturnSpill(StringRef capture, StringRef operand) {
+msl::Stmt *MSLEmitter::mapReturnSpill(StringRef capture, StringRef operand) {
   return ctx.assignStmt(ctx.var(capture), ctx.var(operand));
 }
 
@@ -32,7 +32,7 @@ msl::Stmt *MSLEmitter::astMapReturnSpill(StringRef capture, StringRef operand) {
 // dispatch as one StateMachineScope. `cases` supplies each block's label and
 // its already-built body block (op emission + spill/break tails live in the
 // body).
-msl::Stmt *MSLEmitter::astMapCFGStateMachine(
+msl::Stmt *MSLEmitter::mapCFGStateMachine(
     StringRef state, ArrayRef<std::pair<std::string, msl::Block>> cases) {
   llvm::SmallVector<msl::StateMachineScope::Case, 4> smCases;
   for (auto &c : cases)

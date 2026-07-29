@@ -2,8 +2,8 @@
 //
 // AST builders for the function scopes (driven from emitFunc / emitDeviceFunc /
 // emitDeviceFuncProto / declRetStruct in MSLEmitter.h) plus the per-op dispatch
-// spine (astEmitOp): each op's body is walked into a Block and wrapped with a
-// scope builder here, and astEmitOp is the sole minter of fresh() names.
+// spine (emitOp): each op's body is walked into a Block and wrapped with a
+// scope builder here, and emitOp is the sole minter of fresh() names.
 //
 // Control flow is modelled with real scope nodes (KernelFn/DeviceFn/ForScope/
 // TripCountForScope/IfScope/WhileScope/StateMachineScope) - never Raw blocks.
@@ -32,7 +32,7 @@ using CS = msl::Cast::Style;
 // The `struct fn_<name>_ret { sc f0; ... };` declaration. The field body has no
 // dedicated node kind (a struct decl is not a Stmt in the set), so it is a
 // RawStmt - the one design-sanctioned escape for a leaf with no node.
-msl::Stmt *MSLEmitter::astRetStructDecl(tt::FuncOp func) {
+msl::Stmt *MSLEmitter::retStructDecl(tt::FuncOp func) {
   auto results = func.getFunctionType().getResults();
   std::string name = mslDeviceFuncName(func.getName()) + "_ret";
   std::string body = "struct " + name + " {\n";
@@ -51,19 +51,19 @@ msl::Stmt *MSLEmitter::astRetStructDecl(tt::FuncOp func) {
   return ctx.rawStmt(body);
 }
 
-msl::NamedType *MSLEmitter::astRetStructType(tt::FuncOp func) {
+msl::NamedType *MSLEmitter::retStructType(tt::FuncOp func) {
   return ctx.named(mslDeviceFuncName(func.getName()) + "_ret");
 }
 
-msl::Type *MSLEmitter::astDeviceRetType(tt::FuncOp func) {
+msl::Type *MSLEmitter::deviceRetType(tt::FuncOp func) {
   auto results = func.getFunctionType().getResults();
   if (results.empty())
     return ctx.scalar(msl::Scalar::Void);
   if (isTensorResult(results))
-    return astRetStructType(func);
+    return retStructType(func);
   if (results.size() == 1)
-    return astStorageType(results[0]);
-  return astRetStructType(func);
+    return storageType(results[0]);
+  return retStructType(func);
 }
 
 //===----------------------------------------------------------------------===//
@@ -97,10 +97,10 @@ llvm::SmallVector<msl::Param, 8> MSLEmitter::deviceParams(tt::FuncOp func,
     std::string id = bind ? g.fresh() : ("a" + std::to_string(i));
     if (auto pt = dyn_cast<tt::PointerType>(argTy))
       params.push_back(ctx.param(
-          ctx.ptr(astScalarType(pt.getPointeeType()), msl::AddrSpace::Device),
+          ctx.ptr(scalarType(pt.getPointeeType()), msl::AddrSpace::Device),
           id));
     else
-      params.push_back(ctx.param(astScalarType(argTy), id));
+      params.push_back(ctx.param(scalarType(argTy), id));
   }
   msl::Type *u3 = ctx.vector(msl::Scalar::U32, 3);
   params.push_back(ctx.param(u3, bind ? g.fresh() : "__tgpos"));
@@ -113,9 +113,9 @@ llvm::SmallVector<msl::Param, 8> MSLEmitter::deviceParams(tt::FuncOp func,
   return params;
 }
 
-msl::DeviceFn *MSLEmitter::astDeviceProto(tt::FuncOp func) {
+msl::DeviceFn *MSLEmitter::deviceProto(tt::FuncOp func) {
   int id = nextId;
-  return ctx.deviceFn(astDeviceRetType(func), mslDeviceFuncName(func.getName()),
+  return ctx.deviceFn(deviceRetType(func), mslDeviceFuncName(func.getName()),
                       deviceParams(func, id, /*bind=*/false), msl::Block{});
 }
 
@@ -123,7 +123,7 @@ msl::DeviceFn *MSLEmitter::astDeviceProto(tt::FuncOp func) {
 // Return
 //===----------------------------------------------------------------------===//
 
-msl::Stmt *MSLEmitter::astReturn(tt::ReturnOp op) {
+msl::Stmt *MSLEmitter::emitReturn(tt::ReturnOp op) {
   unsigned n = op.getNumOperands();
   if (n == 0)
     return ctx.returnStmt();
@@ -140,8 +140,8 @@ msl::Stmt *MSLEmitter::astReturn(tt::ReturnOp op) {
   return ctx.returnStmt(nullptr, fields);
 }
 
-// Mirrors the conditions under which astEmitMath / the fp_to_fp narrowing path
-// / astEmitAtomic emit a call to each preamble helper. Must stay in lockstep
+// Mirrors the conditions under which emitMath / the fp_to_fp narrowing path
+// / emitAtomic emit a call to each preamble helper. Must stay in lockstep
 // with those emit sites: a missed helper is a compile error in the MSL.
 msl::HelperSet MSLEmitter::scanHelpers() {
   msl::HelperSet h;
@@ -273,8 +273,8 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     if (auto pt = dyn_cast<tt::PointerType>(argTy)) {
       std::string id = fresh();
       params.push_back(ctx.param(
-          ctx.ptr(astScalarType(pt.getPointeeType()), msl::AddrSpace::Device),
-          id, ctx.bufferAttr(buffer++)));
+          ctx.ptr(scalarType(pt.getPointeeType()), msl::AddrSpace::Device), id,
+          ctx.bufferAttr(buffer++)));
       bindScalar(arg, id);
     } else if (isa<IntegerType, FloatType>(argTy)) {
       scalarArgs.push_back(arg);
@@ -305,7 +305,7 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     unsigned bits = ty.getIntOrFloatBitWidth();
     int size = bits == 1 ? 1 : (int)(bits / 8);
     off = (off + size - 1) / size * size;
-    msl::Type *sc = astScalarType(ty);
+    msl::Type *sc = scalarType(ty);
     std::string id = fresh();
     // *(constant sc*)(argbuf + off)
     msl::Expr *addr = ctx.paren(ctx.binary(msl::BinOp::Add, ctx.var(argbufId),
@@ -367,8 +367,8 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
   }
 
   Region &region = func.getBody();
-  msl::Block body = region.hasOneBlock() ? astWalkBlock(region.front(), indent)
-                                         : astEmitBlockCFG(region);
+  msl::Block body = region.hasOneBlock() ? walkBlock(region.front(), indent)
+                                         : emitBlockCFG(region);
   if (emitFailed)
     return failure();
   for (msl::Stmt *s : body)
@@ -391,7 +391,7 @@ LogicalResult MSLEmitter::declRetStruct(tt::FuncOp func) {
     }
   devRetStruct[func] = mslDeviceFuncName(func.getName()) + "_ret";
   msl::MSLPrinter printer(os);
-  printer.print(astRetStructDecl(func));
+  printer.print(retStructDecl(func));
   os << "\n";
   return success();
 }
@@ -400,7 +400,7 @@ LogicalResult MSLEmitter::emitDeviceFuncProto(tt::FuncOp func, bool asDecl) {
   if (failed(declRetStruct(func)))
     return failure();
   msl::MSLPrinter printer(os);
-  printer.printProto(astDeviceProto(func));
+  printer.printProto(deviceProto(func));
   return success();
 }
 
@@ -411,10 +411,10 @@ LogicalResult MSLEmitter::emitDeviceFunc(tt::FuncOp func) {
     std::string id = fresh();
     if (auto pt = dyn_cast<tt::PointerType>(argTy))
       params.push_back(ctx.param(
-          ctx.ptr(astScalarType(pt.getPointeeType()), msl::AddrSpace::Device),
+          ctx.ptr(scalarType(pt.getPointeeType()), msl::AddrSpace::Device),
           id));
     else if (isa<IntegerType, FloatType>(argTy))
-      params.push_back(ctx.param(astScalarType(argTy), id));
+      params.push_back(ctx.param(scalarType(argTy), id));
     else {
       func.emitError("EmitMSL: unsupported device function argument type");
       return failure();
@@ -443,15 +443,15 @@ LogicalResult MSLEmitter::emitDeviceFunc(tt::FuncOp func) {
   poolBuf = devPoolPtr;
   curDevFunc = func;
   Region &region = func.getBody();
-  msl::Block body = region.hasOneBlock() ? astWalkBlock(region.front(), indent)
-                                         : astEmitBlockCFG(region);
+  msl::Block body = region.hasOneBlock() ? walkBlock(region.front(), indent)
+                                         : emitBlockCFG(region);
   if (emitFailed)
     return failure();
   curDevFunc = nullptr;
   for (msl::Stmt *s : body)
     prologue.push_back(s);
   msl::DeviceFn *fn =
-      ctx.deviceFn(astDeviceRetType(func), mslDeviceFuncName(func.getName()),
+      ctx.deviceFn(deviceRetType(func), mslDeviceFuncName(func.getName()),
                    params, std::move(prologue));
   msl::MSLPrinter printer(os);
   printer.print(fn);

@@ -1,11 +1,12 @@
 // MSLEmitter.h - TritonGPU IR -> MSL lowering state (the emitter class).
 //
 // Extracted from EmitMSL.cpp. Method definitions live in EmitMSL.cpp; the
-// AST type helpers (astScalarType/...) live in MSLTypes.cpp.
+// AST type helpers (scalarType/...) live in MSLTypes.cpp.
 #ifndef MSL_EMITTER_H
 #define MSL_EMITTER_H
 
 #include "MSLAst.h"
+#include "MSLAtomic.h"
 #include "MSLConstants.h"
 #include "MSLFusedDot.h"
 #include "MSLLayoutExpr.h"
@@ -179,14 +180,14 @@ private:
 
   // AST-typed forms of the string type helpers (mslScalarType/mslUnsignedType/
   // mslStorageType). Definitions in MSLTypes.cpp.
-  msl::Type *astScalarType(Type t);
-  msl::Type *astUnsignedType(Type t);
-  msl::Type *astStorageType(Type t);
+  msl::Type *scalarType(Type t);
+  msl::Type *unsignedType(Type t);
+  msl::Type *storageType(Type t);
 
   // Per-element value builders for the reshape/aliasing ops. makeRange yields
   // `start + off`; splat/reshape/join/split just alias a source register name.
-  msl::Expr *astMakeRangeElem(int start, msl::Expr *off);
-  msl::Expr *astAliasElem(StringRef name);
+  msl::Expr *makeRangeElem(int start, msl::Expr *off);
+  msl::Expr *aliasElem(StringRef name);
 
   int nextId = 0;
   int indent = 1;
@@ -194,200 +195,146 @@ private:
 
   llvm::DenseMap<Value, MemDescInfo> memdescMap;
 
-  // Layout coordinate / flat-offset exprs are built by the LayoutExprBuilder;
-  // these forward to it. astPoolRegion/astMemdescElemAddr stay here (they touch
-  // pool/memdesc state, not just layout coords).
-  msl::Expr *astLayoutCoordExpr(RankedTensorType rt, int reg,
-                                StringAttr outDim) {
-    return layout.layoutCoordExpr(rt, reg, outDim);
-  }
-  msl::Expr *astLayoutOffsetExpr(RankedTensorType rt, int reg) {
-    return layout.layoutOffsetExpr(rt, reg);
-  }
-  msl::Expr *astFlatTileOffset(RankedTensorType rt, int reg) {
-    return layout.flatTileOffset(rt, reg);
-  }
-  msl::Expr *astSliceFlatOffset(RankedTensorType rt, int reg) {
-    return layout.sliceFlatOffset(rt, reg);
-  }
-  msl::Expr *astBatchCoordExpr(RankedTensorType rt, int reg) {
-    return layout.batchCoordExpr(rt, reg);
-  }
-  msl::Expr *astTransFlatOffset(RankedTensorType srcTy, ArrayRef<int32_t> perm,
-                                ArrayRef<int64_t> resShape, int reg) {
-    return layout.transFlatOffset(srcTy, perm, resShape, reg);
-  }
-  msl::Expr *astPoolRegion(int64_t byteOffset, StringRef sc);
-  msl::Expr *astMemdescElemAddr(const MemDescInfo &info,
-                                RankedTensorType tileTy, int reg);
+  // Layout coordinate / flat-offset exprs come from `layout` directly.
+  // poolRegion/memdescElemAddr stay here (they touch pool/memdesc state, not
+  // just layout coords).
+  msl::Expr *poolRegion(int64_t byteOffset, StringRef sc);
+  msl::Expr *memdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
+                             int reg);
 
   // AST builders for the dot/GEMM simdgroup-matrix lowering (defs in
   // EmitMSLDot.cpp).
-  msl::MatrixType *astSgFragType(Type t);
-  msl::Expr *astFragAddr(StringRef base, int64_t off);
-  msl::Stmt *astFragDecl(msl::MatrixType *frag, StringRef name);
-  msl::Stmt *astAccFragDecl(msl::MatrixType *frag, StringRef name);
-  msl::Stmt *astSgLoad(StringRef frag, StringRef base, int64_t off, int64_t ld);
-  msl::Stmt *astSgStore(StringRef acc, StringRef base, int64_t off, int64_t ld);
-  msl::Stmt *astSgMultiplyAccumulate(StringRef acc, StringRef a, StringRef b);
-  msl::Expr *astReadbackValue(StringRef buf, msl::Expr *off, StringRef base);
+  msl::MatrixType *sgFragType(Type t);
+  msl::Expr *fragAddr(StringRef base, int64_t off);
+  msl::Stmt *fragDecl(msl::MatrixType *frag, StringRef name);
+  msl::Stmt *accFragDecl(msl::MatrixType *frag, StringRef name);
+  msl::Stmt *sgLoad(StringRef frag, StringRef base, int64_t off, int64_t ld);
+  msl::Stmt *sgStore(StringRef acc, StringRef base, int64_t off, int64_t ld);
+  msl::Stmt *sgMultiplyAccumulate(StringRef acc, StringRef a, StringRef b);
+  msl::Expr *readbackValue(StringRef buf, msl::Expr *off, StringRef base);
 
-  // atomic builders (EmitMSLAtomic.cpp). Multi-statement builders return a
-  // msl::Block so the caller splices them at its own indent (no stray braces);
-  // single-node builders return Stmt*/Expr*.
-  msl::Expr *astInit0(StringRef sc);
-  // as_type<to>(x) - the raw bit-reinterpret used to punt values through the
-  // integer atomic word. Single site for every atomic reinterpret escape.
-  msl::Expr *astAsType(msl::Type *to, msl::Expr *x) {
-    return ctx.cast(msl::Cast::Style::AsType, to, x);
-  }
-  msl::Expr *astDeviceAtomicPtr(StringRef atomicTy, StringRef p);
-  msl::Expr *astCasWeak(msl::Expr *ptr, StringRef expVar, msl::Expr *newVal);
-  msl::Expr *astPacked16Extract(StringRef word, StringRef isHigh);
-  msl::Expr *astPacked16Merge(StringRef word, StringRef isHigh,
-                              msl::Expr *newBitsU32);
-  msl::Block astPacked16Base(StringRef p, std::string &wordPtrOut,
-                             std::string &isHighOut);
-  msl::Expr *astAtomicRmwCall(StringRef fn, StringRef atomicTy, StringRef p,
-                              StringRef v, StringRef order, bool memFlags);
-  msl::Block astFloat32CASLoop(StringRef p, StringRef curId,
-                               msl::Expr *newFloatExpr, StringRef id);
-  msl::Block astPacked16CASLoop(StringRef wordPtr, StringRef isHigh,
-                                StringRef sc, StringRef curId,
-                                msl::Expr *newHalfExpr, StringRef id);
-  msl::Block astInt32CAS(StringRef p, StringRef c, StringRef v, StringRef sc,
-                         StringRef id, bool declare);
-  msl::Block astFloat32CAS(StringRef p, StringRef c, StringRef v, StringRef id,
-                           bool declare);
-  msl::Block astPacked16CAS(StringRef wordPtr, StringRef isHigh, StringRef c,
-                            StringRef v, StringRef sc, StringRef id,
-                            bool declare);
-  msl::Stmt *astDeviceFence();
-  msl::Stmt *astPollSpin(msl::Expr *loadExpr, StringRef want);
-  msl::Expr *astPoll64Load(StringRef p, StringRef wordPtr, msl::Stmt *&out);
-  msl::Stmt *astHistBinsDecl(StringRef bins);
-  msl::Stmt *astHistZeroInit(StringRef bins, StringRef zi, int64_t nBins,
-                             int64_t threads);
-  msl::Stmt *astHistFetchAdd(msl::Expr *guard, StringRef bins, StringRef v);
+  // Atomic RMW / CAS / poll / histogram node trees are built by the
+  // AtomicEmitter; emitAtomic calls through the `atomic` member.
+  AtomicEmitter atomic{ctx, nextId, tidId, poolBuf};
 
   // reduce / scan / map builders (EmitMSLReduce.cpp). Multi-statement builders
   // return a msl::Block spliced at caller indent; single-node builders return
-  // Stmt*/Expr*. The cross-lane shuffles go through astShuffleExpr with the
+  // Stmt*/Expr*. The cross-lane shuffles go through shuffleExpr with the
   // builtin::simd names; control flow is real If/State-machine node trees.
-  msl::Stmt *astMapCaptureDecl(StringRef sc, StringRef name);
-  msl::Stmt *astMapReturnSpill(StringRef capture, StringRef operand);
+  msl::Stmt *mapCaptureDecl(StringRef sc, StringRef name);
+  msl::Stmt *mapReturnSpill(StringRef capture, StringRef operand);
   msl::Stmt *
-  astMapCFGStateMachine(StringRef state,
-                        ArrayRef<std::pair<std::string, msl::Block>> cases);
+  mapCFGStateMachine(StringRef state,
+                     ArrayRef<std::pair<std::string, msl::Block>> cases);
 
   // function / scope / control-flow builders (EmitMSLFunc.cpp). Each takes a
-  // pre-built body Block and returns the scope node: astEmitOp walks the ops
+  // pre-built body Block and returns the scope node: emitOp walks the ops
   // into the body, then wraps it here.
-  msl::DeviceFn *astDeviceProto(tt::FuncOp func);
-  msl::NamedType *astRetStructType(tt::FuncOp func);
-  msl::Stmt *
-  astRetStructDecl(tt::FuncOp func); // ArrayDecl-less; RawStmt struct
-  msl::Type *astDeviceRetType(tt::FuncOp func);
-  msl::Stmt *astReturn(tt::ReturnOp op);
-  msl::ForScope *astForScope(scf::ForOp op, msl::Block body, StringRef iv,
-                             StringRef ivTy);
-  msl::TripCountForScope *astTripCountForScope(scf::ForOp op, msl::Block body,
-                                               StringRef counter, StringRef iv,
-                                               StringRef ivTy);
-  msl::Stmt *astForNode(scf::ForOp op, msl::Block body, StringRef iv,
-                        StringRef tc, StringRef ivTy, bool wideIv);
-  msl::IfScope *astIfScope(scf::IfOp op, msl::Block thenB, msl::Block elseB);
-  msl::WhileScope *astWhileScope(scf::WhileOp op, msl::Block body);
-  void astCopyRegs(msl::Block &out, ArrayRef<std::string> dst,
-                   ArrayRef<std::string> src);
-  msl::Block astBranchEdge(Block *succ, Operation::operand_range args,
-                           StringRef state);
-  msl::Stmt *astCondBranch(Value cond, msl::Block thenB, msl::Block elseB);
-  msl::Block astYieldAssign(Operation *term,
-                            ArrayRef<SmallVector<std::string>> dsts);
+  msl::DeviceFn *deviceProto(tt::FuncOp func);
+  msl::NamedType *retStructType(tt::FuncOp func);
+  msl::Stmt *retStructDecl(tt::FuncOp func); // ArrayDecl-less; RawStmt struct
+  msl::Type *deviceRetType(tt::FuncOp func);
+  msl::Stmt *emitReturn(tt::ReturnOp op);
+  msl::ForScope *forScope(scf::ForOp op, msl::Block body, StringRef iv,
+                          StringRef ivTy);
+  msl::TripCountForScope *tripCountForScope(scf::ForOp op, msl::Block body,
+                                            StringRef counter, StringRef iv,
+                                            StringRef ivTy);
+  msl::Stmt *forNode(scf::ForOp op, msl::Block body, StringRef iv, StringRef tc,
+                     StringRef ivTy, bool wideIv);
+  msl::IfScope *ifScope(scf::IfOp op, msl::Block thenB, msl::Block elseB);
+  msl::WhileScope *whileScope(scf::WhileOp op, msl::Block body);
+  void copyRegs(msl::Block &out, ArrayRef<std::string> dst,
+                ArrayRef<std::string> src);
+  msl::Block branchEdge(Block *succ, Operation::operand_range args,
+                        StringRef state);
+  msl::Stmt *condBranch(Value cond, msl::Block thenB, msl::Block elseB);
+  msl::Block yieldAssign(Operation *term,
+                         ArrayRef<SmallVector<std::string>> dsts);
   // Helpers below mint fresh names over a raw id counter passed by reference
   // (seeded from nextId by the caller) so they never mutate nextId directly.
   llvm::SmallVector<msl::Stmt *, 2> laneWarpProlog();
   llvm::SmallVector<msl::Param, 8> deviceParams(tt::FuncOp func, int &id,
                                                 bool bind);
-  bool astElemwiseDecls(Operation *op, msl::Type *declTy, int &id,
-                        msl::Block &body,
-                        llvm::function_ref<msl::Expr *(int)> mk);
-  bool astDeclBind(Operation *op, msl::Type *declTy, msl::Block &body,
-                   llvm::function_ref<msl::Expr *(int)> mk);
+  bool elemwiseDecls(Operation *op, msl::Type *declTy, int &id,
+                     msl::Block &body, llvm::function_ref<msl::Expr *(int)> mk);
+  bool declBind(Operation *op, msl::Type *declTy, msl::Block &body,
+                llvm::function_ref<msl::Expr *(int)> mk);
   // Dispatch spine: appends the nodes for `op` to `body`. Returns true when the
   // op is handled (nodes appended, or nothing for alias/dataless ops); false
-  // for an unsupported op, which astWalkBlock turns into a hard error.
-  bool astEmitOp(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitArithBinop(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitConstGrid(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitArithMisc(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitMath(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitReshape(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitMemDesc(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitDotMap(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitAtomic(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitScanReduce(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitTensorMove(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitCallReturn(Operation *op, msl::Block &body);
-  std::optional<bool> astEmitControlFlow(Operation *op, msl::Block &body);
-  void astProgramDim(Operation *op, StringRef builtinVar, tt::ProgramIDDim axis,
+  // for an unsupported op, which walkBlock turns into a hard error.
+  bool emitOp(Operation *op, msl::Block &body);
+  std::optional<bool> emitArithBinop(Operation *op, msl::Block &body);
+  std::optional<bool> emitConstGrid(Operation *op, msl::Block &body);
+  std::optional<bool> emitArithMisc(Operation *op, msl::Block &body);
+  std::optional<bool> emitMath(Operation *op, msl::Block &body);
+  std::optional<bool> emitReshape(Operation *op, msl::Block &body);
+  std::optional<bool> emitMemDesc(Operation *op, msl::Block &body);
+  std::optional<bool> emitDotMap(Operation *op, msl::Block &body);
+  std::optional<bool> emitAtomic(Operation *op, msl::Block &body);
+  std::optional<bool> emitScanReduce(Operation *op, msl::Block &body);
+  std::optional<bool> emitTensorMove(Operation *op, msl::Block &body);
+  std::optional<bool> emitCallReturn(Operation *op, msl::Block &body);
+  std::optional<bool> emitControlFlow(Operation *op, msl::Block &body);
+  void programDim(Operation *op, StringRef builtinVar, tt::ProgramIDDim axis,
+                  msl::Block &body);
+  msl::Block walkBlock(Block &blk, unsigned depth);
+  msl::Block emitBlockCFG(Region &region);
+  void emitMapCFG(Region &region, ArrayRef<std::string> capture,
+                  msl::Block &body);
+  msl::Block walkBlock2(Block &blk,
+                        llvm::DenseMap<Value, SmallVector<std::string>> &hoist);
+  msl::Block terminatorEdge(Operation *term, StringRef state);
+  SmallVector<std::string> declResultVars(Value v, msl::Block &body);
+  msl::Expr *derefPtr(Value ptr, StringRef name, StringRef scName);
+  void storeBody(tt::StoreOp op, msl::Block &body);
+  bool combineN(Region &region, ArrayRef<std::string> aVals,
+                ArrayRef<std::string> bVals, msl::Block &body,
+                SmallVectorImpl<std::string> &results);
+  // All strategy selection and budget arithmetic for one tt.dot, with no
+  // emission and no fresh() consumption. emitDot is a dispatch over the
+  // returned plan.
+  DotPlan planDot(tt::DotOp op);
+  bool emitDot(tt::DotOp op, msl::Block &body);
+  bool emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
                      msl::Block &body);
-  msl::Block astWalkBlock(Block &blk, unsigned depth);
-  msl::Block astEmitBlockCFG(Region &region);
-  void astEmitMapCFG(Region &region, ArrayRef<std::string> capture,
+  bool emitDotScalar(tt::DotOp op, msl::Block &body);
+  void stageOperand(msl::Block &body, StringRef tgName, Value stage,
+                    RankedTensorType stageTy, ArrayRef<std::string> names,
+                    bool skip, llvm::function_ref<msl::Expr *(int)> guard);
+  bool emitDotPanel(tt::DotOp op, msl::Block &body, const DotPlan &plan,
+                    const DotEmitCtx &dc);
+  bool
+  emitDotFused(tt::DotOp op, msl::Block &body, const DotPlan &plan,
+               const DotEmitCtx &dc,
+               llvm::function_ref<void(msl::Block &, int64_t, int64_t, int64_t)>
+                   readbackInto);
+  bool emitDotDirect(tt::DotOp op, msl::Block &body, const DotPlan &plan,
+                     const DotEmitCtx &dc);
+  void dotPoolPtrs(msl::Block &body, const DotPlan &plan, DotEmitCtx &dc);
+  SmallVector<std::string> dotResultIds(msl::Block &body, tt::DotOp op,
+                                        const DotPlan &plan);
+  void dotReadback(msl::Block &tgt, RankedTensorType cTy, StringRef tgC,
+                   ArrayRef<std::string> ids, ArrayRef<std::string> base,
+                   int rank, int64_t N, int64_t bi, int64_t r0, int64_t r1,
+                   StringAttr rowDim, StringAttr colDim);
+  std::string shuffle(StringRef op, StringRef sc, StringRef val, StringRef arg,
+                      msl::Block &body);
+  bool scanWarpCarry(Region &region, int nOp, ArrayRef<std::string> scTys,
+                     ArrayRef<int64_t> byteWidths,
+                     ArrayRef<std::pair<int, int32_t>> warpBits,
+                     ArrayRef<int> regs,
+                     SmallVector<SmallVector<std::string>> &accs,
+                     ArrayRef<std::string> laneScan, StringRef axisTopLane,
+                     unsigned axisWarpMask, int numWarps, bool rev,
+                     SmallVectorImpl<std::string> &runTotalOut,
                      msl::Block &body);
-  msl::Block
-  astWalkBlock2(Block &blk,
-                llvm::DenseMap<Value, SmallVector<std::string>> &hoist);
-  msl::Block astTerminatorEdge(Operation *term, StringRef state);
-  SmallVector<std::string> astDeclResultVars(Value v, msl::Block &body);
-  msl::Expr *astDerefPtr(Value ptr, StringRef name, StringRef scName);
-  void astStoreBody(tt::StoreOp op, msl::Block &body);
-  bool astCombineN(Region &region, ArrayRef<std::string> aVals,
-                   ArrayRef<std::string> bVals, msl::Block &body,
-                   SmallVectorImpl<std::string> &results);
-  bool astEmitDot(tt::DotOp op, msl::Block &body);
-  bool astEmitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
-                        msl::Block &body);
-  bool astEmitDotScalar(tt::DotOp op, msl::Block &body);
-  void astStageOperand(msl::Block &body, StringRef tgName, Value stage,
-                       RankedTensorType stageTy, ArrayRef<std::string> names,
-                       bool skip, llvm::function_ref<msl::Expr *(int)> guard);
-  bool astEmitDotPanel(tt::DotOp op, msl::Block &body, Value aStage,
-                       Value bStage, ArrayRef<std::string> aNames,
-                       ArrayRef<std::string> bNames,
-                       ArrayRef<std::string> cInit, ArrayRef<std::string> ids,
-                       int64_t M, int64_t N, int64_t K, int64_t Bd, int rank,
-                       msl::MatrixType *opFrag, StringRef opScalar,
-                       int64_t numWarps, StringAttr rowDim, StringAttr colDim);
-  bool astEmitDotFused(
-      tt::DotOp op, msl::Block &body, Value aStage, Value bStage,
-      ArrayRef<std::string> aNames, ArrayRef<std::string> bNames, StringRef tgA,
-      StringRef tgB, StringRef tgC, ArrayRef<std::string> ids, int64_t M,
-      int64_t N, int64_t K, int64_t mT, int64_t nT, int64_t kT, int64_t nFrag,
-      int64_t numWarps, std::optional<InPlaceOperand> aInPlace,
-      std::optional<InPlaceOperand> bInPlace, msl::MatrixType *opFrag,
-      msl::MatrixType *accFragTy,
-      llvm::function_ref<void(msl::Block &, int64_t, int64_t, int64_t)>
-          readbackInto);
-  std::string astShuffle(StringRef op, StringRef sc, StringRef val,
-                         StringRef arg, msl::Block &body);
-  bool astScanWarpCarry(Region &region, int nOp, ArrayRef<std::string> scTys,
-                        ArrayRef<int64_t> byteWidths,
-                        ArrayRef<std::pair<int, int32_t>> warpBits,
-                        ArrayRef<int> regs,
-                        SmallVector<SmallVector<std::string>> &accs,
-                        ArrayRef<std::string> laneScan, StringRef axisTopLane,
-                        unsigned axisWarpMask, int numWarps, bool rev,
-                        SmallVectorImpl<std::string> &runTotalOut,
-                        msl::Block &body);
-  void astBandRoundTrip(msl::Block &body, StringRef buf, int64_t total,
-                        int64_t band, int srcRc, int resRc,
-                        ArrayRef<std::string> outs,
-                        llvm::function_ref<msl::Expr *(int)> srcOff,
-                        llvm::function_ref<msl::Expr *(int)> srcVal,
-                        llvm::function_ref<msl::Expr *(int)> resOff);
+  void bandRoundTrip(msl::Block &body, StringRef buf, int64_t total,
+                     int64_t band, int srcRc, int resRc,
+                     ArrayRef<std::string> outs,
+                     llvm::function_ref<msl::Expr *(int)> srcOff,
+                     llvm::function_ref<msl::Expr *(int)> srcVal,
+                     llvm::function_ref<msl::Expr *(int)> resOff);
 
   // Shared tt.trans / tt.reshape lowering: stage src regs into a pool buffer at
   // srcOff(r), then read them back at the result's row-major flat offset. Only
@@ -409,10 +356,6 @@ private:
     tt::LinearLayout ll = ttg::toLinearLayout(rt);
     auto kReg = StringAttr::get(v.getContext(), "register");
     return ll.getInDimSize(kReg);
-  }
-
-  SmallVector<int32_t> registerCoords(RankedTensorType rt, int reg) {
-    return layout.registerCoords(rt, reg);
   }
 
   SmallVector<std::string> &names(Value v) { return valMap[v]; }
@@ -519,7 +462,7 @@ private:
 
   std::string floatLit(const APFloat &v);
   std::string floatLit(const APFloat &v, Type ty);
-  msl::Expr *astFloatLit(const APFloat &v, Type ty);
+  msl::Expr *floatLitExpr(const APFloat &v, Type ty);
 
   LogicalResult emitSplat(tt::SplatOp op);
 
@@ -528,10 +471,6 @@ private:
   // tt.broadcast (replicate size-1 source dims). Value carries through; only
   // the register->register permutation/replication changes.
   LogicalResult emitReshapeLike(Value res, Value src, int axis, bool isExpand);
-
-  static uint64_t coordKey(ArrayRef<int32_t> c) {
-    return LayoutExprBuilder::coordKey(c);
-  }
 
   // tt.join(a, b): both operands share a layout; result adds a trailing size-2
   // dim whose two entries live in the same thread (distinct registers). Result
@@ -545,23 +484,25 @@ private:
 
   // AST sub-expression builders: yield the RHS Expr* the decl init uses,
   // resolving operands from already-looked-up register names.
-  msl::Expr *astIntBinaryExpr(Operation *op, StringRef a, StringRef b);
-  msl::Expr *astShiftExpr(Operation *op, StringRef a, StringRef b);
+  msl::Expr *intBinaryExpr(Operation *op, StringRef a, StringRef b);
+  msl::Expr *shiftExpr(Operation *op, StringRef a, StringRef b);
   msl::Expr *recast(msl::Type *opCast, StringRef n);
-  msl::Expr *astElementwiseExpr(msl::BinOp op, msl::Type *opCast, StringRef a,
-                                StringRef b);
-  msl::Expr *astMinMaxExpr(StringRef fn, msl::Type *opCast, bool propagateNan,
-                           StringRef a, StringRef b);
-  msl::Expr *astUnaryExpr(StringRef fn, msl::Type *sc, StringRef v);
-  msl::Expr *astTernaryCallExpr(StringRef fn, StringRef a, StringRef b,
-                                StringRef c);
+  msl::Expr *elementwiseExpr(msl::BinOp op, msl::Type *opCast, StringRef a,
+                             StringRef b);
+  msl::Expr *minMaxExpr(StringRef fn, msl::Type *opCast, bool propagateNan,
+                        StringRef a, StringRef b);
+  msl::Expr *cmpFNaNGuard(msl::Expr *cmp, StringRef a, StringRef b,
+                          bool ordered);
+  msl::Expr *unaryExpr(StringRef fn, msl::Type *sc, StringRef v);
+  msl::Expr *ternaryCallExpr(StringRef fn, StringRef a, StringRef b,
+                             StringRef c);
 
-  msl::Expr *astCastExpr(Operation *op, StringRef v);
-  msl::Expr *astPtrIntCastExpr(Operation *op, StringRef v);
-  msl::Expr *astBitcastExpr(Operation *op, StringRef v);
-  msl::Expr *astClampExpr(tt::ClampFOp op, StringRef x, StringRef lo,
-                          StringRef hi);
-  msl::Expr *astSelectExpr(StringRef c, StringRef t, StringRef f);
+  msl::Expr *castExpr(Operation *op, StringRef v);
+  msl::Expr *ptrIntCastExpr(Operation *op, StringRef v);
+  msl::Expr *bitcastExpr(Operation *op, StringRef v);
+  msl::Expr *clampExpr(tt::ClampFOp op, StringRef x, StringRef lo,
+                       StringRef hi);
+  msl::Expr *selectExpr(StringRef c, StringRef t, StringRef f);
 
   static bool isDatalessType(Type t);
 
@@ -592,8 +533,8 @@ private:
   // Single-expression form of the warp shuffle (no temporaries): the
   // bitcast-through wrapper collapsed into one nested Expr. `sc` picks the
   // reinterpret path (64-bit/bfloat scalars reject the intrinsic directly).
-  msl::Expr *astShuffleExpr(StringRef op, StringRef sc, StringRef val,
-                            StringRef arg);
+  msl::Expr *shuffleExpr(StringRef op, StringRef sc, StringRef val,
+                         StringRef arg);
 
   int tgScratchId = 0;
 
@@ -670,7 +611,7 @@ private:
   std::optional<InPlaceOperand>
   dotOperandInPlaceBuf(Value operand, int64_t rows, int64_t cols);
 
-  msl::Expr *astInPlaceBase(const InPlaceOperand &op);
+  msl::Expr *inPlaceBase(const InPlaceOperand &op);
 
   // A dot operand reached through a convert_layout of a rank-2 distributed
   // tensor. The dot stages its operand into threadgroup memory by row-major
@@ -712,7 +653,6 @@ private:
   static int64_t dotCBandRows(int64_t M, int64_t N, int64_t cBudget,
                               int64_t accBytes);
 
-  static std::string init0(const std::string &sc);
 };
 
 } // namespace mlir::triton::applegpu

@@ -425,6 +425,78 @@ msl::Expr *MSLEmitter::derefPtr(Value ptr, StringRef name, StringRef scName) {
   return ctx.deref(ctx.var(name));
 }
 
+tt::ModuleAxisInfoAnalysis &MSLEmitter::getAxisInfo() {
+  if (!axisInfo)
+    axisInfo = std::make_unique<tt::ModuleAxisInfoAnalysis>(mod);
+  return *axisInfo;
+}
+
+// A run of `w` consecutive registers is one vecW load iff (a) those registers
+// are adjacent along a single tensor dim, (b) the pointer is contiguous and
+// w-aligned along that dim, and (c) the run does not straddle a lane/warp
+// boundary -- all three are exactly what the register bases below encode.
+int MSLEmitter::loadVectorWidth(tt::LoadOp ld) {
+  static const bool disabled = getenv("MSL_DISABLE_LOAD_VECTORIZE") != nullptr;
+  if (disabled)
+    return 1;
+  auto rt = dyn_cast<RankedTensorType>(ld.getResult().getType());
+  if (!rt)
+    return 1;
+  Type elem = elementScalarType(ld.getResult().getType());
+  unsigned bits = elem.getIntOrFloatBitWidth();
+  if (bits != 16 && bits != 32)
+    return 1;
+
+  MLIRContext *c = rt.getContext();
+  tt::LinearLayout ll = ttg::toLinearLayout(rt);
+  auto kReg = StringAttr::get(c, "register");
+  auto outs = llvm::to_vector(ll.getOutDimNames());
+  int nRegLog2 = ll.getInDimSizeLog2(kReg);
+  if (nRegLog2 == 0)
+    return 1;
+
+  // Register bit b must move by exactly 2^b along one fixed dim and nowhere
+  // else; that makes registers 0..2^n-1 the elements [0, 2^n) of that dim.
+  int dim = -1;
+  int runLog2 = 0;
+  for (int b = 0; b < nRegLog2; ++b) {
+    int hit = -1;
+    bool bad = false;
+    for (auto [d, name] : llvm::enumerate(outs)) {
+      int32_t basis = ll.getBasis(kReg, b, name);
+      if (basis == 0)
+        continue;
+      if (hit >= 0 || basis != (1 << b)) {
+        bad = true;
+        break;
+      }
+      hit = d;
+    }
+    if (bad || hit < 0 || (dim >= 0 && hit != dim))
+      break;
+    dim = hit;
+    ++runLog2;
+  }
+  if (dim < 0 || runLog2 == 0)
+    return 1;
+
+  // Metal's portable device vector widths are 2/3/4; the 8-wide extended
+  // vectors (e.g. `bfloat8`) collide with the metal:: names and are not worth
+  // a second load width here.
+  int width = std::min(1 << runLog2, 4);
+  if (width < 2)
+    return 1;
+
+  tt::AxisInfo *ai = getAxisInfo().getAxisInfo(ld.getPtr());
+  if (!ai)
+    return 1;
+  int64_t contig = ai->getContiguity(dim);
+  int64_t align = ai->getDivisibility(dim);
+  while (width > 1 && (contig < width || align < width))
+    width >>= 1;
+  return width;
+}
+
 // Shared banded threadgroup round-trip (trans/reshape): for each band, barrier
 // + scatter each src register to buf[srcOff] + barrier + gather each res
 // register from buf[resOff]. `band == total` uses the direct `buf[off]=v;`
@@ -2542,21 +2614,64 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
     SmallVector<std::string> *other =
         ld.getOther() ? &names(ld.getOther()) : nullptr;
     int rc = regCount(res);
+    int vw = loadVectorWidth(ld);
+    if (vw < 2 || rc % vw != 0)
+      vw = 1;
+
     SmallVector<std::string> ids;
-    for (int r = 0; r < rc; ++r) {
-      std::string id = fresh();
-      msl::Expr *init = other ? static_cast<msl::Expr *>(ctx.var(
-                                    (*other)[other->size() == 1 ? 0 : r]))
-                              : static_cast<msl::Expr *>(ctx.lit("0"));
-      body.push_back(ctx.declStmt(sc, id, init));
-      msl::Expr *deref = derefPtr(ld.getPtr(), ptrs[r], scName);
-      msl::Stmt *assign = ctx.assignStmt(ctx.var(id), deref);
-      if (hasMask)
-        body.push_back(
-            ctx.compactIf(ctx.var((*mask)[mask->size() == 1 ? 0 : r]), assign));
-      else
-        body.push_back(assign);
-      ids.push_back(id);
+    for (int r = 0; r < rc; ++r)
+      ids.push_back(fresh());
+    auto maskOf = [&](int r) {
+      return ctx.var((*mask)[mask->size() == 1 ? 0 : r]);
+    };
+    auto initOf = [&](int r) -> msl::Expr * {
+      return other ? static_cast<msl::Expr *>(
+                         ctx.var((*other)[other->size() == 1 ? 0 : r]))
+                   : static_cast<msl::Expr *>(ctx.lit("0"));
+    };
+    auto scalarLoad = [&](int r) -> msl::Stmt * {
+      msl::Stmt *a = ctx.assignStmt(ctx.var(ids[r]),
+                                    derefPtr(ld.getPtr(), ptrs[r], scName));
+      return hasMask ? static_cast<msl::Stmt *>(ctx.compactIf(maskOf(r), a))
+                     : a;
+    };
+
+    for (int r = 0; r < rc; ++r)
+      body.push_back(ctx.declStmt(sc, ids[r], initOf(r)));
+
+    for (int base = 0; base < rc; base += vw) {
+      if (vw == 1) {
+        body.push_back(scalarLoad(base));
+        continue;
+      }
+      auto *scTy = cast<msl::ScalarType>(sc);
+      msl::Type *vecTy = ctx.vector(scTy->s, vw);
+      msl::Type *vecPtr = ctx.ptr(vecTy, msl::AddrSpace::Device);
+      std::string vid = fresh();
+      msl::Block hot;
+      hot.push_back(ctx.declStmt(
+          vecTy, vid,
+          ctx.deref(ctx.cast(CS::CStyle, vecPtr, ctx.var(ptrs[base])))));
+      for (int i = 0; i < vw; ++i)
+        hot.push_back(ctx.assignStmt(
+            ctx.var(ids[base + i]),
+            ctx.subscript(ctx.var(vid), ctx.lit(std::to_string(i)))));
+
+      if (!hasMask) {
+        for (msl::Stmt *s : hot)
+          body.push_back(s);
+        continue;
+      }
+      // The run's lanes are contiguous but their predicates are not provably
+      // equal, so take the vector path only when all of them hold.
+      SmallVector<msl::Expr *> ms;
+      for (int i = 0; i < vw; ++i)
+        ms.push_back(maskOf(base + i));
+      msl::Block cold;
+      for (int i = 0; i < vw; ++i)
+        cold.push_back(scalarLoad(base + i));
+      body.push_back(ctx.ifElseScope(ctx.chain(B::And, ms), std::move(hot),
+                                     std::move(cold)));
     }
     bindRegs(res, ids);
     return true;

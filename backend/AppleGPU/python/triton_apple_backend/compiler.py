@@ -196,13 +196,17 @@ class MPSBackend(BaseBackend):
         if os.environ.get('TRITON_MPS_DEBUG'):
             print("=== emitted MSL ===")
             print(msl)
-        dump = os.environ.get('TRITON_MSL_DUMP')
-        if dump:
-            with open(dump, 'w') as df:
-                df.write(msl)
         m = re.search(r'kernel void (\w+)\(', msl)
         if not m:
             raise RuntimeError("no 'kernel void' entry found in emitted MSL")
+        dump = os.environ.get('TRITON_MSL_DUMP')
+        if dump:
+            if os.path.isdir(dump):
+                import hashlib
+                tag = hashlib.sha1(msl.encode()).hexdigest()[:8]
+                dump = os.path.join(dump, f'{m.group(1)}.{tag}.metal')
+            with open(dump, 'w') as df:
+                df.write(msl)
         metadata["name"] = m.group(1)
         metadata["shared"] = 0
         return msl

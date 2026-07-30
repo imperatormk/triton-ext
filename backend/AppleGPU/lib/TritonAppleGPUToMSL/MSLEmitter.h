@@ -21,6 +21,7 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
+#include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -175,6 +176,11 @@ private:
   ForwardOStream fwd;
   raw_ostream &os;
 
+  // Pointer contiguity/alignment for load vectorization. Built lazily on the
+  // first load, since most kernels reach emit() without needing it.
+  std::unique_ptr<tt::ModuleAxisInfoAnalysis> axisInfo;
+  tt::ModuleAxisInfoAnalysis &getAxisInfo();
+
   // AST arena. Builders allocate nodes into it and the printer renders them.
   msl::MSLContext ctx;
 
@@ -290,6 +296,9 @@ private:
   msl::Block terminatorEdge(Operation *term, StringRef state);
   SmallVector<std::string> declResultVars(Value v, msl::Block &body);
   msl::Expr *derefPtr(Value ptr, StringRef name, StringRef scName);
+  // Largest power-of-two run of consecutive registers of `ld`'s result that is
+  // contiguous in memory, hence loadable as one vecN. 1 = no vectorization.
+  int loadVectorWidth(tt::LoadOp ld);
   void storeBody(tt::StoreOp op, msl::Block &body);
   bool combineN(Region &region, ArrayRef<std::string> aVals,
                 ArrayRef<std::string> bVals, msl::Block &body,

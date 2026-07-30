@@ -296,9 +296,12 @@ private:
   msl::Block terminatorEdge(Operation *term, StringRef state);
   SmallVector<std::string> declResultVars(Value v, msl::Block &body);
   msl::Expr *derefPtr(Value ptr, StringRef name, StringRef scName);
-  // Largest power-of-two run of consecutive registers of `ld`'s result that is
-  // contiguous in memory, hence loadable as one vecN. 1 = no vectorization.
+  // Largest power-of-two run of consecutive registers of a tensor of type
+  // `valueTy` accessed through `ptr` that is contiguous in memory, hence
+  // transferable as one vecN. 1 = no vectorization.
+  int accessVectorWidth(Type valueTy, Value ptr);
   int loadVectorWidth(tt::LoadOp ld);
+  int storeVectorWidth(tt::StoreOp st);
   void storeBody(tt::StoreOp op, msl::Block &body);
   bool combineN(Region &region, ArrayRef<std::string> aVals,
                 ArrayRef<std::string> bVals, msl::Block &body,

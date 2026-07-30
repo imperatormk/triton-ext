@@ -431,18 +431,15 @@ tt::ModuleAxisInfoAnalysis &MSLEmitter::getAxisInfo() {
   return *axisInfo;
 }
 
-// A run of `w` consecutive registers is one vecW load iff (a) those registers
+// A run of `w` consecutive registers is one vecW access iff (a) those registers
 // are adjacent along a single tensor dim, (b) the pointer is contiguous and
 // w-aligned along that dim, and (c) the run does not straddle a lane/warp
 // boundary -- all three are exactly what the register bases below encode.
-int MSLEmitter::loadVectorWidth(tt::LoadOp ld) {
-  static const bool disabled = getenv("MSL_DISABLE_LOAD_VECTORIZE") != nullptr;
-  if (disabled)
-    return 1;
-  auto rt = dyn_cast<RankedTensorType>(ld.getResult().getType());
+int MSLEmitter::accessVectorWidth(Type valueTy, Value ptr) {
+  auto rt = dyn_cast<RankedTensorType>(valueTy);
   if (!rt)
     return 1;
-  Type elem = elementScalarType(ld.getResult().getType());
+  Type elem = elementScalarType(valueTy);
   unsigned bits = elem.getIntOrFloatBitWidth();
   if (bits != 16 && bits != 32)
     return 1;
@@ -487,7 +484,7 @@ int MSLEmitter::loadVectorWidth(tt::LoadOp ld) {
   if (width < 2)
     return 1;
 
-  tt::AxisInfo *ai = getAxisInfo().getAxisInfo(ld.getPtr());
+  tt::AxisInfo *ai = getAxisInfo().getAxisInfo(ptr);
   if (!ai)
     return 1;
   int64_t contig = ai->getContiguity(dim);
@@ -495,6 +492,20 @@ int MSLEmitter::loadVectorWidth(tt::LoadOp ld) {
   while (width > 1 && (contig < width || align < width))
     width >>= 1;
   return width;
+}
+
+int MSLEmitter::loadVectorWidth(tt::LoadOp ld) {
+  static const bool disabled = getenv("MSL_DISABLE_LOAD_VECTORIZE") != nullptr;
+  if (disabled)
+    return 1;
+  return accessVectorWidth(ld.getResult().getType(), ld.getPtr());
+}
+
+int MSLEmitter::storeVectorWidth(tt::StoreOp st) {
+  static const bool disabled = getenv("MSL_DISABLE_STORE_VECTORIZE") != nullptr;
+  if (disabled)
+    return 1;
+  return accessVectorWidth(st.getValue().getType(), st.getPtr());
 }
 
 // Shared banded threadgroup round-trip (trans/reshape): for each band, barrier
@@ -613,21 +624,68 @@ void MSLEmitter::storeBody(tt::StoreOp op, msl::Block &body) {
     }
   }
 
-  std::string scName =
-      mslScalarType(elementScalarType(op.getValue().getType()));
-  for (int r = 0; r < rc; ++r) {
-    msl::Expr *lhs = derefPtr(op.getPtr(), ptrs[r], scName);
-    msl::Expr *v = ctx.var(vals[vals.size() == 1 ? 0 : r]);
-    msl::Stmt *assign = ctx.assignStmt(lhs, v);
+  Type elemTy = elementScalarType(op.getValue().getType());
+  std::string scName = mslScalarType(elemTy);
+  int vw = storeVectorWidth(op);
+  if (vw < 2 || rc % vw != 0 || vals.size() == 1)
+    vw = 1;
+
+  auto maskOf = [&](int r) {
+    return ctx.var((*mask)[mask->size() == 1 ? 0 : r]);
+  };
+  auto scalarStore = [&](int r) -> msl::Stmt * {
+    msl::Stmt *a = ctx.assignStmt(derefPtr(op.getPtr(), ptrs[r], scName),
+                                  ctx.var(vals[vals.size() == 1 ? 0 : r]));
     msl::Expr *guard = threadPred;
-    if (hasMask) {
-      msl::Expr *m = ctx.var((*mask)[mask->size() == 1 ? 0 : r]);
-      guard = guard ? ctx.binary(B::LAnd, guard, m) : m;
+    if (hasMask)
+      guard =
+          guard
+              ? static_cast<msl::Expr *>(ctx.binary(B::LAnd, guard, maskOf(r)))
+              : static_cast<msl::Expr *>(maskOf(r));
+    return guard ? static_cast<msl::Stmt *>(ctx.compactIf(guard, a)) : a;
+  };
+
+  for (int base = 0; base < rc; base += vw) {
+    if (vw == 1) {
+      body.push_back(scalarStore(base));
+      continue;
     }
-    if (guard)
-      body.push_back(ctx.compactIf(guard, assign));
-    else
-      body.push_back(assign);
+    auto *scTy = cast<msl::ScalarType>(scalarType(elemTy));
+    msl::Type *vecTy = ctx.vector(scTy->s, vw);
+    msl::Type *vecPtr = ctx.ptr(vecTy, msl::AddrSpace::Device);
+    std::string vid = fresh();
+    msl::Block pack;
+    pack.push_back(ctx.declStmt(vecTy, vid));
+    for (int i = 0; i < vw; ++i)
+      pack.push_back(ctx.assignStmt(
+          ctx.subscript(ctx.var(vid), ctx.lit(std::to_string(i))),
+          ctx.var(vals[base + i])));
+    pack.push_back(ctx.assignStmt(
+        ctx.deref(ctx.cast(CS::CStyle, vecPtr, ctx.var(ptrs[base]))),
+        ctx.var(vid)));
+
+    // The run's lanes are contiguous but their predicates are not provably
+    // equal, so the wide store is only legal when all of them hold; otherwise
+    // fall back to per-lane scalar stores so masked-off lanes stay unwritten.
+    if (!hasMask) {
+      if (threadPred) {
+        body.push_back(ctx.ifScope(threadPred, std::move(pack)));
+      } else {
+        for (msl::Stmt *s : pack)
+          body.push_back(s);
+      }
+      continue;
+    }
+    SmallVector<msl::Expr *> ms;
+    for (int i = 0; i < vw; ++i)
+      ms.push_back(maskOf(base + i));
+    msl::Expr *all = ctx.chain(B::And, ms);
+    if (threadPred)
+      all = ctx.binary(B::LAnd, threadPred, all);
+    msl::Block cold;
+    for (int i = 0; i < vw; ++i)
+      cold.push_back(scalarStore(base + i));
+    body.push_back(ctx.ifElseScope(all, std::move(pack), std::move(cold)));
   }
 }
 

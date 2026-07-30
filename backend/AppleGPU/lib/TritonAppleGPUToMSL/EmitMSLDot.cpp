@@ -15,7 +15,6 @@
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
 #include "llvm/Support/raw_ostream.h"
-#include <cstdlib>
 
 using namespace mlir;
 
@@ -27,6 +26,71 @@ using CS = msl::Cast::Style;
 
 template <typename T> T definingOp(Value v) {
   return dyn_cast_or_null<T>(v.getDefiningOp());
+}
+
+// Per-warp ownership of the (mT x nT) accumulator grid.
+//
+// The 1D form hands warp w the fragments w, w+numWarps, ... in row-major order,
+// so at numWarps==nT a warp owns one B column and fragsPerWarp distinct A rows:
+// fragsPerWarp+1 simdgroup_loads per k-step. The 2D form instead gives the warp
+// a (miCount x niCount) subblock, costing miCount+niCount loads for the same
+// fragsPerWarp MMAs.
+//
+// Slot order within a warp is row-major over that subblock, and every consumer
+// of accNames[j] must agree on it - MMA and both readback paths derive (mi, ni)
+// from this one place.
+struct WarpTiling {
+  int64_t miCount = 1, niCount = 1;  // subblock shape owned by one warp
+  int64_t wGridN = 1;                // warps across the N axis
+  bool twoD = false;
+
+  int64_t slots() const { return miCount * niCount; }
+
+  // Fragment coordinates of warp w's slot j.
+  void frag(int64_t w, int64_t j, int64_t nT, int64_t numWarps, int64_t &mi,
+            int64_t &ni) const {
+    if (!twoD) {
+      int64_t f = w + j * numWarps;
+      mi = f / nT;
+      ni = f % nT;
+      return;
+    }
+    mi = (w / wGridN) * miCount + j / niCount;
+    ni = (w % wGridN) * niCount + j % niCount;
+  }
+};
+
+// Factor fragsPerWarp into a near-square (miCount x niCount) that tiles the
+// (mT x nT) grid exactly with numWarps warps. Returns a 1D tiling when no such
+// split exists (prime fragsPerWarp, ragged grid, partial last warp).
+WarpTiling planWarpTiling(int64_t mT, int64_t nT, int64_t numWarps,
+                          int64_t nFrag, int64_t fragsPerWarp) {
+  WarpTiling t;
+  if (numWarps < 1 || fragsPerWarp < 2)
+    return t;
+  // Every warp must be full and the grid exactly covered.
+  if (mT * nT != nFrag || numWarps * fragsPerWarp != nFrag)
+    return t;
+
+  int64_t best = 0;
+  for (int64_t ni = 1; ni <= fragsPerWarp; ++ni) {
+    if (fragsPerWarp % ni)
+      continue;
+    int64_t mi = fragsPerWarp / ni;
+    if (mT % mi || nT % ni)
+      continue;
+    if ((mT / mi) * (nT / ni) != numWarps)
+      continue;
+    // Prefer the split minimising loads (mi+ni), tie-break toward wider ni.
+    if (!best || mi + ni < best) {
+      best = mi + ni;
+      t.miCount = mi;
+      t.niCount = ni;
+      t.wGridN = nT / ni;
+      t.twoD = true;
+    }
+  }
+  return t;
 }
 } // namespace
 
@@ -387,6 +451,7 @@ bool MSLEmitter::emitDotFused(
   const int64_t nT = plan.nT, kT = plan.kT;
   const int64_t nFrag = plan.nFrag, numWarps = plan.numWarps;
   int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
+  WarpTiling wt = planWarpTiling(plan.mT, nT, numWarps, nFrag, fragsPerWarp);
   auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
 
   if (fusedDot.phase == FusedDotPhase::Decl) {
@@ -449,7 +514,45 @@ bool MSLEmitter::emitDotFused(
         }
       }
     };
-    if (branchless) {
+    if (wt.twoD) {
+      // mi is a compile-time constant only within a warp row, so the 2D form
+      // branches per warp-row and keeps ni as a warpId expression.
+      int64_t wGridM = numWarps / wt.wGridN;
+      // ni = (warpId % wGridN) * niCount + c
+      auto niBase = [&]() -> msl::Expr * {
+        msl::Expr *col =
+            ctx.paren(ctx.binary(B::Rem, ctx.var(warpId), ctx.i32lit(wt.wGridN)));
+        return ctx.paren(ctx.mul(col, ctx.i32lit(wt.niCount)));
+      };
+      std::string colKey =
+          "(" + warpId + " % " + std::to_string(wt.wGridN) + ")*" +
+          std::to_string(wt.niCount);
+      auto emitRow = [&](int64_t wr, msl::Block &into) {
+        SmallVector<Slot> slots;
+        for (int64_t r = 0; r < wt.miCount; ++r)
+          for (int64_t c = 0; c < wt.niCount; ++c) {
+            msl::Expr *ni =
+                c ? ctx.paren(ctx.add(niBase(), ctx.i32lit(c))) : niBase();
+            slots.push_back({wr * wt.miCount + r,
+                             colKey + "+" + std::to_string(c), ni});
+          }
+        emitSlots(slots, into);
+      };
+      if (wGridM == 1) {
+        emitRow(0, body);
+      } else {
+        for (int64_t wr = 0; wr < wGridM; ++wr) {
+          msl::Block inner;
+          emitRow(wr, inner);
+          body.push_back(ctx.ifScope(
+              ctx.binary(B::Eq,
+                         ctx.paren(ctx.binary(B::Div, ctx.var(warpId),
+                                              ctx.i32lit(wt.wGridN))),
+                         ctx.i32lit(wr)),
+              std::move(inner)));
+        }
+      }
+    } else if (branchless) {
       std::string niKey = "(" + warpId + " % " + std::to_string(nT) + ")";
       msl::Expr *niExpr =
           ctx.paren(ctx.binary(B::Rem, ctx.var(warpId), ctx.i32lit(nT)));
@@ -485,8 +588,11 @@ bool MSLEmitter::emitDotFused(
     msl::Block ifBody;
     for (int64_t w = 0; w < numWarps; ++w) {
       msl::Block inner;
-      for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
-        int64_t mi = f / nT, ni = f % nT;
+      for (int64_t j = 0; j < fragsPerWarp; ++j) {
+        int64_t mi, ni;
+        wt.frag(w, j, nT, numWarps, mi, ni);
+        if (mi * nT + ni >= nFrag)
+          continue;
         // simdgroup_store(acc, base + (rowB + mi*8)*ldc + (colB + ni*8), ldc);
         msl::Expr *off = ctx.addChain(
             {ctx.var(base),
@@ -510,8 +616,11 @@ bool MSLEmitter::emitDotFused(
       tgt.push_back(ctx.hardBarrier(false));
       for (int64_t w = 0; w < numWarps; ++w) {
         msl::Block inner;
-        for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
-          int64_t mi = f / nT, ni = f % nT;
+        for (int64_t j = 0; j < fragsPerWarp; ++j) {
+          int64_t mi, ni;
+          wt.frag(w, j, nT, numWarps, mi, ni);
+          if (mi * nT + ni >= nFrag)
+            continue;
           inner.push_back(
               sgStore(fusedDot.accNames[j], dc.tgC, mi * 8 * N + ni * 8, N));
         }
@@ -532,8 +641,11 @@ bool MSLEmitter::emitDotFused(
   barrier();
   for (int64_t w = 0; w < numWarps; ++w) {
     msl::Block inner;
-    for (int64_t f = w, j = 0; f < nFrag; f += numWarps, ++j) {
-      int64_t mi = f / nT, ni = f % nT;
+    for (int64_t j = 0; j < fragsPerWarp; ++j) {
+      int64_t mi, ni;
+      wt.frag(w, j, nT, numWarps, mi, ni);
+      if (mi * nT + ni >= nFrag)
+        continue;
       inner.push_back(
           sgStore(fusedDot.accNames[j], dc.tgC, mi * 8 * N + ni * 8, N));
     }

@@ -350,17 +350,21 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
     ds->fullTileVar = ft;
     msl::Expr *cond;
     if (ds->boundM) {
+      auto uniform = [&](const UniformInt &u) -> msl::Expr * {
+        return u.lit ? static_cast<msl::Expr *>(ctx.i32lit(*u.lit))
+                     : ctx.var(scalarName(u.val));
+      };
       // (rowBase + M <= boundM && colBase + N <= boundN)
       cond = ctx.paren(ctx.binary(
           B::LAnd,
           ctx.binary(B::Le,
                      ctx.binary(B::Add, ctx.var(scalarName(ds->rowBase)),
                                 ctx.lit(std::to_string(M))),
-                     ctx.var(scalarName(ds->boundM))),
+                     uniform(ds->boundM)),
           ctx.binary(B::Le,
                      ctx.binary(B::Add, ctx.var(scalarName(ds->colBase)),
                                 ctx.lit(std::to_string(N))),
-                     ctx.var(scalarName(ds->boundN)))));
+                     uniform(ds->boundN))));
     } else {
       cond = ctx.lit("true");
     }
@@ -1367,6 +1371,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     Value src = cl.getSrc(), res = cl.getResult();
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
+    mslReject(cl, "convertLayout", "threadgroup-roundtrip");
     Type elemTy = resTy.getElementType();
     bool isPtr = isa<tt::PointerType>(elemTy);
     std::string ptrTyStr = mslStorageType(resTy);

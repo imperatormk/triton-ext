@@ -39,6 +39,9 @@ namespace mlir::triton::applegpu {
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 
+bool mslLogReject();
+void mslReject(Operation *op, StringRef gate, StringRef reason);
+
 // fresh() over the emitter's live id counter (by reference): builders mint real
 // names that advance the caller's id in lockstep.
 struct LocalGen {
@@ -459,6 +462,9 @@ private:
 
   static Value peelBroadcastExpand(Value v);
 
+  // A tile-uniform integer: a splat of an SSA scalar, or a splat constant.
+  static UniformInt matchUniformInt(Value v);
+
   // A per-tile index `pidBase*TILE + iota` where iota is a 0-based make_range.
   // Returns the scalar tile-base value (pidBase*TILE) or null.
   static Value matchTileIndex(Value v);
@@ -467,17 +473,18 @@ private:
   // where rowTerm = broadcast(rowIdx * splat(ldc)) and colTerm =
   // broadcast(colIdx), each index a per-tile `base + iota`. ldc must be a
   // scalar (loop-invariant); col stride is the implicit 1 of row-major.
-  bool matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
+  bool matchRowMajorOffset(Value off, Value &rowBase, UniformInt &ldc,
                            Value &colBase);
 
   // The store boundary mask `(row < boundM) && (col < boundN)`, with row/col
-  // the same per-tile indices as the address. Extracts the two scalar bounds.
-  bool matchBoundaryMask(Value m, Value &boundM, Value &boundN);
+  // the same per-tile indices as the address. Extracts the two bounds.
+  bool matchBoundaryMask(Value m, UniformInt &boundM, UniformInt &boundN);
 
-  // Recognise `acc(#mma) -> convert_layout -> tt.store(rowmajor)` as the sole
-  // consumer of the fused accumulator. Only an f32->f32 store through a single
-  // convert_layout is taken; anything else (dtype cast, reduction, second dot,
-  // extra users) falls back to the pool readback. Fills `ds` on success.
+  // Recognise `acc(#mma) -> [narrowing] -> convert_layout -> tt.store(rowmajor)`
+  // as the sole consumer of the fused accumulator. An optional float narrowing
+  // (f32 -> f16/bf16) is threaded through and applied per fragment element on
+  // the way out; anything else (reduction, second dot, extra users) falls back
+  // to the pool readback.
   std::optional<DirectStore> matchDirectStore(Value forResult);
 
   static bool isPureBarrierOp(Operation *op);

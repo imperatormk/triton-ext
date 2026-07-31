@@ -14,6 +14,15 @@ namespace mlir::triton::applegpu {
 
 namespace tt = mlir::triton;
 
+// A tile-uniform integer operand: either an SSA scalar that was splatted over
+// the tile, or a splat constant (which carries no Value). Exactly one of the
+// two is set when the value is present.
+struct UniformInt {
+  Value val;
+  std::optional<int64_t> lit;
+  explicit operator bool() const { return val || lit.has_value(); }
+};
+
 // baseOffset is a typed offset node into `buf`; nullptr means no base offset.
 struct MemDescInfo {
   std::string buf;
@@ -41,11 +50,11 @@ enum class FusedDotPhase { None, Decl, MMA, Readback };
 struct DirectStore {
   tt::StoreOp store;
   Value basePtr;           // C matrix base pointer (scalar kernel arg)
-  Value ldc;               // row stride (scalar), col stride is 1 (row-major)
+  UniformInt ldc;          // row stride, col stride is 1 (row-major)
   Value rowBase;           // global row of the tile's top-left element (scalar)
   Value colBase;           // global col of the tile's top-left element (scalar)
-  Value boundM;            // store-mask row bound, or null when unmasked
-  Value boundN;            // store-mask col bound, or null when unmasked
+  UniformInt boundM;       // store-mask row bound, unset when unmasked
+  UniformInt boundN;       // store-mask col bound, unset when unmasked
   std::string fullTileVar; // runtime "whole tile in bounds" predicate
 };
 

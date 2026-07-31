@@ -27,6 +27,30 @@ using CS = msl::Cast::Style;
 template <typename T> T definingOp(Value v) {
   return dyn_cast_or_null<T>(v.getDefiningOp());
 }
+} // namespace
+
+// MSL_LOG_REJECT=1 prints one line per fast-path gate rejection, tagged with
+// the gate, the reason and the enclosing kernel, so a compile-only corpus run
+// yields a rejection histogram.
+bool mslLogReject() {
+  static const bool on = getenv("MSL_LOG_REJECT") != nullptr;
+  return on;
+}
+
+static StringRef enclosingFuncName(Operation *op) {
+  if (auto f = op->getParentOfType<tt::FuncOp>())
+    return f.getName();
+  return "<unknown>";
+}
+
+void mslReject(Operation *op, StringRef gate, StringRef reason) {
+  if (!mslLogReject())
+    return;
+  llvm::errs() << "MSL-REJECT\t" << gate << '\t' << reason << '\t'
+               << enclosingFuncName(op) << '\n';
+}
+
+namespace {
 
 // Per-warp ownership of the (mT x nT) accumulator grid.
 //
@@ -131,19 +155,34 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   if (isa<IntegerType>(aElem) || isa<IntegerType>(bElem) ||
       isa<IntegerType>(cElem)) {
     p.kind = DotPlan::Kind::Scalar;
+    mslReject(op, "planDot", "integer-operands");
     return p;
   }
   p.rank = aTy.getRank();
-  if ((p.rank != 2 && p.rank != 3) || !isDotOperandElem(aElem) ||
-      !isDotOperandElem(bElem) || aElem != bElem ||
-      !(cElem.isF32() || cElem.isF16()))
+  if (p.rank != 2 && p.rank != 3) {
+    mslReject(op, "planDot", "rank-not-2-or-3");
     return p;
+  }
+  if (!isDotOperandElem(aElem) || !isDotOperandElem(bElem)) {
+    mslReject(op, "planDot", "operand-elem-unsupported");
+    return p;
+  }
+  if (aElem != bElem) {
+    mslReject(op, "planDot", "mixed-ab-elem");
+    return p;
+  }
+  if (!(cElem.isF32() || cElem.isF16())) {
+    mslReject(op, "planDot", "acc-elem-not-f32-f16");
+    return p;
+  }
   p.Bd = p.rank == 3 ? cTy.getShape()[0] : 1;
   p.M = cTy.getShape()[p.rank - 2];
   p.N = cTy.getShape()[p.rank - 1];
   p.K = aTy.getShape()[p.rank - 1];
-  if (p.M % 8 || p.N % 8 || p.K % 8)
+  if (p.M % 8 || p.N % 8 || p.K % 8) {
+    mslReject(op, "planDot", "MNK-not-multiple-of-8");
     return p;
+  }
 
   int64_t aBytes = p.M * p.K * byteWidth(aElem);
   int64_t bBytes = p.N * p.K * byteWidth(bElem);
@@ -203,6 +242,10 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
                ? DotPlan::Kind::Panel
            : p.phase != FusedDotPhase::None ? DotPlan::Kind::Fused
                                             : DotPlan::Kind::Direct;
+  if (p.kind == DotPlan::Kind::Panel)
+    mslReject(op, "planDot", "panel-AB-over-TG-budget");
+  else if (p.kind == DotPlan::Kind::Direct)
+    mslReject(op, "planDot", "direct-not-fused");
   return p;
 }
 
@@ -612,10 +655,13 @@ bool MSLEmitter::emitDotFused(
   // Readback.
   if (fusedDot.direct) {
     const DirectStore &d = *fusedDot.direct;
-    std::string base = scalarName(d.basePtr).str(),
-                ldc = scalarName(d.ldc).str();
+    std::string base = scalarName(d.basePtr).str();
     std::string rowB = scalarName(d.rowBase).str(),
                 colB = scalarName(d.colBase).str();
+    auto uniform = [&](const UniformInt &u) -> msl::Expr * {
+      return u.lit ? static_cast<msl::Expr *>(ctx.i32lit(*u.lit))
+                   : ctx.var(scalarName(u.val));
+    };
     msl::Block ifBody;
     for (int64_t w = 0; w < numWarps; ++w) {
       msl::Block inner;
@@ -628,11 +674,11 @@ bool MSLEmitter::emitDotFused(
         msl::Expr *off = ctx.addChain(
             {ctx.var(base),
              ctx.mul(ctx.paren(ctx.add(ctx.var(rowB), ctx.i32lit(mi * 8))),
-                     ctx.var(ldc)),
+                     uniform(d.ldc)),
              ctx.paren(ctx.add(ctx.var(colB), ctx.i32lit(ni * 8)))});
         inner.push_back(ctx.exprStmt(
             ctx.call(msl::builtin::sg::Store,
-                     {ctx.var(fusedDot.accNames[j]), off, ctx.var(ldc)})));
+                     {ctx.var(fusedDot.accNames[j]), off, uniform(d.ldc)})));
       }
       ifBody.push_back(ctx.ifScope(
           ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
@@ -1062,6 +1108,19 @@ bool MSLEmitter::tracesToKernelArg(Value v) {
   return static_cast<bool>(traceToKernelArg(v));
 }
 
+// The integer a uniform tensor holds, when it is a splat arith.constant.
+// A kernel-invariant stride or bound reaches the matchers either as a
+// tt::SplatOp or as a splat constant, so both spellings must be accepted.
+static std::optional<int64_t> splatConstInt(Value v) {
+  DenseElementsAttr attr;
+  if (!matchPattern(v, m_Constant(&attr)) || !attr.isSplat())
+    return std::nullopt;
+  auto ty = dyn_cast<IntegerType>(attr.getElementType());
+  if (!ty)
+    return std::nullopt;
+  return attr.getSplatValue<APInt>().getSExtValue();
+}
+
 Value MSLEmitter::peelBroadcastExpand(Value v) {
   while (v) {
     Operation *def = v.getDefiningOp();
@@ -1105,7 +1164,18 @@ Value MSLEmitter::matchTileIndex(Value v) {
   return Value();
 }
 
-bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
+UniformInt MSLEmitter::matchUniformInt(Value x) {
+  UniformInt u;
+  Value peeled = peelBroadcastExpand(x);
+  if (auto sp = dyn_cast_or_null<tt::SplatOp>(peeled.getDefiningOp())) {
+    u.val = sp.getSrc();
+    return u;
+  }
+  u.lit = splatConstInt(peeled);
+  return u;
+}
+
+bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, UniformInt &ldc,
                                      Value &colBase) {
   auto add = definingOp<arith::AddIOp>(off);
   if (!add)
@@ -1118,17 +1188,12 @@ bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
     auto mul = definingOp<arith::MulIOp>(rowScaled);
     if (!mul)
       return false;
-    auto scalarSrc = [](Value x) -> Value {
-      auto sp =
-          dyn_cast_or_null<tt::SplatOp>(peelBroadcastExpand(x).getDefiningOp());
-      return sp ? sp.getSrc() : Value();
-    };
     Value rIdxA = mul.getLhs(), rIdxB = mul.getRhs();
     Value rb = matchTileIndex(rIdxA);
-    Value stride = scalarSrc(rIdxB);
+    UniformInt stride = matchUniformInt(rIdxB);
     if (!rb || !stride) {
       rb = matchTileIndex(rIdxB);
-      stride = scalarSrc(rIdxA);
+      stride = matchUniformInt(rIdxA);
     }
     if (!rb || !stride)
       return false;
@@ -1141,29 +1206,28 @@ bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, Value &ldc,
          tryTerm(add.getRhs(), add.getLhs());
 }
 
-bool MSLEmitter::matchBoundaryMask(Value m, Value &boundM, Value &boundN) {
+bool MSLEmitter::matchBoundaryMask(Value m, UniformInt &boundM,
+                                   UniformInt &boundN) {
   auto conj = definingOp<arith::AndIOp>(m);
   if (!conj)
     return false;
-  auto cmpBound = [&](Value side, bool wantRow) -> Value {
+  auto cmpBound = [&](Value side) -> UniformInt {
     Value c = peelBroadcastExpand(side);
     auto cmp = definingOp<arith::CmpIOp>(c);
     if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt)
-      return Value();
+      return UniformInt();
     if (!matchTileIndex(cmp.getLhs()))
-      return Value();
-    auto sp = dyn_cast_or_null<tt::SplatOp>(
-        peelBroadcastExpand(cmp.getRhs()).getDefiningOp());
-    return sp ? sp.getSrc() : Value();
+      return UniformInt();
+    return matchUniformInt(cmp.getRhs());
   };
-  if (Value bm = cmpBound(conj.getLhs(), true))
-    if (Value bn = cmpBound(conj.getRhs(), false)) {
+  if (UniformInt bm = cmpBound(conj.getLhs()))
+    if (UniformInt bn = cmpBound(conj.getRhs())) {
       boundM = bm;
       boundN = bn;
       return true;
     }
-  if (Value bm = cmpBound(conj.getRhs(), true))
-    if (Value bn = cmpBound(conj.getLhs(), false)) {
+  if (UniformInt bm = cmpBound(conj.getRhs()))
+    if (UniformInt bn = cmpBound(conj.getLhs())) {
       boundM = bm;
       boundN = bn;
       return true;
@@ -1172,30 +1236,43 @@ bool MSLEmitter::matchBoundaryMask(Value m, Value &boundM, Value &boundN) {
 }
 
 std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
+  Operation *site = forResult.getDefiningOp();
+  auto rej = [&](StringRef why) {
+    if (site)
+      mslReject(site, "matchDirectStore", why);
+    return std::nullopt;
+  };
   if (!forResult.hasOneUse())
-    return std::nullopt;
+    return rej("acc-not-single-use");
   auto cvt = dyn_cast<ttg::ConvertLayoutOp>(*forResult.user_begin());
-  if (!cvt || !cvt.getResult().hasOneUse())
-    return std::nullopt;
+  if (!cvt)
+    return rej("user-not-convert_layout");
+  if (!cvt.getResult().hasOneUse())
+    return rej("convert-not-single-use");
   auto store = dyn_cast<tt::StoreOp>(*cvt.getResult().user_begin());
   if (!store || store.getValue() != cvt.getResult())
-    return std::nullopt;
+    return rej("convert-user-not-store");
   auto cTy = dyn_cast<RankedTensorType>(cvt.getResult().getType());
-  if (!cTy || !cTy.getElementType().isF32())
-    return std::nullopt;
+  if (!cTy)
+    return rej("store-value-not-tensor");
+  if (!cTy.getElementType().isF32())
+    return rej("store-elem-not-f32");
   auto ptr = definingOp<tt::AddPtrOp>(store.getPtr());
   if (!ptr)
-    return std::nullopt;
+    return rej("ptr-not-addptr");
   auto splat = definingOp<tt::SplatOp>(ptr.getPtr());
-  if (!splat || !isa<BlockArgument>(splat.getSrc()))
-    return std::nullopt;
-  Value rowBase, ldc, colBase;
+  if (!splat)
+    return rej("ptr-base-not-splat");
+  if (!isa<BlockArgument>(splat.getSrc()))
+    return rej("ptr-base-not-block-arg");
+  Value rowBase, colBase;
+  UniformInt ldc;
   if (!matchRowMajorOffset(ptr.getOffset(), rowBase, ldc, colBase))
-    return std::nullopt;
-  Value boundM, boundN;
+    return rej("offset-not-row-major");
+  UniformInt boundM, boundN;
   if (store.getMask()) {
     if (!matchBoundaryMask(store.getMask(), boundM, boundN))
-      return std::nullopt;
+      return rej("mask-not-boundary");
   }
   DirectStore ds;
   ds.store = store;
@@ -1227,38 +1304,56 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
       found = d;
       ++nDots;
     }
-  if (nDots != 1 || !found)
+  if (!found)
     return std::nullopt;
+  if (nDots != 1) {
+    mslReject(op, "matchGemmDotLoop", "nDots!=1");
+    return std::nullopt;
+  }
 
   auto cArg = dyn_cast<BlockArgument>(found.getC());
-  if (!cArg || cArg.getOwner() != body)
+  if (!cArg || cArg.getOwner() != body) {
+    mslReject(op, "matchGemmDotLoop", "acc-not-iter-arg");
     return std::nullopt;
+  }
   unsigned idx = cArg.getArgNumber();
   if (idx == 0)
     return std::nullopt; // arg 0 is the induction var
   unsigned iterIdx = idx - 1;
-  if (yield.getOperand(iterIdx) != found.getResult())
+  if (yield.getOperand(iterIdx) != found.getResult()) {
+    mslReject(op, "matchGemmDotLoop", "yield-not-dot-result");
     return std::nullopt;
+  }
   // The iter-arg feeds the dot's C and nothing else; the dot result feeds the
   // yield and nothing else. This keeps the accumulator purely register-carried.
   for (Operation *u : cArg.getUsers())
-    if (u != found.getOperation())
+    if (u != found.getOperation()) {
+      mslReject(op, "matchGemmDotLoop", "acc-extra-user");
       return std::nullopt;
+    }
   for (Operation *u : found.getResult().getUsers())
-    if (u != yield.getOperation())
+    if (u != yield.getOperation()) {
+      mslReject(op, "matchGemmDotLoop", "dot-result-extra-user");
       return std::nullopt;
+    }
 
   auto cTy = dyn_cast<RankedTensorType>(found.getResult().getType());
-  if (!cTy || cTy.getRank() != 2)
+  if (!cTy || cTy.getRank() != 2) {
+    mslReject(op, "matchGemmDotLoop", "acc-rank!=2");
     return std::nullopt;
+  }
   Type aElem = cast<RankedTensorType>(found.getA().getType()).getElementType();
   Type cElem = cTy.getElementType();
-  if (isa<IntegerType>(aElem) || !(cElem.isF32() || cElem.isF16()))
+  if (isa<IntegerType>(aElem) || !(cElem.isF32() || cElem.isF16())) {
+    mslReject(op, "matchGemmDotLoop", "elem-type-unsupported");
     return std::nullopt;
+  }
   int64_t M = cTy.getShape()[0], N = cTy.getShape()[1];
   int64_t K = cast<RankedTensorType>(found.getA().getType()).getShape()[1];
-  if (M % 8 || N % 8 || K % 8)
+  if (M % 8 || N % 8 || K % 8) {
+    mslReject(op, "matchGemmDotLoop", "MNK-not-multiple-of-8");
     return std::nullopt;
+  }
 
   // Gate: the fused path needs a warp-tile of <= 32 simdgroup_float8x8
   // accumulators per warp AND a pool that holds the staged operands.
@@ -1282,8 +1377,10 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   }
   // The fused epilogue overlays C's accumulators on the dead A/B staging, so
   // the pool only has to hold whichever of the two is larger.
-  if (std::max(stagedA + stagedB, cFull) > poolBudget())
+  if (std::max(stagedA + stagedB, cFull) > poolBudget()) {
+    mslReject(op, "matchGemmDotLoop", "pool-over-budget");
     return std::nullopt;
+  }
   tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
   auto kWarpDim = StringAttr::get(op.getContext(), "warp");
   int64_t numWarps = cLL.hasInDim(kWarpDim) ? cLL.getInDimSize(kWarpDim) : 1;
@@ -1291,8 +1388,10 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   if (numWarps > nFrag)
     numWarps = nFrag;
   int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
-  if (fragsPerWarp > 32)
+  if (fragsPerWarp > 32) {
+    mslReject(op, "matchGemmDotLoop", "fragsPerWarp>32");
     return std::nullopt;
+  }
 
   return std::make_pair(found, iterIdx);
 }

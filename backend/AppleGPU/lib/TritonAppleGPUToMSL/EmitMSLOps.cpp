@@ -371,6 +371,14 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
     body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), ft, cond));
     fusedDot.direct = ds;
     directStoreHandled[ds->store.getOperation()] = ft;
+    // On the direct path the fragments go straight to device memory, so the
+    // registers feeding the fallback store are never produced. Everything
+    // between the accumulator and the store has to sit under the same guard or
+    // it reads (and stores) undefined values.
+    if (ds->narrowOp)
+      directStoreHandled[ds->narrowOp] = ft;
+    if (ds->cvt)
+      directStoreHandled[ds->cvt] = ft;
   }
 
   fusedDot.phase = FusedDotPhase::Readback;
@@ -719,6 +727,51 @@ void MSLEmitter::programDim(Operation *op, StringRef builtinVar,
 // handled (including alias/dataless ops that append nothing); false for an
 // unsupported op, which the caller turns into a hard error.
 bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
+  // An op on the direct-store fallback chain only has defined inputs when the
+  // direct path was not taken, so it runs under the same guard. Its results are
+  // declared outside the guard and assigned inside, keeping later ops (and the
+  // guarded store) able to name them.
+  if (!isa<tt::StoreOp>(op)) {
+    auto guarded = directStoreHandled.find(op);
+    if (guarded != directStoreHandled.end()) {
+      std::string ftVar = guarded->second;
+      directStoreHandled.erase(guarded);
+      msl::Block inner;
+      if (!emitOp(op, inner))
+        return false;
+      SmallVector<SmallVector<std::string>> outer;
+      for (Value r : op->getResults()) {
+        auto it = valMap.find(r);
+        if (it == valMap.end()) {
+          outer.push_back({});
+          continue;
+        }
+        SmallVector<std::string> names;
+        for (const std::string &n : it->second) {
+          std::string decl = fresh();
+          body.push_back(ctx.declStmt(
+              scalarType(elementScalarType(r.getType())), decl, nullptr));
+          names.push_back(decl);
+        }
+        outer.push_back(names);
+      }
+      for (auto [ri, r] : llvm::enumerate(op->getResults())) {
+        auto it = valMap.find(r);
+        if (it == valMap.end())
+          continue;
+        for (auto [i, n] : llvm::enumerate(it->second))
+          inner.push_back(ctx.assignStmt(ctx.var(outer[ri][i]), ctx.var(n)));
+      }
+      body.push_back(
+          ctx.ifScope(ctx.unary(msl::UnOp::LNot, ctx.var(ftVar)),
+                      std::move(inner)));
+      for (auto [ri, r] : llvm::enumerate(op->getResults()))
+        if (!outer[ri].empty())
+          valMap[r] = outer[ri];
+      return true;
+    }
+  }
+
   // Barriers: BarrierStmt nodes (printer peephole collapses adjacent ones).
   if (auto b = dyn_cast<ttg::BarrierOp>(op)) {
     uint32_t bits = static_cast<uint32_t>(b.getAddrSpace());

@@ -82,6 +82,7 @@ inline constexpr llvm::StringRef Load = "simdgroup_load";
 inline constexpr llvm::StringRef Store = "simdgroup_store";
 inline constexpr llvm::StringRef MultiplyAccumulate =
     "simdgroup_multiply_accumulate";
+inline constexpr llvm::StringRef ThreadElements = "thread_elements()";
 } // namespace sg
 
 // Explicit-ordering atomic operations. The atomic_* element type names are not

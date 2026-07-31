@@ -662,6 +662,28 @@ bool MSLEmitter::emitDotFused(
       return u.lit ? static_cast<msl::Expr *>(ctx.i32lit(*u.lit))
                    : ctx.var(scalarName(u.val));
     };
+    // simdgroup_store requires the destination scalar to match the fragment's
+    // element type, so a narrow output needs a narrow fragment: each thread
+    // owns two elements, converted through thread_elements().
+    auto narrowed = [&](msl::Block &blk, StringRef accName) -> std::string {
+      if (!d.narrowTo)
+        return accName.str();
+      msl::Type *mt = ctx.matrix(d.narrowTo.isF16() ? msl::MatrixType::Elem::Half
+                                                    : msl::MatrixType::Elem::Bfloat);
+      msl::Type *sc = scalarType(d.narrowTo);
+      std::string id = fresh();
+      blk.push_back(ctx.declStmt(mt, id, nullptr));
+      for (int e = 0; e < 2; ++e) {
+        auto elems = [&](StringRef nm) {
+          return ctx.subscript(
+              ctx.member(ctx.var(nm), msl::builtin::sg::ThreadElements),
+              ctx.i32lit(e));
+        };
+        blk.push_back(ctx.assignStmt(
+            elems(id), ctx.cast(CS::CStyle, sc, elems(accName))));
+      }
+      return id;
+    };
     msl::Block ifBody;
     for (int64_t w = 0; w < numWarps; ++w) {
       msl::Block inner;
@@ -676,9 +698,10 @@ bool MSLEmitter::emitDotFused(
              ctx.mul(ctx.paren(ctx.add(ctx.var(rowB), ctx.i32lit(mi * 8))),
                      uniform(d.ldc)),
              ctx.paren(ctx.add(ctx.var(colB), ctx.i32lit(ni * 8)))});
-        inner.push_back(ctx.exprStmt(
-            ctx.call(msl::builtin::sg::Store,
-                     {ctx.var(fusedDot.accNames[j]), off, uniform(d.ldc)})));
+        std::string sv = narrowed(inner, fusedDot.accNames[j]);
+        inner.push_back(
+            ctx.exprStmt(ctx.call(msl::builtin::sg::Store,
+                                  {ctx.var(sv), off, uniform(d.ldc)})));
       }
       ifBody.push_back(ctx.ifScope(
           ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
@@ -1244,7 +1267,22 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   };
   if (!forResult.hasOneUse())
     return rej("acc-not-single-use");
-  auto cvt = dyn_cast<ttg::ConvertLayoutOp>(*forResult.user_begin());
+  // The f32 accumulator may be narrowed to the output dtype before the layout
+  // convert. simdgroup_store cannot narrow, so the fragment is converted
+  // elementwise through thread_elements() and stored as a narrow fragment.
+  Value chain = forResult;
+  Type narrowTo;
+  arith::TruncFOp narrowOp;
+  if (auto tf = dyn_cast<arith::TruncFOp>(*chain.user_begin())) {
+    if (!tf.getResult().hasOneUse())
+      return rej("narrow-not-single-use");
+    narrowTo = cast<RankedTensorType>(tf.getType()).getElementType();
+    if (!narrowTo.isF16() && !narrowTo.isBF16())
+      return rej("narrow-target-unsupported");
+    narrowOp = tf;
+    chain = tf.getResult();
+  }
+  auto cvt = dyn_cast<ttg::ConvertLayoutOp>(*chain.user_begin());
   if (!cvt)
     return rej("user-not-convert_layout");
   if (!cvt.getResult().hasOneUse())
@@ -1255,8 +1293,12 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   auto cTy = dyn_cast<RankedTensorType>(cvt.getResult().getType());
   if (!cTy)
     return rej("store-value-not-tensor");
-  if (!cTy.getElementType().isF32())
+  if (narrowTo) {
+    if (cTy.getElementType() != narrowTo)
+      return rej("store-elem-mismatches-narrow");
+  } else if (!cTy.getElementType().isF32()) {
     return rej("store-elem-not-f32");
+  }
   auto ptr = definingOp<tt::AddPtrOp>(store.getPtr());
   if (!ptr)
     return rej("ptr-not-addptr");
@@ -1282,6 +1324,9 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   ds.colBase = colBase;
   ds.boundM = boundM;
   ds.boundN = boundN;
+  ds.narrowTo = narrowTo;
+  ds.narrowOp = narrowOp;
+  ds.cvt = cvt;
   return ds;
 }
 

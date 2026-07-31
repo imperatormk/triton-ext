@@ -1371,6 +1371,13 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     Value src = cl.getSrc(), res = cl.getResult();
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
+    // Identical linear layouts place register r of both sides at the same tile
+    // offset for every (register, lane, warp), so the scatter/gather pair would
+    // hand each thread back exactly the values it wrote: rebind instead.
+    if (ttg::toLinearLayout(srcTy) == ttg::toLinearLayout(resTy)) {
+      bindRegs(res, names(src));
+      return true;
+    }
     mslReject(cl, "convertLayout", "threadgroup-roundtrip");
     Type elemTy = resTy.getElementType();
     bool isPtr = isa<tt::PointerType>(elemTy);

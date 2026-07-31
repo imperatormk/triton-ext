@@ -29,27 +29,6 @@ template <typename T> T definingOp(Value v) {
 }
 } // namespace
 
-// MSL_LOG_REJECT=1 prints one line per fast-path gate rejection, tagged with
-// the gate, the reason and the enclosing kernel, so a compile-only corpus run
-// yields a rejection histogram.
-bool mslLogReject() {
-  static const bool on = getenv("MSL_LOG_REJECT") != nullptr;
-  return on;
-}
-
-static StringRef enclosingFuncName(Operation *op) {
-  if (auto f = op->getParentOfType<tt::FuncOp>())
-    return f.getName();
-  return "<unknown>";
-}
-
-void mslReject(Operation *op, StringRef gate, StringRef reason) {
-  if (!mslLogReject())
-    return;
-  llvm::errs() << "MSL-REJECT\t" << gate << '\t' << reason << '\t'
-               << enclosingFuncName(op) << '\n';
-}
-
 namespace {
 
 // Per-warp ownership of the (mT x nT) accumulator grid.

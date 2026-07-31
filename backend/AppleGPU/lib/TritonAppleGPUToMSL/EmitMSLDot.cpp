@@ -201,8 +201,17 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   p.disjointC = !fusedEpilogueC &&
                 p.stagedAB + p.M * p.N * accBytes <= poolBudget();
   p.bandRows = p.M;
-  if (!p.disjointC && !fusedEpilogueC)
-    p.bandRows = dotCBandRows(p.M, p.N, poolBudget(), accBytes);
+  if (!p.disjointC) {
+    // C overlays the dead A/B staging in the fused epilogue, so a band that
+    // fits inside what staging already claimed is free. Sizing it to the whole
+    // budget instead would inflate the pool to the 32KB cap and drop residency
+    // to one threadgroup per core, which costs far more than the extra bands.
+    int64_t budget = fusedEpilogueC ? std::max(p.stagedAB, (int64_t)8 * p.N *
+                                                               accBytes)
+                                    : poolBudget();
+    p.bandRows = dotCBandRows(p.M, p.N, std::min(budget, poolBudget()),
+                              accBytes);
+  }
 
   p.needAB = p.phase == FusedDotPhase::None || p.phase == FusedDotPhase::MMA;
   p.needC = p.phase != FusedDotPhase::Decl;
@@ -403,13 +412,29 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
   };
 
   const int64_t lda = K + plan.aPad, ldb = N + plan.bPad;
+  // A fragment (mi, ki) is shared by every column this warp owns, and B (ki, ni)
+  // by every row, so reloading per (mi, ni) pair costs nT-1 (resp. mT-1)
+  // redundant simdgroup_loads each. The cache is cleared per warp block, which
+  // is the region the fragments stay live across.
+  llvm::DenseMap<std::pair<int64_t, int64_t>, std::string> aFrag, bFrag;
+  auto clearFragCache = [&]() {
+    aFrag.clear();
+    bFrag.clear();
+  };
   auto fragMMA = [&](int64_t mi, int64_t ni, StringRef acc, msl::Block &into) {
     for (int64_t ki = 0; ki < kT; ++ki) {
-      std::string fa = fresh(), fb = fresh();
-      into.push_back(fragDecl(dc.opFrag, fa));
-      into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
-      into.push_back(fragDecl(dc.opFrag, fb));
-      into.push_back(sgLoad(fb, dc.tgB, ki * 8 * ldb + ni * 8, ldb));
+      auto &fa = aFrag[{mi, ki}];
+      if (fa.empty()) {
+        fa = fresh();
+        into.push_back(fragDecl(dc.opFrag, fa));
+        into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
+      }
+      auto &fb = bFrag[{ki, ni}];
+      if (fb.empty()) {
+        fb = fresh();
+        into.push_back(fragDecl(dc.opFrag, fb));
+        into.push_back(sgLoad(fb, dc.tgB, ki * 8 * ldb + ni * 8, ldb));
+      }
       into.push_back(sgMultiplyAccumulate(acc, fa, fb));
     }
   };
@@ -421,6 +446,9 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
                       ctx.lit(std::to_string(bi)));
   };
   for (int64_t bi = 0; bi < Bd; ++bi) {
+    // Each batch restages A/B into the same buffers, so fragments cached from
+    // the previous batch name stale values.
+    clearFragCache();
     barrier();
     auto guardA = [&](int r) { return batchCond(aStageTy, r, bi); };
     auto guardB = [&](int r) { return batchCond(bStageTy, r, bi); };
@@ -437,6 +465,7 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
     if (plan.disjointC) {
       for (int64_t w = 0; w < numWarps; ++w) {
         msl::Block inner;
+        clearFragCache();
         for (int64_t f = w; f < nFrag; f += numWarps) {
           int64_t mi = f / nT, ni = f % nT;
           std::string acc = fresh();
@@ -459,6 +488,7 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       body.push_back(accFragDecl(dc.accFragTy, accName(f / nT, f % nT)));
     for (int64_t w = 0; w < numWarps; ++w) {
       msl::Block inner;
+      clearFragCache();
       for (int64_t f = w; f < nFrag; f += numWarps)
         fragMMA(f / nT, f % nT, accName(f / nT, f % nT), inner);
       warpIf(w, std::move(inner));
@@ -1309,6 +1339,56 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   return ds;
 }
 
+// True when nothing routes the C tile through threadgroup memory: the
+// accumulator fragments go straight to device memory (DirectStore), and every
+// convert_layout it feeds is a lane permutation. Without the DirectStore half
+// the fused readback still stages C through the pool via simdgroup_store, so
+// the reservation has to stay.
+bool MSLEmitter::fusedGemmCIsShuffled(tt::DotOp d) {
+  auto forOp = dyn_cast<scf::ForOp>(d->getParentOp());
+  if (!forOp)
+    return false;
+  auto m = matchGemmDotLoop(forOp);
+  if (!m || m->first != d)
+    return false;
+  Value acc = forOp.getResult(m->second);
+  if (!matchDirectStore(acc))
+    return false;
+
+  SmallVector<Value> work{acc};
+  SmallVector<Value> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    if (llvm::is_contained(seen, v))
+      continue;
+    seen.push_back(v);
+    if (seen.size() > 64)
+      return false; // give up rather than walk an unbounded epilogue
+    for (Operation *user : v.getUsers()) {
+      if (auto cl = dyn_cast<ttg::ConvertLayoutOp>(user)) {
+        auto st = cast<RankedTensorType>(cl.getSrc().getType());
+        auto rt = cast<RankedTensorType>(cl.getResult().getType());
+        if (ttg::toLinearLayout(st) == ttg::toLinearLayout(rt))
+          continue;
+        auto plan = planIntraWarpShuffle(st, rt);
+        if (!plan || !plan->uniformLanePerm || !plan->lanePermLinear)
+          return false;
+        continue;
+      }
+      // Elementwise ops keep the accumulator in its layout, so the convert
+      // downstream of them is still the C relayout. Anything else (reduce,
+      // trans, reshape, dot) may itself need the pool: bail.
+      if (!user->hasTrait<OpTrait::Elementwise>() &&
+          !isa<arith::TruncFOp, arith::ExtFOp, arith::SelectOp, tt::StoreOp>(
+              user))
+        return false;
+      for (Value r : user->getResults())
+        work.push_back(r);
+    }
+  }
+  return true;
+}
+
 bool MSLEmitter::dotIsFusedGemmAcc(tt::DotOp d) {
   auto forOp = dyn_cast<scf::ForOp>(d->getParentOp());
   if (!forOp)
@@ -1399,9 +1479,11 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
     if (dotOperandLocalLoad(found.getB(), K, N))
       stagedB = 0;
   }
-  // The fused epilogue overlays C's accumulators on the dead A/B staging, so
-  // the pool only has to hold whichever of the two is larger.
-  if (std::max(stagedA + stagedB, cFull) > poolBudget()) {
+  // The fused epilogue overlays C's accumulators on the dead A/B staging and
+  // writes it one row band at a time, so C never needs the whole tile - only a
+  // single 8-row band has to fit alongside the staging.
+  int64_t cBand = std::min(cFull, std::max(stagedA + stagedB, (int64_t)8 * N * 4));
+  if (std::max(stagedA + stagedB, cBand) > poolBudget()) {
     mslReject(op, "matchGemmDotLoop", "pool-over-budget");
     return std::nullopt;
   }

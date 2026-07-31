@@ -105,7 +105,16 @@ void MSLEmitter::scanPool(Operation *op) {
   if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op)) {
     if (convertLayoutIsDeadDotStage(c) || convertLayoutIsDeadDotStageSource(c))
       return;
-    auto st = cast<RankedTensorType>(c.getSrc().getType());
+    auto srcT = cast<RankedTensorType>(c.getSrc().getType());
+    auto resT = cast<RankedTensorType>(c.getResult().getType());
+    // Mirrors the emitter's two escapes: an identical layout rebinds and a
+    // lane permutation shuffles, neither of which touches the pool.
+    if (ttg::toLinearLayout(srcT) == ttg::toLinearLayout(resT))
+      return;
+    if (auto plan = planIntraWarpShuffle(srcT, resT))
+      if (plan->uniformLanePerm && plan->lanePermLinear)
+        return;
+    auto st = srcT;
     poolBytes = std::max(poolBytes, tgScratchBytes(st, /*band2D=*/true));
   } else if (auto t = dyn_cast<tt::TransOp>(op)) {
     auto rt = cast<RankedTensorType>(t.getResult().getType());
@@ -158,8 +167,15 @@ void MSLEmitter::scanPool(Operation *op) {
         need = mp * Kd * elemBytes + Kd * np * elemBytes + mp * np * accBytes;
       } else if (dotIsFusedGemmAcc(d)) {
         // Fused K-loop: C lands only in the post-loop epilogue, after a
-        // barrier, so it overlays the dead A/B staging.
-        need = std::max(stagedAB, cFull);
+        // barrier, so it overlays the dead A/B staging. When the epilogue's
+        // relayout is a lane permutation the C tile never reaches threadgroup
+        // memory at all; otherwise the readback stages it one band at a time,
+        // so reserving the full tile would cap the block size for nothing.
+        if (rk == 2 && fusedGemmCIsShuffled(d)) {
+          need = stagedAB;
+        } else {
+          need = std::max(stagedAB, cFull);
+        }
       } else if (stagedAB + cFull <= poolBudget()) {
         need = stagedAB + cFull;
       } else {

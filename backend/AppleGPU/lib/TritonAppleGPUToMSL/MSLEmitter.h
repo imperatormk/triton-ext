@@ -546,6 +546,10 @@ private:
   // True when this dot is the accumulator of a fused GEMM K-loop, i.e. the
   // one emitFusedGemm will route through its post-loop epilogue.
   bool dotIsFusedGemmAcc(tt::DotOp d);
+  // True when every convert_layout the fused accumulator flows into lowers to
+  // a lane permutation, so the C tile never reaches threadgroup memory and the
+  // pool does not have to reserve it.
+  bool fusedGemmCIsShuffled(tt::DotOp d);
 
   // Bitmask over lane (or warp) bits that reduce the given axis: a bit reduces
   // if its LinearLayout basis maps to a nonzero coordinate on the reduced

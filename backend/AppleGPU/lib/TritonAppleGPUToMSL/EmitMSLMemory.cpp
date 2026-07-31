@@ -152,6 +152,10 @@ void MSLEmitter::scanPool(Operation *op) {
         int64_t mp, np;
         dotPanelDims(M, N, Kd, elemBytes, accBytes, mp, np);
         need = mp * Kd * elemBytes + Kd * np * elemBytes + mp * np * accBytes;
+      } else if (dotIsFusedGemmAcc(d)) {
+        // Fused K-loop: C lands only in the post-loop epilogue, after a
+        // barrier, so it overlays the dead A/B staging.
+        need = std::max(stagedAB, cFull);
       } else if (stagedAB + cFull <= poolBudget()) {
         need = stagedAB + cFull;
       } else {

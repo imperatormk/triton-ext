@@ -528,6 +528,10 @@ private:
   // iter-arg index, or nullopt.
   std::optional<std::pair<tt::DotOp, unsigned>> matchGemmDotLoop(scf::ForOp op);
 
+  // True when this dot is the accumulator of a fused GEMM K-loop, i.e. the
+  // one emitFusedGemm will route through its post-loop epilogue.
+  bool dotIsFusedGemmAcc(tt::DotOp d);
+
   // Bitmask over lane (or warp) bits that reduce the given axis: a bit reduces
   // if its LinearLayout basis maps to a nonzero coordinate on the reduced
   // out-dim, i.e. distinct lanes/warps hold distinct axis elements.

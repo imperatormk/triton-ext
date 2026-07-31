@@ -166,11 +166,18 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   p.stagedA = p.aInPlace ? 0 : aBytes;
   p.stagedB = p.bInPlace ? 0 : bBytes;
   p.stagedAB = p.stagedA + p.stagedB;
-  p.disjointC = p.stagedAB + p.M * p.N * accBytes <= poolBudget();
-  p.bandRows =
-      p.disjointC ? p.M : dotCBandRows(p.M, p.N, poolBudget(), accBytes);
-
   p.phase = fusedDot.phase;
+  // The fused epilogue writes C only after the K-loop, behind a barrier, so
+  // its accumulators can reuse the (dead) A/B staging instead of claiming a
+  // disjoint region. Keeping C disjoint there doubles the threadgroup
+  // footprint and costs residency.
+  bool fusedEpilogueC = p.phase != FusedDotPhase::None;
+  p.disjointC = !fusedEpilogueC &&
+                p.stagedAB + p.M * p.N * accBytes <= poolBudget();
+  p.bandRows = p.M;
+  if (!p.disjointC && !fusedEpilogueC)
+    p.bandRows = dotCBandRows(p.M, p.N, poolBudget(), accBytes);
+
   p.needAB = p.phase == FusedDotPhase::None || p.phase == FusedDotPhase::MMA;
   p.needC = p.phase != FusedDotPhase::Decl;
 
@@ -1173,6 +1180,14 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   ds.boundM = boundM;
   ds.boundN = boundN;
   return ds;
+}
+
+bool MSLEmitter::dotIsFusedGemmAcc(tt::DotOp d) {
+  auto forOp = dyn_cast<scf::ForOp>(d->getParentOp());
+  if (!forOp)
+    return false;
+  auto m = matchGemmDotLoop(forOp);
+  return m && m->first == d;
 }
 
 std::optional<std::pair<tt::DotOp, unsigned>>

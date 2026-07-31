@@ -326,21 +326,26 @@ void MSLEmitter::dotReadback(msl::Block &tgt, RankedTensorType cTy,
                                  ctx.i32lit(r0))),
             ctx.i32lit(N)),
         layout.layoutCoordExpr(cTy, r, colDim)));
-    // (rowExpr >= r0 && rowExpr < r1)
-    msl::Expr *guard = ctx.paren(
-        ctx.binary(B::LAnd,
-                   ctx.binary(B::Ge, layout.layoutCoordExpr(cTy, r, rowDim),
-                              ctx.i32lit(r0)),
-                   ctx.binary(B::Lt, layout.layoutCoordExpr(cTy, r, rowDim),
-                              ctx.i32lit(r1))));
-    if (rank == 3)
-      guard = ctx.paren(ctx.binary(
-          B::LAnd,
-          ctx.binary(B::Eq, layout.batchCoordExpr(cTy, r), ctx.i32lit(bi)),
-          guard));
-    tgt.push_back(ctx.compactIfBare(
-        guard,
-        ctx.assignStmt(ctx.var(ids[r]), readbackValue(tgC, bandOff, b))));
+    // (rowExpr >= r0 && rowExpr < r1). The row coord is an xor of layout bases,
+    // so it always lands inside the row dim: a band spanning the whole dim
+    // makes the guard a tautology.
+    bool wholeBand = r0 == 0 && r1 >= cTy.getShape()[cTy.getRank() - 2];
+    msl::Expr *guard = nullptr;
+    if (!wholeBand)
+      guard = ctx.paren(
+          ctx.binary(B::LAnd,
+                     ctx.binary(B::Ge, layout.layoutCoordExpr(cTy, r, rowDim),
+                                ctx.i32lit(r0)),
+                     ctx.binary(B::Lt, layout.layoutCoordExpr(cTy, r, rowDim),
+                                ctx.i32lit(r1))));
+    if (rank == 3) {
+      msl::Expr *batchEq = ctx.binary(
+          B::Eq, layout.batchCoordExpr(cTy, r), ctx.i32lit(bi));
+      guard = guard ? ctx.paren(ctx.binary(B::LAnd, batchEq, guard)) : batchEq;
+    }
+    msl::Stmt *assign =
+        ctx.assignStmt(ctx.var(ids[r]), readbackValue(tgC, bandOff, b));
+    tgt.push_back(guard ? ctx.compactIfBare(guard, assign) : assign);
   }
 }
 
@@ -1246,11 +1251,11 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   if (M % 8 || N % 8 || K % 8)
     return std::nullopt;
 
-  // Gate: the fused path needs a warp-tile of <= 16 simdgroup_float8x8
-  // accumulators per warp AND the disjoint staging path where staged A+B+C
-  // fits the pool (band == M, one readback). Anything larger falls back to
-  // the per-dot path. Staging bytes mirror the dot path:
-  // an operand already resident in a threadgroup buffer (in-place) stages 0.
+  // Gate: the fused path needs a warp-tile of <= 32 simdgroup_float8x8
+  // accumulators per warp AND a pool that holds the staged operands.
+  // Anything larger falls back to the per-dot path. Staging bytes mirror the
+  // dot path: an operand already resident in a threadgroup buffer (in-place)
+  // stages 0.
   int64_t aBytes = M * K * byteWidth(aElem);
   int64_t bBytes = N * K * byteWidth(aElem);
   int64_t cFull = M * N * 4;
@@ -1266,7 +1271,9 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
     if (dotOperandLocalLoad(found.getB(), K, N))
       stagedB = 0;
   }
-  if (stagedA + stagedB + cFull > poolBudget())
+  // The fused epilogue overlays C's accumulators on the dead A/B staging, so
+  // the pool only has to hold whichever of the two is larger.
+  if (std::max(stagedA + stagedB, cFull) > poolBudget())
     return std::nullopt;
   tt::LinearLayout cLL = ttg::toLinearLayout(cTy);
   auto kWarpDim = StringAttr::get(op.getContext(), "warp");
@@ -1275,7 +1282,7 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   if (numWarps > nFrag)
     numWarps = nFrag;
   int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
-  if (fragsPerWarp > 16)
+  if (fragsPerWarp > 32)
     return std::nullopt;
 
   return std::make_pair(found, iterIdx);

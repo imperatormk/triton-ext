@@ -1246,10 +1246,10 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   if (M % 8 || N % 8 || K % 8)
     return std::nullopt;
 
-  // Gate: the fused path only wins with a small warp-tile (<= 8
-  // simdgroup_float8x8 accumulators per warp) AND the disjoint staging path
-  // where staged A+B+C fits the pool (band == M, one readback). Anything
-  // larger falls back to the per-dot path. Staging bytes mirror the dot path:
+  // Gate: the fused path needs a warp-tile of <= 16 simdgroup_float8x8
+  // accumulators per warp AND the disjoint staging path where staged A+B+C
+  // fits the pool (band == M, one readback). Anything larger falls back to
+  // the per-dot path. Staging bytes mirror the dot path:
   // an operand already resident in a threadgroup buffer (in-place) stages 0.
   int64_t aBytes = M * K * byteWidth(aElem);
   int64_t bBytes = N * K * byteWidth(aElem);
@@ -1275,7 +1275,7 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   if (numWarps > nFrag)
     numWarps = nFrag;
   int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
-  if (fragsPerWarp > 8)
+  if (fragsPerWarp > 16)
     return std::nullopt;
 
   return std::make_pair(found, iterIdx);

@@ -316,7 +316,8 @@ private:
   bool emitDotScalar(tt::DotOp op, msl::Block &body);
   void stageOperand(msl::Block &body, StringRef tgName, Value stage,
                     RankedTensorType stageTy, ArrayRef<std::string> names,
-                    bool skip, llvm::function_ref<msl::Expr *(int)> guard);
+                    bool skip, llvm::function_ref<msl::Expr *(int)> guard,
+                    int64_t rowPad = 0);
   bool emitDotPanel(tt::DotOp op, msl::Block &body, const DotPlan &plan,
                     const DotEmitCtx &dc);
   bool

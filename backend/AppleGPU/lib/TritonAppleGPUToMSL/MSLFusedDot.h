@@ -62,6 +62,20 @@ struct FusedDotCtx {
 // emitters need. Produced by MSLEmitter::planDot as a pure function of the op
 // and the emitter's budget state - no emission, no name allocation - so the
 // choice is one inspectable value instead of six interacting flags.
+// Row padding for the staged A (M x K) and B (K x N) simdgroup-matrix
+// operands. Measured on the emitted 64x64x32 fp32 GEMM: an unpadded row
+// stride makes consecutive rows collide in the threadgroup banks; +4
+// elements recovers ~4%, and the optimum is flat (+2..+8 land within noise).
+// Padding only pays when the row stride is bank-aligned to begin with, and it
+// is dropped outright when the widened tiles would not fit the 32KB cap.
+inline void dotStageRowPads(int64_t M, int64_t N, int64_t K, int64_t aEb,
+                            int64_t bEb, int64_t &aPad, int64_t &bPad) {
+  aPad = (K % 8 || aEb * K % 64) ? 0 : 4;
+  bPad = (N % 8 || bEb * N % 64) ? 0 : 4;
+  if (M * (K + aPad) * aEb + K * (N + bPad) * bEb > kTGResidentBudgetBytes)
+    aPad = bPad = 0;
+}
+
 struct DotPlan {
   enum class Kind {
     Unsupported, // shape/element type outside the simdgroup-matrix path
@@ -91,6 +105,10 @@ struct DotPlan {
   int64_t stagedA = 0, stagedB = 0, stagedAB = 0;
   bool disjointC = false;
   int64_t bandRows = 0;
+
+  // Extra columns appended to each staged A/B row so consecutive rows land in
+  // different threadgroup banks. Zero when staging is skipped (in-place).
+  int64_t aPad = 0, bPad = 0;
 
   // Fused three-phase state, mirrored from FusedDotCtx::phase.
   FusedDotPhase phase = FusedDotPhase::None;

@@ -129,16 +129,18 @@ msl::Expr *LayoutExprBuilder::flatTileOffset(RankedTensorType rt, int reg) {
       [&](int d) { return shape[d]; }, stride);
 }
 
-msl::Expr *LayoutExprBuilder::sliceFlatOffset(RankedTensorType rt, int reg) {
+msl::Expr *LayoutExprBuilder::sliceFlatOffset(RankedTensorType rt, int reg,
+                                              int64_t rowPad) {
   tt::LinearLayout ll = ttg::toLinearLayout(rt);
   auto outNames = llvm::to_vector(ll.getOutDimNames());
   auto shape = rt.getShape();
-  int lo = std::max<int>(0, (int)outNames.size() - 2);
+  int last = (int)outNames.size() - 1;
+  int lo = std::max<int>(0, last - 1);
   int64_t stride;
   return foldRowMajor(
-      ctx, (int)outNames.size() - 1, lo,
+      ctx, last, lo,
       [&](int d) { return layoutCoordExpr(rt, reg, outNames[d]); },
-      [&](int d) { return shape[d]; }, stride);
+      [&](int d) { return d == last ? shape[d] + rowPad : shape[d]; }, stride);
 }
 
 msl::Expr *LayoutExprBuilder::batchCoordExpr(RankedTensorType rt, int reg) {

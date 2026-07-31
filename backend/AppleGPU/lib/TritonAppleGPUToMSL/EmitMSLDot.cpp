@@ -101,12 +101,14 @@ WarpTiling planWarpTiling(int64_t mT, int64_t nT, int64_t numWarps,
 void MSLEmitter::stageOperand(msl::Block &body, StringRef tgName, Value stage,
                               RankedTensorType stageTy,
                               ArrayRef<std::string> names, bool skip,
-                              llvm::function_ref<msl::Expr *(int)> guard) {
+                              llvm::function_ref<msl::Expr *(int)> guard,
+                              int64_t rowPad) {
   if (skip)
     return;
   for (int r = 0, n = regCount(stage); r < n; ++r) {
     msl::Stmt *asn = ctx.assignStmt(
-        ctx.subscript(ctx.var(tgName), layout.sliceFlatOffset(stageTy, r)),
+        ctx.subscript(ctx.var(tgName),
+                      layout.sliceFlatOffset(stageTy, r, rowPad)),
         ctx.var(names[r]));
     msl::Expr *g = guard ? guard(r) : nullptr;
     body.push_back(g ? ctx.compactIf(g, asn) : asn);
@@ -163,8 +165,14 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
     if (Value s = dotOperandConvertSource(op, op.getB()))
       p.bStage = s;
 
-  p.stagedA = p.aInPlace ? 0 : aBytes;
-  p.stagedB = p.bInPlace ? 0 : bBytes;
+  dotStageRowPads(p.M, p.N, p.K, byteWidth(aElem), byteWidth(bElem), p.aPad,
+                  p.bPad);
+  if (p.aInPlace)
+    p.aPad = 0;
+  if (p.bInPlace)
+    p.bPad = 0;
+  p.stagedA = p.aInPlace ? 0 : p.M * (p.K + p.aPad) * byteWidth(aElem);
+  p.stagedB = p.bInPlace ? 0 : p.K * (p.N + p.bPad) * byteWidth(bElem);
   p.stagedAB = p.stagedA + p.stagedB;
   p.phase = fusedDot.phase;
   // The fused epilogue writes C only after the K-loop, behind a barrier, so
@@ -365,13 +373,14 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
                 dc.rowDim, dc.colDim);
   };
 
+  const int64_t lda = K + plan.aPad, ldb = N + plan.bPad;
   auto fragMMA = [&](int64_t mi, int64_t ni, StringRef acc, msl::Block &into) {
     for (int64_t ki = 0; ki < kT; ++ki) {
       std::string fa = fresh(), fb = fresh();
       into.push_back(fragDecl(dc.opFrag, fa));
-      into.push_back(sgLoad(fa, dc.tgA, mi * 8 * K + ki * 8, K));
+      into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
       into.push_back(fragDecl(dc.opFrag, fb));
-      into.push_back(sgLoad(fb, dc.tgB, ki * 8 * N + ni * 8, N));
+      into.push_back(sgLoad(fb, dc.tgB, ki * 8 * ldb + ni * 8, ldb));
       into.push_back(sgMultiplyAccumulate(acc, fa, fb));
     }
   };
@@ -388,10 +397,12 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
     auto guardB = [&](int r) { return batchCond(bStageTy, r, bi); };
     stageOperand(
         body, dc.tgA, dc.aStage, aStageTy, dc.aNames, (bool)plan.aInPlace,
-        rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardA) : nullptr);
+        rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardA) : nullptr,
+        plan.aPad);
     stageOperand(
         body, dc.tgB, dc.bStage, bStageTy, dc.bNames, (bool)plan.bInPlace,
-        rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardB) : nullptr);
+        rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardB) : nullptr,
+        plan.bPad);
     barrier();
 
     if (plan.disjointC) {
@@ -457,6 +468,7 @@ bool MSLEmitter::emitDotFused(
   const int64_t M = plan.M, N = plan.N, K = plan.K;
   const int64_t nT = plan.nT, kT = plan.kT;
   const int64_t nFrag = plan.nFrag, numWarps = plan.numWarps;
+  const int64_t lda = K + plan.aPad, ldb = N + plan.bPad;
   int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
   WarpTiling wt = planWarpTiling(plan.mT, nT, numWarps, nFrag, fragsPerWarp);
   auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
@@ -476,9 +488,9 @@ bool MSLEmitter::emitDotFused(
     if (stagesHere)
       barrier();
     stageOperand(body, dc.tgA, dc.aStage, aStageTy, dc.aNames,
-                 (bool)plan.aInPlace, nullptr);
+                 (bool)plan.aInPlace, nullptr, plan.aPad);
     stageOperand(body, dc.tgB, dc.bStage, bStageTy, dc.bNames,
-                 (bool)plan.bInPlace, nullptr);
+                 (bool)plan.bInPlace, nullptr, plan.bPad);
     barrier();
     bool branchless = (numWarps == nT);
     // slots: (mi, niKey, niExpr); niKey dedups bFrag, niExpr is the typed
@@ -499,19 +511,19 @@ bool MSLEmitter::emitDotFused(
             std::string fa = fresh();
             aFrag[mi] = fa;
             into.push_back(fragDecl(dc.opFrag, fa));
-            into.push_back(sgLoad(fa, dc.tgA, mi * 8 * K + ki * 8, K));
+            into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
           }
           if (!bFrag.count(niKey)) {
             std::string fb = fresh();
             bFrag[niKey] = fb;
             into.push_back(fragDecl(dc.opFrag, fb));
-            // simdgroup_load(fb, tgB + (ki*8*N + niExpr * 8), N);
+            // simdgroup_load(fb, tgB + (ki*8*ldb + niExpr * 8), ldb);
             msl::Expr *off = ctx.paren(ctx.add(
-                ctx.i32lit(ki * 8 * N), ctx.mul(pr.niExpr, ctx.i32lit(8))));
+                ctx.i32lit(ki * 8 * ldb), ctx.mul(pr.niExpr, ctx.i32lit(8))));
             into.push_back(ctx.exprStmt(
                 ctx.call(msl::builtin::sg::Load,
                          {ctx.var(fb), ctx.binary(B::Add, ctx.var(dc.tgB), off),
-                          ctx.i32lit(N)})));
+                          ctx.i32lit(ldb)})));
           }
         }
         for (auto [j, mn] : llvm::enumerate(slots)) {

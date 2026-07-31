@@ -29,7 +29,9 @@ public:
   msl::Expr *layoutCoordExpr(RankedTensorType rt, int reg, StringAttr outDim);
   msl::Expr *layoutOffsetExpr(RankedTensorType rt, int reg);
   msl::Expr *flatTileOffset(RankedTensorType rt, int reg);
-  msl::Expr *sliceFlatOffset(RankedTensorType rt, int reg);
+  // `rowPad` widens the innermost (row) stride past the tensor's own width,
+  // spreading successive rows across threadgroup banks.
+  msl::Expr *sliceFlatOffset(RankedTensorType rt, int reg, int64_t rowPad = 0);
   msl::Expr *batchCoordExpr(RankedTensorType rt, int reg);
   msl::Expr *transFlatOffset(RankedTensorType srcTy, ArrayRef<int32_t> perm,
                              ArrayRef<int64_t> resShape, int reg);

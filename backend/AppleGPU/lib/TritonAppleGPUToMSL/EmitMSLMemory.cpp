@@ -129,8 +129,12 @@ void MSLEmitter::scanPool(Operation *op) {
     int64_t M = cTy.getShape()[rk - 2];
     int64_t N = cTy.getShape()[rk - 1];
     int64_t Kd = aTy.getShape()[rk - 1];
-    int64_t aBy = M * Kd * byteWidth(aTy.getElementType());
-    int64_t bBy = Kd * N * byteWidth(bTy.getElementType());
+    int64_t aEb = byteWidth(aTy.getElementType());
+    int64_t bEb = byteWidth(bTy.getElementType());
+    int64_t aPad, bPad;
+    dotStageRowPads(M, N, Kd, aEb, bEb, aPad, bPad);
+    int64_t aBy = M * (Kd + aPad) * aEb;
+    int64_t bBy = Kd * (N + bPad) * bEb;
     Type cE = cTy.getElementType();
     int64_t need;
     if (isa<IntegerType>(cE)) {

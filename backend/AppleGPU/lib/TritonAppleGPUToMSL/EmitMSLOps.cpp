@@ -7,10 +7,15 @@
 
 #include "MSLConstants.h"
 #include "MSLEmitter.h"
+#include "llvm/ADT/StringSet.h"
 
 using namespace mlir;
 
 namespace mlir::triton::applegpu {
+
+// Below this many registers the peeled all-true arm costs more in code size
+// and register pressure than the serialization it removes.
+static constexpr int kMaskFastPathMinRegs = 4;
 
 using B = msl::BinOp;
 using CS = msl::Cast::Style;
@@ -2697,6 +2702,30 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
     for (int r = 0; r < rc; ++r)
       body.push_back(ctx.declStmt(sc, ids[r], initOf(r)));
 
+    // A predicated device load stalls the memory pipe on its predicate, so a
+    // run of individually-guarded loads issues serially. Peeling an
+    // all-masks-true fast path lets the common (interior-tile) case issue as
+    // one unconditional batch; the else arm keeps exact masked semantics.
+    if (vw == 1 && hasMask && rc >= kMaskFastPathMinRegs) {
+      SmallVector<msl::Expr *> ms;
+      llvm::StringSet<> seen;
+      for (int r = 0; r < rc; ++r) {
+        StringRef mn = (*mask)[mask->size() == 1 ? 0 : r];
+        if (seen.insert(mn).second)
+          ms.push_back(ctx.var(mn));
+      }
+      msl::Block hot, cold;
+      for (int r = 0; r < rc; ++r) {
+        hot.push_back(ctx.assignStmt(ctx.var(ids[r]),
+                                     derefPtr(ld.getPtr(), ptrs[r], scName)));
+        cold.push_back(scalarLoad(r));
+      }
+      body.push_back(ctx.ifElseScope(ctx.chain(B::And, ms), std::move(hot),
+                                     std::move(cold)));
+      bindRegs(res, ids);
+      return true;
+    }
+
     for (int base = 0; base < rc; base += vw) {
       if (vw == 1) {
         body.push_back(scalarLoad(base));
@@ -2723,8 +2752,12 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
       // The run's lanes are contiguous but their predicates are not provably
       // equal, so take the vector path only when all of them hold.
       SmallVector<msl::Expr *> ms;
-      for (int i = 0; i < vw; ++i)
-        ms.push_back(maskOf(base + i));
+      llvm::StringSet<> seenVec;
+      for (int i = 0; i < vw; ++i) {
+        StringRef mn = (*mask)[mask->size() == 1 ? 0 : base + i];
+        if (seenVec.insert(mn).second)
+          ms.push_back(ctx.var(mn));
+      }
       msl::Block cold;
       for (int i = 0; i < vw; ++i)
         cold.push_back(scalarLoad(base + i));

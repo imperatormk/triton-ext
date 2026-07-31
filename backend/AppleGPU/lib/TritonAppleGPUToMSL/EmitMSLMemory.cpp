@@ -111,9 +111,10 @@ void MSLEmitter::scanPool(Operation *op) {
     // lane permutation shuffles, neither of which touches the pool.
     if (ttg::toLinearLayout(srcT) == ttg::toLinearLayout(resT))
       return;
-    if (auto plan = planIntraWarpShuffle(srcT, resT))
-      if (plan->uniformLanePerm && plan->lanePermLinear)
-        return;
+    if (!isa<tt::PointerType>(resT.getElementType()))
+      if (auto plan = planIntraWarpShuffle(srcT, resT))
+        if (plan->uniformLanePerm && plan->lanePermLinear)
+          return;
     auto st = srcT;
     poolBytes = std::max(poolBytes, tgScratchBytes(st, /*band2D=*/true));
   } else if (auto t = dyn_cast<tt::TransOp>(op)) {

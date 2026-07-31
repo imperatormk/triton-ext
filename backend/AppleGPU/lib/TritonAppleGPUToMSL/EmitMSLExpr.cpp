@@ -336,7 +336,7 @@ bool MSLEmitter::emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl,
   auto srcTy = cast<RankedTensorType>(cl.getSrc().getType());
   auto resTy = cast<RankedTensorType>(cl.getResult().getType());
   // simd_shuffle takes a scalar of a known width; pointer payloads would need
-  // the ulong path plus a cast back, and no layout conversion produces them.
+  // the ulong path plus a cast back. scanPool mirrors this bail.
   if (isa<tt::PointerType>(resTy.getElementType()))
     return false;
 

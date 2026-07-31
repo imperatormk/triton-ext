@@ -327,8 +327,9 @@ void MSLEmitter::dotReadback(msl::Block &tgt, RankedTensorType cTy,
             ctx.i32lit(N)),
         layout.layoutCoordExpr(cTy, r, colDim)));
     // (rowExpr >= r0 && rowExpr < r1). The row coord is an xor of layout bases,
-    // so it always lands inside the row dim: a band spanning the whole dim
-    // makes the guard a tautology.
+    // so it always lands inside the row dim: only a band covering the whole
+    // dim makes the guard a tautology. A partial band must keep it, or the
+    // registers outside the band get clobbered by this band's gather.
     bool wholeBand = r0 == 0 && r1 >= cTy.getShape()[cTy.getRank() - 2];
     msl::Expr *guard = nullptr;
     if (!wholeBand)
@@ -661,7 +662,9 @@ bool MSLEmitter::emitDotFused(
     return true;
   }
 
-  // Non-direct readback: pool store + gather.
+  // Non-direct readback: pool store + gather. The drain overlays the dead A/B
+  // staging, so it has to happen in one pass -- a second band's stores would
+  // land on the region the first is still gathering from.
   barrier();
   for (int64_t w = 0; w < numWarps; ++w) {
     msl::Block inner;

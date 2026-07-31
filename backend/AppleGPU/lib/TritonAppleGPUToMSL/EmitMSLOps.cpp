@@ -2706,7 +2706,10 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
     // run of individually-guarded loads issues serially. Peeling an
     // all-masks-true fast path lets the common (interior-tile) case issue as
     // one unconditional batch; the else arm keeps exact masked semantics.
-    if (vw == 1 && hasMask && rc >= kMaskFastPathMinRegs) {
+    // Splitting the peel per vector run would re-serialize the runs against
+    // each other, so the guard spans every register of the load and the wide
+    // loads sit inside it -- they issue only when all masks hold.
+    if (hasMask && rc >= kMaskFastPathMinRegs) {
       SmallVector<msl::Expr *> ms;
       llvm::StringSet<> seen;
       for (int r = 0; r < rc; ++r) {
@@ -2715,11 +2718,26 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
           ms.push_back(ctx.var(mn));
       }
       msl::Block hot, cold;
-      for (int r = 0; r < rc; ++r) {
-        hot.push_back(ctx.assignStmt(ctx.var(ids[r]),
-                                     derefPtr(ld.getPtr(), ptrs[r], scName)));
-        cold.push_back(scalarLoad(r));
+      for (int base = 0; base < rc; base += vw) {
+        if (vw == 1) {
+          hot.push_back(ctx.assignStmt(
+              ctx.var(ids[base]), derefPtr(ld.getPtr(), ptrs[base], scName)));
+          continue;
+        }
+        auto *scTy = cast<msl::ScalarType>(sc);
+        msl::Type *vecTy = ctx.vector(scTy->s, vw);
+        msl::Type *vecPtr = ctx.ptr(vecTy, msl::AddrSpace::Device);
+        std::string vid = fresh();
+        hot.push_back(ctx.declStmt(
+            vecTy, vid,
+            ctx.deref(ctx.cast(CS::CStyle, vecPtr, ctx.var(ptrs[base])))));
+        for (int i = 0; i < vw; ++i)
+          hot.push_back(ctx.assignStmt(
+              ctx.var(ids[base + i]),
+              ctx.subscript(ctx.var(vid), ctx.lit(std::to_string(i)))));
       }
+      for (int r = 0; r < rc; ++r)
+        cold.push_back(scalarLoad(r));
       body.push_back(ctx.ifElseScope(ctx.chain(B::And, ms), std::move(hot),
                                      std::move(cold)));
       bindRegs(res, ids);

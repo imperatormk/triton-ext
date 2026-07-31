@@ -327,4 +327,73 @@ msl::Expr *MSLEmitter::makeRangeElem(int start, msl::Expr *off) {
 
 msl::Expr *MSLEmitter::aliasElem(StringRef name) { return ctx.var(name); }
 
+//===----------------------------------------------------------------------===//
+// Intra-warp convert_layout
+//===----------------------------------------------------------------------===//
+
+bool MSLEmitter::emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl,
+                                             msl::Block &body) {
+  auto srcTy = cast<RankedTensorType>(cl.getSrc().getType());
+  auto resTy = cast<RankedTensorType>(cl.getResult().getType());
+  // simd_shuffle takes a scalar of a known width; pointer payloads would need
+  // the ulong path plus a cast back, and no layout conversion produces them.
+  if (isa<tt::PointerType>(resTy.getElementType()))
+    return false;
+
+  auto plan = planIntraWarpShuffle(srcTy, resTy);
+  if (!plan)
+    return false;
+
+  // Without one shared lane index every register needs its own index
+  // computation, at which point the shuffles stop being obviously cheaper than
+  // the round-trip they replace.
+  if (!plan->uniformLanePerm || !plan->lanePermLinear)
+    return false;
+
+  auto &srcNames = names(cl.getSrc());
+  if ((int)srcNames.size() != (int)regCount(cl.getSrc()))
+    return false;
+
+  std::string scStr = mslStorageType(resTy);
+  msl::Type *declTy = storageType(resTy);
+
+  // srcLane = XOR over the set bits of laneId of the permutation's basis.
+  msl::Expr *laneIdx = nullptr;
+  for (size_t b = 0; b < plan->laneBasis.size(); ++b) {
+    int32_t basis = plan->laneBasis[b];
+    if (basis == 0)
+      continue;
+    msl::Expr *bit = ctx.paren(ctx.binary(
+        msl::BinOp::And, ctx.paren(ctx.binary(msl::BinOp::Shr, ctx.var(laneId), ctx.i32lit(b))),
+        ctx.lit("1")));
+    msl::Expr *term =
+        ctx.paren(ctx.binary(msl::BinOp::Mul, bit, ctx.lit(std::to_string(basis))));
+    laneIdx = laneIdx ? ctx.paren(ctx.binary(msl::BinOp::Xor, laneIdx, term)) : term;
+  }
+
+  std::string laneVar;
+  if (laneIdx) {
+    laneVar = fresh();
+    body.push_back(
+        ctx.declStmt(ctx.scalar(msl::Scalar::I32), laneVar, laneIdx));
+  }
+
+  SmallVector<std::string> ids;
+  for (auto &step : plan->steps) {
+    if (step.srcReg < 0 || step.srcReg >= (int)srcNames.size())
+      return false;
+    StringRef srcName = srcNames[step.srcReg];
+    if (step.identity || laneVar.empty()) {
+      ids.push_back(srcName.str());
+      continue;
+    }
+    std::string id = fresh();
+    body.push_back(ctx.declStmt(
+        declTy, id, shuffleExpr(msl::builtin::simd::Shuffle, scStr, srcName, laneVar)));
+    ids.push_back(id);
+  }
+  bindRegs(cl.getResult(), ids);
+  return true;
+}
+
 } // namespace mlir::triton::applegpu

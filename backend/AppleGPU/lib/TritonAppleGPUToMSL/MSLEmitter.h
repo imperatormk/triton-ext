@@ -10,6 +10,7 @@
 #include "MSLConstants.h"
 #include "MSLFusedDot.h"
 #include "MSLLayoutExpr.h"
+#include "MSLShufflePlan.h"
 #include "MSLPrinter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -568,6 +569,11 @@ private:
   // reinterpret path (64-bit/bfloat scalars reject the intrinsic directly).
   msl::Expr *shuffleExpr(StringRef op, StringRef sc, StringRef val,
                          StringRef arg);
+
+  // Lowers a convert_layout as a lane permutation when planIntraWarpShuffle
+  // accepts it. Returns false (emitting nothing) otherwise, so the caller falls
+  // through to the threadgroup round-trip.
+  bool emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl, msl::Block &body);
 
   int tgScratchId = 0;
 

@@ -1431,6 +1431,11 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       bindRegs(res, names(src));
       return true;
     }
+    // Every destination element already sits in the destination lane's own
+    // simdgroup: a lane permutation, which simd_shuffle does with no
+    // threadgroup traffic and no barrier.
+    if (emitIntraWarpShuffleConvert(cl, body))
+      return true;
     mslReject(cl, "convertLayout", "threadgroup-roundtrip");
     Type elemTy = resTy.getElementType();
     bool isPtr = isa<tt::PointerType>(elemTy);

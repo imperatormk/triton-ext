@@ -23,6 +23,10 @@ static void addStoreShuffleLayout(mlir::PassManager *pm,
                                   const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createStoreShuffleLayoutPass());
 }
+static void addPrefetchDotOperand(mlir::PassManager *pm,
+                                  const std::vector<std::string> &) {
+  pm->addPass(mlir::triton::applegpu::createPrefetchDotOperandPass());
+}
 static void addEmitMSL(mlir::PassManager *pm,
                        const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createEmitMSLPass());
@@ -45,6 +49,11 @@ static void registerSimplifyGather() {
 static void registerStoreShuffleLayout() {
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return mlir::triton::applegpu::createStoreShuffleLayoutPass();
+  });
+}
+static void registerPrefetchDotOperand() {
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::triton::applegpu::createPrefetchDotOperandPass();
   });
 }
 static void registerEmitMSL() {
@@ -74,6 +83,8 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       {"simplify_gather", "0.1.0", addSimplifyGather, registerSimplifyGather},
       {"store_shuffle_layout", "0.1.0", addStoreShuffleLayout,
        registerStoreShuffleLayout},
+      {"prefetch_dot_operand", "0.1.0", addPrefetchDotOperand,
+       registerPrefetchDotOperand},
       {"emit_msl", "0.1.0", addEmitMSL, registerEmitMSL},
   };
 
@@ -86,7 +97,7 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       "TritonAppleGPUBackend",
       "0.1.0",
       passes,
-      4, // numPasses
+      5, // numPasses
       dialects,
       1, // numDialects
       nullptr,

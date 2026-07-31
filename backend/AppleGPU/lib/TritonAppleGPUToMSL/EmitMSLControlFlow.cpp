@@ -223,11 +223,53 @@ msl::Block MSLEmitter::terminatorEdge(Operation *term, StringRef state) {
 // Walk a single-block region's ops into a Block: each op goes through
 // emitOp. `depth` is the printer nesting the Block prints at. Terminators
 // (yield/return/branch) are walked too; emitOp handles the dataless ones.
+// True when `op` is the address/load pair of a rotated (software-pipelined)
+// dot operand: a load inside a fused-GEMM K-loop whose only use is the loop's
+// yield, i.e. it produces the value the *next* iteration consumes. Such a load
+// has no consumer in this iteration, so it may sink past the staging barrier
+// and overlap the MMA block. The ops are queued and replayed by
+// emitPendingPrefetchLoads.
+bool MSLEmitter::deferPrefetchLoad(Operation *op) {
+  if (fusedDot.phase != FusedDotPhase::MMA)
+    return false;
+  auto ld = dyn_cast<tt::LoadOp>(op);
+  if (!ld || ld.getMask() || ld.getOther())
+    return false;
+  if (!ld.getResult().hasOneUse())
+    return false;
+  if (!isa<scf::YieldOp>(*ld.getResult().user_begin()))
+    return false;
+  // The pointer is produced in-loop by an addptr whose result also feeds the
+  // yield; take it along so the address math sinks with the load. It must not
+  // have been emitted yet, or its name is already bound.
+  if (auto ap = ld.getPtr().getDefiningOp<tt::AddPtrOp>())
+    if (ap->getBlock() == op->getBlock() && !valMap.count(ap->getResult(0)))
+      pendingPrefetch.push_back(ap);
+  pendingPrefetch.push_back(op);
+  return true;
+}
+
+// Emit the loads held back by deferPrefetchLoad, in original order.
+void MSLEmitter::emitPendingPrefetchLoads(msl::Block &body) {
+  SmallVector<Operation *> queued;
+  queued.swap(pendingPrefetch);
+  for (Operation *op : queued)
+    if (!emitOp(op, body)) {
+      op->emitError("EmitMSL: unhandled deferred prefetch op");
+      emitFailed = true;
+    }
+}
+
 msl::Block MSLEmitter::walkBlock(Block &blk, unsigned depth) {
   msl::Block body;
   int savedIndent = indent;
   indent = depth;
   for (Operation &op : blk) {
+    // A rotated prefetch load feeds the next iteration, so it can be issued
+    // after the dot's publish barrier and overlap the MMAs. Hold it back; the
+    // fused-dot MMA phase emits it at that point.
+    if (deferPrefetchLoad(&op))
+      continue;
     if (emitOp(&op, body))
       continue;
     // No real-kernel op family falls through: emitOp is exhaustive. An

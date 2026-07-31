@@ -15,6 +15,10 @@ std::unique_ptr<mlir::Pass> createSimplifyGatherLayoutPass();
 // #mma -> #blocked convert_layout becomes a within-simdgroup shuffle.
 std::unique_ptr<mlir::Pass> createStoreShuffleLayoutPass();
 
+// Rotate the smaller dot operand's load one iteration ahead of the K-loop so
+// it retires under the MMA block.
+std::unique_ptr<mlir::Pass> createPrefetchDotOperandPass();
+
 } // namespace mlir::triton::applegpu
 
 // Generated pass declarations

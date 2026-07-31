@@ -376,6 +376,12 @@ private:
 
   SmallVector<std::string> &names(Value v) { return valMap[v]; }
 
+  // Rotated dot-operand loads held back by walkBlock so the fused MMA phase
+  // can emit them after its publish barrier (see deferPrefetchLoad).
+  SmallVector<Operation *> pendingPrefetch;
+  bool deferPrefetchLoad(Operation *op);
+  void emitPendingPrefetchLoads(msl::Block &body);
+
   // The single register name of a scalar / single-register value.
   StringRef scalarName(Value v) { return valMap[v][0]; }
 

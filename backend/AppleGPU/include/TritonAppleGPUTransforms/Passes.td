@@ -48,6 +48,31 @@ def StoreShuffleLayout : Pass<"triton-apple-store-shuffle-layout", "mlir::Module
   ];
 }
 
+def PrefetchDotOperand : Pass<"triton-apple-prefetch-dot-operand", "mlir::ModuleOp"> {
+  let summary = "Rotate the smaller dot operand's load ahead of the K-loop";
+
+  let description = [{
+    The MSL path stages both dot operands through threadgroup memory and runs
+    the loop body serially: load -> threadgroup store -> barrier -> MMAs. The
+    MMAs alone already saturate the fp32 issue rate, so the surrounding load
+    traffic is pure serial overhead.
+
+    This peels iteration 0's load for one operand in front of the loop, carries
+    the loaded value as an iter-arg, and issues the next iteration's load
+    before the dot so it retires underneath the MMA block.
+
+    Only the operand with fewer elements is rotated. Rotating both keeps every
+    staged element live across the MMAs and the added register pressure costs
+    more than the overlap wins.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 def SimplifyGatherLayout : Pass<"triton-apple-simplify-gather", "mlir::ModuleOp"> {
   let summary = "Strip efficient_layout from large gather ops to avoid IR explosion";
 

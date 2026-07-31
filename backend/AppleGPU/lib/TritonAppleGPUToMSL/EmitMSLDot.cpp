@@ -342,7 +342,8 @@ void MSLEmitter::dotReadback(msl::Block &tgt, RankedTensorType cTy,
     if (rank == 3) {
       msl::Expr *batchEq = ctx.binary(
           B::Eq, layout.batchCoordExpr(cTy, r), ctx.i32lit(bi));
-      guard = guard ? ctx.paren(ctx.binary(B::LAnd, batchEq, guard)) : batchEq;
+      guard = guard ? ctx.paren(ctx.binary(B::LAnd, batchEq, guard))
+                    : ctx.paren(batchEq);
     }
     msl::Stmt *assign =
         ctx.assignStmt(ctx.var(ids[r]), readbackValue(tgC, bandOff, b));
@@ -498,6 +499,11 @@ bool MSLEmitter::emitDotFused(
     stageOperand(body, dc.tgB, dc.bStage, bStageTy, dc.bNames,
                  (bool)plan.bInPlace, nullptr, plan.bPad);
     barrier();
+    // A prefetched operand arrives as a loop-carried block argument: its load
+    // was issued for the *next* iteration, so the value consumed here is
+    // already in registers and its global load can sink past this barrier to
+    // overlap the MMAs below. Emit those loads now, after the publish barrier.
+    emitPendingPrefetchLoads(body);
     bool branchless = (numWarps == nT);
     // slots: (mi, niKey, niExpr); niKey dedups bFrag, niExpr is the typed
     // index.

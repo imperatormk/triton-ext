@@ -160,6 +160,12 @@ class MPSBackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
 
+        # Rotate the cheaper dot operand's load one iteration ahead so it
+        # retires under the MMA block instead of serialising in front of it.
+        _plugin.add_prefetch_dot_operand(pm)
+        passes.common.add_canonicalizer(pm)
+        passes.common.add_cse(pm)
+
         # Fuse nested loops marked with tt.flatten (tl.range(flatten=True))
         passes.ttgpuir.add_fuse_nested_loops(pm)
         passes.common.add_canonicalizer(pm)

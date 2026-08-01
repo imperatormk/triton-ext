@@ -18,6 +18,10 @@ namespace mlir::triton::applegpu {
 // through poolBudget(), never a bare literal, so they cannot drift.
 inline constexpr int64_t kTGResidentBudgetBytes = 32768;
 
+// Smallest per-simdgroup band worth an async-copy request; TRITON_MSL_DMA_MIN_BAND
+// overrides it for sweeping.
+inline constexpr int64_t kDmaMinBandBytesDefault = 4096;
+
 } // namespace mlir::triton::applegpu
 
 namespace mlir::triton::applegpu::msl {

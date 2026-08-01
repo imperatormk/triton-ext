@@ -381,44 +381,70 @@ std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
 // The DMA form of an async copy: the pointer tensor must denote a contiguous
 // device tile whose destination is a plain unpadded row-major threadgroup
 // buffer, which is exactly what the pipeliner allocates.
-std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac) {
-  if (!dmaStagingEnabled())
-    return std::nullopt;
-  // air.simdgroup_async_copy_2d takes no predicate, so a masked copy would
-  // read the full tile past the end of a ragged operand and stage garbage.
-  // Those keep the register path, which applies the mask per element.
-  // A per-element mask cannot be expressed -- the intrinsic takes no predicate,
-  // and the copy would read past a ragged operand. A *uniform* mask can: the
-  // pipeliner splats a single "is this trip in range" i1 across the tile, and
-  // that just guards the whole call. Distinguishing the two is what lets the
-  // pipelined copies reach the DMA at all.
+static int64_t dmaNumWarps(Operation *o) {
+  if (auto mod = o->getParentOfType<ModuleOp>())
+    if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+      return a.getInt();
+  return 1;
+}
+
+int64_t MSLEmitter::dmaMinBandBytes() {
+  static const int64_t v = [] {
+    if (const char *s = getenv("TRITON_MSL_DMA_MIN_BAND"))
+      if (int64_t n = atoll(s); n >= 0)
+        return n;
+    return kDmaMinBandBytesDefault;
+  }();
+  return v;
+}
+
+// Shared by the copy itself and the sibling walk, so the two cannot disagree.
+bool MSLEmitter::dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac) {
+  // The intrinsic takes no predicate, so a per-element mask would read past a
+  // ragged operand; a uniform one just guards the whole call.
   if (Value m = ac.getMask())
     if (!definingOp<tt::SplatOp>(peelBroadcast(m)))
-      return std::nullopt;
+      return false;
   auto srcTy = dyn_cast<RankedTensorType>(ac.getSrc().getType());
   auto mt = dyn_cast<ttg::MemDescType>(ac.getResult().getType());
   if (!srcTy || !mt || srcTy.getRank() != 2 || mt.getRank() != 2)
-    return std::nullopt;
+    return false;
   Type e = mt.getElementType();
   if (!(e.isF32() || e.isF16() || e.isBF16()))
-    return std::nullopt;
+    return false;
   // A non-row-major destination cannot be expressed as (dstStride, dims).
   if (!memdescStrides(mt).empty())
+    return false;
+  // Asynchronous, so one buffer lets trip N+1's request overwrite the tile trip
+  // N is still reading -- the register path survives that only by being
+  // synchronous and barrier-ordered.
+  Value buf = ac.getResult();
+  while (auto idx = buf.getDefiningOp<ttg::MemDescIndexOp>())
+    buf = idx.getSrc();
+  auto bt = dyn_cast<ttg::MemDescType>(buf.getType());
+  if (!bt || bt.getRank() < 3 || bt.getShape()[0] < 2)
+    return false;
+  // A request moves one warp's band, not the tile; below a few KB it costs more
+  // than the scatter it replaces (512B and 1KB both measured as losses).
+  int64_t rows = mt.getShape()[0], cols = mt.getShape()[1];
+  int64_t nw = dmaNumWarps(ac);
+  int64_t band = (nw > 0 && rows % nw == 0) ? rows / nw : rows;
+  if (band * cols * byteWidth(e) < dmaMinBandBytes())
+    return false;
+  return matchTilePointer(ac.getSrc(), rows, cols).has_value();
+}
+
+std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac) {
+  if (!dmaStagingEnabled() || !dmaCopyEligible(ac))
     return std::nullopt;
+  auto mt = cast<ttg::MemDescType>(ac.getResult().getType());
   auto ds = matchTilePointer(ac.getSrc(), mt.getShape()[0], mt.getShape()[1]);
-  if (!ds)
-    return std::nullopt;
   // All-or-nothing per loop: staging one operand by DMA and the other through
   // registers mixes two layouts for the same MMA block and computes garbage.
   if (auto forOp = dyn_cast_or_null<scf::ForOp>(ac->getParentOp())) {
     bool allOk = true;
     forOp.walk([&](ttg::AsyncCopyGlobalToLocalOp other) {
-      if (other == ac || !allOk)
-        return;
-      auto omt = dyn_cast<ttg::MemDescType>(other.getResult().getType());
-      if (!omt || omt.getRank() != 2 || !memdescStrides(omt).empty() ||
-          !matchTilePointer(other.getSrc(), omt.getShape()[0],
-                            omt.getShape()[1]))
+      if (other != ac && allOk && !dmaCopyEligible(other))
         allOk = false;
     });
     if (!allOk)
@@ -430,8 +456,8 @@ std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalO
     auto it = valMap.find(v);
     return it != valMap.end() && it->second.size() == 1;
   };
-  if (!bound(ds->basePtr) || !(ds->rowStrideLit || bound(ds->rowStride)) || !bound(ds->rowShift) ||
-      !bound(ds->colShift))
+  if (!bound(ds->basePtr) || !(ds->rowStrideLit || bound(ds->rowStride)) ||
+      !bound(ds->rowShift) || !bound(ds->colShift))
     return std::nullopt;
   return ds;
 }

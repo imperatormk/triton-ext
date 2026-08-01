@@ -346,6 +346,7 @@ private:
                      const DotEmitCtx &dc);
   void dotPoolPtrs(msl::Block &body, const DotPlan &plan, DotEmitCtx &dc);
   static bool dmaStagingEnabled();
+  static int64_t dmaMinBandBytes();
   std::optional<DirectStage> bDmaCandidate(tt::DotOp op,
                                            bool requireBound = true);
   std::optional<DirectStage> dotDmaStage(tt::DotOp op);
@@ -362,6 +363,7 @@ private:
   msl::Stmt *dmaWait(StringRef handle);
   std::optional<DirectStage>
   asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac);
+  bool dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac);
   SmallVector<std::string> dotResultIds(msl::Block &body, tt::DotOp op,
                                         const DotPlan &plan);
   void dotReadback(msl::Block &tgt, RankedTensorType cTy, StringRef tgC,

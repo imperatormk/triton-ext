@@ -1444,6 +1444,13 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
   // ttg.async_copy_global_to_local: synchronous masked per-thread stage +
   // barrier.
   if (auto ac = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
+    // Warps in this threadgroup, from the module attribute the launch uses.
+    auto numWarpsForOp = [&](Operation *o) -> int64_t {
+      if (auto mod = o->getParentOfType<ModuleOp>())
+        if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+          return a.getInt();
+      return 1;
+    };
     // On hardware this copy is asynchronous and only lands at the matching
     // async_wait, so the pipeliner is free to issue it into a slot the current
     // trip is still reading -- with numBuffers==1 it always does. We lower it
@@ -1466,6 +1473,16 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       MemDescInfo di = memdescMap[ac.getResult()];
       auto mt = cast<ttg::MemDescType>(ac.getResult().getType());
       int64_t eb = byteWidth(mt.getElementType());
+      // air.simdgroup_async_copy_2d is issued *per simdgroup*, so every warp
+      // requesting the whole tile moves it numWarps times over -- measured as
+      // ~2x per warp doubling (nw2 0.775, nw4 1.006, nw8 1.915 ms). Apple's own
+      // GEMM partitions by simdgroup_index_in_threadgroup; do the same and give
+      // warp w the row band [w*band, (w+1)*band).
+      int64_t rows = mt.getShape()[0], cols = mt.getShape()[1];
+      int64_t nw = numWarpsForOp(ac);
+      int64_t band = (nw > 0 && rows % nw == 0) ? rows / nw : rows;
+      bool split = band != rows;
+
       msl::Expr *dstPtr = ctx.var(di.buf);
       if (di.baseOffset)
         dstPtr = ctx.paren(ctx.binary(B::Add, dstPtr, di.baseOffset));
@@ -1474,18 +1491,29 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       // per copy *site*, reused every trip: minting a fresh name per emission
       // leaves the loop waiting on the prologue's stale tokens while its own
       // copies are never waited on at all.
+      msl::Expr *srcPtr = nullptr;
       auto hit = dmaHandleFor.find(ac.getOperation());
       if (hit == dmaHandleFor.end())
         return false;
       const std::string &h = hit->second;
+      srcPtr = dmaTileOrigin(*ds, dotDmaTripVar(ac));
+      if (split) {
+        msl::Expr *wRows =
+            ctx.paren(ctx.binary(B::Mul, ctx.var(warpId), ctx.i32lit(band)));
+        dstPtr = ctx.paren(ctx.binary(
+            B::Add, dstPtr,
+            ctx.paren(ctx.binary(B::Mul, wRows, ctx.i32lit(cols)))));
+        srcPtr = ctx.binary(
+            B::Add, srcPtr,
+            ctx.paren(ctx.binary(B::Mul, wRows,
+                                 ctx.var(scalarName(ds->rowStride)))));
+      }
       body.push_back(ctx.assignStmt(
           ctx.var(h),
           ctx.call("__triton_tg_async_copy_begin_" + std::to_string(eb),
-                   {dstPtr, ctx.i32lit(mt.getShape()[1]),
-                    dmaTileOrigin(*ds, dotDmaTripVar(ac)),
-                    ctx.var(scalarName(ds->rowStride)),
-                    ctx.i32lit(mt.getShape()[0]),
-                    ctx.i32lit(mt.getShape()[1])})));
+                   {dstPtr, ctx.i32lit(cols), srcPtr,
+                    ctx.var(scalarName(ds->rowStride)), ctx.i32lit(band),
+                    ctx.i32lit(cols)})));
       pendingDmaHandles.push_back(h);
       bindDataless(ac.getResult());
       return true;

@@ -40,6 +40,9 @@ bool initHasCall(msl::Expr *e);
 
 struct DeadLocalMarker {
   llvm::DenseSet<llvm::StringRef> used;
+  // How many times each name appears in a read position, so a self-sustaining
+  // induction cycle can be told apart from a genuinely consumed value.
+  llvm::DenseMap<llvm::StringRef, unsigned> readCount;
   // Raw text is opaque to the AST, so any name it mentions must be assumed
   // live. Rather than parse it, a Raw node anywhere disables the pass.
   bool sawRaw = false;
@@ -48,9 +51,12 @@ struct DeadLocalMarker {
     if (!e)
       return;
     switch (e->kind) {
-    case msl::Expr::Kind::VarRef:
-      used.insert(llvm::cast<msl::VarRef>(e)->name);
+    case msl::Expr::Kind::VarRef: {
+      llvm::StringRef n = llvm::cast<msl::VarRef>(e)->name;
+      used.insert(n);
+      ++readCount[n];
       return;
+    }
     case msl::Expr::Kind::Raw:
       sawRaw = true;
       return;
@@ -277,6 +283,95 @@ unsigned dropDeadDeclsIn(msl::Stmt *s,
   }
 }
 
+// A loop-carried induction pair keeps itself alive: `adv = base + step;` and
+// `base = adv;` make each name a reader of the other, so plain liveness never
+// removes them even when nothing else reads either. Collect the pairs whose
+// names are read exactly twice -- once in the advance, once in the carry --
+// which means every read is internal to the cycle.
+void findDeadInductionCycles(const msl::Block &b,
+                             const llvm::DenseMap<llvm::StringRef, unsigned> &reads,
+                             llvm::DenseSet<llvm::StringRef> &dead) {
+  // adv name -> base name, for `adv = base + step;` decls in this block.
+  llvm::DenseMap<llvm::StringRef, llvm::StringRef> advOf;
+  for (const msl::Stmt *s : b) {
+    if (auto *d = llvm::dyn_cast<msl::DeclStmt>(s)) {
+      auto *bin = llvm::dyn_cast_or_null<msl::Binary>(d->init);
+      if (bin && bin->op == msl::BinOp::Add)
+        if (auto *lhs = llvm::dyn_cast<msl::VarRef>(bin->lhs))
+          if (llvm::isa<msl::VarRef>(bin->rhs))
+            advOf[d->name] = lhs->name;
+      continue;
+    }
+    if (auto *a = llvm::dyn_cast<msl::AssignStmt>(s)) {
+      if (a->compound != msl::AssignStmt::Compound::None)
+        continue;
+      auto *lv = llvm::dyn_cast<msl::VarRef>(a->lhs);
+      auto *rv = llvm::dyn_cast<msl::VarRef>(a->rhs);
+      if (!lv || !rv)
+        continue;
+      auto it = advOf.find(rv->name);
+      if (it == advOf.end() || it->second != lv->name)
+        continue;
+      // `base` is read once by the advance, `adv` once by the carry. Any other
+      // read means the pointer is genuinely used.
+      auto rb = reads.find(lv->name), ra = reads.find(rv->name);
+      if (rb != reads.end() && rb->second == 1 && ra != reads.end() &&
+          ra->second == 1) {
+        dead.insert(lv->name);
+        dead.insert(rv->name);
+      }
+      continue;
+    }
+    // Recurse into scopes.
+    if (auto *f = llvm::dyn_cast<msl::ForScope>(s))
+      findDeadInductionCycles(f->body, reads, dead);
+    else if (auto *f = llvm::dyn_cast<msl::TripCountForScope>(s))
+      findDeadInductionCycles(f->body, reads, dead);
+    else if (auto *i = llvm::dyn_cast<msl::IfScope>(s)) {
+      findDeadInductionCycles(i->thenB, reads, dead);
+      findDeadInductionCycles(i->elseB, reads, dead);
+    } else if (auto *w = llvm::dyn_cast<msl::WhileScope>(s))
+      findDeadInductionCycles(w->body, reads, dead);
+    else if (auto *p = llvm::dyn_cast<msl::PlainScope>(s))
+      findDeadInductionCycles(p->body, reads, dead);
+  }
+}
+
+// Drops the decls and carries of a dead induction cycle.
+unsigned dropDeadCycle(msl::Block &b,
+                       const llvm::DenseSet<llvm::StringRef> &dead) {
+  unsigned removed = 0;
+  msl::Block keep;
+  keep.reserve(b.size());
+  for (msl::Stmt *s : b) {
+    if (auto *d = llvm::dyn_cast<msl::DeclStmt>(s))
+      if (dead.count(d->name)) {
+        ++removed;
+        continue;
+      }
+    if (auto *a = llvm::dyn_cast<msl::AssignStmt>(s))
+      if (auto *lv = llvm::dyn_cast<msl::VarRef>(a->lhs))
+        if (dead.count(lv->name) && !initHasCall(a->rhs)) {
+          ++removed;
+          continue;
+        }
+    if (auto *f = llvm::dyn_cast<msl::ForScope>(s))
+      removed += dropDeadCycle(f->body, dead);
+    else if (auto *f = llvm::dyn_cast<msl::TripCountForScope>(s))
+      removed += dropDeadCycle(f->body, dead);
+    else if (auto *i = llvm::dyn_cast<msl::IfScope>(s)) {
+      removed += dropDeadCycle(i->thenB, dead);
+      removed += dropDeadCycle(i->elseB, dead);
+    } else if (auto *w = llvm::dyn_cast<msl::WhileScope>(s))
+      removed += dropDeadCycle(w->body, dead);
+    else if (auto *p = llvm::dyn_cast<msl::PlainScope>(s))
+      removed += dropDeadCycle(p->body, dead);
+    keep.push_back(s);
+  }
+  b = std::move(keep);
+  return removed;
+}
+
 // Returns the number of decls removed, so the driver can iterate to fixpoint.
 unsigned dropDeadDecls(msl::Block &b,
                        const llvm::DenseSet<llvm::StringRef> &used) {
@@ -314,7 +409,12 @@ static void eliminateDeadLocals(msl::KernelFn *fn) {
     m.stmt(fn);
     if (m.sawRaw)
       return;
-    if (dropDeadDecls(fn->body, m.used) == 0)
+    llvm::DenseSet<llvm::StringRef> deadCycle;
+    findDeadInductionCycles(fn->body, m.readCount, deadCycle);
+    unsigned n = dropDeadDecls(fn->body, m.used);
+    if (!deadCycle.empty())
+      n += dropDeadCycle(fn->body, deadCycle);
+    if (n == 0)
       return;
   }
 }

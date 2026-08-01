@@ -26,6 +26,283 @@ using B = msl::BinOp;
 using CS = msl::Cast::Style;
 
 //===----------------------------------------------------------------------===//
+// Dead local elimination
+//===----------------------------------------------------------------------===//
+
+namespace {
+// Collects every name that appears in a *read* position, then drops DeclStmts
+// whose name is never read. The emitter materialises one local per SSA value,
+// so any op whose result a later op folded into its own expression leaves a
+// declaration behind with no use. The in-process compile path never surfaced
+// these, but the toolchain path (used when a kernel links the async-copy shim)
+// warns on each one.
+struct DeadLocalMarker {
+  llvm::DenseSet<llvm::StringRef> used;
+  // Raw text is opaque to the AST, so any name it mentions must be assumed
+  // live. Rather than parse it, a Raw node anywhere disables the pass.
+  bool sawRaw = false;
+
+  void expr(msl::Expr *e) {
+    if (!e)
+      return;
+    switch (e->kind) {
+    case msl::Expr::Kind::VarRef:
+      used.insert(llvm::cast<msl::VarRef>(e)->name);
+      return;
+    case msl::Expr::Kind::Raw:
+      sawRaw = true;
+      return;
+    case msl::Expr::Kind::Literal:
+      return;
+    case msl::Expr::Kind::Binary: {
+      auto *b = llvm::cast<msl::Binary>(e);
+      expr(b->lhs);
+      expr(b->rhs);
+      return;
+    }
+    case msl::Expr::Kind::Unary:
+      expr(llvm::cast<msl::Unary>(e)->x);
+      return;
+    case msl::Expr::Kind::Cast:
+      expr(llvm::cast<msl::Cast>(e)->x);
+      return;
+    case msl::Expr::Kind::Call:
+      for (msl::Expr *a : llvm::cast<msl::Call>(e)->args)
+        expr(a);
+      return;
+    case msl::Expr::Kind::Ternary: {
+      auto *t = llvm::cast<msl::Ternary>(e);
+      expr(t->c);
+      expr(t->a);
+      expr(t->b);
+      return;
+    }
+    case msl::Expr::Kind::Subscript: {
+      auto *s = llvm::cast<msl::Subscript>(e);
+      expr(s->base);
+      expr(s->idx);
+      return;
+    }
+    case msl::Expr::Kind::Member:
+      expr(llvm::cast<msl::Member>(e)->base);
+      return;
+    case msl::Expr::Kind::Deref:
+      expr(llvm::cast<msl::Deref>(e)->x);
+      return;
+    case msl::Expr::Kind::AddrOf:
+      expr(llvm::cast<msl::AddrOf>(e)->x);
+      return;
+    case msl::Expr::Kind::Paren:
+      expr(llvm::cast<msl::Paren>(e)->x);
+      return;
+    }
+  }
+
+  void block(const msl::Block &b) {
+    for (msl::Stmt *s : b)
+      stmt(s);
+  }
+
+  void stmt(msl::Stmt *s) {
+    if (!s)
+      return;
+    switch (s->kind) {
+    case msl::Stmt::Kind::Decl:
+      // The initialiser is a read; the declared name itself is not.
+      expr(llvm::cast<msl::DeclStmt>(s)->init);
+      return;
+    case msl::Stmt::Kind::ArrayDecl:
+      return;
+    case msl::Stmt::Kind::Assign: {
+      auto *a = llvm::cast<msl::AssignStmt>(s);
+      // A plain `v = rhs` does not read v, but `v[i] = rhs`, `*v = rhs` and
+      // `v += rhs` all do.
+      if (a->compound != msl::AssignStmt::Compound::None ||
+          !llvm::isa<msl::VarRef>(a->lhs))
+        expr(a->lhs);
+      expr(a->rhs);
+      return;
+    }
+    case msl::Stmt::Kind::Expr:
+      expr(llvm::cast<msl::ExprStmt>(s)->e);
+      return;
+    case msl::Stmt::Kind::Return: {
+      auto *r = llvm::cast<msl::ReturnStmt>(s);
+      expr(r->val);
+      for (msl::Expr *f : r->structFields)
+        expr(f);
+      return;
+    }
+    case msl::Stmt::Kind::Raw:
+      sawRaw = true;
+      return;
+    case msl::Stmt::Kind::Break:
+    case msl::Stmt::Kind::Continue:
+    case msl::Stmt::Kind::Barrier:
+      return;
+    case msl::Stmt::Kind::CompactIf: {
+      auto *c = llvm::cast<msl::CompactIfStmt>(s);
+      expr(c->cond);
+      stmt(c->then);
+      return;
+    }
+    case msl::Stmt::Kind::KernelFn:
+      block(llvm::cast<msl::KernelFn>(s)->body);
+      return;
+    case msl::Stmt::Kind::DeviceFn:
+      block(llvm::cast<msl::DeviceFn>(s)->body);
+      return;
+    case msl::Stmt::Kind::ForScope: {
+      auto *f = llvm::cast<msl::ForScope>(s);
+      stmt(f->initDecl);
+      expr(f->cond);
+      stmt(f->step);
+      block(f->body);
+      return;
+    }
+    case msl::Stmt::Kind::TripCountForScope: {
+      auto *f = llvm::cast<msl::TripCountForScope>(s);
+      stmt(f->ivDecl);
+      expr(f->guard);
+      block(f->body);
+      return;
+    }
+    case msl::Stmt::Kind::IfScope: {
+      auto *i = llvm::cast<msl::IfScope>(s);
+      expr(i->cond);
+      block(i->thenB);
+      block(i->elseB);
+      return;
+    }
+    case msl::Stmt::Kind::WhileScope: {
+      auto *w = llvm::cast<msl::WhileScope>(s);
+      expr(w->cond);
+      block(w->body);
+      return;
+    }
+    case msl::Stmt::Kind::StateMachineScope: {
+      auto *m = llvm::cast<msl::StateMachineScope>(s);
+      used.insert(m->stateVar);
+      for (auto &c : m->cases)
+        block(c.body);
+      return;
+    }
+    case msl::Stmt::Kind::PlainScope:
+      block(llvm::cast<msl::PlainScope>(s)->body);
+      return;
+    }
+  }
+};
+
+// An initialiser that calls a function may have side effects, so its decl is
+// only removable if the call itself is known pure. Nothing else in the emitted
+// AST can have a side effect in a read position.
+bool initHasCall(msl::Expr *e) {
+  if (!e)
+    return false;
+  switch (e->kind) {
+  case msl::Expr::Kind::Call:
+  case msl::Expr::Kind::Raw:
+    return true;
+  case msl::Expr::Kind::VarRef:
+  case msl::Expr::Kind::Literal:
+    return false;
+  case msl::Expr::Kind::Binary: {
+    auto *b = llvm::cast<msl::Binary>(e);
+    return initHasCall(b->lhs) || initHasCall(b->rhs);
+  }
+  case msl::Expr::Kind::Unary:
+    return initHasCall(llvm::cast<msl::Unary>(e)->x);
+  case msl::Expr::Kind::Cast:
+    return initHasCall(llvm::cast<msl::Cast>(e)->x);
+  case msl::Expr::Kind::Ternary: {
+    auto *t = llvm::cast<msl::Ternary>(e);
+    return initHasCall(t->c) || initHasCall(t->a) || initHasCall(t->b);
+  }
+  case msl::Expr::Kind::Subscript: {
+    auto *s = llvm::cast<msl::Subscript>(e);
+    return initHasCall(s->base) || initHasCall(s->idx);
+  }
+  case msl::Expr::Kind::Member:
+    return initHasCall(llvm::cast<msl::Member>(e)->base);
+  case msl::Expr::Kind::Deref:
+    return initHasCall(llvm::cast<msl::Deref>(e)->x);
+  case msl::Expr::Kind::AddrOf:
+    return initHasCall(llvm::cast<msl::AddrOf>(e)->x);
+  case msl::Expr::Kind::Paren:
+    return initHasCall(llvm::cast<msl::Paren>(e)->x);
+  }
+  return true;
+}
+
+unsigned dropDeadDecls(msl::Block &b, const llvm::DenseSet<llvm::StringRef> &used);
+
+unsigned dropDeadDeclsIn(msl::Stmt *s,
+                         const llvm::DenseSet<llvm::StringRef> &used) {
+  if (!s)
+    return 0;
+  switch (s->kind) {
+  case msl::Stmt::Kind::KernelFn:
+    return dropDeadDecls(llvm::cast<msl::KernelFn>(s)->body, used);
+  case msl::Stmt::Kind::DeviceFn:
+    return dropDeadDecls(llvm::cast<msl::DeviceFn>(s)->body, used);
+  case msl::Stmt::Kind::ForScope:
+    return dropDeadDecls(llvm::cast<msl::ForScope>(s)->body, used);
+  case msl::Stmt::Kind::TripCountForScope:
+    return dropDeadDecls(llvm::cast<msl::TripCountForScope>(s)->body, used);
+  case msl::Stmt::Kind::IfScope: {
+    auto *i = llvm::cast<msl::IfScope>(s);
+    return dropDeadDecls(i->thenB, used) + dropDeadDecls(i->elseB, used);
+  }
+  case msl::Stmt::Kind::WhileScope:
+    return dropDeadDecls(llvm::cast<msl::WhileScope>(s)->body, used);
+  case msl::Stmt::Kind::StateMachineScope: {
+    unsigned n = 0;
+    for (auto &c : llvm::cast<msl::StateMachineScope>(s)->cases)
+      n += dropDeadDecls(c.body, used);
+    return n;
+  }
+  case msl::Stmt::Kind::PlainScope:
+    return dropDeadDecls(llvm::cast<msl::PlainScope>(s)->body, used);
+  default:
+    return 0;
+  }
+}
+
+// Returns the number of decls removed, so the driver can iterate to fixpoint.
+unsigned dropDeadDecls(msl::Block &b,
+                       const llvm::DenseSet<llvm::StringRef> &used) {
+  unsigned removed = 0;
+  msl::Block keep;
+  keep.reserve(b.size());
+  for (msl::Stmt *s : b) {
+    if (auto *d = llvm::dyn_cast<msl::DeclStmt>(s))
+      if (!used.count(d->name) && !initHasCall(d->init)) {
+        ++removed;
+        continue;
+      }
+    removed += dropDeadDeclsIn(s, used);
+    keep.push_back(s);
+  }
+  b = std::move(keep);
+  return removed;
+}
+} // namespace
+
+// Removes locals the emitter declared but nothing reads. Runs to fixpoint:
+// dropping one decl can orphan the one feeding its initialiser.
+static void eliminateDeadLocals(msl::KernelFn *fn) {
+  for (int pass = 0; pass < 8; ++pass) {
+    DeadLocalMarker m;
+    m.stmt(fn);
+    if (m.sawRaw)
+      return;
+    if (dropDeadDecls(fn->body, m.used) == 0)
+      return;
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Return-struct type + device return type
 //===----------------------------------------------------------------------===//
 
@@ -379,6 +656,7 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     prologue.push_back(s);
   msl::KernelFn *fn = ctx.kernelFn(maxThreads, mslKernelName(func.getName()),
                                    params, std::move(prologue));
+  eliminateDeadLocals(fn);
   msl::MSLPrinter printer(os);
   printer.print(fn);
   return success();

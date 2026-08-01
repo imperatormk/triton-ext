@@ -25,6 +25,42 @@ _plugin = getattr(passes, 'plugin', None)
 _msl_out_lock = threading.Lock()
 
 
+_ASYNC_COPY_SYM = '__triton_tg_async_copy'
+_ASYNC_COPY_SHIM_AIR = os.path.join(os.path.dirname(__file__),
+                                    'async_copy_shim.air')
+
+
+def _compile_and_link_shim(msl):
+    """Compile MSL and link the prebuilt threadgroup-DMA shim into the metallib.
+
+    The in-process newLibraryWithSource: path used for every other kernel cannot
+    link a separate AIR object, so kernels calling the shim must go through the
+    command-line toolchain instead. That route costs roughly 10x more per kernel
+    (~580ms vs ~60ms, measured), which is why it is taken only when the emitted
+    MSL actually references the shim.
+    """
+    import subprocess
+    if not os.path.exists(_ASYNC_COPY_SHIM_AIR):
+        raise RuntimeError(
+            f"async-copy shim not built: {_ASYNC_COPY_SHIM_AIR} is missing")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, 'k.metal')
+        air = os.path.join(d, 'k.air')
+        lib = os.path.join(d, 'k.metallib')
+        with open(src, 'w') as f:
+            f.write(msl)
+        subprocess.run(
+            ['xcrun', '-sdk', 'macosx', 'metal', '-c',
+             '-fmetal-math-mode=safe', src, '-o', air],
+            check=True, capture_output=True)
+        subprocess.run(
+            ['xcrun', '-sdk', 'macosx', 'metallib', air,
+             _ASYNC_COPY_SHIM_AIR, '-o', lib],
+            check=True, capture_output=True)
+        with open(lib, 'rb') as f:
+            return f.read()
+
+
 def _pmaybe_enable_debug(pm):
     if os.environ.get('TRITON_MPS_DEBUG'):
         pm.enable_debug()
@@ -222,6 +258,8 @@ class MPSBackend(BaseBackend):
         # FP, silently miscompiling any kernel that produces or consumes Inf/NaN
         # or relies on RTNE. Which kernels see Inf/NaN is a runtime property, so
         # scoping is unsound; safe math is proven zero-cost on the GEMM path.
+        if _ASYNC_COPY_SYM in msl:
+            return _compile_and_link_shim(msl)
         from triton_apple_backend import metal_utils
         return metal_utils.compile_source(msl, 'safe')
 

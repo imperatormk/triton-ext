@@ -71,3 +71,20 @@ set_target_properties(TritonAppleGPUBackend PROPERTIES
 if(APPLE)
     target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-flat_namespace)
 endif()
+
+# Assemble the threadgroup-DMA shim once here rather than on every kernel
+# compile. Kernels that reference it are linked against this .air object.
+if(APPLE)
+    set(ASYNC_COPY_SHIM_SRC
+        "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend/async_copy_shim.ll")
+    set(ASYNC_COPY_SHIM_AIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend/async_copy_shim.air")
+    add_custom_command(
+        OUTPUT "${ASYNC_COPY_SHIM_AIR}"
+        COMMAND xcrun metal-as "${ASYNC_COPY_SHIM_SRC}" -o "${ASYNC_COPY_SHIM_AIR}"
+        DEPENDS "${ASYNC_COPY_SHIM_SRC}"
+        COMMENT "Assembling AppleGPU threadgroup async-copy shim")
+    add_custom_target(AppleGPUAsyncCopyShim ALL
+        DEPENDS "${ASYNC_COPY_SHIM_AIR}")
+    add_dependencies(TritonAppleGPUBackend AppleGPUAsyncCopyShim)
+endif()

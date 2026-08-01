@@ -4,4 +4,5 @@ build*
 !triton-ext.toml
 *.pyc
 *.so
+*.air
 .venv

@@ -268,7 +268,7 @@ void MSLEmitter::scanPool(Operation *op) {
           // drop the larger blocks; band it to what actually fits beside them.
           need = cBanded;
         } else {
-          need = std::max(stagedAB, cBanded);
+          need = std::max(stagedAB, dmaSlack ? cBanded : cFull);
         }
         // With both operands read in place (pipelined into their own
         // allocations) stagedAB is zero. The readback still declares a

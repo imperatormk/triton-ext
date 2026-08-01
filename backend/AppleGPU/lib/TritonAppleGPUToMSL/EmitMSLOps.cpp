@@ -1406,8 +1406,11 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     // async_wait, so the pipeliner is free to issue it into a slot the current
     // trip is still reading -- with numBuffers==1 it always does. We lower it
     // to a synchronous store, which would clobber that slot immediately, so
-    // the reads have to be fenced off first.
-    body.push_back(ctx.hardBarrier(false));
+    // the reads have to be fenced off first. Consecutive copies share one
+    // fence: the second would separate two staging writes that nothing reads
+    // in between.
+    if (body.empty() || !isa<msl::BarrierStmt>(body.back()))
+      body.push_back(ctx.hardBarrier(false));
     auto srcTy = cast<RankedTensorType>(ac.getSrc().getType());
     MemDescInfo dst = memdescMap[ac.getResult()];
     auto &ptrs = names(ac.getSrc());

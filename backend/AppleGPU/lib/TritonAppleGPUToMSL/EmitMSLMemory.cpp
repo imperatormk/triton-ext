@@ -258,6 +258,13 @@ void MSLEmitter::scanPool(Operation *op) {
         // exists; only an unmasked store bypasses threadgroup memory entirely.
         if (rk == 2 && fusedGemmCIsShuffled(d) && !fusedGemmCHasFallback(d)) {
           need = stagedAB;
+        } else if (stagedAB == 0) {
+          // Operands live in their own local_alloc buffers (the pipelined DMA
+          // path), so stagedAB is 0 and there is nothing for C to overlay in
+          // the pool. Reserving the whole C tile on top of those buffers is
+          // what asked for 45-56KB against a 32KB cap and had the autotuner
+          // drop the larger blocks; band it to what actually fits beside them.
+          need = std::min(cFull, poolBudget());
         } else {
           need = std::max(stagedAB, cFull);
         }

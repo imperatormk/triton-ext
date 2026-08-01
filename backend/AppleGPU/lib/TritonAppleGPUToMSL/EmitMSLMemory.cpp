@@ -269,6 +269,14 @@ void MSLEmitter::scanPool(Operation *op) {
           need = std::min(cFull, poolBudget());
       } else if (stagedAB + cFull <= poolBudget()) {
         need = stagedAB + cFull;
+      } else if (rk == 2 && dotIsFusedGemmAcc(d) && cStoresDirect(d)) {
+        // C stores straight to device and never reaches the pool, so a band
+        // reservation is pure waste. With both operands on DMA stagedAB is 0,
+        // and that 2KB band was the whole reason BLOCK_K=64 did not fit.
+        // fusedGemmCIsShuffled is stricter than needed here -- it also demands
+        // the epilogue relayout be a lane permutation, which fails at larger
+        // BLOCK_K even though the store itself is still direct.
+        need = stagedAB;
       } else {
         int64_t band = dotCBandRows(M, N, poolBudget(), accBytes);
         need = std::max(stagedAB, band * N * accBytes);

@@ -595,6 +595,7 @@ private:
   // pool does not have to reserve it.
   bool fusedGemmCIsShuffled(tt::DotOp d);
   bool fusedGemmCHasFallback(tt::DotOp d);
+  bool cStoresDirect(tt::DotOp d);
 
   // Bitmask over lane (or warp) bits that reduce the given axis: a bit reduces
   // if its LinearLayout basis maps to a nonzero coordinate on the reduced

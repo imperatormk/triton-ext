@@ -1965,6 +1965,19 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
 // True when the direct C store keeps a threadgroup fallback arm: a boundary
 // mask means the ragged tile still goes through the pool, so its space cannot
 // be reclaimed even though the full-tile path stores straight to device.
+// True when this dot's C goes straight to device with no threadgroup fallback
+// arm, so the readback never touches the pool.
+bool MSLEmitter::cStoresDirect(tt::DotOp d) {
+  auto forOp = dyn_cast<scf::ForOp>(d->getParentOp());
+  if (!forOp)
+    return false;
+  auto m = matchGemmDotLoop(forOp);
+  if (!m || m->first != d)
+    return false;
+  auto ds = matchDirectStore(forOp.getResult(m->second));
+  return ds && !ds->boundM;
+}
+
 bool MSLEmitter::fusedGemmCHasFallback(tt::DotOp d) {
   auto forOp = dyn_cast<scf::ForOp>(d->getParentOp());
   if (!forOp)
@@ -2116,7 +2129,13 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   // single 8-row band has to fit alongside the staging.
   int64_t cBand =
       std::min(cFull, std::max(stagedA + stagedB, (int64_t)8 * N * 4));
-  if (std::max(stagedA + stagedB, cBand) > poolBudget()) {
+  // Operands staged into their own local_alloc buffers are dead by the
+  // epilogue exactly like pool staging is, so the C band overlays them too.
+  // Counting the band *on top* of those buffers made poolBudget() zero and
+  // rejected the whole fused path -- which then forced C back through the
+  // pool, the very reservation this check was worried about.
+  int64_t liveOperandBytes = (stagedA == 0 && stagedB == 0) ? liveTgBytes : 0;
+  if (std::max(stagedA + stagedB, cBand) > poolBudget() + liveOperandBytes) {
     mslReject(op, "matchGemmDotLoop", "pool-over-budget");
     return std::nullopt;
   }

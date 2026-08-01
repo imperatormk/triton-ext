@@ -1441,6 +1441,27 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     int vw = accessVectorWidth(srcTy, ac.getSrc());
     if (vw < 2 || rc % vw != 0)
       vw = 1;
+    // accessVectorWidth only says the *device* addresses of a register run are
+    // contiguous. The threadgroup slots have to be contiguous as well, or the
+    // wide store writes the run down one row when the operand lays it out down
+    // a column. A column-major fp32 operand has sizePerThread [4,1], so its
+    // four consecutive registers land 64 slots apart, not 1.
+    if (vw > 1) {
+      auto slotOf = [&](int r) -> int64_t {
+        auto c = layout.registerCoords(srcTy, r);
+        auto shape = srcTy.getShape();
+        int64_t off = 0;
+        for (size_t d = 0; d < c.size(); ++d)
+          off = off * shape[d] + c[d];
+        return off;
+      };
+      int64_t base0 = slotOf(0);
+      for (int k = 1; k < vw; ++k)
+        if (slotOf(k) != base0 + k) {
+          vw = 1;
+          break;
+        }
+    }
     Type elem = elementScalarType(srcTy);
     msl::Type *scTy = scalarType(elem);
     std::string scName = mslScalarType(elem);

@@ -65,6 +65,13 @@ Value peelBroadcast(Value v) {
       v = e.getSrc();
       continue;
     }
+    // A layout convert on an index tensor relabels which lane holds which
+    // element; the values are unchanged, so it cannot affect whether the
+    // offset is a unit range or a uniform splat.
+    if (auto c = definingOp<ttg::ConvertLayoutOp>(v)) {
+      v = c.getSrc();
+      continue;
+    }
     return v;
   }
 }
@@ -254,6 +261,11 @@ std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
 // buffer, which is exactly what the pipeliner allocates.
 std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac) {
   if (!dmaStagingEnabled())
+    return std::nullopt;
+  // air.simdgroup_async_copy_2d takes no predicate, so a masked copy would
+  // read the full tile past the end of a ragged operand and stage garbage.
+  // Those keep the register path, which applies the mask per element.
+  if (ac.getMask())
     return std::nullopt;
   auto srcTy = dyn_cast<RankedTensorType>(ac.getSrc().getType());
   auto mt = dyn_cast<ttg::MemDescType>(ac.getResult().getType());

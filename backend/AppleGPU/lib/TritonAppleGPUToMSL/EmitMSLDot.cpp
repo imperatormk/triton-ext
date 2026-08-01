@@ -199,15 +199,11 @@ bool MSLEmitter::dmaStagingEnabled() {
 // the dot emitter cannot disagree about whether the shim is referenced.
 // Only the B operand is considered: add_prefetch_dot_operand has already
 // rotated A into a loop-carried value with no load left to match.
-std::optional<DirectStage> MSLEmitter::dotDmaStage(tt::DotOp op) {
-  if (!dmaStagingEnabled())
-    return std::nullopt;
-  // Only the fused path emits the copy. The panel and direct paths still read
-  // the operand's per-register names, which suppressing the load would leave
-  // unbound.
-  DotPlan p = planDot(op);
-  if (p.kind != DotPlan::Kind::Fused || p.bInPlace)
-    return std::nullopt;
+// Shape/element/pointer test for device-direct B staging. Deliberately free of
+// any planDot call: planDot itself needs this to size the pool, so the two
+// would otherwise recurse.
+std::optional<DirectStage> MSLEmitter::bDmaCandidate(tt::DotOp op,
+                                                    bool requireBound) {
   auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
   auto bTy = dyn_cast<RankedTensorType>(op.getB().getType());
   if (!aTy || !bTy || aTy.getRank() != 2 || bTy.getRank() != 2)
@@ -218,43 +214,35 @@ std::optional<DirectStage> MSLEmitter::dotDmaStage(tt::DotOp op) {
   Value stage = op.getB();
   if (Value s = dotOperandConvertSource(op, op.getB()))
     stage = s;
-  return matchDirectStage(stage, bTy.getShape()[0], bTy.getShape()[1]);
+  auto ds = matchDirectStage(stage, bTy.getShape()[0], bTy.getShape()[1]);
+  if (!ds)
+    return std::nullopt;
+  // The copy spells the base pointer and the strides as MSL scalars, so every
+  // one of them must already be bound. A shift defined inside the K-loop (or
+  // otherwise not yet emitted) has no name here.
+  auto bound = [&](Value v) {
+    if (!v)
+      return true;
+    auto it = valMap.find(v);
+    return it != valMap.end() && it->second.size() == 1;
+  };
+  if (requireBound &&
+      (!bound(ds->basePtr) || !bound(ds->rowStride) || !bound(ds->rowShift) ||
+       !bound(ds->colShift)))
+    return std::nullopt;
+  return ds;
 }
 
-// True when `op` is a load whose result only feeds dot operands that this
-// emitter will stage by DMA. Such a load is dead: the DMA moves the tile
-// device->threadgroup without ever materialising it in registers. The value is
-// still bound (to an empty register list) so nothing downstream looks it up.
-bool MSLEmitter::loadIsDmaStaged(Operation *op) {
+std::optional<DirectStage> MSLEmitter::dotDmaStage(tt::DotOp op) {
   if (!dmaStagingEnabled())
-    return false;
-  auto ld = dyn_cast<tt::LoadOp>(op);
-  if (!ld || ld.getResult().use_empty())
-    return false;
-  for (Operation *user : ld.getResult().getUsers()) {
-    // The operand may reach the dot through a layout convert that the dot
-    // itself elides (dotOperandConvertSource).
-    Operation *consumer = user;
-    if (auto c = dyn_cast<ttg::ConvertLayoutOp>(user)) {
-      if (!c.getResult().hasOneUse())
-        return false;
-      consumer = *c.getResult().user_begin();
-    }
-    auto d = dyn_cast<tt::DotOp>(consumer);
-    if (!d)
-      return false;
-    auto ds = dotDmaStage(d);
-    if (!ds)
-      return false;
-    // Only the B operand is DMA-staged; a load feeding A still needs registers.
-    Value stage = d.getB();
-    if (Value s = dotOperandConvertSource(d, d.getB()))
-      stage = s;
-    if (stage != user->getResult(0) && stage != ld.getResult())
-      return false;
-  }
-  bindDataless(ld.getResult());
-  return true;
+    return std::nullopt;
+  // Only the fused path emits the copy. The panel and direct paths still read
+  // the operand's per-register names, which suppressing the load would leave
+  // unbound.
+  DotPlan p = planDot(op);
+  if (p.kind != DotPlan::Kind::Fused || p.bInPlace)
+    return std::nullopt;
+  return bDmaCandidate(op);
 }
 
 // The K-loop induction variable, as an MSL name, when this dot sits directly in
@@ -313,6 +301,59 @@ msl::Stmt *MSLEmitter::dmaBegin(StringRef handle, StringRef tgBuf,
 msl::Stmt *MSLEmitter::dmaWait(StringRef handle) {
   return ctx.exprStmt(ctx.call("__triton_tg_async_copy_wait",
                                {ctx.var(handle)}));
+}
+
+// `h = begin(tgBbase + parity*stagedB, ...)` for the trip after the current
+// one. The destination is the tile the current MMAs are not reading, selected
+// by the parity flag the caller has already flipped.
+msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
+                                    const DotEmitCtx &dc,
+                                    const DirectStage &ds,
+                                    RankedTensorType bStageTy, int64_t ldb,
+                                    StringRef tripVar, bool nextTrip) {
+  int64_t eb = byteWidth(bStageTy.getElementType());
+  // The parity names the tile this trip READS. The priming copy fills that
+  // tile; the in-loop copy fills the other one, for the next trip to read
+  // after the top-of-trip flip.
+  msl::Expr *slot =
+      nextTrip ? ctx.paren(ctx.binary(B::Sub, ctx.i32lit(1),
+                                      ctx.var(fusedDot.dmaParity)))
+               : static_cast<msl::Expr *>(ctx.var(fusedDot.dmaParity));
+  // air.simdgroup_async_copy_2d is issued per simdgroup, so letting every warp
+  // request the whole tile would move it numWarps times over. Split it by rows
+  // instead: warp w takes the band [w*bandRows, (w+1)*bandRows).
+  int64_t nw = plan.numWarps > 0 ? plan.numWarps : 1;
+  int64_t band = ds.rows / nw;
+  bool split = band > 0 && ds.rows % nw == 0;
+  if (!split) {
+    band = ds.rows;
+    nw = 1;
+  }
+  msl::Expr *dst = ctx.paren(ctx.binary(
+      B::Add, ctx.var(dc.tgB),
+      ctx.paren(ctx.binary(B::Mul, slot, ctx.i32lit(plan.stagedB / eb)))));
+  // The next trip's tile starts one K-block further down B's rows.
+  msl::Expr *src = dmaTileOrigin(ds, tripVar);
+  if (nextTrip)
+    src = ctx.binary(
+        B::Add, src,
+        ctx.paren(ctx.binary(B::Mul, ctx.i32lit(ds.rows),
+                             ctx.var(scalarName(ds.rowStride)))));
+  if (split) {
+    msl::Expr *wRows =
+        ctx.paren(ctx.binary(B::Mul, ctx.var(warpId), ctx.i32lit(band)));
+    dst = ctx.paren(ctx.binary(
+        B::Add, dst,
+        ctx.paren(ctx.binary(B::Mul, wRows, ctx.i32lit(ldb)))));
+    src = ctx.binary(
+        B::Add, src,
+        ctx.paren(ctx.binary(B::Mul, wRows, ctx.var(scalarName(ds.rowStride)))));
+  }
+  msl::Expr *c = ctx.call(
+      "__triton_tg_async_copy_begin_" + std::to_string(eb),
+      {dst, ctx.i32lit(ldb), src, ctx.var(scalarName(ds.rowStride)),
+       ctx.i32lit(band), ctx.i32lit(ds.cols)});
+  return ctx.assignStmt(ctx.var(handle), c);
 }
 
 namespace {
@@ -500,6 +541,14 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   p.stagedB = p.bInPlace ? 0 : p.K * (p.N + p.bPad) * byteWidth(bElem);
   p.stagedAB = p.stagedA + p.stagedB;
   p.phase = fusedDot.phase;
+  // A second B tile for the in-flight copy, sitting directly after the first,
+  // so C (disjoint or banded) starts past both. Every phase must agree on this,
+  // or they would disagree about where C begins -- hence the binding-free form
+  // of the candidate test, which depends only on the IR.
+  p.dmaB = p.phase != FusedDotPhase::None && p.stagedB &&
+           dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false);
+  if (p.dmaB)
+    p.stagedAB += p.stagedB;
   // The fused epilogue writes C only after the K-loop, behind a barrier, so
   // its accumulators can reuse the (dead) A/B staging instead of claiming a
   // disjoint region. Keeping C disjoint there doubles the threadgroup
@@ -571,6 +620,21 @@ bool MSLEmitter::emitDot(tt::DotOp op, msl::Block &body) {
   dc.aNames = names(dc.aStage);
   dc.bNames = names(dc.bStage);
 
+  // The pipeline's parity/handle names must exist before dotPoolPtrs, which
+  // derives the read-side B pointer from the parity. Mint them on the first
+  // phase that sees this dot; their declarations are emitted in Decl.
+  if (plan.dmaB && fusedDot.dmaParity.empty()) {
+    fusedDot.dmaParity = fresh();
+    fusedDot.dmaHandle = fresh();
+  }
+
+  // Rotate the tile pair before the read-side pointer is derived: the copy the
+  // previous trip issued targeted the tile this trip reads.
+  if (plan.dmaB && plan.phase == FusedDotPhase::MMA)
+    body.push_back(ctx.assignStmt(
+        ctx.var(fusedDot.dmaParity),
+        ctx.binary(B::Sub, ctx.i32lit(1), ctx.var(fusedDot.dmaParity))));
+
   dotPoolPtrs(body, plan, dc);
   dc.ids = dotResultIds(body, op, plan);
 
@@ -615,14 +679,32 @@ void MSLEmitter::dotPoolPtrs(msl::Block &body, const DotPlan &plan,
   dc.tgA = fresh();
   dc.tgB = fresh();
   dc.tgC = fresh();
+  // Default the read-side B pointer to the single-tile case; the double-
+  // buffered path overrides it below. Phases that skip the A/B declarations
+  // still hand this name to the fragment loads.
+  dc.tgBCur = dc.tgB;
   if (plan.needAB) {
     body.push_back(ctx.declStmt(tgPtr(dc.opScalar), dc.tgA,
                                 plan.aInPlace ? inPlaceBase(*plan.aInPlace)
                                               : poolRegion(0, dc.opScalar)));
-    body.push_back(ctx.declStmt(tgPtr(dc.opScalar), dc.tgB,
-                                plan.bInPlace
-                                    ? inPlaceBase(*plan.bInPlace)
-                                    : poolRegion(plan.stagedA, dc.opScalar)));
+    msl::Expr *bBase = plan.bInPlace ? inPlaceBase(*plan.bInPlace)
+                                     : poolRegion(plan.stagedA, dc.opScalar);
+    body.push_back(ctx.declStmt(tgPtr(dc.opScalar), dc.tgB, bBase));
+    // With two B tiles, the one this trip's MMAs read is selected by the parity
+    // flag. dc.tgB stays the base of the pair (the copy indexes off it), and
+    // tgBCur is what the simdgroup_loads use.
+    if (plan.dmaB && !fusedDot.dmaParity.empty()) {
+      dc.tgBCur = fresh();
+      int64_t eb = byteWidth(elementScalarType(plan.bStage.getType()));
+      body.push_back(ctx.declStmt(
+          tgPtr(dc.opScalar), dc.tgBCur,
+          ctx.binary(B::Add, ctx.var(dc.tgB),
+                     ctx.paren(ctx.binary(B::Mul,
+                                          ctx.var(fusedDot.dmaParity),
+                                          ctx.i32lit(plan.stagedB / eb))))));
+    } else {
+      dc.tgBCur = dc.tgB;
+    }
   }
   if (plan.needC)
     body.push_back(
@@ -740,7 +822,7 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       if (fb.empty()) {
         fb = fresh();
         into.push_back(fragDecl(dc.opFrag, fb));
-        into.push_back(sgLoad(fb, dc.tgB, ki * 8 * ldb + ni * 8, ldb));
+        into.push_back(sgLoad(fb, dc.tgBCur, ki * 8 * ldb + ni * 8, ldb));
       }
       into.push_back(sgMultiplyAccumulate(acc, fa, fb));
     }
@@ -846,42 +928,69 @@ bool MSLEmitter::emitDotFused(
       fusedDot.accNames[j] = acc;
       body.push_back(accFragDecl(dc.accFragTy, acc));
     }
+    // Software-pipeline state. The prologue copy itself is issued at the top of
+    // the first MMA trip (the pool pointers are declared per-phase, so the
+    // threadgroup tile names are not in scope here); a null handle marks "no
+    // copy in flight yet" so that first trip skips the wait.
+    if (plan.dmaB) {
+      body.push_back(
+          ctx.declStmt(ctx.named("int"), fusedDot.dmaParity, ctx.i32lit(0)));
+      body.push_back(
+          ctx.declStmt(ctx.named("ulong"), fusedDot.dmaHandle, ctx.lit("0")));
+    }
     return true;
   }
 
   if (fusedDot.phase == FusedDotPhase::MMA) {
     // B may be staged by threadgroup DMA instead of through registers.
     //
-    // The copy cannot be issued before the leading barrier: that barrier is
-    // what guarantees the previous iteration's simdgroup_loads have finished
-    // reading this same buffer, and the DMA writes it. Issuing earlier is a
-    // multi-warp write-during-read race.
+    // Two B tiles alternate: this trip's MMAs read one while the copy feeding
+    // the next trip fills the other. Both the issue and the wait for a given
+    // tile therefore sit a full MMA block apart, which is the overlap -- a
+    // single-buffered copy has only A's register scatter to hide behind and
+    // measures ~30% slower than staging B through registers.
     //
-    // So the copy is issued just after that barrier and the wait is placed
-    // after A's register scatter, which is the only work available to overlap
-    // it: this iteration's MMAs read the tile, so the wait must precede the
-    // publish barrier.
+    // The rotation is carried in threadgroup memory, not registers, so the
+    // loop-carried state is just the parity flag and the event token.
     std::optional<DirectStage> bDma;
-    std::string bDmaHandle;
-    if (!plan.bInPlace)
+    if (plan.dmaB)
       bDma = dotDmaStage(op);
 
     bool stagesHere = !plan.aInPlace || !plan.bInPlace;
     if (stagesHere)
       barrier();
     if (bDma) {
-      bDmaHandle = fresh();
-      body.push_back(dmaBegin(
-          bDmaHandle, dc.tgB, ldb, dmaTileOrigin(*bDma, dotDmaTripVar(op)),
-          *bDma, byteWidth(bStageTy.getElementType())));
+      // First trip: nothing is in flight yet, so fill the tile this trip reads
+      // and wait for it. Later trips consume the copy issued a block earlier.
+      msl::Block prime;
+      prime.push_back(dmaBeginInto(fusedDot.dmaHandle, plan, dc, *bDma,
+                                   bStageTy, ldb, dotDmaTripVar(op),
+                                   /*nextTrip=*/false));
+      body.push_back(ctx.ifScope(
+          ctx.binary(B::Eq, ctx.var(fusedDot.dmaHandle), ctx.lit("0")),
+          std::move(prime)));
     }
     stageOperand(body, dc.tgA, dc.aStage, aStageTy, dc.aNames,
                  (bool)plan.aInPlace, nullptr, plan.aPad);
     stageOperand(body, dc.tgB, dc.bStage, bStageTy, dc.bNames,
                  (bool)plan.bInPlace || bDma.has_value(), nullptr, plan.bPad);
+    // A's register scatter is independent of B's tile, so it overlaps the
+    // transfer; the wait only has to precede the publish barrier.
     if (bDma)
-      body.push_back(dmaWait(bDmaHandle));
+      body.push_back(dmaWait(fusedDot.dmaHandle));
     barrier();
+    // Issue the next trip's B copy into the tile this trip is *not* reading.
+    // It lands after the publish barrier so the previous copy has been waited
+    // on and both tiles are quiescent, and before the MMA block so the whole
+    // block overlaps the transfer.
+    // The read-side pointer was derived from the parity at the top of this
+    // trip, so the parity must not move until the MMAs are done with it. Issue
+    // the next trip's copy into the other tile (parity, not 1-parity) and flip
+    // only at the start of the next trip.
+    if (bDma)
+      body.push_back(dmaBeginInto(fusedDot.dmaHandle, plan, dc, *bDma,
+                                  bStageTy, ldb, dotDmaTripVar(op),
+                                  /*nextTrip=*/true));
     // A prefetched operand arrives as a loop-carried block argument: its load
     // was issued for the *next* iteration, so the value consumed here is
     // already in registers and its global load can sink past this barrier to
@@ -917,7 +1026,7 @@ bool MSLEmitter::emitDotFused(
                 ctx.i32lit(ki * 8 * ldb), ctx.mul(pr.niExpr, ctx.i32lit(8))));
             into.push_back(ctx.exprStmt(
                 ctx.call(msl::builtin::sg::Load,
-                         {ctx.var(fb), ctx.binary(B::Add, ctx.var(dc.tgB), off),
+                         {ctx.var(fb), ctx.binary(B::Add, ctx.var(dc.tgBCur), off),
                           ctx.i32lit(ldb)})));
           }
         }

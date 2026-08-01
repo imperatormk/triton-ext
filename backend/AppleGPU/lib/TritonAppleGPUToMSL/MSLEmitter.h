@@ -30,6 +30,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Signals.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <set>
@@ -333,9 +334,14 @@ private:
                      const DotEmitCtx &dc);
   void dotPoolPtrs(msl::Block &body, const DotPlan &plan, DotEmitCtx &dc);
   static bool dmaStagingEnabled();
+  std::optional<DirectStage> bDmaCandidate(tt::DotOp op,
+                                           bool requireBound = true);
   std::optional<DirectStage> dotDmaStage(tt::DotOp op);
+  msl::Stmt *dmaBeginInto(StringRef handle, const DotPlan &plan,
+                          const DotEmitCtx &dc, const DirectStage &ds,
+                          RankedTensorType bStageTy, int64_t ldb,
+                          StringRef tripVar, bool nextTrip);
   StringRef dotDmaTripVar(tt::DotOp op);
-  bool loadIsDmaStaged(Operation *op);
   msl::Expr *dmaTileOrigin(const DirectStage &ds, StringRef tripVar);
   msl::Stmt *dmaBegin(StringRef handle, StringRef tgBuf, int64_t pitch,
                       msl::Expr *src, const DirectStage &ds, int64_t elemBytes);
@@ -370,7 +376,22 @@ private:
   void emitTileRoundTrip(Value res, Value src, RankedTensorType srcTy,
                          RankedTensorType resTy, msl::Block &body,
                          llvm::function_ref<msl::Expr *(int)> srcOff);
-  bool emitFailed = false;
+  // Assigning true prints the stack that set it when TRITON_MSL_TRACE_FAIL is
+  // set: emission failure otherwise unwinds through several `return false`
+  // hops and surfaces only as "PassManager::run failed".
+  struct FailFlag {
+    bool v = false;
+    FailFlag &operator=(bool b) {
+      if (b && !v && getenv("TRITON_MSL_TRACE_FAIL")) {
+        llvm::errs() << "[msl] emitFailed set here:\n";
+        llvm::sys::PrintStackTrace(llvm::errs());
+      }
+      v = b;
+      return *this;
+    }
+    operator bool() const { return v; }
+  };
+  FailFlag emitFailed;
 
   std::string fresh() { return "v" + std::to_string(nextId++); }
 

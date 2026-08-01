@@ -68,6 +68,9 @@ struct FusedDotCtx {
   SmallVector<std::string> baseNames;
   std::string tgA, tgB, tgC;
   std::optional<DirectStore> direct;
+  // Device-direct B staging: the in-flight copy's event token and the flag
+  // selecting which of the two B tiles it targets. Both are loop-carried.
+  std::string dmaHandle, dmaParity;
 };
 
 // The lowering strategy for one tt.dot plus every derived quantity the
@@ -129,6 +132,10 @@ struct DotPlan {
   // Pool layout: A at 0, B at stagedA, C at stagedAB (disjoint) or 0 (aliased
   // over A/B, which forces the banded C round-trip).
   int64_t stagedA = 0, stagedB = 0, stagedAB = 0;
+  // Device-direct B staging keeps two B tiles, at stagedA and stagedA+stagedB,
+  // so the copy feeding the next K-trip is in flight while this trip's MMAs
+  // read the other. Set only on the fused path.
+  bool dmaB = false;
   bool disjointC = false;
   int64_t bandRows = 0;
 
@@ -155,6 +162,9 @@ struct DotEmitCtx {
   ArrayRef<std::string> aNames, bNames, cInit;
 
   std::string tgA, tgB, tgC;
+  // With double-buffered DMA staging tgB is the base of the tile pair and
+  // tgBCur is the one this trip reads; otherwise they are the same.
+  std::string tgBCur;
   SmallVector<std::string> ids;
 
   StringAttr rowDim, colDim;

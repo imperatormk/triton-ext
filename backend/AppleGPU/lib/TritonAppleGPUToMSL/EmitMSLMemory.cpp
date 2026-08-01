@@ -147,6 +147,7 @@ void MSLEmitter::scanPool(Operation *op) {
     int64_t bBy = Kd * (N + bPad) * bEb;
     Type cE = cTy.getElementType();
     int64_t need;
+    int64_t dmaSlack = 0;
     if (isa<IntegerType>(cE)) {
       need = aBy + bBy;
     } else {
@@ -159,6 +160,17 @@ void MSLEmitter::scanPool(Operation *op) {
         if (dotOperandLocalLoad(d.getB(), Kd, N))
           stagedB = 0;
       }
+      // Device-direct B staging keeps a second B tile so the copy feeding the
+      // next K-trip can be in flight while this trip's MMAs read the other one.
+      // Held aside from stagedAB so it does not disturb the panel/C decisions
+      // below, and folded back into `need` once those have been made.
+      // scanPool runs before any fused phase is set, so ask the phase-free
+      // candidate test rather than dotDmaStage (which would see phase None and
+      // under-reserve the second tile).
+      dmaSlack =
+          (stagedB && dmaStagingEnabled() && bDmaCandidate(d, false))
+              ? bBy
+              : 0;
       int64_t stagedAB = stagedA + stagedB;
       int64_t cFull = M * N * accBytes;
       if (stagedAB == aBy + bBy &&
@@ -184,7 +196,7 @@ void MSLEmitter::scanPool(Operation *op) {
         need = std::max(stagedAB, band * N * accBytes);
       }
     }
-    poolBytes = std::max(poolBytes, need);
+    poolBytes = std::max(poolBytes, need + dmaSlack);
   } else if (auto r = dyn_cast<tt::ReduceOp>(op)) {
     auto st = cast<RankedTensorType>(r.getOperand(0).getType());
     tt::LinearLayout ll = ttg::toLinearLayout(st);

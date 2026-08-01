@@ -346,7 +346,6 @@ private:
                      const DotEmitCtx &dc);
   void dotPoolPtrs(msl::Block &body, const DotPlan &plan, DotEmitCtx &dc);
   static bool dmaStagingEnabled();
-  static int64_t dmaMinBandBytes();
   std::optional<DirectStage> bDmaCandidate(tt::DotOp op,
                                            bool requireBound = true);
   std::optional<DirectStage> dotDmaStage(tt::DotOp op);

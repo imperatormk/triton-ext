@@ -381,22 +381,6 @@ std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
 // The DMA form of an async copy: the pointer tensor must denote a contiguous
 // device tile whose destination is a plain unpadded row-major threadgroup
 // buffer, which is exactly what the pipeliner allocates.
-static int64_t dmaNumWarps(Operation *o) {
-  if (auto mod = o->getParentOfType<ModuleOp>())
-    if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
-      return a.getInt();
-  return 1;
-}
-
-int64_t MSLEmitter::dmaMinBandBytes() {
-  static const int64_t v = [] {
-    if (const char *s = getenv("TRITON_MSL_DMA_MIN_BAND"))
-      if (int64_t n = atoll(s); n >= 0)
-        return n;
-    return kDmaMinBandBytesDefault;
-  }();
-  return v;
-}
 
 // Shared by the copy itself and the sibling walk, so the two cannot disagree.
 bool MSLEmitter::dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac) {
@@ -424,13 +408,7 @@ bool MSLEmitter::dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac) {
   auto bt = dyn_cast<ttg::MemDescType>(buf.getType());
   if (!bt || bt.getRank() < 3 || bt.getShape()[0] < 2)
     return false;
-  // A request moves one warp's band, not the tile; below a few KB it costs more
-  // than the scatter it replaces (512B and 1KB both measured as losses).
   int64_t rows = mt.getShape()[0], cols = mt.getShape()[1];
-  int64_t nw = dmaNumWarps(ac);
-  int64_t band = (nw > 0 && rows % nw == 0) ? rows / nw : rows;
-  if (band * cols * byteWidth(e) < dmaMinBandBytes())
-    return false;
   return matchTilePointer(ac.getSrc(), rows, cols).has_value();
 }
 

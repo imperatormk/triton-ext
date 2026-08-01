@@ -43,8 +43,8 @@ namespace {
 // of accNames[j] must agree on it - MMA and both readback paths derive (mi, ni)
 // from this one place.
 struct WarpTiling {
-  int64_t miCount = 1, niCount = 1;  // subblock shape owned by one warp
-  int64_t wGridN = 1;                // warps across the N axis
+  int64_t miCount = 1, niCount = 1; // subblock shape owned by one warp
+  int64_t wGridN = 1;               // warps across the N axis
   bool twoD = false;
 
   int64_t slots() const { return miCount * niCount; }
@@ -204,19 +204,19 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // disjoint region. Keeping C disjoint there doubles the threadgroup
   // footprint and costs residency.
   bool fusedEpilogueC = p.phase != FusedDotPhase::None;
-  p.disjointC = !fusedEpilogueC &&
-                p.stagedAB + p.M * p.N * accBytes <= poolBudget();
+  p.disjointC =
+      !fusedEpilogueC && p.stagedAB + p.M * p.N * accBytes <= poolBudget();
   p.bandRows = p.M;
   if (!p.disjointC) {
     // C overlays the dead A/B staging in the fused epilogue, so a band that
     // fits inside what staging already claimed is free. Sizing it to the whole
     // budget instead would inflate the pool to the 32KB cap and drop residency
     // to one threadgroup per core, which costs far more than the extra bands.
-    int64_t budget = fusedEpilogueC ? std::max(p.stagedAB, (int64_t)8 * p.N *
-                                                               accBytes)
-                                    : poolBudget();
-    p.bandRows = dotCBandRows(p.M, p.N, std::min(budget, poolBudget()),
-                              accBytes);
+    int64_t budget = fusedEpilogueC
+                         ? std::max(p.stagedAB, (int64_t)8 * p.N * accBytes)
+                         : poolBudget();
+    p.bandRows =
+        dotCBandRows(p.M, p.N, std::min(budget, poolBudget()), accBytes);
   }
 
   p.needAB = p.phase == FusedDotPhase::None || p.phase == FusedDotPhase::MMA;
@@ -377,8 +377,8 @@ void MSLEmitter::dotReadback(msl::Block &tgt, RankedTensorType cTy,
                      ctx.binary(B::Lt, layout.layoutCoordExpr(cTy, r, rowDim),
                                 ctx.i32lit(r1))));
     if (rank == 3) {
-      msl::Expr *batchEq = ctx.binary(
-          B::Eq, layout.batchCoordExpr(cTy, r), ctx.i32lit(bi));
+      msl::Expr *batchEq =
+          ctx.binary(B::Eq, layout.batchCoordExpr(cTy, r), ctx.i32lit(bi));
       guard = guard ? ctx.paren(ctx.binary(B::LAnd, batchEq, guard))
                     : ctx.paren(batchEq);
     }
@@ -418,8 +418,8 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
   };
 
   const int64_t lda = K + plan.aPad, ldb = N + plan.bPad;
-  // A fragment (mi, ki) is shared by every column this warp owns, and B (ki, ni)
-  // by every row, so reloading per (mi, ni) pair costs nT-1 (resp. mT-1)
+  // A fragment (mi, ki) is shared by every column this warp owns, and B (ki,
+  // ni) by every row, so reloading per (mi, ni) pair costs nT-1 (resp. mT-1)
   // redundant simdgroup_loads each. The cache is cleared per warp block, which
   // is the region the fragments stay live across.
   llvm::DenseMap<std::pair<int64_t, int64_t>, std::string> aFrag, bFrag;
@@ -609,21 +609,20 @@ bool MSLEmitter::emitDotFused(
       int64_t wGridM = numWarps / wt.wGridN;
       // ni = (warpId % wGridN) * niCount + c
       auto niBase = [&]() -> msl::Expr * {
-        msl::Expr *col =
-            ctx.paren(ctx.binary(B::Rem, ctx.var(warpId), ctx.i32lit(wt.wGridN)));
+        msl::Expr *col = ctx.paren(
+            ctx.binary(B::Rem, ctx.var(warpId), ctx.i32lit(wt.wGridN)));
         return ctx.paren(ctx.mul(col, ctx.i32lit(wt.niCount)));
       };
-      std::string colKey =
-          "(" + warpId + " % " + std::to_string(wt.wGridN) + ")*" +
-          std::to_string(wt.niCount);
+      std::string colKey = "(" + warpId + " % " + std::to_string(wt.wGridN) +
+                           ")*" + std::to_string(wt.niCount);
       auto emitRow = [&](int64_t wr, msl::Block &into) {
         SmallVector<Slot> slots;
         for (int64_t r = 0; r < wt.miCount; ++r)
           for (int64_t c = 0; c < wt.niCount; ++c) {
             msl::Expr *ni =
                 c ? ctx.paren(ctx.add(niBase(), ctx.i32lit(c))) : niBase();
-            slots.push_back({wr * wt.miCount + r,
-                             colKey + "+" + std::to_string(c), ni});
+            slots.push_back(
+                {wr * wt.miCount + r, colKey + "+" + std::to_string(c), ni});
           }
         emitSlots(slots, into);
       };
@@ -683,8 +682,9 @@ bool MSLEmitter::emitDotFused(
     auto narrowed = [&](msl::Block &blk, StringRef accName) -> std::string {
       if (!d.narrowTo)
         return accName.str();
-      msl::Type *mt = ctx.matrix(d.narrowTo.isF16() ? msl::MatrixType::Elem::Half
-                                                    : msl::MatrixType::Elem::Bfloat);
+      msl::Type *mt =
+          ctx.matrix(d.narrowTo.isF16() ? msl::MatrixType::Elem::Half
+                                        : msl::MatrixType::Elem::Bfloat);
       msl::Type *sc = scalarType(d.narrowTo);
       std::string id = fresh();
       blk.push_back(ctx.declStmt(mt, id, nullptr));
@@ -694,8 +694,8 @@ bool MSLEmitter::emitDotFused(
               ctx.member(ctx.var(nm), msl::builtin::sg::ThreadElements),
               ctx.i32lit(e));
         };
-        blk.push_back(ctx.assignStmt(
-            elems(id), ctx.cast(CS::CStyle, sc, elems(accName))));
+        blk.push_back(ctx.assignStmt(elems(id),
+                                     ctx.cast(CS::CStyle, sc, elems(accName))));
       }
       return id;
     };
@@ -714,9 +714,8 @@ bool MSLEmitter::emitDotFused(
                      uniform(d.ldc)),
              ctx.paren(ctx.add(ctx.var(colB), ctx.i32lit(ni * 8)))});
         std::string sv = narrowed(inner, fusedDot.accNames[j]);
-        inner.push_back(
-            ctx.exprStmt(ctx.call(msl::builtin::sg::Store,
-                                  {ctx.var(sv), off, uniform(d.ldc)})));
+        inner.push_back(ctx.exprStmt(ctx.call(
+            msl::builtin::sg::Store, {ctx.var(sv), off, uniform(d.ldc)})));
       }
       ifBody.push_back(ctx.ifScope(
           ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
@@ -1488,7 +1487,8 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   // The fused epilogue overlays C's accumulators on the dead A/B staging and
   // writes it one row band at a time, so C never needs the whole tile - only a
   // single 8-row band has to fit alongside the staging.
-  int64_t cBand = std::min(cFull, std::max(stagedA + stagedB, (int64_t)8 * N * 4));
+  int64_t cBand =
+      std::min(cFull, std::max(stagedA + stagedB, (int64_t)8 * N * 4));
   if (std::max(stagedA + stagedB, cBand) > poolBudget()) {
     mslReject(op, "matchGemmDotLoop", "pool-over-budget");
     return std::nullopt;

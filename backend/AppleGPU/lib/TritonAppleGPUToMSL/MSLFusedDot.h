@@ -49,16 +49,16 @@ enum class FusedDotPhase { None, Decl, MMA, Readback };
 // gather). Populated when matchDirectStore succeeds; empty otherwise.
 struct DirectStore {
   tt::StoreOp store;
-  Value basePtr;           // C matrix base pointer (scalar kernel arg)
-  UniformInt ldc;          // row stride, col stride is 1 (row-major)
-  Value rowBase;           // global row of the tile's top-left element (scalar)
-  Value colBase;           // global col of the tile's top-left element (scalar)
-  UniformInt boundM;       // store-mask row bound, unset when unmasked
-  UniformInt boundN;       // store-mask col bound, unset when unmasked
-  Type narrowTo;             // f16/bf16 output element type, null when f32
+  Value basePtr;     // C matrix base pointer (scalar kernel arg)
+  UniformInt ldc;    // row stride, col stride is 1 (row-major)
+  Value rowBase;     // global row of the tile's top-left element (scalar)
+  Value colBase;     // global col of the tile's top-left element (scalar)
+  UniformInt boundM; // store-mask row bound, unset when unmasked
+  UniformInt boundN; // store-mask col bound, unset when unmasked
+  Type narrowTo;     // f16/bf16 output element type, null when f32
   Operation *narrowOp = nullptr; // the elided truncf, when narrowing
   Operation *cvt = nullptr;      // the layout convert feeding the store
-  std::string fullTileVar; // runtime "whole tile in bounds" predicate
+  std::string fullTileVar;       // runtime "whole tile in bounds" predicate
 };
 
 struct FusedDotCtx {

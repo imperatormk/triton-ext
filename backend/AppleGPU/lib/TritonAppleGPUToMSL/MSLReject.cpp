@@ -1,4 +1,5 @@
-// MSLReject.cpp - MSL_LOG_REJECT diagnostics for the fast-path classifier gates.
+// MSLReject.cpp - MSL_LOG_REJECT diagnostics for the fast-path classifier
+// gates.
 //
 // Diagnostics only: nothing here participates in codegen. MSL_LOG_REJECT=1
 // prints one MSL-REJECT line per gate rejection and, at process teardown, an
@@ -76,9 +77,9 @@ std::string configBrief(Operation *op) {
       return i.getInt();
     return -1;
   };
-  return ("warps=" + llvm::Twine(attr("ttg.num-warps")) + ",ctas=" +
-          llvm::Twine(attr("ttg.num-ctas")) + ",tpw=" +
-          llvm::Twine(attr("ttg.threads-per-warp")))
+  return ("warps=" + llvm::Twine(attr("ttg.num-warps")) +
+          ",ctas=" + llvm::Twine(attr("ttg.num-ctas")) +
+          ",tpw=" + llvm::Twine(attr("ttg.threads-per-warp")))
       .str();
 }
 

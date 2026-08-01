@@ -364,11 +364,13 @@ bool MSLEmitter::emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl,
     if (basis == 0)
       continue;
     msl::Expr *bit = ctx.paren(ctx.binary(
-        msl::BinOp::And, ctx.paren(ctx.binary(msl::BinOp::Shr, ctx.var(laneId), ctx.i32lit(b))),
+        msl::BinOp::And,
+        ctx.paren(ctx.binary(msl::BinOp::Shr, ctx.var(laneId), ctx.i32lit(b))),
         ctx.lit("1")));
-    msl::Expr *term =
-        ctx.paren(ctx.binary(msl::BinOp::Mul, bit, ctx.lit(std::to_string(basis))));
-    laneIdx = laneIdx ? ctx.paren(ctx.binary(msl::BinOp::Xor, laneIdx, term)) : term;
+    msl::Expr *term = ctx.paren(
+        ctx.binary(msl::BinOp::Mul, bit, ctx.lit(std::to_string(basis))));
+    laneIdx =
+        laneIdx ? ctx.paren(ctx.binary(msl::BinOp::Xor, laneIdx, term)) : term;
   }
 
   std::string laneVar;
@@ -389,7 +391,8 @@ bool MSLEmitter::emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl,
     }
     std::string id = fresh();
     body.push_back(ctx.declStmt(
-        declTy, id, shuffleExpr(msl::builtin::simd::Shuffle, scStr, srcName, laneVar)));
+        declTy, id,
+        shuffleExpr(msl::builtin::simd::Shuffle, scStr, srcName, laneVar)));
     ids.push_back(id);
   }
   bindRegs(cl.getResult(), ids);

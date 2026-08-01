@@ -762,9 +762,8 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
         for (auto [i, n] : llvm::enumerate(it->second))
           inner.push_back(ctx.assignStmt(ctx.var(outer[ri][i]), ctx.var(n)));
       }
-      body.push_back(
-          ctx.ifScope(ctx.unary(msl::UnOp::LNot, ctx.var(ftVar)),
-                      std::move(inner)));
+      body.push_back(ctx.ifScope(ctx.unary(msl::UnOp::LNot, ctx.var(ftVar)),
+                                 std::move(inner)));
       for (auto [ri, r] : llvm::enumerate(op->getResults()))
         if (!outer[ri].empty())
           valMap[r] = outer[ri];

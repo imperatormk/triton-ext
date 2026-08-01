@@ -13,7 +13,8 @@ namespace {
 
 // A tensor coordinate packed into one integer so it can key a DenseMap. Every
 // out dim is < 2^16 for the tile sizes the emitter builds.
-std::optional<uint64_t> packCoords(ArrayRef<std::pair<StringAttr, int32_t>> cs) {
+std::optional<uint64_t>
+packCoords(ArrayRef<std::pair<StringAttr, int32_t>> cs) {
   uint64_t key = 0;
   for (auto &[dim, v] : cs) {
     if (v < 0 || v >= (1 << 16))
@@ -82,7 +83,8 @@ std::optional<ShufflePlan> planIntraWarpShuffle(RankedTensorType srcTy,
 
   for (int32_t warp = 0; warp < nWarps; ++warp) {
     // Coordinates this warp owns on the source side, and who owns them.
-    llvm::DenseMap<uint64_t, std::pair<int32_t, int32_t>> owner; // -> (lane,reg)
+    llvm::DenseMap<uint64_t, std::pair<int32_t, int32_t>>
+        owner; // -> (lane,reg)
     for (int32_t reg = 0; reg < nSrcRegs; ++reg)
       for (int32_t lane = 0; lane < nLanes; ++lane) {
         auto k = at(sl, ids, reg, lane, warp);

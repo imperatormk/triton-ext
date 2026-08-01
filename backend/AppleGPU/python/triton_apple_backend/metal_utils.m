@@ -142,7 +142,9 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
             [enc setBytes:&info.floatVal length:sizeof(float) atIndex:i];
             break;
           case ArgInfo::BYTES:
-            [enc setBytes:info.bytesPtr length:(NSUInteger)info.bytesLen atIndex:i];
+            [enc setBytes:info.bytesPtr
+                   length:(NSUInteger)info.bytesLen
+                  atIndex:i];
             break;
           }
         }

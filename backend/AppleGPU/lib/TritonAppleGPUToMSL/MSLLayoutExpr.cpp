@@ -56,8 +56,9 @@ msl::Expr *LayoutExprBuilder::layoutCoordExpr(RankedTensorType rt, int reg,
       }
       // A maximal run of consecutive bits whose basis is the identity
       // (basis(k) == 1<<k) collapses to one masked shift instead of a per-bit
-      // (((id >> k) & 1) * basis) xor chain. The bases are powers of two, so the
-      // xor over a disjoint run is an or, i.e. a contiguous bitfield of idExpr.
+      // (((id >> k) & 1) * basis) xor chain. The bases are powers of two, so
+      // the xor over a disjoint run is an or, i.e. a contiguous bitfield of
+      // idExpr.
       if (basis == (1 << b)) {
         int e = b;
         while (e < n && ll.getBasis(in, e, outDim) == (1 << e))
@@ -65,8 +66,8 @@ msl::Expr *LayoutExprBuilder::layoutCoordExpr(RankedTensorType rt, int reg,
         int len = e - b;
         int32_t mask = ((1 << len) - 1) << b;
         // (idExpr & mask)  -- b is already the field's low bit, so no reshift.
-        terms.push_back(ctx.paren(ctx.binary(
-            msl::BinOp::And, ctx.var(idExpr), ctx.lit(std::to_string(mask)))));
+        terms.push_back(ctx.paren(ctx.binary(msl::BinOp::And, ctx.var(idExpr),
+                                             ctx.lit(std::to_string(mask)))));
         b = e;
         continue;
       }

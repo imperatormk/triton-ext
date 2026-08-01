@@ -10,8 +10,8 @@
 #include "MSLConstants.h"
 #include "MSLFusedDot.h"
 #include "MSLLayoutExpr.h"
-#include "MSLShufflePlan.h"
 #include "MSLPrinter.h"
+#include "MSLShufflePlan.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -481,11 +481,11 @@ private:
   // the same per-tile indices as the address. Extracts the two bounds.
   bool matchBoundaryMask(Value m, UniformInt &boundM, UniformInt &boundN);
 
-  // Recognise `acc(#mma) -> [narrowing] -> convert_layout -> tt.store(rowmajor)`
-  // as the sole consumer of the fused accumulator. An optional float narrowing
-  // (f32 -> f16/bf16) is threaded through and applied per fragment element on
-  // the way out; anything else (reduction, second dot, extra users) falls back
-  // to the pool readback.
+  // Recognise `acc(#mma) -> [narrowing] -> convert_layout ->
+  // tt.store(rowmajor)` as the sole consumer of the fused accumulator. An
+  // optional float narrowing (f32 -> f16/bf16) is threaded through and applied
+  // per fragment element on the way out; anything else (reduction, second dot,
+  // extra users) falls back to the pool readback.
   std::optional<DirectStore> matchDirectStore(Value forResult);
 
   static bool isPureBarrierOp(Operation *op);

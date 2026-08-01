@@ -119,9 +119,9 @@ class PrefetchDotOperandPass
     SmallVector<Value> newInits(forOp.getInitArgs().begin(),
                                 forOp.getInitArgs().end());
     newInits.push_back(peeled.getResult());
-    auto newFor = scf::ForOp::create(b, forOp.getLoc(), forOp.getLowerBound(),
-                                     forOp.getUpperBound(), forOp.getStep(),
-                                     newInits);
+    auto newFor =
+        scf::ForOp::create(b, forOp.getLoc(), forOp.getLowerBound(),
+                           forOp.getUpperBound(), forOp.getStep(), newInits);
     Block *body = forOp.getBody();
     Block *newBody = newFor.getBody();
 
@@ -145,9 +145,9 @@ class PrefetchDotOperandPass
     auto advanced = tt::AddPtrOp::create(
         ib, loc, r.advance.getResult().getType(),
         newBody->getArgument(r.ptrIdx + 1), r.advance.getOffset());
-    auto next = tt::LoadOp::create(ib, loc, advanced.getResult(),
-                                   r.load.getCache(), r.load.getEvict(),
-                                   r.load.getIsVolatile());
+    auto next =
+        tt::LoadOp::create(ib, loc, advanced.getResult(), r.load.getCache(),
+                           r.load.getEvict(), r.load.getIsVolatile());
     r.load.erase();
 
     auto yield = cast<scf::YieldOp>(newBody->getTerminator());

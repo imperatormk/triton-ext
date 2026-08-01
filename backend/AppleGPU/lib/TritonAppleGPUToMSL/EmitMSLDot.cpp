@@ -934,9 +934,6 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // of the candidate test, which depends only on the IR.
   p.dmaB = p.phase != FusedDotPhase::None && p.stagedB &&
            dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false) &&
-           // The second tile must fit, or the PSO fails to build at launch
-           // ("threadgroup memory size exceeds the maximum") rather than
-           // falling back.
            p.stagedAB + p.stagedB <= kTGResidentBudgetBytes;
   if (p.dmaB)
     p.stagedAB += p.stagedB;

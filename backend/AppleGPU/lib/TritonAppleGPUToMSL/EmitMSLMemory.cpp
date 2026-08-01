@@ -242,6 +242,8 @@ void MSLEmitter::scanPool(Operation *op) {
                      : 0;
       int64_t stagedAB = stagedA + stagedB;
       int64_t cFull = M * N * accBytes;
+      int64_t cBudget = poolBudget() - dmaSlack;
+      int64_t cBanded = std::min(cFull, cBudget);
       if (stagedAB == aBy + bBy &&
           dotNeedsPanel(M, N, Kd, elemBytes, accBytes)) {
         int64_t mp, np;
@@ -264,16 +266,16 @@ void MSLEmitter::scanPool(Operation *op) {
           // the pool. Reserving the whole C tile on top of those buffers is
           // what asked for 45-56KB against a 32KB cap and had the autotuner
           // drop the larger blocks; band it to what actually fits beside them.
-          need = std::min(cFull, poolBudget());
+          need = cBanded;
         } else {
-          need = std::max(stagedAB, cFull);
+          need = std::max(stagedAB, cBanded);
         }
         // With both operands read in place (pipelined into their own
         // allocations) stagedAB is zero. The readback still declares a
         // threadgroup C pointer whenever it emits a fallback arm, so the pool
         // has to cover that; an unmasked store has no such arm.
         if (need == 0 && fusedGemmCHasFallback(d))
-          need = std::min(cFull, poolBudget());
+          need = cBanded;
       } else if (stagedAB + cFull <= poolBudget()) {
         need = stagedAB + cFull;
       } else if (rk == 2 && dotIsFusedGemmAcc(d) && cStoresDirect(d)) {
@@ -285,7 +287,7 @@ void MSLEmitter::scanPool(Operation *op) {
         // BLOCK_K even though the store itself is still direct.
         need = stagedAB;
       } else {
-        int64_t band = dotCBandRows(M, N, poolBudget(), accBytes);
+        int64_t band = dotCBandRows(M, N, cBudget, accBytes);
         need = std::max(stagedAB, band * N * accBytes);
       }
     }

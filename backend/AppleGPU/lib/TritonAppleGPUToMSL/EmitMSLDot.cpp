@@ -516,7 +516,7 @@ StringRef MSLEmitter::dotDmaTripVar(Operation *op) {
 msl::Expr *MSLEmitter::dmaRowStride(const DirectStage &ds) {
   if (ds.rowStrideLit)
     return ctx.i32lit(*ds.rowStrideLit);
-  return dmaRowStride(ds);
+  return ctx.var(scalarName(ds.rowStride));
 }
 
 // The tile origin: base + (rowShift*rowStride + colShift) elements, plus the
@@ -733,7 +733,30 @@ void MSLEmitter::stageOperand(msl::Block &body, StringRef tgName, Value stage,
                               int64_t rowPad) {
   if (skip)
     return;
-  for (int r = 0, n = regCount(stage); r < n; ++r) {
+  int n = regCount(stage);
+  // Consecutive registers whose threadgroup slots are also consecutive can be
+  // published as one vector store instead of vw scalar stores that each rebuild
+  // the whole swizzle index. A column-major operand lays its registers down a
+  // column (slots rowLen apart), so the run has to be checked, not assumed.
+  int vw = stageVectorWidth(stageTy, n, rowPad);
+  Type elem = elementScalarType(stageTy);
+  for (int r = 0; r < n; r += (vw > 1 ? vw : 1)) {
+    if (vw > 1 && !guard) {
+      msl::Type *vecTy =
+          ctx.vector(cast<msl::ScalarType>(scalarType(elem))->s, vw);
+      msl::Type *tgVecPtr = ctx.ptr(vecTy, msl::AddrSpace::Threadgroup);
+      SmallVector<msl::Expr *> elems;
+      for (int k = 0; k < vw; ++k)
+        elems.push_back(ctx.var(names[r + k]));
+      body.push_back(ctx.assignStmt(
+          ctx.deref(ctx.paren(ctx.cast(
+              msl::Cast::Style::CStyle, tgVecPtr,
+              ctx.paren(ctx.binary(
+                  msl::BinOp::Add, ctx.var(tgName),
+                  layout.sliceFlatOffset(stageTy, r, rowPad)))))),
+          ctx.call(mslScalarType(elem) + std::to_string(vw), elems)));
+      continue;
+    }
     msl::Stmt *asn = ctx.assignStmt(
         ctx.subscript(ctx.var(tgName),
                       layout.sliceFlatOffset(stageTy, r, rowPad)),
@@ -741,6 +764,49 @@ void MSLEmitter::stageOperand(msl::Block &body, StringRef tgName, Value stage,
     msl::Expr *g = guard ? guard(r) : nullptr;
     body.push_back(g ? ctx.compactIf(g, asn) : asn);
   }
+}
+
+// The widest run of consecutive registers that lands on consecutive threadgroup
+// slots, capped at 4 (MSL's widest vector). Returns 1 when no widening is safe.
+int MSLEmitter::stageVectorWidth(RankedTensorType stageTy, int regs,
+                                 int64_t rowPad) {
+  if (regs < 2)
+    return 1;
+  auto shape = stageTy.getShape();
+  int rk = shape.size();
+  if (rk < 2)
+    return 1;
+  auto slotOf = [&](int r) -> int64_t {
+    auto c = layout.registerCoords(stageTy, r);
+    if ((int)c.size() != rk)
+      return -1;
+    int64_t off = 0;
+    for (int d = 0; d < rk; ++d)
+      off = off * (d == rk - 1 ? shape[d] + rowPad : shape[d]) + c[d];
+    return off;
+  };
+  int64_t s0 = slotOf(0);
+  if (s0 < 0)
+    return 1;
+  int vw = 1;
+  for (int k = 1; k < 4 && k < regs; ++k) {
+    int64_t sk = slotOf(k);
+    if (sk < 0 || sk - s0 != k)
+      break;
+    vw = k + 1;
+  }
+  if (vw < 2 || regs % vw != 0)
+    return 1;
+  // Every run must repeat the pattern, not just the first one.
+  for (int base = vw; base + vw <= regs; base += vw) {
+    int64_t b0 = slotOf(base);
+    if (b0 < 0)
+      return 1;
+    for (int k = 1; k < vw; ++k)
+      if (slotOf(base + k) - b0 != k)
+        return 1;
+  }
+  return vw;
 }
 
 // Strategy + budget arithmetic for one tt.dot. Pure: reads the op, the layout
@@ -2135,7 +2201,42 @@ bool MSLEmitter::cStoresDirect(tt::DotOp d) {
   if (!m || m->first != d)
     return false;
   auto ds = matchDirectStore(forOp.getResult(m->second));
-  return ds && !ds->boundM;
+  if (!ds)
+    return false;
+  if (!ds->boundM)
+    return true;
+  auto cTy = cast<RankedTensorType>(d.getResult().getType());
+  int rk = cTy.getRank();
+  return directStoreNeverRagged(*ds, cTy.getShape()[rk - 2],
+                                cTy.getShape()[rk - 1]);
+}
+
+// `origin` is a multiple of `blk` when it is spelled `x * blk` (or `blk * x`),
+// which is how every tile origin reaches here: `pid * BLOCK`. A bare scalar
+// carries no such proof and is rejected.
+static bool isMultipleOfBlock(Value origin, int64_t blk) {
+  if (blk <= 0)
+    return false;
+  auto mul = dyn_cast_or_null<arith::MulIOp>(origin.getDefiningOp());
+  if (!mul)
+    return false;
+  APInt c;
+  for (Value side : {mul.getRhs(), mul.getLhs()})
+    if (matchPattern(side, m_ConstantInt(&c)) && c.getSExtValue() != 0 &&
+        c.getSExtValue() % blk == 0)
+      return true;
+  return false;
+}
+
+bool MSLEmitter::directStoreNeverRagged(const DirectStore &ds, int64_t M,
+                                        int64_t N) {
+  if (!ds.boundM || !ds.boundN)
+    return false;
+  if (!ds.boundM.lit || !ds.boundN.lit)
+    return false;
+  if (M <= 0 || N <= 0 || *ds.boundM.lit % M != 0 || *ds.boundN.lit % N != 0)
+    return false;
+  return isMultipleOfBlock(ds.rowBase, M) && isMultipleOfBlock(ds.colBase, N);
 }
 
 bool MSLEmitter::fusedGemmCHasFallback(tt::DotOp d) {
@@ -2146,7 +2247,12 @@ bool MSLEmitter::fusedGemmCHasFallback(tt::DotOp d) {
   if (!m || m->first != d)
     return false;
   auto ds = matchDirectStore(forOp.getResult(m->second));
-  return ds && ds->boundM;
+  if (!ds || !ds->boundM)
+    return false;
+  auto cTy = cast<RankedTensorType>(d.getResult().getType());
+  int rk = cTy.getRank();
+  return !directStoreNeverRagged(*ds, cTy.getShape()[rk - 2],
+                                 cTy.getShape()[rk - 1]);
 }
 
 bool MSLEmitter::fusedGemmCIsShuffled(tt::DotOp d) {

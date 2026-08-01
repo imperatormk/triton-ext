@@ -349,7 +349,10 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
     std::string ft = fresh();
     ds->fullTileVar = ft;
     msl::Expr *cond;
-    if (ds->boundM) {
+    if (ds->boundM && directStoreNeverRagged(*ds, M, N)) {
+      cond = ctx.lit("true");
+      ds->alwaysFullTile = true;
+    } else if (ds->boundM) {
       auto uniform = [&](const UniformInt &u) -> msl::Expr * {
         return u.lit ? static_cast<msl::Expr *>(ctx.i32lit(*u.lit))
                      : ctx.var(scalarName(u.val));

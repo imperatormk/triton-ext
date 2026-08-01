@@ -527,6 +527,16 @@ private:
   bool matchBoundaryMask(Value m, Value rowBase, Value colBase,
                          UniformInt &boundM, UniformInt &boundN);
 
+  // True when a boundary-masked store can never actually be ragged: both bounds
+  // are compile-time literals, and each tile origin is provably a multiple of
+  // its block size (`pid * BLOCK`), which the bound divides exactly. Both halves
+  // are required -- a literal bound alone says nothing about where the tile
+  // starts. Anything dynamic or indivisible keeps the fallback arm and its pool
+  // reservation.
+  bool directStoreNeverRagged(const DirectStore &ds, int64_t M, int64_t N);
+
+  int stageVectorWidth(RankedTensorType stageTy, int regs, int64_t rowPad);
+
   // Recognise `acc(#mma) -> [narrowing] -> convert_layout ->
   // tt.store(rowmajor)` as the sole consumer of the fused accumulator. An
   // optional float narrowing (f32 -> f16/bf16) is threaded through and applied

@@ -2134,7 +2134,14 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   // Counting the band *on top* of those buffers made poolBudget() zero and
   // rejected the whole fused path -- which then forced C back through the
   // pool, the very reservation this check was worried about.
-  int64_t liveOperandBytes = (stagedA == 0 && stagedB == 0) ? liveTgBytes : 0;
+  // Credit only *this dot's* operand tiles, not liveTgBytes: that counts every
+  // local_alloc in the function, so on a multi-dot kernel it hands out far more
+  // headroom than the epilogue can actually reuse and the kernel then asks for
+  // more threadgroup memory than the device has.
+  int64_t liveOperandBytes =
+      (stagedA == 0 && stagedB == 0)
+          ? std::min(liveTgBytes, aBytes + bBytes)
+          : 0;
   if (std::max(stagedA + stagedB, cBand) > poolBudget() + liveOperandBytes) {
     mslReject(op, "matchGemmDotLoop", "pool-over-budget");
     return std::nullopt;

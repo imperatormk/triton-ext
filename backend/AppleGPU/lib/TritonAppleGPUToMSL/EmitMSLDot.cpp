@@ -265,8 +265,14 @@ std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalO
   // air.simdgroup_async_copy_2d takes no predicate, so a masked copy would
   // read the full tile past the end of a ragged operand and stage garbage.
   // Those keep the register path, which applies the mask per element.
-  if (ac.getMask())
-    return std::nullopt;
+  // A per-element mask cannot be expressed -- the intrinsic takes no predicate,
+  // and the copy would read past a ragged operand. A *uniform* mask can: the
+  // pipeliner splats a single "is this trip in range" i1 across the tile, and
+  // that just guards the whole call. Distinguishing the two is what lets the
+  // pipelined copies reach the DMA at all.
+  if (Value m = ac.getMask())
+    if (!definingOp<tt::SplatOp>(peelBroadcast(m)))
+      return std::nullopt;
   auto srcTy = dyn_cast<RankedTensorType>(ac.getSrc().getType());
   auto mt = dyn_cast<ttg::MemDescType>(ac.getResult().getType());
   if (!srcTy || !mt || srcTy.getRank() != 2 || mt.getRank() != 2)

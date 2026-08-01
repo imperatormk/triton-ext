@@ -1508,12 +1508,17 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
             ctx.paren(ctx.binary(B::Mul, wRows,
                                  ctx.var(scalarName(ds->rowStride)))));
       }
-      body.push_back(ctx.assignStmt(
+      msl::Stmt *issue = ctx.assignStmt(
           ctx.var(h),
           ctx.call("__triton_tg_async_copy_begin_" + std::to_string(eb),
                    {dstPtr, ctx.i32lit(cols), srcPtr,
                     ctx.var(scalarName(ds->rowStride)), ctx.i32lit(band),
-                    ctx.i32lit(cols)})));
+                    ctx.i32lit(cols)}));
+      // A uniform mask guards the whole issue; the token stays 0 when the trip
+      // is out of range, and waiting on a null token is a no-op.
+      if (Value m = ac.getMask())
+        issue = ctx.compactIf(ctx.var(names(m)[0]), issue);
+      body.push_back(issue);
       pendingDmaHandles.push_back(h);
       bindDataless(ac.getResult());
       return true;

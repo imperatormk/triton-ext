@@ -546,7 +546,11 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // or they would disagree about where C begins -- hence the binding-free form
   // of the candidate test, which depends only on the IR.
   p.dmaB = p.phase != FusedDotPhase::None && p.stagedB &&
-           dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false);
+           dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false) &&
+           // The second tile must fit, or the PSO fails to build at launch
+           // ("threadgroup memory size exceeds the maximum") rather than
+           // falling back.
+           p.stagedAB + p.stagedB <= kTGResidentBudgetBytes;
   if (p.dmaB)
     p.stagedAB += p.stagedB;
   // The fused epilogue writes C only after the K-loop, behind a barrier, so

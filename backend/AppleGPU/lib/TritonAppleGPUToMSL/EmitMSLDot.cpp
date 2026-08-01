@@ -1184,8 +1184,16 @@ bool MSLEmitter::emitDotFused(
       readbackInto(tgt, 0, 0, M);
       tgt.push_back(ctx.hardBarrier(false));
     }
-    body.push_back(ctx.ifElseScope(ctx.var(d.fullTileVar), std::move(ifBody),
-                                   std::move(elseBody)));
+    if (d.alwaysFullTile) {
+      // Unmasked store: the fallback arm is dead. Emitting it anyway keeps a
+      // threadgroup C pointer live and forces a pool reservation the kernel
+      // never touches.
+      for (msl::Stmt *s : ifBody)
+        body.push_back(s);
+    } else {
+      body.push_back(ctx.ifElseScope(ctx.var(d.fullTileVar), std::move(ifBody),
+                                     std::move(elseBody)));
+    }
     return true;
   }
 

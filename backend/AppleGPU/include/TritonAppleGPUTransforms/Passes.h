@@ -19,6 +19,10 @@ std::unique_ptr<mlir::Pass> createStoreShuffleLayoutPass();
 // it retires under the MMA block.
 std::unique_ptr<mlir::Pass> createPrefetchDotOperandPass();
 
+// Route K-loop dot operands through shared memory (local_alloc/local_load) so
+// Triton's software pipeliner will multi-buffer them.
+std::unique_ptr<mlir::Pass> createShareDotOperandsPass();
+
 } // namespace mlir::triton::applegpu
 
 // Generated pass declarations

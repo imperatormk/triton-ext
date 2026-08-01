@@ -7,6 +7,8 @@
 #include "TritonAppleGPUTransforms/Passes.h"
 #include "triton/Tools/PluginUtils.h"
 
+#include <iterator>
+
 // ---------------------------------------------------------------------------
 // Pass "add" callbacks — each appends its pass to the pipeline.
 // ---------------------------------------------------------------------------
@@ -26,6 +28,10 @@ static void addStoreShuffleLayout(mlir::PassManager *pm,
 static void addPrefetchDotOperand(mlir::PassManager *pm,
                                   const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createPrefetchDotOperandPass());
+}
+static void addShareDotOperands(mlir::PassManager *pm,
+                                const std::vector<std::string> &) {
+  pm->addPass(mlir::triton::applegpu::createShareDotOperandsPass());
 }
 static void addEmitMSL(mlir::PassManager *pm,
                        const std::vector<std::string> &) {
@@ -54,6 +60,11 @@ static void registerStoreShuffleLayout() {
 static void registerPrefetchDotOperand() {
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return mlir::triton::applegpu::createPrefetchDotOperandPass();
+  });
+}
+static void registerShareDotOperands() {
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::triton::applegpu::createShareDotOperandsPass();
   });
 }
 static void registerEmitMSL() {
@@ -85,6 +96,8 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
        registerStoreShuffleLayout},
       {"prefetch_dot_operand", "0.1.0", addPrefetchDotOperand,
        registerPrefetchDotOperand},
+      {"share_dot_operands", "0.1.0", addShareDotOperands,
+       registerShareDotOperands},
       {"emit_msl", "0.1.0", addEmitMSL, registerEmitMSL},
   };
 
@@ -97,9 +110,12 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       "TritonAppleGPUBackend",
       "0.1.0",
       passes,
-      5, // numPasses
+      // Derived from the arrays above: a hardcoded count silently truncates
+      // the table when a pass is added (the dropped entry then resolves to a
+      // null function pointer and segfaults at pipeline construction).
+      std::size(passes),
       dialects,
-      1, // numDialects
+      std::size(dialects),
       nullptr,
       0, // numOps
       TRITON_VERSION,

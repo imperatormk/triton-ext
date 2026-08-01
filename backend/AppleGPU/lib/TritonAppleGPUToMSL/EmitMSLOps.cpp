@@ -367,6 +367,7 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
                      uniform(ds->boundN))));
     } else {
       cond = ctx.lit("true");
+      ds->alwaysFullTile = true;
     }
     body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), ft, cond));
     fusedDot.direct = ds;
@@ -1337,12 +1338,17 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     auto mt = cast<ttg::MemDescType>(la.getResult().getType());
     // `threadgroup sc buf[N];` - the address space is part of the element type
     // spelling for a threadgroup array decl.
-    msl::Type *scTy =
-        ctx.named("threadgroup " + mslScalarType(mt.getElementType()));
-    std::string buf = "__tg_buf_" + std::to_string(tgScratchId++);
-    body.push_back(ctx.arrayDeclStmt(scTy, buf, memdescFlatSize(mt)));
-    memdescMap[la.getResult()] = {buf, nullptr};
+    // emitFunc pre-declared every allocation so planDot could see it; only
+    // mint one here if that prescan did not run (device functions).
+    if (!memdescMap.count(la.getResult())) {
+      msl::Type *scTy =
+          ctx.named("threadgroup " + mslScalarType(mt.getElementType()));
+      std::string buf = "__tg_buf_" + std::to_string(tgScratchId++);
+      body.push_back(ctx.arrayDeclStmt(scTy, buf, memdescFlatSize(mt)));
+      memdescMap[la.getResult()] = {buf, nullptr};
+    }
     if (Value init = la.getSrc()) {
+      const std::string &buf = memdescMap[la.getResult()].buf;
       auto srcTy = cast<RankedTensorType>(init.getType());
       auto &vals = names(init);
       body.push_back(ctx.hardBarrier(false));
@@ -1397,16 +1403,71 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     auto &ptrs = names(ac.getSrc());
     bool hasMask = ac.getMask() != nullptr;
     SmallVector<std::string> *mask = hasMask ? &names(ac.getMask()) : nullptr;
-    for (int r = 0, n = regCount(ac.getSrc()); r < n; ++r) {
-      msl::Expr *addr =
-          ctx.subscript(ctx.var(dst.buf), memdescElemAddr(dst, srcTy, r));
-      msl::Expr *load = ctx.deref(ctx.var(ptrs[r]));
-      msl::Stmt *asn = ctx.assignStmt(addr, load);
-      if (hasMask)
-        body.push_back(
-            ctx.compactIf(ctx.var((*mask)[mask->size() == 1 ? 0 : r]), asn));
-      else
-        body.push_back(asn);
+    int rc = regCount(ac.getSrc());
+    // Mirror the tt.load lowering: a run of registers that is contiguous in
+    // device memory is one wide load, and a predicate that holds for every
+    // register is hoisted so the run issues unconditionally. Without this the
+    // pipelined staging is one predicated scalar load per element -- measured
+    // 24 scalar copies where the register path issues 6 vector loads.
+    int vw = accessVectorWidth(srcTy, ac.getSrc());
+    if (vw < 2 || rc % vw != 0)
+      vw = 1;
+    Type elem = elementScalarType(srcTy);
+    msl::Type *scTy = scalarType(elem);
+    std::string scName = mslScalarType(elem);
+
+    auto stageRun = [&](msl::Block &into, int base) {
+      if (vw == 1) {
+        into.push_back(ctx.assignStmt(
+            ctx.subscript(ctx.var(dst.buf), memdescElemAddr(dst, srcTy, base)),
+            ctx.deref(ctx.var(ptrs[base]))));
+        return;
+      }
+      msl::Type *vecTy = ctx.vector(cast<msl::ScalarType>(scTy)->s, vw);
+      msl::Type *vecPtr = ctx.ptr(vecTy, msl::AddrSpace::Device);
+      std::string vid = fresh();
+      into.push_back(ctx.declStmt(
+          vecTy, vid,
+          ctx.deref(ctx.paren(
+              ctx.cast(CS::CStyle, vecPtr, ctx.var(ptrs[base]))))));
+      for (int k = 0; k < vw; ++k)
+        into.push_back(ctx.assignStmt(
+            ctx.subscript(ctx.var(dst.buf),
+                          memdescElemAddr(dst, srcTy, base + k)),
+            ctx.subscript(ctx.var(vid), ctx.i32lit(k))));
+    };
+
+    if (hasMask && rc >= kMaskFastPathMinRegs) {
+      SmallVector<msl::Expr *> ms;
+      llvm::StringSet<> seen;
+      for (int r = 0; r < rc; ++r) {
+        StringRef mn = (*mask)[mask->size() == 1 ? 0 : r];
+        if (seen.insert(mn).second)
+          ms.push_back(ctx.var(mn));
+      }
+      msl::Block hot, cold;
+      for (int base = 0; base < rc; base += vw)
+        stageRun(hot, base);
+      for (int r = 0; r < rc; ++r)
+        cold.push_back(ctx.compactIf(
+            ctx.var((*mask)[mask->size() == 1 ? 0 : r]),
+            ctx.assignStmt(
+                ctx.subscript(ctx.var(dst.buf), memdescElemAddr(dst, srcTy, r)),
+                ctx.deref(ctx.var(ptrs[r])))));
+      msl::Expr *all = ms[0];
+      for (size_t i = 1; i < ms.size(); ++i)
+        all = ctx.binary(B::And, all, ms[i]);
+      body.push_back(ctx.ifElseScope(all, std::move(hot), std::move(cold)));
+    } else if (hasMask) {
+      for (int r = 0; r < rc; ++r)
+        body.push_back(ctx.compactIf(
+            ctx.var((*mask)[mask->size() == 1 ? 0 : r]),
+            ctx.assignStmt(
+                ctx.subscript(ctx.var(dst.buf), memdescElemAddr(dst, srcTy, r)),
+                ctx.deref(ctx.var(ptrs[r])))));
+    } else {
+      for (int base = 0; base < rc; base += vw)
+        stageRun(body, base);
     }
     body.push_back(ctx.barrier(false));
     bindDataless(ac.getResult());

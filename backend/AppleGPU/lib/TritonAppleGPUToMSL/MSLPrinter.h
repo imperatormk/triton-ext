@@ -58,6 +58,8 @@ private:
   // boundary.
   bool barrierPending = false;
   bool barrierPendingDevice = false;
+  // True immediately after a hard barrier was printed with nothing since.
+  bool justEmittedBarrier = false;
   void flushBarrier();
 
   llvm::raw_ostream &ind() {

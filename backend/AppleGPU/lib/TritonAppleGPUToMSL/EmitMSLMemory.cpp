@@ -192,6 +192,12 @@ void MSLEmitter::scanPool(Operation *op) {
         } else {
           need = std::max(stagedAB, cFull);
         }
+        // With both operands read in place (pipelined into their own
+        // allocations) stagedAB is zero. The readback still declares a
+        // threadgroup C pointer whenever it emits a fallback arm, so the pool
+        // has to cover that; an unmasked store has no such arm.
+        if (need == 0 && fusedGemmCHasFallback(d))
+          need = std::min(cFull, poolBudget());
       } else if (stagedAB + cFull <= poolBudget()) {
         need = stagedAB + cFull;
       } else {

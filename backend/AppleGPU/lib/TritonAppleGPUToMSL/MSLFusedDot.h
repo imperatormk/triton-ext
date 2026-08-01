@@ -59,6 +59,10 @@ struct DirectStore {
   Operation *narrowOp = nullptr; // the elided truncf, when narrowing
   Operation *cvt = nullptr;      // the layout convert feeding the store
   std::string fullTileVar;       // runtime "whole tile in bounds" predicate
+  // True when fullTileVar is the constant `true` (an unmasked store): the
+  // threadgroup fallback arm is then unreachable and must not be emitted, or
+  // it forces a C pool reservation that is never indexed.
+  bool alwaysFullTile = false;
 };
 
 struct FusedDotCtx {

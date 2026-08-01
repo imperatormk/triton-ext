@@ -380,14 +380,21 @@ void MSLPrinter::printBlock(const Block &b) {
   for (const Stmt *s : b) {
     if (auto *bar = llvm::dyn_cast<BarrierStmt>(s)) {
       if (bar->hard) {
-        // Flush any pending soft barrier, then emit this one verbatim; it never
-        // collapses with an adjacent barrier.
+        // Flush any pending soft barrier, then emit this one verbatim. Two
+        // hard barriers in a row with no statement between them are the same
+        // synchronisation point, though: the pipeliner's per-copy barrier
+        // lands directly on the staging barrier, and the second is dead.
+        if (justEmittedBarrier && !barrierPending) {
+          barrierPendingDevice = false;
+          continue;
+        }
         flushBarrier();
         if (bar->device)
           ind() << "threadgroup_barrier(mem_flags::mem_threadgroup | "
                    "mem_flags::mem_device);\n";
         else
           ind() << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        justEmittedBarrier = true;
         continue;
       }
       barrierPending = true;
@@ -395,6 +402,7 @@ void MSLPrinter::printBlock(const Block &b) {
       continue;
     }
     flushBarrier();
+    justEmittedBarrier = false;
     printStmt(s);
   }
 }

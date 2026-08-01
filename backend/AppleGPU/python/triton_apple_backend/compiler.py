@@ -198,9 +198,14 @@ class MPSBackend(BaseBackend):
 
         # Rotate the cheaper dot operand's load one iteration ahead so it
         # retires under the MMA block instead of serialising in front of it.
-        _plugin.add_prefetch_dot_operand(pm)
-        passes.common.add_canonicalizer(pm)
-        passes.common.add_cse(pm)
+        # This is the MSL path's stand-in for the software pipeliner, so the
+        # two must not both run: prefetch turns the operand into a loop-carried
+        # value whose load feeds only the yield, leaving the pipeliner nothing
+        # to rotate.
+        if not os.environ.get('TRITON_MSL_PIPELINE'):
+            _plugin.add_prefetch_dot_operand(pm)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
 
         # Fuse nested loops marked with tt.flatten (tl.range(flatten=True))
         passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -214,6 +219,16 @@ class MPSBackend(BaseBackend):
         # device-direct DMA staging path (TRITON_MSL_DMA_STAGE) now that
         # air.simdgroup_async_copy_2d is reachable. Experimental, default off.
         if os.environ.get('TRITON_MSL_PIPELINE'):
+            # The pipeliner only multi-buffers a load whose sole user is a
+            # local_alloc, so dot operands have to reach it through shared
+            # memory or num_stages stays inert.
+            _plugin.add_share_dot_operands(pm)
+            passes.common.add_canonicalizer(pm)
+            # add_pipeline only runs lowerLoops + expandLoops; without
+            # assign_latencies first nothing is ever marked for rotation and
+            # the pass is a no-op.
+            passes.ttgpuir.add_assign_latencies(pm, options.num_stages)
+            passes.ttgpuir.add_schedule_loops(pm)
             passes.ttgpuir.add_pipeline(pm, options.num_stages, False)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)

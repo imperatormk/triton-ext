@@ -73,6 +73,35 @@ def PrefetchDotOperand : Pass<"triton-apple-prefetch-dot-operand", "mlir::Module
   ];
 }
 
+def ShareDotOperands : Pass<"triton-apple-share-dot-operands", "mlir::ModuleOp"> {
+  let summary = "Route K-loop dot operands through shared memory so the "
+                "software pipeliner can multi-buffer them";
+
+  let description = [{
+    Triton's pipeliner only multi-buffers a load whose single user is a
+    `ttg.local_alloc` (see mustLoadToRegisters in LowerLoops.cpp); anything else
+    "must load to registers" and is left alone. The MSL path keeps dot operands
+    in blocked (register) layouts, so no load ever qualified and `num_stages`
+    was silently inert -- ns=2/3/4 produced byte-identical code.
+
+    This rewrites `tt.load -> tt.dot` inside a K-loop into
+    `tt.load -> ttg.local_alloc -> ttg.local_load -> tt.dot`, which is the shape
+    the pipeliner recognises. The emitter already lowers both ops, and its
+    in-place dot-operand path reads straight out of the allocation, so the
+    round trip costs nothing when the pipeliner declines.
+
+    Only unmasked loads inside a loop whose result feeds a dot are rewritten:
+    a masked load cannot become an async copy, and a load outside a loop has
+    nothing to pipeline against.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 def SimplifyGatherLayout : Pass<"triton-apple-simplify-gather", "mlir::ModuleOp"> {
   let summary = "Strip efficient_layout from large gather ops to avoid IR explosion";
 

@@ -661,6 +661,17 @@ void MSLPrinter::printPreamble(const HelperSet &h) {
   os << "#include <metal_stdlib>\n";
   os << "#include <metal_simdgroup_matrix>\n";
   os << "using namespace metal;\n\n";
+  // air.simdgroup_async_copy_2d has no MSL spelling; these resolve at metallib
+  // link time against the prebuilt AIR shim (async_copy_shim.ll). The presence
+  // of this symbol is also what tells the driver to take the linking compile
+  // path, so the name must match _ASYNC_COPY_SYM in compiler.py.
+  if (h.tgAsyncCopy)
+    os << R"MSL(extern "C" ulong __triton_tg_async_copy_begin_4(threadgroup void*, ulong, device const void*, ulong, ulong, ulong);
+extern "C" ulong __triton_tg_async_copy_begin_2(threadgroup void*, ulong, device const void*, ulong, ulong, ulong);
+extern "C" ulong __triton_tg_async_copy_begin_1(threadgroup void*, ulong, device const void*, ulong, ulong, ulong);
+extern "C" void __triton_tg_async_copy_wait(ulong);
+
+)MSL";
   if (h.erf)
     os << R"MSL(static inline float tt_erf(float x){
   float t = 1.0f/(1.0f+0.5f*metal::fabs(x));

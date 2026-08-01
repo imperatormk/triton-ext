@@ -481,6 +481,15 @@ msl::HelperSet MSLEmitter::scanHelpers() {
       }
     }
   });
+  // The preamble is printed before any body is emitted, and whether a given dot
+  // takes the DMA path depends on emission-time state (the fused phase), so it
+  // cannot be predicted reliably here. Declaring the shim entry points whenever
+  // the gate is on and any dot could match is safe: unused extern "C"
+  // declarations cost nothing, whereas a missing one is a compile error.
+  // The declarations are also what select the shim-linking compile path, so
+  // this must not be narrower than what the emitter actually emits.
+  if (dmaStagingEnabled())
+    mod.walk([&](tt::DotOp d) { h.tgAsyncCopy = true; });
   return h;
 }
 

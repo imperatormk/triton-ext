@@ -270,6 +270,11 @@ msl::Block MSLEmitter::walkBlock(Block &blk, unsigned depth) {
     // fused-dot MMA phase emits it at that point.
     if (deferPrefetchLoad(&op))
       continue;
+    // A load whose value only ever reaches a dot operand staged by DMA has no
+    // consumer left: the tile is copied device->threadgroup, so materialising
+    // its registers is dead work the MSL compiler would then warn about.
+    if (loadIsDmaStaged(&op))
+      continue;
     if (emitOp(&op, body))
       continue;
     // No real-kernel op family falls through: emitOp is exhaustive. An

@@ -88,6 +88,20 @@ inline void dotStageRowPads(int64_t M, int64_t N, int64_t K, int64_t aEb,
     aPad = bPad = 0;
 }
 
+// A dot operand whose load denotes a contiguous 2D device tile, so it can be
+// staged by threadgroup DMA instead of through registers. The tile origin is
+// `basePtr + rowShift*rowStride + colShift`, each shift being a uniform scalar
+// (null when absent); `ptrDelta` is added once per K-loop trip.
+struct DirectStage {
+  Value basePtr;
+  Value rowStride;
+  Value rowShift;
+  Value colShift;
+  Value ptrDelta;
+  int64_t rows = 0;
+  int64_t cols = 0;
+};
+
 struct DotPlan {
   enum class Kind {
     Unsupported, // shape/element type outside the simdgroup-matrix path

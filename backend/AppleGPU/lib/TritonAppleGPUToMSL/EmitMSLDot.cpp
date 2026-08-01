@@ -53,19 +53,6 @@ template <typename T> T definingOp(Value v) {
 
 namespace {
 
-// A dot operand that can be staged by DMA instead of through registers.
-// The tile origin is `basePtr + rowShift*rowStride + colShift`, each shift
-// being a uniform scalar (null when absent); `ptrDelta` is added once per
-// K-loop trip.
-struct DirectStage {
-  Value basePtr;
-  Value rowStride;
-  Value rowShift;
-  Value colShift;
-  Value ptrDelta;
-  int64_t rows = 0;
-  int64_t cols = 0;
-};
 
 // Peel the broadcast/expand_dims wrappers a pointer tensor accumulates.
 Value peelBroadcast(Value v) {
@@ -197,6 +184,135 @@ std::optional<DirectStage> matchDirectStage(Value operand, int64_t rows,
 
   return DirectStage{splat.getSrc(), stride,     rowShift, colShift,
                      delta,          (int64_t)rows, (int64_t)cols};
+}
+
+// True when device-direct operand staging is enabled. Off unless the
+// environment asks for it: the DMA path changes how operands reach the MMA and
+// async copy has historically produced silent wrong answers rather than
+// crashes, so it must be opt-in until proven on a wider body of kernels.
+bool MSLEmitter::dmaStagingEnabled() {
+  static const bool on = getenv("TRITON_MSL_DMA_STAGE") != nullptr;
+  return on;
+}
+
+// The single decision point for device-direct staging, so the preamble scan and
+// the dot emitter cannot disagree about whether the shim is referenced.
+// Only the B operand is considered: add_prefetch_dot_operand has already
+// rotated A into a loop-carried value with no load left to match.
+std::optional<DirectStage> MSLEmitter::dotDmaStage(tt::DotOp op) {
+  if (!dmaStagingEnabled())
+    return std::nullopt;
+  // Only the fused path emits the copy. The panel and direct paths still read
+  // the operand's per-register names, which suppressing the load would leave
+  // unbound.
+  DotPlan p = planDot(op);
+  if (p.kind != DotPlan::Kind::Fused || p.bInPlace)
+    return std::nullopt;
+  auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
+  auto bTy = dyn_cast<RankedTensorType>(op.getB().getType());
+  if (!aTy || !bTy || aTy.getRank() != 2 || bTy.getRank() != 2)
+    return std::nullopt;
+  Type be = bTy.getElementType();
+  if (!(be.isF32() || be.isF16() || be.isBF16()))
+    return std::nullopt;
+  Value stage = op.getB();
+  if (Value s = dotOperandConvertSource(op, op.getB()))
+    stage = s;
+  return matchDirectStage(stage, bTy.getShape()[0], bTy.getShape()[1]);
+}
+
+// True when `op` is a load whose result only feeds dot operands that this
+// emitter will stage by DMA. Such a load is dead: the DMA moves the tile
+// device->threadgroup without ever materialising it in registers. The value is
+// still bound (to an empty register list) so nothing downstream looks it up.
+bool MSLEmitter::loadIsDmaStaged(Operation *op) {
+  if (!dmaStagingEnabled())
+    return false;
+  auto ld = dyn_cast<tt::LoadOp>(op);
+  if (!ld || ld.getResult().use_empty())
+    return false;
+  for (Operation *user : ld.getResult().getUsers()) {
+    // The operand may reach the dot through a layout convert that the dot
+    // itself elides (dotOperandConvertSource).
+    Operation *consumer = user;
+    if (auto c = dyn_cast<ttg::ConvertLayoutOp>(user)) {
+      if (!c.getResult().hasOneUse())
+        return false;
+      consumer = *c.getResult().user_begin();
+    }
+    auto d = dyn_cast<tt::DotOp>(consumer);
+    if (!d)
+      return false;
+    auto ds = dotDmaStage(d);
+    if (!ds)
+      return false;
+    // Only the B operand is DMA-staged; a load feeding A still needs registers.
+    Value stage = d.getB();
+    if (Value s = dotOperandConvertSource(d, d.getB()))
+      stage = s;
+    if (stage != user->getResult(0) && stage != ld.getResult())
+      return false;
+  }
+  bindDataless(ld.getResult());
+  return true;
+}
+
+// The K-loop induction variable, as an MSL name, when this dot sits directly in
+// one. The recognised operand pointer advances by `ptrDelta` per trip, and the
+// loop IV counts K elements per trip, so the origin's offset is
+// (iv / step) * ptrDelta. Empty when the dot is not in a loop, in which case the
+// tile origin has no per-trip term.
+StringRef MSLEmitter::dotDmaTripVar(tt::DotOp op) {
+  auto forOp = dyn_cast_or_null<scf::ForOp>(op->getParentOp());
+  if (!forOp)
+    return {};
+  auto it = valMap.find(forOp.getInductionVar());
+  if (it == valMap.end() || it->second.empty())
+    return {};
+  return it->second[0];
+}
+
+// The tile origin: base + (rowShift*rowStride + colShift) elements, plus the
+// per-trip delta accumulated by the K-loop. Every term is a uniform scalar, so
+// the result is threadgroup-uniform -- which the DMA requires.
+msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
+  msl::Expr *off = nullptr;
+  auto add = [&](msl::Expr *e) {
+    off = off ? ctx.binary(B::Add, off, e) : e;
+  };
+  if (ds.rowShift)
+    add(ctx.paren(ctx.binary(B::Mul, ctx.var(scalarName(ds.rowShift)),
+                             ctx.var(scalarName(ds.rowStride)))));
+  if (ds.colShift)
+    add(ctx.var(scalarName(ds.colShift)));
+  // The K-loop IV counts K elements, and the operand advances one row per K
+  // element, so the per-trip origin offset is exactly iv*rowStride -- no need
+  // to divide the IV by the loop step and rescale by ptrDelta.
+  if (ds.ptrDelta && !tripVar.empty())
+    add(ctx.paren(ctx.binary(B::Mul, ctx.var(tripVar),
+                             ctx.var(scalarName(ds.rowStride)))));
+  msl::Expr *base = ctx.var(scalarName(ds.basePtr));
+  return off ? ctx.binary(B::Add, base, ctx.paren(off)) : base;
+}
+
+// `ulong h = __triton_tg_async_copy_begin_<n>(tg, pitch, src, stride, rows,
+// cols);` -- one entry point per element size, because the intrinsic silently
+// copies garbage when its element size is not a literal constant.
+msl::Stmt *MSLEmitter::dmaBegin(StringRef handle, StringRef tgBuf,
+                                int64_t pitch, msl::Expr *src,
+                                const DirectStage &ds, int64_t elemBytes) {
+  std::string callee =
+      "__triton_tg_async_copy_begin_" + std::to_string(elemBytes);
+  msl::Expr *c = ctx.call(
+      callee, {ctx.var(tgBuf), ctx.i32lit(pitch), src,
+               ctx.var(scalarName(ds.rowStride)), ctx.i32lit(ds.rows),
+               ctx.i32lit(ds.cols)});
+  return ctx.declStmt(ctx.named("ulong"), handle, c);
+}
+
+msl::Stmt *MSLEmitter::dmaWait(StringRef handle) {
+  return ctx.exprStmt(ctx.call("__triton_tg_async_copy_wait",
+                               {ctx.var(handle)}));
 }
 
 namespace {
@@ -734,13 +850,37 @@ bool MSLEmitter::emitDotFused(
   }
 
   if (fusedDot.phase == FusedDotPhase::MMA) {
+    // B may be staged by threadgroup DMA instead of through registers.
+    //
+    // The copy cannot be issued before the leading barrier: that barrier is
+    // what guarantees the previous iteration's simdgroup_loads have finished
+    // reading this same buffer, and the DMA writes it. Issuing earlier is a
+    // multi-warp write-during-read race.
+    //
+    // So the copy is issued just after that barrier and the wait is placed
+    // after A's register scatter, which is the only work available to overlap
+    // it: this iteration's MMAs read the tile, so the wait must precede the
+    // publish barrier.
+    std::optional<DirectStage> bDma;
+    std::string bDmaHandle;
+    if (!plan.bInPlace)
+      bDma = dotDmaStage(op);
+
     bool stagesHere = !plan.aInPlace || !plan.bInPlace;
     if (stagesHere)
       barrier();
+    if (bDma) {
+      bDmaHandle = fresh();
+      body.push_back(dmaBegin(
+          bDmaHandle, dc.tgB, ldb, dmaTileOrigin(*bDma, dotDmaTripVar(op)),
+          *bDma, byteWidth(bStageTy.getElementType())));
+    }
     stageOperand(body, dc.tgA, dc.aStage, aStageTy, dc.aNames,
                  (bool)plan.aInPlace, nullptr, plan.aPad);
     stageOperand(body, dc.tgB, dc.bStage, bStageTy, dc.bNames,
-                 (bool)plan.bInPlace, nullptr, plan.bPad);
+                 (bool)plan.bInPlace || bDma.has_value(), nullptr, plan.bPad);
+    if (bDma)
+      body.push_back(dmaWait(bDmaHandle));
     barrier();
     // A prefetched operand arrives as a loop-carried block argument: its load
     // was issued for the *next* iteration, so the value consumed here is

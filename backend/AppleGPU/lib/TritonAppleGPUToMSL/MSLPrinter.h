@@ -25,6 +25,7 @@ struct HelperSet {
   bool atomicF32 = false;
   bool atomicPacked16 = false;
   bool fp8 = false;
+  bool tgAsyncCopy = false;
 };
 
 class MSLPrinter {

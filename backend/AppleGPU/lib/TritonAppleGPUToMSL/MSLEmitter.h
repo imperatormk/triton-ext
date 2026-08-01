@@ -332,6 +332,14 @@ private:
   bool emitDotDirect(tt::DotOp op, msl::Block &body, const DotPlan &plan,
                      const DotEmitCtx &dc);
   void dotPoolPtrs(msl::Block &body, const DotPlan &plan, DotEmitCtx &dc);
+  static bool dmaStagingEnabled();
+  std::optional<DirectStage> dotDmaStage(tt::DotOp op);
+  StringRef dotDmaTripVar(tt::DotOp op);
+  bool loadIsDmaStaged(Operation *op);
+  msl::Expr *dmaTileOrigin(const DirectStage &ds, StringRef tripVar);
+  msl::Stmt *dmaBegin(StringRef handle, StringRef tgBuf, int64_t pitch,
+                      msl::Expr *src, const DirectStage &ds, int64_t elemBytes);
+  msl::Stmt *dmaWait(StringRef handle);
   SmallVector<std::string> dotResultIds(msl::Block &body, tt::DotOp op,
                                         const DotPlan &plan);
   void dotReadback(msl::Block &tgt, RankedTensorType cTy, StringRef tgC,

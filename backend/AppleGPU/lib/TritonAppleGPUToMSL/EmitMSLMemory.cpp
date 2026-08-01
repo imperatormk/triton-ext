@@ -289,9 +289,10 @@ void MSLEmitter::scanPool(Operation *op) {
         need = std::max(stagedAB, band * N * accBytes);
       }
     }
-    // The readback always declares a threadgroup C pointer, so an empty pool
-    // would leave that cast with no buffer to name.
-    if (need == 0 && rk == 2 && dotIsFusedGemmAcc(d) && !isa<IntegerType>(cE))
+    // A readback that still emits its threadgroup C pointer needs a buffer to
+    // name; a provably-direct store has no such arm and needs nothing.
+    if (need == 0 && rk == 2 && dotIsFusedGemmAcc(d) && !isa<IntegerType>(cE) &&
+        !cStoresDirect(d))
       need = N * 4;
     poolBytes = std::max(poolBytes, need + dmaSlack);
   } else if (auto r = dyn_cast<tt::ReduceOp>(op)) {

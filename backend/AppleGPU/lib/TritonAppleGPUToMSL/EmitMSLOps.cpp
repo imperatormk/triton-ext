@@ -1537,6 +1537,14 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       msl::Block hot, cold;
       for (int base = 0; base < rc; base += vw)
         stageRun(hot, base);
+      // Every register under one predicate: the hot guard is already the whole
+      // condition, so the fallback arm is unreachable and only doubles the
+      // load count (`if (m) {...} else { if (m) {...} }`).
+      if (ms.size() == 1) {
+        body.push_back(ctx.ifScope(ms[0], std::move(hot)));
+        bindDataless(ac.getResult());
+        return true;
+      }
       // The cold arm still runs on the ragged trip, so it is worth
       // vectorising too: when every register of a run shares one mask name the
       // whole run is one predicated wide copy instead of vw scalar ones.

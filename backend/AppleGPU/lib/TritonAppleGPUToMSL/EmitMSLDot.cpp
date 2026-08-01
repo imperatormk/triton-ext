@@ -743,22 +743,42 @@ void MSLEmitter::stageOperand(msl::Block &body, StringRef tgName, Value stage,
   // the whole swizzle index. A column-major operand lays its registers down a
   // column (slots rowLen apart), so the run has to be checked, not assumed.
   int vw = stageVectorWidth(stageTy, n, rowPad);
+  // A guarded run can still be widened, but only under one predicate, so every
+  // register in it must carry the same one.
+  auto render = [&](msl::Expr *e) {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    msl::MSLPrinter(os).printExpr(e);
+    return os.str();
+  };
+  if (guard && vw > 1) {
+    for (int r = 0; r + vw <= n && vw > 1; r += vw) {
+      std::string g0 = render(guard(r));
+      for (int k = 1; k < vw; ++k)
+        if (render(guard(r + k)) != g0) {
+          vw = 1;
+          break;
+        }
+    }
+  }
   Type elem = elementScalarType(stageTy);
   for (int r = 0; r < n; r += (vw > 1 ? vw : 1)) {
-    if (vw > 1 && !guard) {
+    if (vw > 1) {
       msl::Type *vecTy =
           ctx.vector(cast<msl::ScalarType>(scalarType(elem))->s, vw);
       msl::Type *tgVecPtr = ctx.ptr(vecTy, msl::AddrSpace::Threadgroup);
       SmallVector<msl::Expr *> elems;
       for (int k = 0; k < vw; ++k)
         elems.push_back(ctx.var(names[r + k]));
-      body.push_back(ctx.assignStmt(
+      msl::Stmt *vasn = ctx.assignStmt(
           ctx.deref(ctx.paren(ctx.cast(
               msl::Cast::Style::CStyle, tgVecPtr,
               ctx.paren(ctx.binary(
                   msl::BinOp::Add, ctx.var(tgName),
                   layout.sliceFlatOffset(stageTy, r, rowPad)))))),
-          ctx.call(mslScalarType(elem) + std::to_string(vw), elems)));
+          ctx.call(mslScalarType(elem) + std::to_string(vw), elems));
+      msl::Expr *vg = guard ? guard(r) : nullptr;
+      body.push_back(vg ? ctx.compactIf(vg, vasn) : vasn);
       continue;
     }
     msl::Stmt *asn = ctx.assignStmt(

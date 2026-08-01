@@ -386,7 +386,10 @@ unsigned dropDeadDecls(msl::Block &b,
       }
     // A plain `v = rhs` to a name nothing reads dies with its declaration;
     // leaving it behind would reference an identifier that no longer exists.
-    if (auto *a = llvm::dyn_cast<msl::AssignStmt>(s))
+    msl::Stmt *assign = s;
+    if (auto *c = llvm::dyn_cast<msl::CompactIfStmt>(s))
+      assign = c->then;
+    if (auto *a = llvm::dyn_cast_or_null<msl::AssignStmt>(assign))
       if (a->compound == msl::AssignStmt::Compound::None)
         if (auto *lhs = llvm::dyn_cast<msl::VarRef>(a->lhs))
           if (!used.count(lhs->name) && !initHasCall(a->rhs)) {

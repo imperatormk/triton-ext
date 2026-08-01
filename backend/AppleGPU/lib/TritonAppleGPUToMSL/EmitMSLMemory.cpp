@@ -289,6 +289,10 @@ void MSLEmitter::scanPool(Operation *op) {
         need = std::max(stagedAB, band * N * accBytes);
       }
     }
+    // The readback always declares a threadgroup C pointer, so an empty pool
+    // would leave that cast with no buffer to name.
+    if (need == 0 && rk == 2 && dotIsFusedGemmAcc(d) && !isa<IntegerType>(cE))
+      need = N * 4;
     poolBytes = std::max(poolBytes, need + dmaSlack);
   } else if (auto r = dyn_cast<tt::ReduceOp>(op)) {
     auto st = cast<RankedTensorType>(r.getOperand(0).getType());

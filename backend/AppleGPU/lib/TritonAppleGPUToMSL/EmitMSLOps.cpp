@@ -786,9 +786,12 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
   }
   if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op)) {
     // async_commit_group only closes a batch; it is async_wait that makes the
-    // staged tiles visible. Emitting a barrier for the commit as well puts a
-    // full threadgroup sync between the copies of a single trip.
-    body.push_back(ctx.barrier(/*device=*/false));
+    // staged tiles visible. A barrier for the commit as well puts a full
+    // threadgroup sync between the copies of a single trip, and a wait whose
+    // tail is already fenced (nothing but address arithmetic since the last
+    // barrier) adds a second sync at the same point.
+    if (isa<ttg::AsyncWaitOp>(op) && !barrierCoversTail(body))
+      body.push_back(ctx.barrier(/*device=*/false));
     for (Value r : op->getResults())
       bindDataless(r);
     return true;
@@ -1409,7 +1412,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     // the reads have to be fenced off first. Consecutive copies share one
     // fence: the second would separate two staging writes that nothing reads
     // in between.
-    if (body.empty() || !isa<msl::BarrierStmt>(body.back()))
+    if (!barrierCoversTail(body))
       body.push_back(ctx.hardBarrier(false));
     auto srcTy = cast<RankedTensorType>(ac.getSrc().getType());
     MemDescInfo dst = memdescMap[ac.getResult()];

@@ -211,6 +211,7 @@ private:
   // just layout coords).
   msl::Expr *poolRegion(int64_t byteOffset, StringRef sc);
   static SmallVector<int64_t> memdescStrides(ttg::MemDescType mt);
+  static bool barrierCoversTail(const msl::Block &body);
   msl::Expr *memdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
                              int reg);
 

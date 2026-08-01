@@ -7,6 +7,8 @@
 // explicit ctx.paren(...) wherever a subexpression needs precedence grouping.
 
 #include "MSLConstants.h"
+
+
 #include "MSLEmitter.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -15,6 +17,30 @@
 using namespace mlir;
 
 namespace mlir::triton::applegpu {
+
+namespace {
+// An initialiser that only computes an address: no subscript, deref or call.
+bool isPureAddressExpr(const msl::Expr *e) {
+  if (!e)
+    return true;
+  switch (e->kind) {
+  case msl::Expr::Kind::VarRef:
+  case msl::Expr::Kind::Literal:
+    return true;
+  case msl::Expr::Kind::Binary:
+    return isPureAddressExpr(llvm::cast<msl::Binary>(e)->lhs) &&
+           isPureAddressExpr(llvm::cast<msl::Binary>(e)->rhs);
+  case msl::Expr::Kind::Unary:
+    return isPureAddressExpr(llvm::cast<msl::Unary>(e)->x);
+  case msl::Expr::Kind::Cast:
+    return isPureAddressExpr(llvm::cast<msl::Cast>(e)->x);
+  case msl::Expr::Kind::Paren:
+    return isPureAddressExpr(llvm::cast<msl::Paren>(e)->x);
+  default:
+    return false;
+  }
+}
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // Threadgroup pool region
@@ -61,6 +87,22 @@ SmallVector<int64_t> MSLEmitter::memdescStrides(ttg::MemDescType mt) {
     acc *= mt.getShape()[d];
   }
   return strides;
+}
+
+// True when a barrier already covers the tail of `body`: the last statement is
+// a barrier, or everything since one is pure address arithmetic. Declarations
+// whose initialiser touches no memory cannot separate two synchronisation
+// points, and the pipeliner emits a run of them (the next trip's operand
+// pointers) between its wait and the staging copies.
+bool MSLEmitter::barrierCoversTail(const msl::Block &body) {
+  for (auto it = body.rbegin(); it != body.rend(); ++it) {
+    if (isa<msl::BarrierStmt>(*it))
+      return true;
+    auto *d = dyn_cast<msl::DeclStmt>(*it);
+    if (!d || !isPureAddressExpr(d->init))
+      return false;
+  }
+  return false;
 }
 
 msl::Expr *MSLEmitter::memdescElemAddr(const MemDescInfo &info,

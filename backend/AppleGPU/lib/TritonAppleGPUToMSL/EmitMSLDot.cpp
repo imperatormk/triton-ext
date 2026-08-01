@@ -29,6 +29,176 @@ template <typename T> T definingOp(Value v) {
 }
 } // namespace
 
+//===----------------------------------------------------------------------===//
+// Device-direct operand staging (threadgroup DMA)
+//===----------------------------------------------------------------------===//
+//
+// A dot operand normally reaches its threadgroup tile through registers: the
+// tt.load materialises one register per element, then stageOperand scatters
+// those registers into the pool. air.simdgroup_async_copy_2d can instead move
+// the tile device->threadgroup directly, but only when the operand's pointer
+// tensor really denotes a contiguous 2D tile: a uniform scalar base, a scalar
+// row stride, and a unit-stride column range.
+//
+// The recogniser below matches exactly the shape Triton emits for
+// `base + row[:,None]*stride + col[None,:]`:
+//
+//   addptr(broadcast(addptr(splat(%base), mul(rowIdx, splat(%stride)))),
+//          broadcast(colRange))
+//
+// The destination needs no adjustment: stageOperand already writes a plain
+// padded row-major tile (the XOR trees in its index are disjoint-bit
+// composition, not a swizzle), so the DMA writes the identical layout and the
+// consumer simdgroup_loads keep their existing offsets.
+
+namespace {
+
+// A dot operand that can be staged by DMA instead of through registers.
+// The tile origin is `basePtr + rowShift*rowStride + colShift`, each shift
+// being a uniform scalar (null when absent); `ptrDelta` is added once per
+// K-loop trip.
+struct DirectStage {
+  Value basePtr;
+  Value rowStride;
+  Value rowShift;
+  Value colShift;
+  Value ptrDelta;
+  int64_t rows = 0;
+  int64_t cols = 0;
+};
+
+// Peel the broadcast/expand_dims wrappers a pointer tensor accumulates.
+Value peelBroadcast(Value v) {
+  while (true) {
+    if (auto b = definingOp<tt::BroadcastOp>(v)) {
+      v = b.getSrc();
+      continue;
+    }
+    if (auto e = definingOp<tt::ExpandDimsOp>(v)) {
+      v = e.getSrc();
+      continue;
+    }
+    return v;
+  }
+}
+
+// True when `v` indexes a unit-stride row: a 0..n-1 iota, optionally shifted by
+// a uniform scalar (`splat(k) + iota`, as a tile's column offset carries the
+// block's N-origin). Any such shift is uniform across the tile, so it moves the
+// tile origin rather than breaking contiguity; it is returned in `shiftOut` to
+// be folded into the base pointer.
+bool isUnitRange(Value v, Value *shiftOut = nullptr) {
+  Value s = peelBroadcast(v);
+  if (auto add = definingOp<arith::AddIOp>(s)) {
+    Value a = add.getLhs(), b = add.getRhs();
+    for (int i = 0; i < 2; ++i) {
+      if (auto sp = definingOp<tt::SplatOp>(peelBroadcast(a)))
+        if (isUnitRange(b)) {
+          if (shiftOut)
+            *shiftOut = sp.getSrc();
+          return true;
+        }
+      std::swap(a, b);
+    }
+    return false;
+  }
+  auto r = definingOp<tt::MakeRangeOp>(s);
+  return r && r.getStart() == 0;
+}
+
+// Match `mul(rowIndex, splat(stride))` (either operand order) and return the
+// scalar stride. The row index may itself carry a uniform block-origin shift,
+// which is reported in `shiftOut` (in rows, to be scaled by the stride).
+Value matchRowStride(Value v, Value *shiftOut = nullptr) {
+  auto mul = definingOp<arith::MulIOp>(peelBroadcast(v));
+  if (!mul)
+    return nullptr;
+  Value a = mul.getLhs(), b = mul.getRhs();
+  for (int i = 0; i < 2; ++i) {
+    if (isUnitRange(a, shiftOut))
+      if (auto sp = definingOp<tt::SplatOp>(peelBroadcast(b)))
+        return sp.getSrc();
+    std::swap(a, b);
+  }
+  return nullptr;
+}
+
+} // namespace
+
+// A GEMM's operand pointer is loop-carried: the tile pointer enters as an
+// scf.for iter_arg and is advanced each trip by `addptr(arg, splat(delta))`.
+// The tile stays contiguous with the same row stride throughout -- only its
+// origin moves, by a uniform scalar -- so resolve the block argument to the
+// loop's *initial* pointer and report the per-trip delta separately.
+// Returns the init value, or null when the recurrence is not this shape.
+static Value resolveLoopCarriedPtr(Value v, Value &deltaOut) {
+  auto arg = dyn_cast<BlockArgument>(v);
+  if (!arg)
+    return v;
+  auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+  if (!forOp || arg.getArgNumber() == 0)
+    return nullptr;
+  unsigned idx = arg.getArgNumber() - 1;
+  auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  auto ap = definingOp<tt::AddPtrOp>(yield.getOperand(idx));
+  // The recurrence must be exactly `next = addptr(thisArg, splat(scalar))`.
+  if (!ap || ap.getPtr() != v)
+    return nullptr;
+  auto sp = definingOp<tt::SplatOp>(peelBroadcast(ap.getOffset()));
+  if (!sp)
+    return nullptr;
+  deltaOut = sp.getSrc();
+  return forOp.getInitArgs()[idx];
+}
+
+// Recognise a dot operand whose load is a contiguous device tile.
+// `rows`/`cols` are the operand's logical tile shape.
+std::optional<DirectStage> matchDirectStage(Value operand, int64_t rows,
+                                            int64_t cols) {
+  bool dbg = getenv("TRITON_MSL_DMA_PROBE") != nullptr;
+  auto bail = [&](const char *why) {
+    if (dbg)
+      llvm::errs() << "[dma-probe]   bail: " << why << "\n";
+    return std::nullopt;
+  };
+
+  auto ld = definingOp<tt::LoadOp>(operand);
+  // A masked load would need the DMA to honour per-element predicates, which
+  // the intrinsic cannot express; boundary tiles keep the register path.
+  if (!ld)
+    return bail("operand not defined by a tt.load");
+  if (ld.getMask() || ld.getOther())
+    return bail("masked load (boundary tile keeps the register path)");
+
+  Value delta;
+  Value tilePtr = resolveLoopCarriedPtr(ld.getPtr(), delta);
+  if (!tilePtr)
+    return bail("loop-carried ptr not a uniform addptr recurrence");
+
+  auto colAdd = definingOp<tt::AddPtrOp>(tilePtr);
+  if (!colAdd)
+    return bail("tile ptr not an addptr");
+  Value colShift;
+  if (!isUnitRange(colAdd.getOffset(), &colShift))
+    return bail("column offset not a unit range");
+
+  auto rowAdd = definingOp<tt::AddPtrOp>(peelBroadcast(colAdd.getPtr()));
+  if (!rowAdd)
+    return bail("row ptr not an addptr");
+
+  auto splat = definingOp<tt::SplatOp>(peelBroadcast(rowAdd.getPtr()));
+  if (!splat)
+    return bail("base not a splat of a scalar pointer");
+
+  Value rowShift;
+  Value stride = matchRowStride(rowAdd.getOffset(), &rowShift);
+  if (!stride)
+    return bail("row offset not iota*splat(stride)");
+
+  return DirectStage{splat.getSrc(), stride,     rowShift, colShift,
+                     delta,          (int64_t)rows, (int64_t)cols};
+}
+
 namespace {
 
 // Per-warp ownership of the (mT x nT) accumulator grid.
@@ -188,6 +358,21 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   if (!p.bInPlace)
     if (Value s = dotOperandConvertSource(op, op.getB()))
       p.bStage = s;
+
+  if (getenv("TRITON_MSL_DMA_PROBE")) {
+    auto report = [&](const char *which, Value stage, int64_t r, int64_t c) {
+      auto m = matchDirectStage(stage, r, c);
+      llvm::errs() << "[dma-probe] " << which << " " << r << "x" << c << " "
+                   << (m ? "MATCH" : "no-match") << " def=";
+      if (Operation *d = stage.getDefiningOp())
+        llvm::errs() << d->getName();
+      else
+        llvm::errs() << "<blockarg>";
+      llvm::errs() << "\n";
+    };
+    report("A", p.aStage, p.M, p.K);
+    report("B", p.bStage, p.K, p.N);
+  }
 
   dotStageRowPads(p.M, p.N, p.K, byteWidth(aElem), byteWidth(bElem), p.aPad,
                   p.bPad);

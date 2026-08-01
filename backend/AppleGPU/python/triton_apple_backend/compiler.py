@@ -206,10 +206,17 @@ class MPSBackend(BaseBackend):
         passes.ttgpuir.add_fuse_nested_loops(pm)
         passes.common.add_canonicalizer(pm)
 
-        # The MSL path has no async copy (staging lowers to a synchronous
-        # threadgroup copy), so it stays single-buffered — the software
-        # pipeliner would only add staging, barriers and slot rotation with no
-        # overlap benefit. No pipelining pass runs here.
+        # The MSL path normally stays single-buffered: staging lowers to a
+        # synchronous threadgroup copy, so the software pipeliner would only add
+        # staging, barriers and slot rotation with no overlap benefit.
+        #
+        # TRITON_MSL_PIPELINE runs it anyway, for measuring against the
+        # device-direct DMA staging path (TRITON_MSL_DMA_STAGE) now that
+        # air.simdgroup_async_copy_2d is reachable. Experimental, default off.
+        if os.environ.get('TRITON_MSL_PIPELINE'):
+            passes.ttgpuir.add_pipeline(pm, options.num_stages, False)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
 
         pm.run(mod, 'make_ttgir')
         metadata["shared"] = mod.get_int_attr("ttg.shared") or 0

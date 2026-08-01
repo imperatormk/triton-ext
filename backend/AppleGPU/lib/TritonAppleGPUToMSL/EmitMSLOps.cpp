@@ -790,8 +790,12 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
     // threadgroup sync between the copies of a single trip, and a wait whose
     // tail is already fenced (nothing but address arithmetic since the last
     // barrier) adds a second sync at the same point.
-    if (isa<ttg::AsyncWaitOp>(op) && !barrierCoversTail(body))
-      body.push_back(ctx.barrier(/*device=*/false));
+    if (isa<ttg::AsyncWaitOp>(op)) {
+      if (!barrierCoversTail(body))
+        body.push_back(ctx.barrier(/*device=*/false));
+      // The batch ends here; the next copy opens a new one and fences again.
+      asyncCopyFenced = false;
+    }
     for (Value r : op->getResults())
       bindDataless(r);
     return true;
@@ -1412,8 +1416,13 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     // the reads have to be fenced off first. Consecutive copies share one
     // fence: the second would separate two staging writes that nothing reads
     // in between.
-    if (!barrierCoversTail(body))
+    // Apple's own M1 GEMM issues its whole batch of async copies back to back
+    // and only then waits, so the requests overlap in the queue. Match that:
+    // fence once ahead of the batch, not between its members. The copies of a
+    // batch write disjoint buffers and nothing reads them until the wait.
+    if (!asyncCopyFenced && !barrierCoversTail(body))
       body.push_back(ctx.hardBarrier(false));
+    asyncCopyFenced = true;
     auto srcTy = cast<RankedTensorType>(ac.getSrc().getType());
     MemDescInfo dst = memdescMap[ac.getResult()];
     auto &ptrs = names(ac.getSrc());

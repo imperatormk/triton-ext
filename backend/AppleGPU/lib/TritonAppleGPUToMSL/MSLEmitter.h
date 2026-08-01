@@ -212,6 +212,9 @@ private:
   msl::Expr *poolRegion(int64_t byteOffset, StringRef sc);
   static SmallVector<int64_t> memdescStrides(ttg::MemDescType mt);
   static bool barrierCoversTail(const msl::Block &body);
+  // Set once a batch of async copies has been fenced, cleared at the wait that
+  // closes the batch, so its members share a single fence.
+  bool asyncCopyFenced = false;
   msl::Expr *memdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
                              int reg);
 

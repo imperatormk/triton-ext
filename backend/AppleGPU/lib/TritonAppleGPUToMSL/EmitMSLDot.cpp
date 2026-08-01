@@ -1681,32 +1681,41 @@ bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, UniformInt &ldc,
          tryTerm(add.getRhs(), add.getLhs());
 }
 
-bool MSLEmitter::matchBoundaryMask(Value m, UniformInt &boundM,
-                                   UniformInt &boundN) {
+// `rowBase`/`colBase` are the tile origins the store's own offset used, so each
+// half of the conjunction is assigned to the axis whose origin it compares
+// against. Matching on operand order instead would silently swap the two bounds
+// whenever the IR happened to emit them the other way round, which only shows
+// up when both axes are ragged AND M != N.
+bool MSLEmitter::matchBoundaryMask(Value m, Value rowBase, Value colBase,
+                                   UniformInt &boundM, UniformInt &boundN) {
   auto conj = definingOp<arith::AndIOp>(m);
   if (!conj)
     return false;
-  auto cmpBound = [&](Value side) -> UniformInt {
+  auto cmpBound = [&](Value side, Value &axis) -> UniformInt {
     Value c = peelBroadcastExpand(side);
     auto cmp = definingOp<arith::CmpIOp>(c);
     if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt)
       return UniformInt();
-    if (!matchTileIndex(cmp.getLhs()))
+    axis = matchTileIndex(cmp.getLhs());
+    if (!axis)
       return UniformInt();
     return matchUniformInt(cmp.getRhs());
   };
-  if (UniformInt bm = cmpBound(conj.getLhs()))
-    if (UniformInt bn = cmpBound(conj.getRhs())) {
-      boundM = bm;
-      boundN = bn;
-      return true;
-    }
-  if (UniformInt bm = cmpBound(conj.getRhs()))
-    if (UniformInt bn = cmpBound(conj.getLhs())) {
-      boundM = bm;
-      boundN = bn;
-      return true;
-    }
+  Value axisL, axisR;
+  UniformInt bl = cmpBound(conj.getLhs(), axisL);
+  UniformInt br = cmpBound(conj.getRhs(), axisR);
+  if (!bl || !br)
+    return false;
+  if (axisL == rowBase && axisR == colBase) {
+    boundM = bl;
+    boundN = br;
+    return true;
+  }
+  if (axisR == rowBase && axisL == colBase) {
+    boundM = br;
+    boundN = bl;
+    return true;
+  }
   return false;
 }
 
@@ -1754,18 +1763,41 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   auto ptr = definingOp<tt::AddPtrOp>(store.getPtr());
   if (!ptr)
     return rej("ptr-not-addptr");
-  auto splat = definingOp<tt::SplatOp>(ptr.getPtr());
+  Value ptrBase = ptr.getPtr();
+  Value rowOff;
+  if (auto inner = definingOp<tt::AddPtrOp>(peelBroadcast(ptrBase))) {
+    rowOff = inner.getOffset();
+    ptrBase = inner.getPtr();
+  }
+  auto splat = definingOp<tt::SplatOp>(peelBroadcast(ptrBase));
   if (!splat)
     return rej("ptr-base-not-splat");
   if (!isa<BlockArgument>(splat.getSrc()))
     return rej("ptr-base-not-block-arg");
   Value rowBase, colBase;
   UniformInt ldc;
-  if (!matchRowMajorOffset(ptr.getOffset(), rowBase, ldc, colBase))
+  if (rowOff) {
+    Value cb = matchTileIndex(ptr.getOffset());
+    auto mul = definingOp<arith::MulIOp>(peelBroadcastExpand(rowOff));
+    if (!cb || !mul)
+      return rej("split-offset-shape");
+    Value rb = matchTileIndex(mul.getLhs());
+    UniformInt stride = matchUniformInt(mul.getRhs());
+    if (!rb || !stride) {
+      rb = matchTileIndex(mul.getRhs());
+      stride = matchUniformInt(mul.getLhs());
+    }
+    if (!rb || !stride)
+      return rej("split-offset-rowterm");
+    rowBase = rb;
+    colBase = cb;
+    ldc = stride;
+  } else if (!matchRowMajorOffset(ptr.getOffset(), rowBase, ldc, colBase)) {
     return rej("offset-not-row-major");
+  }
   UniformInt boundM, boundN;
   if (store.getMask()) {
-    if (!matchBoundaryMask(store.getMask(), boundM, boundN))
+    if (!matchBoundaryMask(store.getMask(), rowBase, colBase, boundM, boundN))
       return rej("mask-not-boundary");
   }
   DirectStore ds;
@@ -1787,6 +1819,20 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
 // convert_layout it feeds is a lane permutation. Without the DirectStore half
 // the fused readback still stages C through the pool via simdgroup_store, so
 // the reservation has to stay.
+// True when the direct C store keeps a threadgroup fallback arm: a boundary
+// mask means the ragged tile still goes through the pool, so its space cannot
+// be reclaimed even though the full-tile path stores straight to device.
+bool MSLEmitter::fusedGemmCHasFallback(tt::DotOp d) {
+  auto forOp = dyn_cast<scf::ForOp>(d->getParentOp());
+  if (!forOp)
+    return false;
+  auto m = matchGemmDotLoop(forOp);
+  if (!m || m->first != d)
+    return false;
+  auto ds = matchDirectStore(forOp.getResult(m->second));
+  return ds && ds->boundM;
+}
+
 bool MSLEmitter::fusedGemmCIsShuffled(tt::DotOp d) {
   auto forOp = dyn_cast<scf::ForOp>(d->getParentOp());
   if (!forOp)

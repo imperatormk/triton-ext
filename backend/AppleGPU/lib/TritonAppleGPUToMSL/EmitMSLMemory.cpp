@@ -184,7 +184,10 @@ void MSLEmitter::scanPool(Operation *op) {
         // relayout is a lane permutation the C tile never reaches threadgroup
         // memory at all; otherwise the readback stages it one band at a time,
         // so reserving the full tile would cap the block size for nothing.
-        if (rk == 2 && fusedGemmCIsShuffled(d)) {
+        // A boundary-masked store keeps a threadgroup fallback arm for the
+        // ragged tile, so C still needs the pool even when the direct path
+        // exists; only an unmasked store bypasses threadgroup memory entirely.
+        if (rk == 2 && fusedGemmCIsShuffled(d) && !fusedGemmCHasFallback(d)) {
           need = stagedAB;
         } else {
           need = std::max(stagedAB, cFull);

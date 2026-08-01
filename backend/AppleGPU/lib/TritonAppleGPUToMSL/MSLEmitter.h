@@ -508,7 +508,8 @@ private:
 
   // The store boundary mask `(row < boundM) && (col < boundN)`, with row/col
   // the same per-tile indices as the address. Extracts the two bounds.
-  bool matchBoundaryMask(Value m, UniformInt &boundM, UniformInt &boundN);
+  bool matchBoundaryMask(Value m, Value rowBase, Value colBase,
+                         UniformInt &boundM, UniformInt &boundN);
 
   // Recognise `acc(#mma) -> [narrowing] -> convert_layout ->
   // tt.store(rowmajor)` as the sole consumer of the fused accumulator. An
@@ -579,6 +580,7 @@ private:
   // a lane permutation, so the C tile never reaches threadgroup memory and the
   // pool does not have to reserve it.
   bool fusedGemmCIsShuffled(tt::DotOp d);
+  bool fusedGemmCHasFallback(tt::DotOp d);
 
   // Bitmask over lane (or warp) bits that reduce the given axis: a bit reduces
   // if its LinearLayout basis maps to a nonzero coordinate on the reduced

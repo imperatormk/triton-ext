@@ -1441,6 +1441,11 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     int vw = accessVectorWidth(srcTy, ac.getSrc());
     if (vw < 2 || rc % vw != 0)
       vw = 1;
+    // Slot delta between consecutive registers of a run: 1 means the run is
+    // contiguous in threadgroup memory and can be stored as one vector, any
+    // other constant means it is strided and the lanes are scattered
+    // individually (still one wide device load).
+    int64_t slotStride = 1;
     // accessVectorWidth only says the *device* addresses of a register run are
     // contiguous. The threadgroup slots have to be contiguous as well, or the
     // wide store writes the run down one row when the operand lays it out down
@@ -1456,11 +1461,14 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
         return off;
       };
       int64_t base0 = slotOf(0);
-      for (int k = 1; k < vw; ++k)
-        if (slotOf(k) != base0 + k) {
-          vw = 1;
+      slotStride = slotOf(1) - base0;
+      for (int k = 2; k < vw; ++k)
+        if (slotOf(k) - base0 != slotStride * k) {
+          slotStride = 0; // not an arithmetic progression: no wide store
           break;
         }
+      if (slotStride == 0)
+        vw = 1;
     }
     Type elem = elementScalarType(srcTy);
     msl::Type *scTy = scalarType(elem);
@@ -1484,13 +1492,23 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       // slots s..s+vw-1 for every lane/warp), so the scatter is one vector
       // store through a threadgroup vector pointer rather than vw scalar
       // stores, each of which would recompute the full address expression.
-      msl::Type *tgVecPtr = ctx.ptr(vecTy, msl::AddrSpace::Threadgroup);
-      into.push_back(ctx.assignStmt(
-          ctx.deref(ctx.paren(ctx.cast(
-              CS::CStyle, tgVecPtr,
-              ctx.paren(ctx.binary(B::Add, ctx.var(dst.buf),
-                                   memdescElemAddr(dst, srcTy, base)))))),
-          ctx.var(vid)));
+      if (slotStride == 1) {
+        msl::Type *tgVecPtr = ctx.ptr(vecTy, msl::AddrSpace::Threadgroup);
+        into.push_back(ctx.assignStmt(
+            ctx.deref(ctx.paren(ctx.cast(
+                CS::CStyle, tgVecPtr,
+                ctx.paren(ctx.binary(B::Add, ctx.var(dst.buf),
+                                     memdescElemAddr(dst, srcTy, base)))))),
+            ctx.var(vid)));
+        return;
+      }
+      // Strided run (a column-major operand lays its registers down a column):
+      // the wide device load still holds, only the scatter is per lane.
+      for (int k = 0; k < vw; ++k)
+        into.push_back(ctx.assignStmt(
+            ctx.subscript(ctx.var(dst.buf),
+                          memdescElemAddr(dst, srcTy, base + k)),
+            ctx.subscript(ctx.var(vid), ctx.i32lit(k))));
     };
 
     if (hasMask && rc >= kMaskFastPathMinRegs) {

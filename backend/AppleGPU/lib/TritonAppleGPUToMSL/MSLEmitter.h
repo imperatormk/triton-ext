@@ -215,6 +215,13 @@ private:
   // Set once a batch of async copies has been fenced, cleared at the wait that
   // closes the batch, so its members share a single fence.
   bool asyncCopyFenced = false;
+  // Event tokens of DMA copies issued since the last wait.
+  SmallVector<std::string> pendingDmaHandles;
+  // Tokens needing a prologue declaration (issue and wait can be in different
+  // scopes).
+  SmallVector<std::string> dmaHandleDecls;
+  // One event token per async-copy site, reused across trips.
+  llvm::DenseMap<Operation *, std::string> dmaHandleFor;
   msl::Expr *memdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
                              int reg);
 
@@ -346,11 +353,13 @@ private:
                           const DotEmitCtx &dc, const DirectStage &ds,
                           RankedTensorType bStageTy, int64_t ldb,
                           StringRef tripVar, bool nextTrip);
-  StringRef dotDmaTripVar(tt::DotOp op);
+  StringRef dotDmaTripVar(Operation *op);
   msl::Expr *dmaTileOrigin(const DirectStage &ds, StringRef tripVar);
   msl::Stmt *dmaBegin(StringRef handle, StringRef tgBuf, int64_t pitch,
                       msl::Expr *src, const DirectStage &ds, int64_t elemBytes);
   msl::Stmt *dmaWait(StringRef handle);
+  std::optional<DirectStage>
+  asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac);
   SmallVector<std::string> dotResultIds(msl::Block &body, tt::DotOp op,
                                         const DotPlan &plan);
   void dotReadback(msl::Block &tgt, RankedTensorType cTy, StringRef tgC,

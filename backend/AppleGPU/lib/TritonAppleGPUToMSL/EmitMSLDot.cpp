@@ -69,6 +69,20 @@ Value peelBroadcast(Value v) {
   }
 }
 
+// True when a tensor value is uniform across the tile: `tt.splat` of a scalar,
+// or a constant whose elements are all equal (`arith.constant dense<32>`, which
+// is how a literal K-step advance is spelled).
+bool isUniformTensor(Value v) {
+  Value p = peelBroadcast(v);
+  if (definingOp<tt::SplatOp>(p))
+    return true;
+  if (auto cst = definingOp<arith::ConstantOp>(p))
+    if (auto dense = dyn_cast<DenseElementsAttr>(cst.getValue()))
+      return dense.isSplat();
+  return false;
+}
+
+
 // True when `v` indexes a unit-stride row: a 0..n-1 iota, optionally shifted by
 // a uniform scalar (`splat(k) + iota`, as a tile's column offset carries the
 // block's N-origin). Any such shift is uniform across the tile, so it moves the
@@ -118,7 +132,22 @@ Value matchRowStride(Value v, Value *shiftOut = nullptr) {
 // origin moves, by a uniform scalar -- so resolve the block argument to the
 // loop's *initial* pointer and report the per-trip delta separately.
 // Returns the init value, or null when the recurrence is not this shape.
-static Value resolveLoopCarriedPtr(Value v, Value &deltaOut) {
+static Value resolveLoopCarriedPtr(Value v, Value &deltaOut,
+                                   std::optional<int64_t> &deltaLit,
+                                   int *peeledSteps = nullptr) {
+  // The pipeliner copies from the *advanced* pointer, `addptr(arg, splat(d))`,
+  // one step beyond the iter-arg. Peel that so the recurrence below sees the
+  // block argument; the extra step only moves the tile origin, uniformly.
+  if (auto ap = definingOp<tt::AddPtrOp>(v))
+    if (isa<BlockArgument>(ap.getPtr()))
+      if (isUniformTensor(ap.getOffset())) {
+        v = ap.getPtr();
+        // The copy reads one step *ahead* of the iter-arg (it prefetches the
+        // next trip). Dropping the step here would make trip 0 re-fetch the
+        // tile the peeled prologue copy already staged.
+        if (peeledSteps)
+          ++*peeledSteps;
+      }
   auto arg = dyn_cast<BlockArgument>(v);
   if (!arg)
     return v;
@@ -131,15 +160,28 @@ static Value resolveLoopCarriedPtr(Value v, Value &deltaOut) {
   // The recurrence must be exactly `next = addptr(thisArg, splat(scalar))`.
   if (!ap || ap.getPtr() != v)
     return nullptr;
-  auto sp = definingOp<tt::SplatOp>(peelBroadcast(ap.getOffset()));
-  if (!sp)
+  // Record the advance itself rather than assuming it equals the row stride:
+  // B walks K down its rows (delta == a scalar stride), A walks K along its
+  // columns (delta == a constant K-block).
+  Value off = peelBroadcast(ap.getOffset());
+  if (auto sp = definingOp<tt::SplatOp>(off)) {
+    deltaOut = sp.getSrc();
+  } else if (auto cst = definingOp<arith::ConstantOp>(off)) {
+    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat())
+      return nullptr;
+    deltaLit = dense.getSplatValue<APInt>().getSExtValue();
+  } else {
     return nullptr;
-  deltaOut = sp.getSrc();
+  }
   return forOp.getInitArgs()[idx];
 }
 
 // Recognise a dot operand whose load is a contiguous device tile.
 // `rows`/`cols` are the operand's logical tile shape.
+std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
+                                            int64_t cols);
+
 std::optional<DirectStage> matchDirectStage(Value operand, int64_t rows,
                                             int64_t cols) {
   bool dbg = getenv("TRITON_MSL_DMA_PROBE") != nullptr;
@@ -157,8 +199,25 @@ std::optional<DirectStage> matchDirectStage(Value operand, int64_t rows,
   if (ld.getMask() || ld.getOther())
     return bail("masked load (boundary tile keeps the register path)");
 
+  return matchTilePointer(ld.getPtr(), rows, cols);
+}
+
+// The pointer half of matchDirectStage: given the *pointer tensor* of a load or
+// an async copy, recover the uniform base, row stride and block-origin shifts
+// that air.simdgroup_async_copy_2d needs.
+std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
+                                            int64_t cols) {
+  bool dbg = getenv("TRITON_MSL_DMA_PROBE") != nullptr;
+  auto bail = [&](const char *why) {
+    if (dbg)
+      llvm::errs() << "[dma-probe]   bail: " << why << "\n";
+    return std::nullopt;
+  };
+
   Value delta;
-  Value tilePtr = resolveLoopCarriedPtr(ld.getPtr(), delta);
+  std::optional<int64_t> deltaLit;
+  int peeled = 0;
+  Value tilePtr = resolveLoopCarriedPtr(ptr, delta, deltaLit, &peeled);
   if (!tilePtr)
     return bail("loop-carried ptr not a uniform addptr recurrence");
 
@@ -182,8 +241,59 @@ std::optional<DirectStage> matchDirectStage(Value operand, int64_t rows,
   if (!stride)
     return bail("row offset not iota*splat(stride)");
 
-  return DirectStage{splat.getSrc(), stride,     rowShift, colShift,
-                     delta,          (int64_t)rows, (int64_t)cols};
+  DirectStage out{splat.getSrc(), stride, rowShift, colShift, delta};
+  out.ptrDeltaLit = deltaLit;
+  out.aheadSteps = peeled;
+  out.rows = rows;
+  out.cols = cols;
+  return out;
+}
+
+// The DMA form of an async copy: the pointer tensor must denote a contiguous
+// device tile whose destination is a plain unpadded row-major threadgroup
+// buffer, which is exactly what the pipeliner allocates.
+std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac) {
+  if (!dmaStagingEnabled())
+    return std::nullopt;
+  auto srcTy = dyn_cast<RankedTensorType>(ac.getSrc().getType());
+  auto mt = dyn_cast<ttg::MemDescType>(ac.getResult().getType());
+  if (!srcTy || !mt || srcTy.getRank() != 2 || mt.getRank() != 2)
+    return std::nullopt;
+  Type e = mt.getElementType();
+  if (!(e.isF32() || e.isF16() || e.isBF16()))
+    return std::nullopt;
+  // A non-row-major destination cannot be expressed as (dstStride, dims).
+  if (!memdescStrides(mt).empty())
+    return std::nullopt;
+  auto ds = matchTilePointer(ac.getSrc(), mt.getShape()[0], mt.getShape()[1]);
+  if (!ds)
+    return std::nullopt;
+  // All-or-nothing per loop: staging one operand by DMA and the other through
+  // registers mixes two layouts for the same MMA block and computes garbage.
+  if (auto forOp = dyn_cast_or_null<scf::ForOp>(ac->getParentOp())) {
+    bool allOk = true;
+    forOp.walk([&](ttg::AsyncCopyGlobalToLocalOp other) {
+      if (other == ac || !allOk)
+        return;
+      auto omt = dyn_cast<ttg::MemDescType>(other.getResult().getType());
+      if (!omt || omt.getRank() != 2 || !memdescStrides(omt).empty() ||
+          !matchTilePointer(other.getSrc(), omt.getShape()[0],
+                            omt.getShape()[1]))
+        allOk = false;
+    });
+    if (!allOk)
+      return std::nullopt;
+  }
+  auto bound = [&](Value v) {
+    if (!v)
+      return true;
+    auto it = valMap.find(v);
+    return it != valMap.end() && it->second.size() == 1;
+  };
+  if (!bound(ds->basePtr) || !bound(ds->rowStride) || !bound(ds->rowShift) ||
+      !bound(ds->colShift))
+    return std::nullopt;
+  return ds;
 }
 
 // True when device-direct operand staging is enabled. Off unless the
@@ -250,7 +360,7 @@ std::optional<DirectStage> MSLEmitter::dotDmaStage(tt::DotOp op) {
 // loop IV counts K elements per trip, so the origin's offset is
 // (iv / step) * ptrDelta. Empty when the dot is not in a loop, in which case the
 // tile origin has no per-trip term.
-StringRef MSLEmitter::dotDmaTripVar(tt::DotOp op) {
+StringRef MSLEmitter::dotDmaTripVar(Operation *op) {
   auto forOp = dyn_cast_or_null<scf::ForOp>(op->getParentOp());
   if (!forOp)
     return {};
@@ -276,9 +386,34 @@ msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
   // The K-loop IV counts K elements, and the operand advances one row per K
   // element, so the per-trip origin offset is exactly iv*rowStride -- no need
   // to divide the IV by the loop step and rescale by ptrDelta.
-  if (ds.ptrDelta && !tripVar.empty())
-    add(ctx.paren(ctx.binary(B::Mul, ctx.var(tripVar),
-                             ctx.var(scalarName(ds.rowStride)))));
+  // The IV counts K elements and the tile advances `delta` elements per trip of
+  // `rows` (B) or `cols` (A) K-elements, so the origin term is
+  // iv * delta / step. A scalar delta is B's row stride and the step is `rows`,
+  // giving iv*stride; a literal delta is A's K-block and divides out exactly.
+  if (!tripVar.empty()) {
+    // `iv` counts K elements; a copy running `aheadSteps` blocks ahead adds
+    // that many K-blocks on top.
+    if (ds.ptrDeltaLit) {
+      int64_t step = ds.cols; // advances along its columns
+      if (step > 0 && *ds.ptrDeltaLit % step == 0) {
+        int64_t perK = *ds.ptrDeltaLit / step;
+        msl::Expr *t = ctx.var(tripVar);
+        if (ds.aheadSteps)
+          t = ctx.paren(ctx.binary(
+              B::Add, t, ctx.i32lit(ds.aheadSteps * ds.cols)));
+        if (perK != 1)
+          t = ctx.paren(ctx.binary(B::Mul, t, ctx.i32lit(perK)));
+        add(ctx.paren(t));
+      }
+    } else if (ds.ptrDelta) {
+      msl::Expr *t = ctx.var(tripVar);
+      if (ds.aheadSteps)
+        t = ctx.paren(
+            ctx.binary(B::Add, t, ctx.i32lit(ds.aheadSteps * ds.rows)));
+      add(ctx.paren(
+          ctx.binary(B::Mul, t, ctx.var(scalarName(ds.rowStride)))));
+    }
+  }
   msl::Expr *base = ctx.var(scalarName(ds.basePtr));
   return off ? ctx.binary(B::Add, base, ctx.paren(off)) : base;
 }

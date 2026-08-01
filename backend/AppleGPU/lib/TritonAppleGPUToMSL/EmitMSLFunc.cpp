@@ -36,6 +36,8 @@ namespace {
 // declaration behind with no use. The in-process compile path never surfaced
 // these, but the toolchain path (used when a kernel links the async-copy shim)
 // warns on each one.
+bool initHasCall(msl::Expr *e);
+
 struct DeadLocalMarker {
   llvm::DenseSet<llvm::StringRef> used;
   // Raw text is opaque to the AST, so any name it mentions must be assumed
@@ -115,6 +117,12 @@ struct DeadLocalMarker {
       return;
     case msl::Stmt::Kind::Assign: {
       auto *a = llvm::cast<msl::AssignStmt>(s);
+      // A name assigned a side-effecting call is live even if nothing has read
+      // it yet: dropping its declaration leaves the assignment referring to an
+      // identifier that no longer exists.
+      if (initHasCall(a->rhs))
+        if (auto *lv = llvm::dyn_cast<msl::VarRef>(a->lhs))
+          used.insert(lv->name);
       // A plain `v = rhs` does not read v, but `v[i] = rhs`, `*v = rhs` and
       // `v += rhs` all do.
       if (a->compound != msl::AssignStmt::Compound::None ||
@@ -497,8 +505,10 @@ msl::HelperSet MSLEmitter::scanHelpers() {
   // declarations cost nothing, whereas a missing one is a compile error.
   // The declarations are also what select the shim-linking compile path, so
   // this must not be narrower than what the emitter actually emits.
-  if (dmaStagingEnabled())
+  if (dmaStagingEnabled()) {
     mod.walk([&](tt::DotOp d) { h.tgAsyncCopy = true; });
+    mod.walk([&](ttg::AsyncCopyGlobalToLocalOp) { h.tgAsyncCopy = true; });
+  }
   return h;
 }
 
@@ -665,6 +675,32 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
         ctx.arrayDeclStmt(ctx.named("threadgroup char"), poolBuf, kernelPool));
   }
 
+  // One DMA event token per async-copy site, declared before the walk: the
+  // issue and its wait can land in different scopes, and the loop body is
+  // walked more than once, so the name has to be stable and already in scope.
+  if (dmaStagingEnabled()) {
+    // Copies feeding the same loop-carried token slot are one pipeline stage:
+    // the peeled prologue copy fills what trip 0 waits on, the in-loop copy
+    // fills what later trips wait on. They must share a token, or trip 0 waits
+    // on a null one and reads an unfilled tile.
+    llvm::DenseMap<void *, std::string> stageTok;
+    func.walk([&](ttg::AsyncCopyGlobalToLocalOp ac) {
+      if (dmaHandleFor.count(ac.getOperation()))
+        return;
+      // Stage key: the memdesc allocation this copy targets.
+      Value dst = ac.getResult();
+      while (auto mi = dst.getDefiningOp<ttg::MemDescIndexOp>())
+        dst = mi.getSrc();
+      std::string &tok = stageTok[dst.getAsOpaquePointer()];
+      if (tok.empty()) {
+        tok = fresh();
+        prologue.push_back(
+            ctx.declStmt(ctx.named("ulong"), tok, ctx.lit("0")));
+      }
+      dmaHandleFor[ac.getOperation()] = tok;
+    });
+  }
+
   // Declare every local_alloc's buffer up front. planDot decides whether a dot
   // can read its operand straight out of the allocation, and it runs while the
   // loop's Decl phase is emitted -- before the body walk would have reached an
@@ -707,6 +743,9 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
                                          : emitBlockCFG(region);
   if (emitFailed)
     return failure();
+  dmaHandleDecls.clear();
+  // Tokens are keyed per copy site; a later kernel must mint its own.
+  dmaHandleFor.clear();
   for (msl::Stmt *s : body)
     prologue.push_back(s);
   msl::KernelFn *fn = ctx.kernelFn(maxThreads, mslKernelName(func.getName()),

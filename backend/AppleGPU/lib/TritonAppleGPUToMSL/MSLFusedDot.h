@@ -105,6 +105,11 @@ struct DirectStage {
   Value rowShift;
   Value colShift;
   Value ptrDelta;
+  // Elements the tile origin advances per K-trip. Either a scalar SSA value
+  // (ptrDelta) or, when the recurrence steps by a splat constant, a literal.
+  std::optional<int64_t> ptrDeltaLit;
+  // K-blocks this copy runs ahead of the loop induction variable.
+  int aheadSteps = 0;
   int64_t rows = 0;
   int64_t cols = 0;
 };

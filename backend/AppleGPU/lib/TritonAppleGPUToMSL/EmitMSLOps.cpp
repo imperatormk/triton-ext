@@ -791,6 +791,41 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
     // tail is already fenced (nothing but address arithmetic since the last
     // barrier) adds a second sync at the same point.
     if (isa<ttg::AsyncWaitOp>(op)) {
+      // Wait on the copies this wait actually closes. The loop body is walked
+      // more than once (Decl then MMA phase), so a mutable "pending" list is
+      // drained by the first walk and empty for the second -- the tokens have
+      // to come from the IR, through the per-site map.
+      if (auto w = dyn_cast<ttg::AsyncWaitOp>(op)) {
+        // A token reaches the wait as a loop iter-arg, so resolve block
+        // arguments back to the commit the loop yields for that slot.
+        llvm::SmallVector<std::string> waits;
+        std::function<void(Value)> collect = [&](Value tok) {
+          if (auto arg = dyn_cast<BlockArgument>(tok)) {
+            auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+            if (!forOp || arg.getArgNumber() == 0)
+              return;
+            auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+            collect(yield.getOperand(arg.getArgNumber() - 1));
+            return;
+          }
+          auto commit = dyn_cast_or_null<ttg::AsyncCommitGroupOp>(
+              tok.getDefiningOp());
+          if (!commit)
+            return;
+          for (Value inner : commit.getInputTokens())
+            if (Operation *cp = inner.getDefiningOp()) {
+              auto it = dmaHandleFor.find(cp);
+              if (it != dmaHandleFor.end() &&
+                  !llvm::is_contained(waits, it->second))
+                waits.push_back(it->second);
+            }
+        };
+        for (Value tok : w.getAsyncToken())
+          collect(tok);
+        for (const std::string &h : waits)
+          body.push_back(dmaWait(h));
+      }
+      pendingDmaHandles.clear();
       if (!barrierCoversTail(body))
         body.push_back(ctx.barrier(/*device=*/false));
       // The batch ends here; the next copy opens a new one and fences again.
@@ -1423,6 +1458,38 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     if (!asyncCopyFenced && !barrierCoversTail(body))
       body.push_back(ctx.hardBarrier(false));
     asyncCopyFenced = true;
+
+    // True device->threadgroup DMA: air.simdgroup_async_copy_2d moves the tile
+    // without it ever entering registers, so the whole load+scatter disappears.
+    // ttg.async_copy_global_to_local is literally this operation.
+    if (auto ds = asyncCopyDma(ac)) {
+      MemDescInfo di = memdescMap[ac.getResult()];
+      auto mt = cast<ttg::MemDescType>(ac.getResult().getType());
+      int64_t eb = byteWidth(mt.getElementType());
+      msl::Expr *dstPtr = ctx.var(di.buf);
+      if (di.baseOffset)
+        dstPtr = ctx.paren(ctx.binary(B::Add, dstPtr, di.baseOffset));
+      // The wait may sit in an outer scope than the issue, so the token is
+      // declared in the function prologue and only assigned here. One token
+      // per copy *site*, reused every trip: minting a fresh name per emission
+      // leaves the loop waiting on the prologue's stale tokens while its own
+      // copies are never waited on at all.
+      auto hit = dmaHandleFor.find(ac.getOperation());
+      if (hit == dmaHandleFor.end())
+        return false;
+      const std::string &h = hit->second;
+      body.push_back(ctx.assignStmt(
+          ctx.var(h),
+          ctx.call("__triton_tg_async_copy_begin_" + std::to_string(eb),
+                   {dstPtr, ctx.i32lit(mt.getShape()[1]),
+                    dmaTileOrigin(*ds, dotDmaTripVar(ac)),
+                    ctx.var(scalarName(ds->rowStride)),
+                    ctx.i32lit(mt.getShape()[0]),
+                    ctx.i32lit(mt.getShape()[1])})));
+      pendingDmaHandles.push_back(h);
+      bindDataless(ac.getResult());
+      return true;
+    }
     auto srcTy = cast<RankedTensorType>(ac.getSrc().getType());
     MemDescInfo dst = memdescMap[ac.getResult()];
     auto &ptrs = names(ac.getSrc());

@@ -669,6 +669,9 @@ void MSLPrinter::printPreamble(const HelperSet &h) {
     os << R"MSL(extern "C" ulong __triton_tg_async_copy_begin_4(threadgroup void*, ulong, device const void*, ulong, ulong, ulong);
 extern "C" ulong __triton_tg_async_copy_begin_2(threadgroup void*, ulong, device const void*, ulong, ulong, ulong);
 extern "C" ulong __triton_tg_async_copy_begin_1(threadgroup void*, ulong, device const void*, ulong, ulong, ulong);
+extern "C" ulong __triton_tg_async_copy_begin_4_tr(threadgroup void*, ulong, device const void*, ulong, ulong, ulong);
+extern "C" ulong __triton_tg_async_copy_begin_2_tr(threadgroup void*, ulong, device const void*, ulong, ulong, ulong);
+extern "C" ulong __triton_tg_async_copy_begin_1_tr(threadgroup void*, ulong, device const void*, ulong, ulong, ulong);
 extern "C" void __triton_tg_async_copy_wait(ulong);
 
 )MSL";

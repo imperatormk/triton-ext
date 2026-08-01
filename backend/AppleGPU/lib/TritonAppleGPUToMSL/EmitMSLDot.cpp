@@ -16,6 +16,8 @@
 #include "MSLEmitter.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <functional>
+
 using namespace mlir;
 
 namespace mlir::triton::applegpu {
@@ -95,13 +97,37 @@ bool isUniformTensor(Value v) {
 // block's N-origin). Any such shift is uniform across the tile, so it moves the
 // tile origin rather than breaking contiguity; it is returned in `shiftOut` to
 // be folded into the base pointer.
-bool isUnitRange(Value v, Value *shiftOut = nullptr) {
+bool isUnitRange(Value v, Value *shiftOut = nullptr,
+                 int64_t tileRows = 0) {
   Value s = peelBroadcast(v);
+  // `rm % M` keeps a ragged trailing tile in bounds by wrapping it. That wrap
+  // is only harmless when it can never fall inside a tile: with a run-time
+  // bound, or an extent the block does not divide, the last tile is split --
+  // for N=30522/BLOCK_N=32 it runs 30496..30521 then 1..5, which is not a
+  // rectangle in device memory and no 2D strided copy can express it. Only a
+  // constant extent that the tile size divides is safe, and then the remainder
+  // is an identity over every tile and can be peeled outright.
+  // tt.contiguity is NOT sufficient here: it describes the typical tile, not
+  // the trailing one.
+  if (auto rem = definingOp<arith::RemSIOp>(s)) {
+    if (!tileRows)
+      return false;
+    auto cst = definingOp<arith::ConstantOp>(peelBroadcast(rem.getRhs()));
+    if (!cst)
+      return false;
+    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat())
+      return false;
+    int64_t extent = dense.getSplatValue<APInt>().getSExtValue();
+    if (extent <= 0 || extent % tileRows != 0)
+      return false;
+    return isUnitRange(rem.getLhs(), shiftOut, tileRows);
+  }
   if (auto add = definingOp<arith::AddIOp>(s)) {
     Value a = add.getLhs(), b = add.getRhs();
     for (int i = 0; i < 2; ++i) {
       if (auto sp = definingOp<tt::SplatOp>(peelBroadcast(a)))
-        if (isUnitRange(b)) {
+        if (isUnitRange(b, nullptr, tileRows)) {
           if (shiftOut)
             *shiftOut = sp.getSrc();
           return true;
@@ -117,15 +143,33 @@ bool isUnitRange(Value v, Value *shiftOut = nullptr) {
 // Match `mul(rowIndex, splat(stride))` (either operand order) and return the
 // scalar stride. The row index may itself carry a uniform block-origin shift,
 // which is reported in `shiftOut` (in rows, to be scaled by the stride).
-Value matchRowStride(Value v, Value *shiftOut = nullptr) {
+// The stride is a splat of a kernel argument, or -- when the template's shapes
+// are static, as inductor's are -- a folded `arith.constant dense<n>`. A match
+// reports whichever form it found; `strideLit` is set only for the latter.
+Value matchRowStride(Value v, Value *shiftOut = nullptr, int64_t tileRows = 0,
+                     std::optional<int64_t> *strideLit = nullptr,
+                     bool *matched = nullptr) {
   auto mul = definingOp<arith::MulIOp>(peelBroadcast(v));
   if (!mul)
     return nullptr;
   Value a = mul.getLhs(), b = mul.getRhs();
   for (int i = 0; i < 2; ++i) {
-    if (isUnitRange(a, shiftOut))
-      if (auto sp = definingOp<tt::SplatOp>(peelBroadcast(b)))
+    if (isUnitRange(a, shiftOut, tileRows)) {
+      Value pb = peelBroadcast(b);
+      if (auto sp = definingOp<tt::SplatOp>(pb)) {
+        if (matched)
+          *matched = true;
         return sp.getSrc();
+      }
+      if (auto cst = definingOp<arith::ConstantOp>(pb))
+        if (auto dense = dyn_cast<DenseElementsAttr>(cst.getValue()))
+          if (dense.isSplat() && strideLit) {
+            *strideLit = dense.getSplatValue<APInt>().getSExtValue();
+            if (matched)
+              *matched = true;
+            return nullptr;
+          }
+    }
     std::swap(a, b);
   }
   return nullptr;
@@ -231,28 +275,106 @@ std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
   auto colAdd = definingOp<tt::AddPtrOp>(tilePtr);
   if (!colAdd)
     return bail("tile ptr not an addptr");
-  Value colShift;
-  if (!isUnitRange(colAdd.getOffset(), &colShift))
-    return bail("column offset not a unit range");
 
-  auto rowAdd = definingOp<tt::AddPtrOp>(peelBroadcast(colAdd.getPtr()));
-  if (!rowAdd)
-    return bail("row ptr not an addptr");
+  // The two axis offsets reach the addptr either as a chain of two addptrs or,
+  // as inductor's mm template spells it, already summed into one offset tensor.
+  Value axis0, axis1;
+  Value base;
+  if (auto inner = definingOp<tt::AddPtrOp>(peelBroadcast(colAdd.getPtr()))) {
+    axis0 = colAdd.getOffset();
+    axis1 = inner.getOffset();
+    base = inner.getPtr();
+  } else if (auto sum =
+                 definingOp<arith::AddIOp>(peelBroadcast(colAdd.getOffset()))) {
+    axis0 = sum.getLhs();
+    axis1 = sum.getRhs();
+    base = colAdd.getPtr();
+  } else {
+    return bail("tile offset is neither a chained addptr nor a sum of axes");
+  }
 
-  auto splat = definingOp<tt::SplatOp>(peelBroadcast(rowAdd.getPtr()));
+  auto splat = definingOp<tt::SplatOp>(peelBroadcast(base));
   if (!splat)
     return bail("base not a splat of a scalar pointer");
 
-  Value rowShift;
-  Value stride = matchRowStride(rowAdd.getOffset(), &rowShift);
-  if (!stride)
-    return bail("row offset not iota*splat(stride)");
+  // One axis offset walks contiguously (a unit range), the other is
+  // iota*stride. Which *tensor* axis each varies along decides the orientation:
+  // `tt.expand_dims axis=d` is constant along d, so it varies along 1-d. The
+  // tile is row-major when the contiguous offset varies along the column axis
+  // (dim 1), and column-major -- inductor hands B in with strides [1, N] --
+  // when it varies along the row axis instead.
+  std::function<bool(Value)> variesAlongCols = [&](Value v) -> bool {
+    Value s = v;
+    while (true) {
+      if (auto b = definingOp<tt::BroadcastOp>(s)) {
+        s = b.getSrc();
+        continue;
+      }
+      if (auto c = definingOp<ttg::ConvertLayoutOp>(s)) {
+        s = c.getSrc();
+        continue;
+      }
+      break;
+    }
+    if (auto e = definingOp<tt::ExpandDimsOp>(s))
+      return e.getAxis() == 0;
+    if (auto mul = definingOp<arith::MulIOp>(s))
+      return variesAlongCols(mul.getLhs()) || variesAlongCols(mul.getRhs());
+    if (auto add = definingOp<arith::AddIOp>(s))
+      return variesAlongCols(add.getLhs()) || variesAlongCols(add.getRhs());
+    return false;
+  };
 
-  DirectStage out{splat.getSrc(), stride, rowShift, colShift, delta};
+  // Sort the two offsets by the tensor axis each varies along, so `rowAxis`
+  // walks down the tile and `colAxis` across it regardless of the order the
+  // template happened to sum them in.
+  Value rowAxis = axis0, colAxis = axis1;
+  if (variesAlongCols(axis0))
+    std::swap(rowAxis, colAxis);
+  if (variesAlongCols(rowAxis) || !variesAlongCols(colAxis))
+    return bail("tile offsets do not vary along distinct axes");
+
+  // A contiguous axis is spelled either as a bare iota or as iota*splat(s)
+  // where s is 1 at runtime. The latter is inductor's form -- it multiplies
+  // both axes by a stride even when one of them is unit -- so the contiguity
+  // of a tile is not decidable here and the *pair* of strides is carried
+  // instead; the copy picks the contiguous one.
+  // A wrap on an axis is only safe when the tile size along *that* axis
+  // divides the operand extent, so each axis is checked against its own dim.
+  Value rowShift, colShift;
+  std::optional<int64_t> rowStrideLit, colStrideLit;
+  bool rowMatched = false, colMatched = false;
+  Value rowStride =
+      matchRowStride(rowAxis, &rowShift, rows, &rowStrideLit, &rowMatched);
+  Value colStride =
+      matchRowStride(colAxis, &colShift, cols, &colStrideLit, &colMatched);
+  if (!rowMatched && !isUnitRange(rowAxis, &rowShift, rows))
+    return bail("row offset neither iota nor iota*splat(stride)");
+  if (!colMatched && !isUnitRange(colAxis, &colShift, cols))
+    return bail("column offset neither iota nor iota*splat(stride)");
+
+  // Row-major means the column axis is the contiguous one -- i.e. it carries no
+  // stride of its own, or a stride of exactly 1. Anything else means the tile
+  // walks down its columns and the row stride is the contiguous direction.
+  bool colIsUnit = !colStride && (!colStrideLit || *colStrideLit == 1);
+  bool transposed = !colIsUnit;
+  Value stride = transposed ? colStride : rowStride;
+  std::optional<int64_t> strideLit = transposed ? colStrideLit : rowStrideLit;
+  if (!stride && !strideLit)
+    return bail("no strided axis to describe the tile pitch");
+
+  DirectStage out;
+  out.basePtr = splat.getSrc();
+  out.rowStride = stride;
+  out.rowShift = rowShift;
+  out.colShift = colShift;
+  out.ptrDelta = delta;
+  out.rowStrideLit = strideLit;
   out.ptrDeltaLit = deltaLit;
   out.aheadSteps = peeled;
   out.rows = rows;
   out.cols = cols;
+  out.srcTransposed = transposed;
   return out;
 }
 
@@ -308,7 +430,7 @@ std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalO
     auto it = valMap.find(v);
     return it != valMap.end() && it->second.size() == 1;
   };
-  if (!bound(ds->basePtr) || !bound(ds->rowStride) || !bound(ds->rowShift) ||
+  if (!bound(ds->basePtr) || !(ds->rowStrideLit || bound(ds->rowStride)) || !bound(ds->rowShift) ||
       !bound(ds->colShift))
     return std::nullopt;
   return ds;
@@ -355,7 +477,7 @@ std::optional<DirectStage> MSLEmitter::bDmaCandidate(tt::DotOp op,
     return it != valMap.end() && it->second.size() == 1;
   };
   if (requireBound &&
-      (!bound(ds->basePtr) || !bound(ds->rowStride) || !bound(ds->rowShift) ||
+      (!bound(ds->basePtr) || !(ds->rowStrideLit || bound(ds->rowStride)) || !bound(ds->rowShift) ||
        !bound(ds->colShift)))
     return std::nullopt;
   return ds;
@@ -388,6 +510,15 @@ StringRef MSLEmitter::dotDmaTripVar(Operation *op) {
   return it->second[0];
 }
 
+// The row pitch as an expression, whichever form the matcher recovered. Every
+// site that spells the stride goes through here so the two forms cannot
+// diverge.
+msl::Expr *MSLEmitter::dmaRowStride(const DirectStage &ds) {
+  if (ds.rowStrideLit)
+    return ctx.i32lit(*ds.rowStrideLit);
+  return dmaRowStride(ds);
+}
+
 // The tile origin: base + (rowShift*rowStride + colShift) elements, plus the
 // per-trip delta accumulated by the K-loop. Every term is a uniform scalar, so
 // the result is threadgroup-uniform -- which the DMA requires.
@@ -398,7 +529,7 @@ msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
   };
   if (ds.rowShift)
     add(ctx.paren(ctx.binary(B::Mul, ctx.var(scalarName(ds.rowShift)),
-                             ctx.var(scalarName(ds.rowStride)))));
+                             dmaRowStride(ds))));
   if (ds.colShift)
     add(ctx.var(scalarName(ds.colShift)));
   // The K-loop IV counts K elements, and the operand advances one row per K
@@ -429,11 +560,20 @@ msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
         t = ctx.paren(
             ctx.binary(B::Add, t, ctx.i32lit(ds.aheadSteps * ds.rows)));
       add(ctx.paren(
-          ctx.binary(B::Mul, t, ctx.var(scalarName(ds.rowStride)))));
+          ctx.binary(B::Mul, t, dmaRowStride(ds))));
     }
   }
   msl::Expr *base = ctx.var(scalarName(ds.basePtr));
   return off ? ctx.binary(B::Add, base, ctx.paren(off)) : base;
+}
+
+// The shim entry point for an element size, in the orientation the source tile
+// needs. One entry point per element size because the intrinsic silently copies
+// garbage when its element size is not a literal constant; the `_tr` forms swap
+// the source strides so a column-major tile still lands row-major.
+std::string MSLEmitter::dmaCallee(int64_t elemBytes, bool transposed) {
+  return "__triton_tg_async_copy_begin_" + std::to_string(elemBytes) +
+         (transposed ? "_tr" : "");
 }
 
 // `ulong h = __triton_tg_async_copy_begin_<n>(tg, pitch, src, stride, rows,
@@ -442,11 +582,10 @@ msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
 msl::Stmt *MSLEmitter::dmaBegin(StringRef handle, StringRef tgBuf,
                                 int64_t pitch, msl::Expr *src,
                                 const DirectStage &ds, int64_t elemBytes) {
-  std::string callee =
-      "__triton_tg_async_copy_begin_" + std::to_string(elemBytes);
+  std::string callee = dmaCallee(elemBytes, ds.srcTransposed);
   msl::Expr *c = ctx.call(
       callee, {ctx.var(tgBuf), ctx.i32lit(pitch), src,
-               ctx.var(scalarName(ds.rowStride)), ctx.i32lit(ds.rows),
+               dmaRowStride(ds), ctx.i32lit(ds.rows),
                ctx.i32lit(ds.cols)});
   return ctx.declStmt(ctx.named("ulong"), handle, c);
 }
@@ -491,7 +630,7 @@ msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
     src = ctx.binary(
         B::Add, src,
         ctx.paren(ctx.binary(B::Mul, ctx.i32lit(ds.rows),
-                             ctx.var(scalarName(ds.rowStride)))));
+                             dmaRowStride(ds))));
   if (split) {
     msl::Expr *wRows =
         ctx.paren(ctx.binary(B::Mul, ctx.var(warpId), ctx.i32lit(band)));
@@ -500,11 +639,11 @@ msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
         ctx.paren(ctx.binary(B::Mul, wRows, ctx.i32lit(ldb)))));
     src = ctx.binary(
         B::Add, src,
-        ctx.paren(ctx.binary(B::Mul, wRows, ctx.var(scalarName(ds.rowStride)))));
+        ctx.paren(ctx.binary(B::Mul, wRows, dmaRowStride(ds))));
   }
   msl::Expr *c = ctx.call(
-      "__triton_tg_async_copy_begin_" + std::to_string(eb),
-      {dst, ctx.i32lit(ldb), src, ctx.var(scalarName(ds.rowStride)),
+      dmaCallee(eb, ds.srcTransposed),
+      {dst, ctx.i32lit(ldb), src, dmaRowStride(ds),
        ctx.i32lit(band), ctx.i32lit(ds.cols)});
   return ctx.assignStmt(ctx.var(handle), c);
 }
@@ -673,7 +812,10 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
     auto report = [&](const char *which, Value stage, int64_t r, int64_t c) {
       auto m = matchDirectStage(stage, r, c);
       llvm::errs() << "[dma-probe] " << which << " " << r << "x" << c << " "
-                   << (m ? "MATCH" : "no-match") << " def=";
+                   << (!m                 ? "no-match"
+                       : m->srcTransposed ? "MATCH-transposed(declined)"
+                                          : "MATCH")
+                   << " def=";
       if (Operation *d = stage.getDefiningOp())
         llvm::errs() << d->getName();
       else

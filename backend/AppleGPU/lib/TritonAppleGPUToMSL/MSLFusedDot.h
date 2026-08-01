@@ -101,7 +101,10 @@ inline void dotStageRowPads(int64_t M, int64_t N, int64_t K, int64_t aEb,
 // (null when absent); `ptrDelta` is added once per K-loop trip.
 struct DirectStage {
   Value basePtr;
+  // The row pitch, either as a bound SSA scalar (a kernel stride argument) or,
+  // when the template folded it, as a literal. Exactly one is set.
   Value rowStride;
+  std::optional<int64_t> rowStrideLit;
   Value rowShift;
   Value colShift;
   Value ptrDelta;
@@ -112,6 +115,11 @@ struct DirectStage {
   int aheadSteps = 0;
   int64_t rows = 0;
   int64_t cols = 0;
+  // The device tile is contiguous down its columns rather than across its rows
+  // (a B operand handed in with strides [1, N]). The `_tr` shim entry points
+  // swap the source strides so such a tile still lands row-major in threadgroup
+  // memory, which keeps the transpose out of the MMA entirely.
+  bool srcTransposed = false;
 };
 
 struct DotPlan {

@@ -1506,13 +1506,13 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
         srcPtr = ctx.binary(
             B::Add, srcPtr,
             ctx.paren(ctx.binary(B::Mul, wRows,
-                                 ctx.var(scalarName(ds->rowStride)))));
+                                 dmaRowStride(*ds))));
       }
       msl::Stmt *issue = ctx.assignStmt(
           ctx.var(h),
-          ctx.call("__triton_tg_async_copy_begin_" + std::to_string(eb),
+          ctx.call(dmaCallee(eb, ds->srcTransposed),
                    {dstPtr, ctx.i32lit(cols), srcPtr,
-                    ctx.var(scalarName(ds->rowStride)), ctx.i32lit(band),
+                    dmaRowStride(*ds), ctx.i32lit(band),
                     ctx.i32lit(cols)}));
       // A uniform mask guards the whole issue; the token stays 0 when the trip
       // is out of range, and waiting on a null token is a no-op.

@@ -67,6 +67,58 @@ define i64 @__triton_tg_async_copy_begin_1(i8 addrspace(3)* %dst, i64 %dstStride
   ret i64 %h
 }
 
+; Transposing variants. The two stride operands after each pointer are the row
+; stride and the element stride; swapping them on the source side walks the
+; device tile down its columns while the destination stays row-major, so a
+; column-major operand (inductor hands B in with strides [1, N]) lands in
+; threadgroup memory in the layout simdgroup_load already expects. Verified on
+; device: the non-transposing form mis-stages the same tile at element (0,1).
+;
+; This is what keeps the transpose out of the MMA: no transpose flag has to be
+; threaded through simdgroup_load and no fragment addressing changes.
+
+define i64 @__triton_tg_async_copy_begin_4_tr(i8 addrspace(3)* %dst, i64 %dstStride,
+                                              i8 addrspace(1)* %src, i64 %srcStride,
+                                              i64 %rows, i64 %cols) {
+  %d0 = insertelement <2 x i64> undef, i64 %cols, i32 0
+  %dims = insertelement <2 x i64> %d0, i64 %rows, i32 1
+  %e = call %struct._simdgroup_event_t* @air.simdgroup_async_copy_2d.p3i8.p1i8(
+      i64 4, i64 4,
+      i8 addrspace(3)* %dst, i64 %dstStride, i64 1, <2 x i64> %dims,
+      i8 addrspace(1)* %src, i64 1, i64 %srcStride, <2 x i64> %dims,
+      <2 x i64> zeroinitializer, i32 0)
+  %h = ptrtoint %struct._simdgroup_event_t* %e to i64
+  ret i64 %h
+}
+
+define i64 @__triton_tg_async_copy_begin_2_tr(i8 addrspace(3)* %dst, i64 %dstStride,
+                                              i8 addrspace(1)* %src, i64 %srcStride,
+                                              i64 %rows, i64 %cols) {
+  %d0 = insertelement <2 x i64> undef, i64 %cols, i32 0
+  %dims = insertelement <2 x i64> %d0, i64 %rows, i32 1
+  %e = call %struct._simdgroup_event_t* @air.simdgroup_async_copy_2d.p3i8.p1i8(
+      i64 2, i64 2,
+      i8 addrspace(3)* %dst, i64 %dstStride, i64 1, <2 x i64> %dims,
+      i8 addrspace(1)* %src, i64 1, i64 %srcStride, <2 x i64> %dims,
+      <2 x i64> zeroinitializer, i32 0)
+  %h = ptrtoint %struct._simdgroup_event_t* %e to i64
+  ret i64 %h
+}
+
+define i64 @__triton_tg_async_copy_begin_1_tr(i8 addrspace(3)* %dst, i64 %dstStride,
+                                              i8 addrspace(1)* %src, i64 %srcStride,
+                                              i64 %rows, i64 %cols) {
+  %d0 = insertelement <2 x i64> undef, i64 %cols, i32 0
+  %dims = insertelement <2 x i64> %d0, i64 %rows, i32 1
+  %e = call %struct._simdgroup_event_t* @air.simdgroup_async_copy_2d.p3i8.p1i8(
+      i64 1, i64 1,
+      i8 addrspace(3)* %dst, i64 %dstStride, i64 1, <2 x i64> %dims,
+      i8 addrspace(1)* %src, i64 1, i64 %srcStride, <2 x i64> %dims,
+      <2 x i64> zeroinitializer, i32 0)
+  %h = ptrtoint %struct._simdgroup_event_t* %e to i64
+  ret i64 %h
+}
+
 ; The event token crosses the ABI as an integer: MSL requires an explicit
 ; address space on every pointer type, so it cannot be declared as an opaque
 ; pointer on the MSL side.

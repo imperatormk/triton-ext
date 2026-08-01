@@ -357,6 +357,8 @@ private:
   msl::Expr *dmaTileOrigin(const DirectStage &ds, StringRef tripVar);
   msl::Stmt *dmaBegin(StringRef handle, StringRef tgBuf, int64_t pitch,
                       msl::Expr *src, const DirectStage &ds, int64_t elemBytes);
+  static std::string dmaCallee(int64_t elemBytes, bool transposed);
+  msl::Expr *dmaRowStride(const DirectStage &ds);
   msl::Stmt *dmaWait(StringRef handle);
   std::optional<DirectStage>
   asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac);

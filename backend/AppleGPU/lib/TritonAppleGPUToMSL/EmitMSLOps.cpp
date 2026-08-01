@@ -785,7 +785,11 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
     return true;
   }
   if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op)) {
-    body.push_back(ctx.barrier(/*device=*/false));
+    // async_commit_group only closes a batch; it is async_wait that makes the
+    // staged tiles visible. Emitting a barrier for the commit as well puts a
+    // full threadgroup sync between the copies of a single trip.
+    if (isa<ttg::AsyncWaitOp>(op))
+      body.push_back(ctx.barrier(/*device=*/false));
     for (Value r : op->getResults())
       bindDataless(r);
     return true;
@@ -1430,11 +1434,17 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
           vecTy, vid,
           ctx.deref(ctx.paren(
               ctx.cast(CS::CStyle, vecPtr, ctx.var(ptrs[base]))))));
-      for (int k = 0; k < vw; ++k)
-        into.push_back(ctx.assignStmt(
-            ctx.subscript(ctx.var(dst.buf),
-                          memdescElemAddr(dst, srcTy, base + k)),
-            ctx.subscript(ctx.var(vid), ctx.i32lit(k))));
+      // The run's threadgroup slots are consecutive (verified: a vw-run maps to
+      // slots s..s+vw-1 for every lane/warp), so the scatter is one vector
+      // store through a threadgroup vector pointer rather than vw scalar
+      // stores, each of which would recompute the full address expression.
+      msl::Type *tgVecPtr = ctx.ptr(vecTy, msl::AddrSpace::Threadgroup);
+      into.push_back(ctx.assignStmt(
+          ctx.deref(ctx.paren(ctx.cast(
+              CS::CStyle, tgVecPtr,
+              ctx.paren(ctx.binary(B::Add, ctx.var(dst.buf),
+                                   memdescElemAddr(dst, srcTy, base)))))),
+          ctx.var(vid)));
     };
 
     if (hasMask && rc >= kMaskFastPathMinRegs) {
@@ -1469,7 +1479,11 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       for (int base = 0; base < rc; base += vw)
         stageRun(body, base);
     }
-    body.push_back(ctx.barrier(false));
+    // No barrier here: the copy's visibility point is the matching
+    // async_wait, which emits one. Emitting a barrier per copy separates the
+    // A and B staging of the same trip with a full threadgroup sync that
+    // synchronises nothing -- they write different buffers and both have to
+    // land before the next trip reads either.
     bindDataless(ac.getResult());
     return true;
   }

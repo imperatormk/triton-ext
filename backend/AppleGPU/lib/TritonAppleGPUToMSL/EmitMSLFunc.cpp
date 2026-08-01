@@ -679,7 +679,7 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
         ctx.named("threadgroup " + mslScalarType(mt.getElementType()));
     std::string buf = "__tg_buf_" + std::to_string(tgScratchId++);
     prologue.push_back(ctx.arrayDeclStmt(scTy, buf, memdescFlatSize(mt)));
-    memdescMap[la.getResult()] = {buf, nullptr};
+    memdescMap[la.getResult()] = {buf, nullptr, memdescStrides(mt)};
   });
   // A pipelined operand reaches its dot through memdesc_index (the buffer slot
   // for this trip), and that is the value the dot looks up, not the allocation.
@@ -699,7 +699,7 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     msl::Expr *base =
         byteOff == 0 ? nullptr
                      : static_cast<msl::Expr *>(ctx.lit(std::to_string(byteOff)));
-    memdescMap[mi.getResult()] = {parent.buf, base};
+    memdescMap[mi.getResult()] = {parent.buf, base, parent.bufStrides};
   });
 
   Region &region = func.getBody();

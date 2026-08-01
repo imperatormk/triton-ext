@@ -210,6 +210,7 @@ private:
   // poolRegion/memdescElemAddr stay here (they touch pool/memdesc state, not
   // just layout coords).
   msl::Expr *poolRegion(int64_t byteOffset, StringRef sc);
+  static SmallVector<int64_t> memdescStrides(ttg::MemDescType mt);
   msl::Expr *memdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
                              int reg);
 

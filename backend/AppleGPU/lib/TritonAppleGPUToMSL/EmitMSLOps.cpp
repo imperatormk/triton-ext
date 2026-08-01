@@ -788,8 +788,7 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
     // async_commit_group only closes a batch; it is async_wait that makes the
     // staged tiles visible. Emitting a barrier for the commit as well puts a
     // full threadgroup sync between the copies of a single trip.
-    if (isa<ttg::AsyncWaitOp>(op))
-      body.push_back(ctx.barrier(/*device=*/false));
+    body.push_back(ctx.barrier(/*device=*/false));
     for (Value r : op->getResults())
       bindDataless(r);
     return true;
@@ -1349,7 +1348,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
           ctx.named("threadgroup " + mslScalarType(mt.getElementType()));
       std::string buf = "__tg_buf_" + std::to_string(tgScratchId++);
       body.push_back(ctx.arrayDeclStmt(scTy, buf, memdescFlatSize(mt)));
-      memdescMap[la.getResult()] = {buf, nullptr};
+      memdescMap[la.getResult()] = {buf, nullptr, memdescStrides(mt)};
     }
     if (Value init = la.getSrc()) {
       const std::string &buf = memdescMap[la.getResult()].buf;
@@ -1358,7 +1357,8 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       body.push_back(ctx.hardBarrier(false));
       for (int r = 0, n = regCount(init); r < n; ++r)
         body.push_back(ctx.assignStmt(
-            ctx.subscript(ctx.var(buf), layout.flatTileOffset(srcTy, r)),
+            ctx.subscript(ctx.var(buf),
+                          memdescElemAddr(memdescMap[la.getResult()], srcTy, r)),
             ctx.var(vals[r])));
       body.push_back(ctx.hardBarrier(false));
     }
@@ -1402,11 +1402,36 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
   // ttg.async_copy_global_to_local: synchronous masked per-thread stage +
   // barrier.
   if (auto ac = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
+    // On hardware this copy is asynchronous and only lands at the matching
+    // async_wait, so the pipeliner is free to issue it into a slot the current
+    // trip is still reading -- with numBuffers==1 it always does. We lower it
+    // to a synchronous store, which would clobber that slot immediately, so
+    // the reads have to be fenced off first.
+    body.push_back(ctx.hardBarrier(false));
     auto srcTy = cast<RankedTensorType>(ac.getSrc().getType());
     MemDescInfo dst = memdescMap[ac.getResult()];
     auto &ptrs = names(ac.getSrc());
     bool hasMask = ac.getMask() != nullptr;
     SmallVector<std::string> *mask = hasMask ? &names(ac.getMask()) : nullptr;
+    // A masked-off element must take `other`, exactly as tt.load does. Leaving
+    // the slot untouched keeps whatever the previous trip wrote, which with the
+    // pipeliner's rotating buffers is another tile's data -- observed as NaN on
+    // a boundary-masked pipelined GEMM.
+    SmallVector<std::string> *other =
+        ac.getOther() ? &names(ac.getOther()) : nullptr;
+    auto otherOf = [&](int r) -> msl::Expr * {
+      return other ? static_cast<msl::Expr *>(
+                         ctx.var((*other)[other->size() == 1 ? 0 : r]))
+                   : static_cast<msl::Expr *>(ctx.lit("0"));
+    };
+    // `buf[slot] = m ? *p : other;` -- one unconditional store either way, so
+    // the slot never keeps a previous trip's value.
+    auto maskedCopy = [&](int r) -> msl::Stmt * {
+      return ctx.assignStmt(
+          ctx.subscript(ctx.var(dst.buf), memdescElemAddr(dst, srcTy, r)),
+          ctx.ternary(ctx.var((*mask)[mask->size() == 1 ? 0 : r]),
+                      ctx.deref(ctx.var(ptrs[r])), otherOf(r)));
+    };
     int rc = regCount(ac.getSrc());
     // Mirror the tt.load lowering: a run of registers that is contiguous in
     // device memory is one wide load, and a predicate that holds for every
@@ -1467,17 +1492,21 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
         for (int k = 1; uniformRun && k < vw; ++k)
           uniformRun = (*mask)[mask->size() == 1 ? 0 : base + k] == m0;
         if (uniformRun) {
-          msl::Block run;
+          // Whole run shares one predicate: wide copy when it holds, `other`
+          // into every slot when it does not.
+          msl::Block run, none;
           stageRun(run, base);
-          cold.push_back(ctx.ifScope(ctx.var(m0), std::move(run)));
+          for (int k = 0; k < vw; ++k)
+            none.push_back(ctx.assignStmt(
+                ctx.subscript(ctx.var(dst.buf),
+                              memdescElemAddr(dst, srcTy, base + k)),
+                otherOf(base + k)));
+          cold.push_back(
+              ctx.ifElseScope(ctx.var(m0), std::move(run), std::move(none)));
           base += vw;
           continue;
         }
-        cold.push_back(ctx.compactIf(
-            ctx.var(m0),
-            ctx.assignStmt(ctx.subscript(ctx.var(dst.buf),
-                                         memdescElemAddr(dst, srcTy, base)),
-                           ctx.deref(ctx.var(ptrs[base])))));
+        cold.push_back(maskedCopy(base));
         ++base;
       }
       msl::Expr *all = ms[0];
@@ -1486,11 +1515,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       body.push_back(ctx.ifElseScope(all, std::move(hot), std::move(cold)));
     } else if (hasMask) {
       for (int r = 0; r < rc; ++r)
-        body.push_back(ctx.compactIf(
-            ctx.var((*mask)[mask->size() == 1 ? 0 : r]),
-            ctx.assignStmt(
-                ctx.subscript(ctx.var(dst.buf), memdescElemAddr(dst, srcTy, r)),
-                ctx.deref(ctx.var(ptrs[r])))));
+        body.push_back(maskedCopy(r));
     } else {
       for (int base = 0; base < rc; base += vw)
         stageRun(body, base);

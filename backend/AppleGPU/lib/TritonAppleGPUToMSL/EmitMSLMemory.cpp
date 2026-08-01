@@ -36,6 +36,33 @@ msl::Expr *MSLEmitter::poolRegion(int64_t byteOffset, StringRef sc) {
 // Memdesc element address
 //===----------------------------------------------------------------------===//
 
+// Row strides for a memdesc, honouring the shared encoding's `order`. The
+// fastest-varying dim gets stride 1 and the rest multiply up in order. Returns
+// empty for a plain row-major layout, which memdescElemAddr handles directly.
+SmallVector<int64_t> MSLEmitter::memdescStrides(ttg::MemDescType mt) {
+  auto shared = dyn_cast<ttg::SwizzledSharedEncodingAttr>(mt.getEncoding());
+  if (!shared)
+    return {};
+  auto order = shared.getOrder();
+  int rank = mt.getRank();
+  if ((int)order.size() != rank)
+    return {};
+  bool rowMajor = true;
+  for (int i = 0; i < rank; ++i)
+    if ((int)order[i] != rank - 1 - i)
+      rowMajor = false;
+  if (rowMajor)
+    return {};
+  SmallVector<int64_t> strides(rank, 1);
+  int64_t acc = 1;
+  for (int i = 0; i < rank; ++i) {
+    int d = order[i];
+    strides[d] = acc;
+    acc *= mt.getShape()[d];
+  }
+  return strides;
+}
+
 msl::Expr *MSLEmitter::memdescElemAddr(const MemDescInfo &info,
                                        RankedTensorType tileTy, int reg) {
   msl::Expr *off;
@@ -281,7 +308,7 @@ LogicalResult MSLEmitter::emitMemDescIndex(ttg::MemDescIndexOp op) {
       parent.baseOffset
           ? ctx.paren(ctx.binary(msl::BinOp::Add, parent.baseOffset, scaled))
           : ctx.paren(scaled);
-  memdescMap[op.getResult()] = {parent.buf, base};
+  memdescMap[op.getResult()] = {parent.buf, base, parent.bufStrides};
   return success();
 }
 

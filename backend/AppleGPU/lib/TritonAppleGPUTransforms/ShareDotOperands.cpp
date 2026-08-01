@@ -38,8 +38,14 @@ tt::LoadOp operandLoad(Value operand, scf::ForOp forOp) {
   while (auto cvt = v.getDefiningOp<ttg::ConvertLayoutOp>())
     v = cvt.getSrc();
   auto load = v.getDefiningOp<tt::LoadOp>();
-  if (!load || load.getMask() || load.getOther())
+  if (!load)
     return nullptr;
+  // Masked loads are wrapped too, and they are the important case: the
+  // pipeliner only honours an existing local_alloc's encoding, so a load that
+  // is not pre-wrapped falls through to getOrder(ty) and gets a column-major
+  // shared layout for a transposed operand -- which simdgroup_load, taking one
+  // scalar stride, cannot address. The mask and `other` are applied by the
+  // load itself, so the allocation just stores the already-masked value.
   if (load->getParentOp() != forOp.getOperation())
     return nullptr;
   // local_alloc consumes the load's result, so anything else reading it would

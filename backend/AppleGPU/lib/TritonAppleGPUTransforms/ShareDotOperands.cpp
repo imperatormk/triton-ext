@@ -58,7 +58,16 @@ void routeThroughShared(tt::LoadOp load) {
   if (!blocked)
     return;
 
-  SmallVector<unsigned> order(blocked.getOrder());
+  // The emitter addresses every threadgroup tile row-major (flatTileOffset
+  // folds the out-dims in shape order and ignores the shared encoding's
+  // `order`), so the allocation must say row-major too. Inheriting the
+  // blocked layout's order instead makes a column-major operand be written
+  // one way and read another -- measured as wrong answers on every dtype with
+  // a transposed B, while row-major B stayed correct.
+  SmallVector<unsigned> order;
+  for (int d = (int)ty.getRank() - 1; d >= 0; --d)
+    order.push_back((unsigned)d);
+  (void)blocked;
   auto ctaLayout = ttg::getCGALayout(ty.getEncoding());
   auto shared = ttg::SwizzledSharedEncodingAttr::get(ctx, /*vec=*/1,
                                                      /*perPhase=*/1,

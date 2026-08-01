@@ -376,6 +376,35 @@ void MSLPrinter::printStmtInline(const Stmt *s) {
   llvm_unreachable("printStmtInline: unsupported stmt");
 }
 
+// A `T *p = <expr>;` whose initialiser is pure address arithmetic over names
+// already in scope: it touches no memory, so it cannot separate two
+// synchronisation points.
+static bool isPureAddressExpr(const Expr *e) {
+  if (!e)
+    return true;
+  switch (e->kind) {
+  case Expr::Kind::VarRef:
+  case Expr::Kind::Literal:
+    return true;
+  case Expr::Kind::Binary:
+    return isPureAddressExpr(llvm::cast<Binary>(e)->lhs) &&
+           isPureAddressExpr(llvm::cast<Binary>(e)->rhs);
+  case Expr::Kind::Unary:
+    return isPureAddressExpr(llvm::cast<Unary>(e)->x);
+  case Expr::Kind::Cast:
+    return isPureAddressExpr(llvm::cast<Cast>(e)->x);
+  case Expr::Kind::Paren:
+    return isPureAddressExpr(llvm::cast<Paren>(e)->x);
+  default:
+    return false;
+  }
+}
+
+static bool isPureAddressDecl(const Stmt *s) {
+  auto *d = llvm::dyn_cast<DeclStmt>(s);
+  return d && isPureAddressExpr(d->init);
+}
+
 void MSLPrinter::printBlock(const Block &b) {
   for (const Stmt *s : b) {
     if (auto *bar = llvm::dyn_cast<BarrierStmt>(s)) {
@@ -402,7 +431,8 @@ void MSLPrinter::printBlock(const Block &b) {
       continue;
     }
     flushBarrier();
-    justEmittedBarrier = false;
+    if (!isPureAddressDecl(s))
+      justEmittedBarrier = false;
     printStmt(s);
   }
 }

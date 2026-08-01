@@ -1458,12 +1458,28 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       msl::Block hot, cold;
       for (int base = 0; base < rc; base += vw)
         stageRun(hot, base);
-      for (int r = 0; r < rc; ++r)
+      // The cold arm still runs on the ragged trip, so it is worth
+      // vectorising too: when every register of a run shares one mask name the
+      // whole run is one predicated wide copy instead of vw scalar ones.
+      for (int base = 0; base < rc;) {
+        StringRef m0 = (*mask)[mask->size() == 1 ? 0 : base];
+        bool uniformRun = vw > 1 && base + vw <= rc;
+        for (int k = 1; uniformRun && k < vw; ++k)
+          uniformRun = (*mask)[mask->size() == 1 ? 0 : base + k] == m0;
+        if (uniformRun) {
+          msl::Block run;
+          stageRun(run, base);
+          cold.push_back(ctx.ifScope(ctx.var(m0), std::move(run)));
+          base += vw;
+          continue;
+        }
         cold.push_back(ctx.compactIf(
-            ctx.var((*mask)[mask->size() == 1 ? 0 : r]),
-            ctx.assignStmt(
-                ctx.subscript(ctx.var(dst.buf), memdescElemAddr(dst, srcTy, r)),
-                ctx.deref(ctx.var(ptrs[r])))));
+            ctx.var(m0),
+            ctx.assignStmt(ctx.subscript(ctx.var(dst.buf),
+                                         memdescElemAddr(dst, srcTy, base)),
+                           ctx.deref(ctx.var(ptrs[base])))));
+        ++base;
+      }
       msl::Expr *all = ms[0];
       for (size_t i = 1; i < ms.size(); ++i)
         all = ctx.binary(B::And, all, ms[i]);

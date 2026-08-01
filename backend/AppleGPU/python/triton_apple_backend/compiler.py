@@ -228,6 +228,11 @@ class MPSBackend(BaseBackend):
             # assign_latencies first nothing is ever marked for rotation and
             # the pass is a no-op.
             passes.ttgpuir.add_assign_latencies(pm, options.num_stages)
+            # NOTE: add_schedule_loops miscompiles a column-major dot operand
+            # on this backend -- solo repro gives err=nan with it and err=0
+            # without, with ShareDotOperands disabled either way, so the defect
+            # is upstream of our passes. Multi-buffering does not happen
+            # without it, so the pipeliner stays gated off until this is fixed.
             passes.ttgpuir.add_schedule_loops(pm)
             passes.ttgpuir.add_pipeline(pm, options.num_stages, False)
             passes.common.add_canonicalizer(pm)

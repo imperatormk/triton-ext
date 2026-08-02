@@ -91,12 +91,21 @@ struct FusedDotCtx {
 // while residency is still the binding limit. Past kTGResidencyFloor the pool
 // no longer decides occupancy - registers and warp slots do - so a nominal step
 // costs nothing while the bank conflicts remain real.
+// An operand that never reaches the pool - device-direct, or read in place out
+// of a caller's buffer - contributes no footprint, so charging its tile against
+// the budget makes the widened tiles look unaffordable and silently drops the
+// other operand's padding too.
 inline void dotStageRowPads(int64_t M, int64_t N, int64_t K, int64_t aEb,
-                            int64_t bEb, int64_t &aPad, int64_t &bPad) {
-  aPad = (K % 8 || aEb * K % 64) ? 0 : 4;
-  bPad = (N % 8 || bEb * N % 64) ? 0 : 4;
-  int64_t bare = M * K * aEb + K * N * bEb;
-  int64_t padded = M * (K + aPad) * aEb + K * (N + bPad) * bEb;
+                            int64_t bEb, int64_t &aPad, int64_t &bPad,
+                            bool aUnstaged = false, bool bUnstaged = false) {
+  aPad = (aUnstaged || K % 8 || aEb * K % 64) ? 0 : 4;
+  bPad = (bUnstaged || N % 8 || bEb * N % 64) ? 0 : 4;
+  int64_t aBare = aUnstaged ? 0 : M * K * aEb;
+  int64_t bBare = bUnstaged ? 0 : K * N * bEb;
+  int64_t aPadded = aUnstaged ? 0 : M * (K + aPad) * aEb;
+  int64_t bPadded = bUnstaged ? 0 : K * (N + bPad) * bEb;
+  int64_t bare = aBare + bBare;
+  int64_t padded = aPadded + bPadded;
   if (padded > kTGResidentBudgetBytes ||
       (tgResidency(padded) < tgResidency(bare) &&
        tgResidency(padded) < kTGResidencyFloor))

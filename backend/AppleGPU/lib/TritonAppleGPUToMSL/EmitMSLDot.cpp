@@ -998,12 +998,6 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
     report("B", p.bStage, p.K, p.N);
   }
 
-  dotStageRowPads(p.M, p.N, p.K, byteWidth(aElem), byteWidth(bElem), p.aPad,
-                  p.bPad);
-  if (p.aInPlace)
-    p.aPad = 0;
-  if (p.bInPlace)
-    p.bPad = 0;
   p.phase = fusedDot.phase;
   // A padded row stride makes the copy's destination pitch differ from its
   // width, which costs far more in the DMA engine than the bank padding
@@ -1011,8 +1005,6 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // destination: every one of its 3136 copies has dstStride == cols.
   bool bDma = p.phase != FusedDotPhase::None && !p.bInPlace &&
               dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false);
-  if (bDma)
-    p.bPad = 0;
   // A device-direct A claims no pool at all. Decided here, before stagedA is
   // computed, so the pool sizing and the emission cannot disagree about it.
   tt::LinearLayout cLLEarly = ttg::toLinearLayout(cTy);
@@ -1024,8 +1016,9 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
     nwEarly = nFragEarly;
   if (p.phase != FusedDotPhase::None && !p.aInPlace)
     p.aDirect = aDirectCandidate(op, p.M, p.K, nwEarly, /*requireBound=*/false);
-  if (p.aDirect)
-    p.aPad = 0;
+  dotStageRowPads(p.M, p.N, p.K, byteWidth(aElem), byteWidth(bElem), p.aPad,
+                  p.bPad, p.aInPlace || p.aDirect.has_value(),
+                  p.bInPlace.has_value() || bDma);
   p.stagedA =
       (p.aInPlace || p.aDirect) ? 0 : p.M * (p.K + p.aPad) * byteWidth(aElem);
   p.stagedB = p.bInPlace ? 0 : p.K * (p.N + p.bPad) * byteWidth(bElem);

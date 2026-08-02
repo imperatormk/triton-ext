@@ -210,8 +210,27 @@ void MSLEmitter::scanPool(Operation *op) {
     int64_t Kd = aTy.getShape()[rk - 1];
     int64_t aEb = byteWidth(aTy.getElementType());
     int64_t bEb = byteWidth(bTy.getElementType());
+    // The pad decision weighs the pool footprint, so it has to know which
+    // operands reach the pool at all. Both predicates are phase-free, so this
+    // asks exactly what planDot asks.
+    bool aUnstaged = false, bUnstaged = false;
+    if (rk == 2 && M * Kd * aEb + Kd * N * bEb <= kTGResidentBudgetBytes) {
+      aUnstaged = (bool)dotOperandLocalLoad(d.getA(), M, Kd);
+      bUnstaged = (bool)dotOperandLocalLoad(d.getB(), Kd, N);
+    }
+    if (!aUnstaged && dotIsFusedGemmAcc(d)) {
+      tt::LinearLayout llEarly = ttg::toLinearLayout(cTy);
+      auto wdEarly = StringAttr::get(d.getContext(), "warp");
+      int64_t nwE = llEarly.hasInDim(wdEarly) ? llEarly.getInDimSize(wdEarly) : 1;
+      int64_t nfE = (M / 8) * (N / 8);
+      if (nwE > nfE)
+        nwE = nfE;
+      aUnstaged = (bool)aDirectCandidate(d, M, Kd, nwE, /*requireBound=*/false);
+    }
+    if (!bUnstaged && dmaStagingEnabled() && bDmaCandidate(d, false))
+      bUnstaged = true;
     int64_t aPad, bPad;
-    dotStageRowPads(M, N, Kd, aEb, bEb, aPad, bPad);
+    dotStageRowPads(M, N, Kd, aEb, bEb, aPad, bPad, aUnstaged, bUnstaged);
     int64_t aBy = M * (Kd + aPad) * aEb;
     int64_t bBy = Kd * (N + bPad) * bEb;
     Type cE = cTy.getElementType();

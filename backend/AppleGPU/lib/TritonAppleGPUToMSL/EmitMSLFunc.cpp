@@ -672,8 +672,12 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
   // the Metal compiler budgets for exactly this size instead of an
   // occupancy-driven ceiling that could reject a valid launch.
   msl::Attr *maxThreads = nullptr;
-  if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
-    maxThreads = ctx.maxThreadsAttr(nw.getInt() * 32);
+  if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps")) {
+    int64_t tpw = 32;
+    if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.threads-per-warp"))
+      tpw = a.getInt();
+    maxThreads = ctx.maxThreadsAttr(nw.getInt() * tpw);
+  }
 
   // Params + prologue mint real fresh() names IN ORDER (before the body walk)
   // so body register names stay in lockstep with the string ABI numbering.

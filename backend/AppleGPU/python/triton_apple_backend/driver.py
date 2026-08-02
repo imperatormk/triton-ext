@@ -130,6 +130,11 @@ class MPSUtils:
             # configs needing more threads. Must be accurate: a cross-warp-smem
             # kernel launched with fewer threads leaves smem slots unwritten ->
             # uninitialized reads -> nondeterministic wrong answers.
+            # NOTE: the emitter pins [[max_total_threads_per_threadgroup]] to
+            # exactly num_warps*threads_per_warp, so this reports back the size
+            # we asked for and can never be short. It is a launch-shape check,
+            # not a register-pressure one -- a kernel that genuinely cannot hold
+            # that many threads fails when the PSO is built, not here.
             max_threads = getattr(function,
                                   'max_total_threads_per_threadgroup', 1024)
             return module, function, 0, 0, max_threads

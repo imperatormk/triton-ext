@@ -1720,28 +1720,73 @@ bool MSLEmitter::emitDotFused(
       }
       return id;
     };
+    // Warp w's slot j sits at an offset affine in w, so one block parameterised
+    // by warpId covers every warp. Emitting a guarded copy per warp instead
+    // duplicates the whole fragment epilogue numWarps times for nothing.
+    bool mergeWarps = wt.twoD || numWarps == 1;
+    for (int64_t w = 0; w < numWarps && mergeWarps; ++w)
+      for (int64_t j = 0; j < fragsPerWarp; ++j) {
+        int64_t mi, ni, mi0, ni0;
+        wt.frag(w, j, nT, numWarps, mi, ni);
+        wt.frag(0, j, nT, numWarps, mi0, ni0);
+        if (mi != mi0 + (w / wt.wGridN) * wt.miCount ||
+            ni != ni0 + (w % wt.wGridN) * wt.niCount ||
+            (mi * nT + ni >= nFrag) != (mi0 * nT + ni0 >= nFrag))
+          mergeWarps = false;
+      }
     msl::Block ifBody;
-    for (int64_t w = 0; w < numWarps; ++w) {
+    if (mergeWarps) {
       msl::Block inner;
+      msl::Expr *wRow =
+          ctx.mul(ctx.paren(ctx.binary(B::Div, ctx.var(warpId),
+                                       ctx.i32lit(wt.wGridN))),
+                  ctx.i32lit(wt.miCount * 8));
+      msl::Expr *wCol =
+          ctx.mul(ctx.paren(ctx.binary(B::Rem, ctx.var(warpId),
+                                       ctx.i32lit(wt.wGridN))),
+                  ctx.i32lit(wt.niCount * 8));
       for (int64_t j = 0; j < fragsPerWarp; ++j) {
         int64_t mi, ni;
-        wt.frag(w, j, nT, numWarps, mi, ni);
+        wt.frag(0, j, nT, numWarps, mi, ni);
         if (mi * nT + ni >= nFrag)
           continue;
-        // simdgroup_store(acc, base + (rowB + mi*8)*ldc + (colB + ni*8), ldc);
         msl::Expr *off = ctx.addChain(
             {ctx.var(base),
-             ctx.mul(ctx.paren(ctx.add(ctx.var(rowB), ctx.i32lit(mi * 8))),
+             ctx.mul(ctx.paren(ctx.addChain({ctx.var(rowB), wRow,
+                                             ctx.i32lit(mi * 8)})),
                      uniform(d.ldc)),
-             ctx.paren(ctx.add(ctx.var(colB), ctx.i32lit(ni * 8)))});
+             ctx.paren(ctx.addChain({ctx.var(colB), wCol,
+                                     ctx.i32lit(ni * 8)}))});
         std::string sv =
             narrowed(inner, biased(inner, fusedDot.accNames[j], ni));
         inner.push_back(ctx.exprStmt(ctx.call(
             msl::builtin::sg::Store, {ctx.var(sv), off, uniform(d.ldc)})));
       }
-      ifBody.push_back(ctx.ifScope(
-          ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
-          std::move(inner)));
+      for (msl::Stmt *s : inner)
+        ifBody.push_back(s);
+    } else {
+      for (int64_t w = 0; w < numWarps; ++w) {
+        msl::Block inner;
+        for (int64_t j = 0; j < fragsPerWarp; ++j) {
+          int64_t mi, ni;
+          wt.frag(w, j, nT, numWarps, mi, ni);
+          if (mi * nT + ni >= nFrag)
+            continue;
+          // simdgroup_store(acc, base + (rowB + mi*8)*ldc + (colB + ni*8), ldc);
+          msl::Expr *off = ctx.addChain(
+              {ctx.var(base),
+               ctx.mul(ctx.paren(ctx.add(ctx.var(rowB), ctx.i32lit(mi * 8))),
+                       uniform(d.ldc)),
+               ctx.paren(ctx.add(ctx.var(colB), ctx.i32lit(ni * 8)))});
+          std::string sv =
+              narrowed(inner, biased(inner, fusedDot.accNames[j], ni));
+          inner.push_back(ctx.exprStmt(ctx.call(
+              msl::builtin::sg::Store, {ctx.var(sv), off, uniform(d.ldc)})));
+        }
+        ifBody.push_back(ctx.ifScope(
+            ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
+            std::move(inner)));
+      }
     }
     // The pool image of C is the plain row-major tile (that is what the
     // simdgroup_store above writes), so the ragged arm can stream it to device
@@ -1766,19 +1811,41 @@ bool MSLEmitter::emitDotFused(
     {
       msl::Block &tgt = elseBody;
       tgt.push_back(ctx.hardBarrier(false));
-      for (int64_t w = 0; w < numWarps; ++w) {
-        msl::Block inner;
+      if (mergeWarps) {
+        msl::Expr *wOff = ctx.paren(ctx.add(
+            ctx.mul(ctx.paren(ctx.binary(B::Div, ctx.var(warpId),
+                                         ctx.i32lit(wt.wGridN))),
+                    ctx.i32lit(wt.miCount * 8 * N)),
+            ctx.mul(ctx.paren(ctx.binary(B::Rem, ctx.var(warpId),
+                                         ctx.i32lit(wt.wGridN))),
+                    ctx.i32lit(wt.niCount * 8))));
         for (int64_t j = 0; j < fragsPerWarp; ++j) {
           int64_t mi, ni;
-          wt.frag(w, j, nT, numWarps, mi, ni);
+          wt.frag(0, j, nT, numWarps, mi, ni);
           if (mi * nT + ni >= nFrag)
             continue;
-          inner.push_back(
-              sgStore(fusedDot.accNames[j], dc.tgC, mi * 8 * N + ni * 8, N));
+          tgt.push_back(ctx.exprStmt(ctx.call(
+              msl::builtin::sg::Store,
+              {ctx.var(fusedDot.accNames[j]),
+               ctx.addChain({ctx.var(dc.tgC),
+                             ctx.i32lit(mi * 8 * N + ni * 8), wOff}),
+               ctx.lit(std::to_string(N))})));
         }
-        tgt.push_back(ctx.ifScope(
-            ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
-            std::move(inner)));
+      } else {
+        for (int64_t w = 0; w < numWarps; ++w) {
+          msl::Block inner;
+          for (int64_t j = 0; j < fragsPerWarp; ++j) {
+            int64_t mi, ni;
+            wt.frag(w, j, nT, numWarps, mi, ni);
+            if (mi * nT + ni >= nFrag)
+              continue;
+            inner.push_back(
+                sgStore(fusedDot.accNames[j], dc.tgC, mi * 8 * N + ni * 8, N));
+          }
+          tgt.push_back(ctx.ifScope(
+              ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
+              std::move(inner)));
+        }
       }
       tgt.push_back(ctx.hardBarrier(false));
       // The ragged tile is written straight out of the pool, one bounded

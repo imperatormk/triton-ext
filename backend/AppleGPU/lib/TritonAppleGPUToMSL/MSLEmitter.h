@@ -344,10 +344,15 @@ private:
                    readbackInto);
   bool emitDotDirect(tt::DotOp op, msl::Block &body, const DotPlan &plan,
                      const DotEmitCtx &dc);
-  void dotPoolPtrs(msl::Block &body, const DotPlan &plan, DotEmitCtx &dc);
+  void dotPoolPtrs(msl::Block &body, tt::DotOp op, const DotPlan &plan,
+                   DotEmitCtx &dc);
   static bool dmaStagingEnabled();
   std::optional<DirectStage> bDmaCandidate(tt::DotOp op,
                                            bool requireBound = true);
+  static bool aDirectEnabled();
+  std::optional<DirectStage> aDirectCandidate(tt::DotOp op, int64_t M,
+                                              int64_t K, int64_t numWarps,
+                                              bool requireBound = true);
   std::optional<DirectStage> dotDmaStage(tt::DotOp op);
   msl::Stmt *dmaBeginInto(StringRef handle, const DotPlan &plan,
                           const DotEmitCtx &dc, const DirectStage &ds,

@@ -229,6 +229,21 @@ void MSLEmitter::scanPool(Operation *op) {
         if (dotOperandLocalLoad(d.getB(), Kd, N))
           stagedB = 0;
       }
+      // Mirrors planDot: a device-direct A claims no pool. Both sides ask the
+      // same phase-free predicate, so the reservation cannot drift from the
+      // emission -- a mismatch here overwrites the staging underneath.
+      if (stagedA && dotIsFusedGemmAcc(d)) {
+        tt::LinearLayout ll = ttg::toLinearLayout(cTy);
+        auto wd = StringAttr::get(d.getContext(), "warp");
+        int64_t nw = ll.hasInDim(wd) ? ll.getInDimSize(wd) : 1;
+        int64_t nf = (M / 8) * (N / 8);
+        if (nw > nf)
+          nw = nf;
+        if (aDirectCandidate(d, M, Kd, nw, /*requireBound=*/false)) {
+          stagedA = 0;
+          aBy = 0;
+        }
+      }
       // Device-direct B staging keeps a second B tile so the copy feeding the
       // next K-trip can be in flight while this trip's MMAs read the other one.
       // Held aside from stagedAB so it does not disturb the panel/C decisions

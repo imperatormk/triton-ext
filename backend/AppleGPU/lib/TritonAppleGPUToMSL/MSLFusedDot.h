@@ -165,6 +165,11 @@ struct DotPlan {
   // so the copy feeding the next K-trip is in flight while this trip's MMAs
   // read the other. Set only on the fused path.
   bool dmaB = false;
+  // A's fragments are simdgroup_load-ed straight off the device tile instead of
+  // being staged: the warp partition splits along M, so each warp reads only
+  // the rows it owns and A is never shared. Requires an unmasked row-major
+  // operand; `aDirect` carries the tile origin the loads address off.
+  std::optional<DirectStage> aDirect;
   bool disjointC = false;
   int64_t bandRows = 0;
 
@@ -194,6 +199,11 @@ struct DotEmitCtx {
   // With double-buffered DMA staging tgB is the base of the tile pair and
   // tgBCur is the one this trip reads; otherwise they are the same.
   std::string tgBCur;
+  // Device pointer to this warp's A rows, when A bypasses threadgroup memory.
+  // Empty on the staged path, where the A fragments read tgA instead.
+  std::string devA;
+  // Element stride between consecutive A rows in device memory.
+  msl::Expr *devALda = nullptr;
   SmallVector<std::string> ids;
 
   StringAttr rowDim, colDim;

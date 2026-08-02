@@ -487,6 +487,65 @@ std::optional<DirectStage> MSLEmitter::bDmaCandidate(tt::DotOp op,
   return ds;
 }
 
+// Device-direct A is built and correct but measured a regression at every
+// config tried on the 16384x30522x768 column-major addmm: BM32/nw2 226.3 ->
+// 257.4, BM64/nw4 236.3 -> 261.2, BM64/nw2 279.0 -> 282.2, BM128/nw4 387.7 ->
+// 387.2 (device-event timing, round-robin, per-round minimum, relerr 0 on every
+// arm). The hand-written kernel this was ported from wins 231.9 -> 202.5 with
+// the same structure, and the emitter's K-loop matches it at 0.5
+// simdgroup_load per MMA, so the difference is not the load/MMA ratio and is
+// not yet explained. Off until it is.
+bool MSLEmitter::aDirectEnabled() { return false; }
+
+// A's fragments can be simdgroup_load-ed straight off device memory when the
+// operand denotes an unmasked row-major device tile and the warp partition
+// splits along M alone. The second condition is what makes A warp-private: warp
+// w touches only rows [w*(M/numWarps), (w+1)*(M/numWarps)), so no warp ever
+// reads a row another warp would have had to publish, and the tile needs
+// neither staging nor a rendezvous.
+//
+// A masked load is rejected inside matchDirectStage: a ragged M tile would read
+// off the end of A, which is a silent out-of-bounds read rather than a fault,
+// so boundary tiles keep the staged path.
+//
+// The transposed form is deliberately declined. simdgroup_load's transpose flag
+// is a real mathematical transpose and would compute correctly, but a
+// column-major A has no reuse along the row axis and measured slower than
+// staging it.
+std::optional<DirectStage> MSLEmitter::aDirectCandidate(tt::DotOp op, int64_t M,
+                                                        int64_t K,
+                                                        int64_t numWarps,
+                                                        bool requireBound) {
+  if (!aDirectEnabled())
+    return std::nullopt;
+  auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
+  if (!aTy || aTy.getRank() != 2)
+    return std::nullopt;
+  Type ae = aTy.getElementType();
+  if (!(ae.isF32() || ae.isF16() || ae.isBF16()))
+    return std::nullopt;
+  // Warps must tile M alone, in equal whole-fragment bands.
+  if (numWarps < 1 || M % (numWarps * 8))
+    return std::nullopt;
+  Value stage = op.getA();
+  if (Value s = dotOperandConvertSource(op, op.getA()))
+    stage = s;
+  auto ds = matchDirectStage(stage, M, K);
+  if (!ds || ds->srcTransposed)
+    return std::nullopt;
+  auto bound = [&](Value v) {
+    if (!v)
+      return true;
+    auto it = valMap.find(v);
+    return it != valMap.end() && it->second.size() == 1;
+  };
+  if (requireBound &&
+      (!bound(ds->basePtr) || !(ds->rowStrideLit || bound(ds->rowStride)) ||
+       !bound(ds->rowShift) || !bound(ds->colShift)))
+    return std::nullopt;
+  return ds;
+}
+
 std::optional<DirectStage> MSLEmitter::dotDmaStage(tt::DotOp op) {
   if (!dmaStagingEnabled())
     return std::nullopt;
@@ -704,13 +763,30 @@ struct WarpTiling {
 // only a larger per-warp accumulator tile lowers it. Verified 2026-08-01 across
 // the 12-kernel inductor corpus: every config takes the 2D path.
 WarpTiling planWarpTiling(int64_t mT, int64_t nT, int64_t numWarps,
-                          int64_t nFrag, int64_t fragsPerWarp) {
+                          int64_t nFrag, int64_t fragsPerWarp,
+                          bool preferMSplit) {
   WarpTiling t;
   if (numWarps < 1 || fragsPerWarp < 2)
     return t;
   // Every warp must be full and the grid exactly covered.
   if (mT * nT != nFrag || numWarps * fragsPerWarp != nFrag)
     return t;
+
+  // A device-direct A operand needs each warp to own a contiguous band of M and
+  // the full N extent, so that the rows a warp reads are private to it. That is
+  // the ni == nT split; it costs more simdgroup_loads than the near-square one,
+  // but those loads now come from device memory and the staging they replace
+  // cost more than they do.
+  if (preferMSplit && nT <= fragsPerWarp && fragsPerWarp % nT == 0) {
+    int64_t mi = fragsPerWarp / nT;
+    if (mT % mi == 0 && (mT / mi) == numWarps) {
+      t.miCount = mi;
+      t.niCount = nT;
+      t.wGridN = 1;
+      t.twoD = true;
+      return t;
+    }
+  }
 
   int64_t best = 0;
   for (int64_t ni = 1; ni <= fragsPerWarp; ++ni) {
@@ -939,7 +1015,21 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
               dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false);
   if (bDma)
     p.bPad = 0;
-  p.stagedA = p.aInPlace ? 0 : p.M * (p.K + p.aPad) * byteWidth(aElem);
+  // A device-direct A claims no pool at all. Decided here, before stagedA is
+  // computed, so the pool sizing and the emission cannot disagree about it.
+  tt::LinearLayout cLLEarly = ttg::toLinearLayout(cTy);
+  auto kWarpDimEarly = StringAttr::get(op.getContext(), "warp");
+  int64_t nwEarly =
+      cLLEarly.hasInDim(kWarpDimEarly) ? cLLEarly.getInDimSize(kWarpDimEarly) : 1;
+  int64_t nFragEarly = (p.M / 8) * (p.N / 8);
+  if (nwEarly > nFragEarly)
+    nwEarly = nFragEarly;
+  if (p.phase != FusedDotPhase::None && !p.aInPlace)
+    p.aDirect = aDirectCandidate(op, p.M, p.K, nwEarly, /*requireBound=*/false);
+  if (p.aDirect)
+    p.aPad = 0;
+  p.stagedA =
+      (p.aInPlace || p.aDirect) ? 0 : p.M * (p.K + p.aPad) * byteWidth(aElem);
   p.stagedB = p.bInPlace ? 0 : p.K * (p.N + p.bPad) * byteWidth(bElem);
   p.stagedAB = p.stagedA + p.stagedB;
   // A second B tile for the in-flight copy, sitting directly after the first,
@@ -1041,7 +1131,7 @@ bool MSLEmitter::emitDot(tt::DotOp op, msl::Block &body) {
         ctx.var(fusedDot.dmaParity),
         ctx.binary(B::Sub, ctx.i32lit(1), ctx.var(fusedDot.dmaParity))));
 
-  dotPoolPtrs(body, plan, dc);
+  dotPoolPtrs(body, op, plan, dc);
   dc.ids = dotResultIds(body, op, plan);
 
   auto outNames = llvm::to_vector(ttg::toLinearLayout(cTy).getOutDimNames());
@@ -1077,8 +1167,8 @@ bool MSLEmitter::emitDot(tt::DotOp op, msl::Block &body) {
 // unconditionally even when a phase suppresses the matching decl - the fused
 // phases share one id numbering, so skipping a fresh() here would renumber
 // every later name.
-void MSLEmitter::dotPoolPtrs(msl::Block &body, const DotPlan &plan,
-                             DotEmitCtx &dc) {
+void MSLEmitter::dotPoolPtrs(msl::Block &body, tt::DotOp op,
+                             const DotPlan &plan, DotEmitCtx &dc) {
   auto tgPtr = [&](StringRef scalar) {
     return ctx.ptr(ctx.named(scalar), msl::AddrSpace::Threadgroup);
   };
@@ -1089,10 +1179,37 @@ void MSLEmitter::dotPoolPtrs(msl::Block &body, const DotPlan &plan,
   // buffered path overrides it below. Phases that skip the A/B declarations
   // still hand this name to the fragment loads.
   dc.tgBCur = dc.tgB;
+  if (plan.needAB && plan.aDirect) {
+    // `devA = Abase + <tile origin> + warpId * (M/numWarps) * lda`: the first
+    // row of the band this warp owns, at this trip's K block.
+    int64_t bandRows = plan.M / plan.numWarps;
+    dc.devALda = dmaRowStride(*plan.aDirect);
+    dc.devA = fresh();
+    // The tile origin without any per-trip term: dmaTileOrigin's trip term
+    // assumes the induction variable counts K elements, but this loop's counts
+    // K *blocks*, so the K advance is added here instead.
+    DirectStage stat = *plan.aDirect;
+    stat.ptrDelta = Value();
+    stat.ptrDeltaLit = std::nullopt;
+    msl::Expr *origin = dmaTileOrigin(stat, /*tripVar=*/StringRef());
+    if (StringRef tv = dotDmaTripVar(op); !tv.empty())
+      origin = ctx.binary(
+          B::Add, origin,
+          ctx.paren(ctx.binary(B::Mul, ctx.var(tv), ctx.i32lit(plan.K))));
+    msl::Expr *bandOff = ctx.paren(
+        ctx.binary(B::Mul,
+                   ctx.paren(ctx.binary(B::Mul, ctx.var(warpId),
+                                        ctx.i32lit(bandRows))),
+                   dc.devALda));
+    body.push_back(ctx.declStmt(
+        ctx.ptr(ctx.named(dc.opScalar), msl::AddrSpace::Device), dc.devA,
+        ctx.binary(B::Add, origin, bandOff)));
+  }
   if (plan.needAB) {
-    body.push_back(ctx.declStmt(tgPtr(dc.opScalar), dc.tgA,
-                                plan.aInPlace ? inPlaceBase(*plan.aInPlace)
-                                              : poolRegion(0, dc.opScalar)));
+    if (!plan.aDirect)
+      body.push_back(ctx.declStmt(tgPtr(dc.opScalar), dc.tgA,
+                                  plan.aInPlace ? inPlaceBase(*plan.aInPlace)
+                                                : poolRegion(0, dc.opScalar)));
     msl::Expr *bBase = plan.bInPlace ? inPlaceBase(*plan.bInPlace)
                                      : poolRegion(plan.stagedA, dc.opScalar);
     body.push_back(ctx.declStmt(tgPtr(dc.opScalar), dc.tgB, bBase));
@@ -1324,7 +1441,8 @@ bool MSLEmitter::emitDotFused(
   const int64_t nFrag = plan.nFrag, numWarps = plan.numWarps;
   const int64_t lda = K + plan.aPad, ldb = N + plan.bPad;
   int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
-  WarpTiling wt = planWarpTiling(plan.mT, nT, numWarps, nFrag, fragsPerWarp);
+  WarpTiling wt = planWarpTiling(plan.mT, nT, numWarps, nFrag, fragsPerWarp,
+                                 plan.aDirect.has_value());
   auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
 
   if (fusedDot.phase == FusedDotPhase::Decl) {
@@ -1377,7 +1495,8 @@ bool MSLEmitter::emitDotFused(
           std::move(prime)));
     }
     stageOperand(body, dc.tgA, dc.aStage, aStageTy, dc.aNames,
-                 (bool)plan.aInPlace, nullptr, plan.aPad);
+                 (bool)plan.aInPlace || plan.aDirect.has_value(), nullptr,
+                 plan.aPad);
     stageOperand(body, dc.tgB, dc.bStage, bStageTy, dc.bNames,
                  (bool)plan.bInPlace || bDma.has_value(), nullptr, plan.bPad);
     // A's register scatter is independent of B's tile, so it overlaps the
@@ -1421,7 +1540,22 @@ bool MSLEmitter::emitDotFused(
             std::string fa = fresh();
             aFrag[mi] = fa;
             into.push_back(fragDecl(dc.opFrag, fa));
-            into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
+            if (!dc.devA.empty()) {
+              // devA already points at this warp's band, so the fragment row is
+              // band-relative; the row stride is A's device pitch.
+              int64_t bandFrags = plan.M / (numWarps * 8);
+              int64_t rowInBand = bandFrags ? mi % bandFrags : mi;
+              msl::Expr *off = ctx.paren(ctx.add(
+                  ctx.paren(ctx.binary(B::Mul, ctx.i32lit(rowInBand * 8),
+                                       dc.devALda)),
+                  ctx.i32lit(ki * 8)));
+              into.push_back(ctx.exprStmt(ctx.call(
+                  msl::builtin::sg::Load,
+                  {ctx.var(fa), ctx.binary(B::Add, ctx.var(dc.devA), off),
+                   dc.devALda})));
+            } else {
+              into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
+            }
           }
           if (!bFrag.count(niKey)) {
             std::string fb = fresh();
@@ -2431,6 +2565,16 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
       stagedA = 0;
     if (dotOperandLocalLoad(found.getB(), K, N))
       stagedB = 0;
+  }
+  {
+    tt::LinearLayout ll = ttg::toLinearLayout(cTy);
+    auto wd = StringAttr::get(op.getContext(), "warp");
+    int64_t nw = ll.hasInDim(wd) ? ll.getInDimSize(wd) : 1;
+    int64_t nf = (M / 8) * (N / 8);
+    if (nw > nf)
+      nw = nf;
+    if (stagedA && aDirectCandidate(found, M, K, nw, /*requireBound=*/false))
+      stagedA = 0;
   }
   // The fused epilogue overlays C's accumulators on the dead A/B staging and
   // writes it one row band at a time, so C never needs the whole tile - only a

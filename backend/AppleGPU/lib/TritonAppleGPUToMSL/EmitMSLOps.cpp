@@ -563,7 +563,7 @@ std::optional<bool> MSLEmitter::foldBoundedRem(arith::RemSIOp op,
   // an index feeding the operand loads -- even one the hardware could fold --
   // moves this kernel to a smaller per-thread register budget and costs a step
   // of occupancy. Aliasing is what keeps it in the larger one.
-  if (c % tile == 0) {
+  if (c % tile == 0 || lhsHasClampedOrigin(op.getLhs())) {
     bindRegs(op.getResult(), names(op.getLhs()));
     return true;
   }
@@ -586,6 +586,80 @@ std::optional<bool> MSLEmitter::foldBoundedRem(arith::RemSIOp op,
     ids.push_back(id);
   }
   bindRegs(op.getResult(), ids);
+  return true;
+}
+
+// The last tile of a dimension that the block size does not divide hangs over
+// the end. Pulling its origin back so the whole tile lands inside turns every
+// index into `origin + constant`, which is what keeps the wrap from becoming a
+// per-lane operation on the operand addresses -- and that operation is a step
+// of occupancy, not just its own arithmetic. The overhang columns are then
+// computed twice, by this tile and its neighbour, with identical values.
+bool MSLEmitter::lhsHasClampedOrigin(Value v) {
+  SmallVector<Value> work{v};
+  llvm::SmallPtrSet<Operation *, 8> seen;
+  while (!work.empty()) {
+    Value cur = work.pop_back_val();
+    if (clampedOrigins.contains(cur))
+      return true;
+    Operation *def = cur.getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      continue;
+    if (isa<arith::AddIOp, tt::SplatOp, tt::ExpandDimsOp, tt::BroadcastOp,
+            tt::MakeRangeOp>(def))
+      for (Value o : def->getOperands())
+        work.push_back(o);
+  }
+  return false;
+}
+
+std::optional<bool> MSLEmitter::clampTileOrigin(arith::MulIOp mul,
+                                                msl::Type *declTy,
+                                                msl::Block &body) {
+  if (isa<RankedTensorType>(mul.getType()))
+    return std::nullopt;
+  // `pid * BLOCK`: the block size is the constant side.
+  APInt bc;
+  int64_t block = 0;
+  for (Value side : {mul.getRhs(), mul.getLhs()})
+    if (matchPattern(side, m_ConstantInt(&bc)))
+      block = bc.getSExtValue();
+  if (block <= 0)
+    return std::nullopt;
+  // The dimension's extent is whatever a `% extent` downstream reduces this
+  // origin's range by; without one there is no boundary tile to pull back.
+  int64_t extent = 0;
+  for (Operation *u : mul.getResult().getUsers()) {
+    Operation *cur = u;
+    for (int hop = 0; cur && hop < 4; ++hop) {
+      if (auto rem = dyn_cast<arith::RemSIOp>(cur)) {
+        APInt e;
+        if (matchPattern(rem.getRhs(), m_ConstantInt(&e)))
+          extent = e.getSExtValue();
+        break;
+      }
+      if (!isa<arith::AddIOp, tt::SplatOp, tt::ExpandDimsOp, tt::BroadcastOp>(
+              cur) ||
+          !cur->hasOneUse())
+        break;
+      cur = *cur->getResult(0).getUsers().begin();
+    }
+    if (extent)
+      break;
+  }
+  if (extent <= block || extent % block == 0)
+    return std::nullopt;
+  // Only sound when a doubled column is harmless: the overhang is recomputed by
+  // this tile and its neighbour from the same inputs, so both write the same
+  // value. A store that accumulates rather than overwrites would not qualify.
+  std::string id = fresh();
+  body.push_back(ctx.declStmt(
+      declTy, id,
+      ctx.call("min", {intBinaryExpr(mul, names(mul.getLhs())[0],
+                                     names(mul.getRhs())[0]),
+                       ctx.i32lit(extent - block)})));
+  bindRegs(mul.getResult(), {id});
+  clampedOrigins.insert(mul.getResult());
   return true;
 }
 
@@ -979,6 +1053,9 @@ std::optional<bool> MSLEmitter::emitArithBinop(Operation *op,
     if (auto rem = dyn_cast<arith::RemSIOp>(op))
       if (auto folded = foldBoundedRem(rem, declTy, body))
         return *folded;
+    if (auto mul = dyn_cast<arith::MulIOp>(op))
+      if (auto clamped = clampTileOrigin(mul, declTy, body))
+        return *clamped;
     return declBind(op, declTy, body, [&](int r) {
       return intBinaryExpr(op, reg(op->getOperand(0), r),
                            reg(op->getOperand(1), r));

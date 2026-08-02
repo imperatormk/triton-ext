@@ -323,6 +323,12 @@ private:
   // `x % c` with x provably below 2c: one compare+select, no integer divide.
   std::optional<bool> foldBoundedRem(arith::RemSIOp op, msl::Type *declTy,
                                      msl::Block &body);
+  std::optional<bool> clampTileOrigin(arith::MulIOp mul, msl::Type *declTy,
+                                      msl::Block &body);
+  bool lhsHasClampedOrigin(Value v);
+  // Tile origins pulled back so a boundary tile lands inside the dimension;
+  // a remainder on one of these can no longer wrap.
+  DenseSet<Value> clampedOrigins;
   void storeBody(tt::StoreOp op, msl::Block &body);
   bool combineN(Region &region, ArrayRef<std::string> aVals,
                 ArrayRef<std::string> bVals, msl::Block &body,

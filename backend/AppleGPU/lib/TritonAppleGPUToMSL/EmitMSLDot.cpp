@@ -580,11 +580,15 @@ msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
   auto add = [&](msl::Expr *e) {
     off = off ? ctx.binary(B::Add, off, e) : e;
   };
-  if (ds.rowShift)
-    add(ctx.paren(ctx.binary(B::Mul, ctx.var(scalarName(ds.rowShift)),
+  // rowStride is the pitch of whichever axis is strided; the other axis is
+  // contiguous and shifts by one element. Transposing swaps which is which.
+  Value pitched = ds.srcTransposed ? ds.colShift : ds.rowShift;
+  Value unitAxis = ds.srcTransposed ? ds.rowShift : ds.colShift;
+  if (pitched)
+    add(ctx.paren(ctx.binary(B::Mul, ctx.var(scalarName(pitched)),
                              dmaRowStride(ds))));
-  if (ds.colShift)
-    add(ctx.var(scalarName(ds.colShift)));
+  if (unitAxis)
+    add(ctx.var(scalarName(unitAxis)));
   // The K-loop IV counts K elements, and the operand advances one row per K
   // element, so the per-trip origin offset is exactly iv*rowStride -- no need
   // to divide the IV by the loop step and rescale by ptrDelta.
@@ -612,8 +616,11 @@ msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
       if (ds.aheadSteps)
         t = ctx.paren(
             ctx.binary(B::Add, t, ctx.i32lit(ds.aheadSteps * ds.rows)));
-      add(ctx.paren(
-          ctx.binary(B::Mul, t, dmaRowStride(ds))));
+      // The IV steps down the tile's rows, which are contiguous when the source
+      // is transposed.
+      add(ds.srcTransposed
+              ? ctx.paren(t)
+              : ctx.paren(ctx.binary(B::Mul, t, dmaRowStride(ds))));
     }
   }
   msl::Expr *base = ctx.var(scalarName(ds.basePtr));
@@ -689,8 +696,10 @@ msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
   if (nextTrip)
     src = ctx.binary(
         B::Add, src,
-        ctx.paren(ctx.binary(B::Mul, ctx.i32lit(ds.rows),
-                             dmaRowStride(ds))));
+        ds.srcTransposed
+            ? static_cast<msl::Expr *>(ctx.i32lit(ds.rows))
+            : ctx.paren(ctx.binary(B::Mul, ctx.i32lit(ds.rows),
+                                   dmaRowStride(ds))));
   if (split) {
     msl::Expr *wOff =
         ctx.paren(ctx.binary(B::Mul, ctx.var(warpId), ctx.i32lit(band)));

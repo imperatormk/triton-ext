@@ -557,6 +557,16 @@ std::optional<bool> MSLEmitter::foldBoundedRem(arith::RemSIOp op,
   // (ceil(c/tile)-1)*tile + tile-1 < 2c whenever c >= tile.
   if (c < tile)
     return std::nullopt;
+  // When c is a whole number of tiles the grid never produces an x that
+  // reaches it, so the remainder is the identity and the op can be dropped
+  // outright. That matters beyond the arithmetic: any surviving operation on
+  // an index feeding the operand loads -- even one the hardware could fold --
+  // moves this kernel to a smaller per-thread register budget and costs a step
+  // of occupancy. Aliasing is what keeps it in the larger one.
+  if (c % tile == 0) {
+    bindRegs(op.getResult(), names(op.getLhs()));
+    return true;
+  }
   int64_t maxX = ((c + tile - 1) / tile - 1) * tile + tile - 1;
   if (maxX >= 2 * c)
     return std::nullopt;

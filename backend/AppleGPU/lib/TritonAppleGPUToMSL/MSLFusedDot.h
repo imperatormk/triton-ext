@@ -58,6 +58,14 @@ struct DirectStore {
   Type narrowTo;     // f16/bf16 output element type, null when f32
   Operation *narrowOp = nullptr; // the elided truncf, when narrowing
   Operation *cvt = nullptr;      // the layout convert feeding the store
+  // An `acc + bias` epilogue whose bias is one value per column, broadcast down
+  // the rows (the addmm bias). Folded into the fragments before the store, so
+  // it costs 8 device loads per fragment column instead of a whole tile round
+  // trip. Null when the accumulator reaches the store unmodified.
+  Value biasPtr;   // bias base pointer (scalar kernel arg)
+  Value biasCol;   // global col of the tile's first bias element (scalar)
+  Operation *biasAdd = nullptr; // the elided arith.addf
+  Operation *biasCvt = nullptr; // the elided layout convert, when present
   std::string fullTileVar;       // runtime "whole tile in bounds" predicate
   // True when fullTileVar is the constant `true` (an unmasked store): the
   // threadgroup fallback arm is then unreachable and must not be emitted, or

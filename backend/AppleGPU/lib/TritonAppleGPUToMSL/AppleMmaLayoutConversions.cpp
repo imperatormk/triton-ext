@@ -1,5 +1,10 @@
 // AppleMmaEncodingAttr::toLinearLayout: Apple simdgroup MMA encoding →
-// LinearLayout. Verified on M1: lane T, reg R → row = (T>>3)+R*4, col = T&7.
+// LinearLayout. Verified on M1 by reading back thread_elements() of a loaded
+// 8x8 fragment: for lane T and element e,
+//   col = e | ((T&1)<<1) | (((T>>3)&1)<<2)
+//   row = ((T>>1)&1) | (((T>>2)&1)<<1) | (((T>>4)&1)<<2)
+// which is what the register/lane bases below spell. Note col is independent of
+// row, so a row-broadcast epilogue operand is uniform across a fragment's rows.
 
 #include "Dialect/TritonAppleGPU/IR/Dialect.h"
 #include "mlir/IR/MLIRContext.h"

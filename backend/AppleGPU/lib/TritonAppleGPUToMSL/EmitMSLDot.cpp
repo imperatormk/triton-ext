@@ -1674,6 +1674,52 @@ bool MSLEmitter::emitDotFused(
       }
       return id;
     };
+    // The column a lane's element e occupies inside an 8x8 fragment is
+    // `e | ((lane&1)<<1) | (((lane>>3)&1)<<2)` -- independent of the row (see
+    // AppleMmaLayoutConversions.cpp). So a bias that is constant down a column
+    // is uniform over a fragment's rows and costs two scalar loads per
+    // fragment, not one per accumulator element.
+    std::string biasLaneCol;
+    if (d.biasPtr) {
+      biasLaneCol = fresh();
+      body.push_back(ctx.declStmt(
+          ctx.scalar(msl::Scalar::I32), biasLaneCol,
+          ctx.binary(
+              B::Or,
+              ctx.paren(ctx.binary(
+                  B::Shl,
+                  ctx.paren(ctx.binary(B::And, ctx.var(laneId), ctx.i32lit(1))),
+                  ctx.i32lit(1))),
+              ctx.paren(ctx.binary(
+                  B::Shl,
+                  ctx.paren(ctx.binary(
+                      B::And,
+                      ctx.paren(ctx.binary(B::Shr, ctx.var(laneId),
+                                           ctx.i32lit(3))),
+                      ctx.i32lit(1))),
+                  ctx.i32lit(2))))));
+    }
+    // acc + bias[biasCol + ni*8 + laneCol + e], into a scratch fragment so the
+    // accumulator stays clean for the fallback arm.
+    auto biased = [&](msl::Block &blk, StringRef accName,
+                      int64_t ni) -> std::string {
+      if (!d.biasPtr)
+        return accName.str();
+      std::string id = fresh();
+      blk.push_back(ctx.declStmt(dc.accFragTy, id, ctx.var(accName)));
+      for (int e = 0; e < 2; ++e) {
+        msl::Expr *slot = ctx.subscript(
+            ctx.member(ctx.var(id), msl::builtin::sg::ThreadElements),
+            ctx.i32lit(e));
+        msl::Expr *addr =
+            ctx.addChain({ctx.var(scalarName(d.biasPtr)),
+                          ctx.var(scalarName(d.biasCol)),
+                          ctx.i32lit(ni * 8 + e), ctx.var(biasLaneCol)});
+        blk.push_back(ctx.assignStmt(
+            slot, ctx.binary(B::Add, slot, ctx.deref(ctx.paren(addr)))));
+      }
+      return id;
+    };
     msl::Block ifBody;
     for (int64_t w = 0; w < numWarps; ++w) {
       msl::Block inner;
@@ -1688,7 +1734,8 @@ bool MSLEmitter::emitDotFused(
              ctx.mul(ctx.paren(ctx.add(ctx.var(rowB), ctx.i32lit(mi * 8))),
                      uniform(d.ldc)),
              ctx.paren(ctx.add(ctx.var(colB), ctx.i32lit(ni * 8)))});
-        std::string sv = narrowed(inner, fusedDot.accNames[j]);
+        std::string sv =
+            narrowed(inner, biased(inner, fusedDot.accNames[j], ni));
         inner.push_back(ctx.exprStmt(ctx.call(
             msl::builtin::sg::Store, {ctx.var(sv), off, uniform(d.ldc)})));
       }
@@ -2262,6 +2309,62 @@ bool MSLEmitter::matchBoundaryMask(Value m, Value rowBase, Value colBase,
   return false;
 }
 
+Value MSLEmitter::matchRowBroadcastBias(Value v, DirectStore &ds) {
+  if (!v.hasOneUse())
+    return Value();
+  auto add = dyn_cast<arith::AddFOp>(*v.user_begin());
+  if (!add)
+    return Value();
+  Value other = add.getLhs() == v ? add.getRhs() : add.getLhs();
+  // The row broadcast can sit on either side of the load -- on the loaded
+  // values (a 1 x N load broadcast down the rows) or on the pointer (a
+  // broadcast pointer tensor loaded at full tile shape) -- and a layout convert
+  // may wrap either. Both spellings denote the same tile, and neither op
+  // changes a value, so both are peeled and elided along with the add.
+  Operation *cvt = nullptr;
+  auto peel = [&](Value x) {
+    while (x) {
+      if (auto c = definingOp<ttg::ConvertLayoutOp>(x)) {
+        cvt = c;
+        x = c.getSrc();
+        continue;
+      }
+      if (auto b = definingOp<tt::BroadcastOp>(x)) {
+        x = b.getSrc();
+        continue;
+      }
+      break;
+    }
+    return x;
+  };
+  auto load = definingOp<tt::LoadOp>(peel(other));
+  if (!load)
+    return Value();
+  auto lTy = dyn_cast<RankedTensorType>(load.getType());
+  if (!lTy || !lTy.getElementType().isF32())
+    return Value();
+  auto ptr = definingOp<tt::AddPtrOp>(peel(load.getPtr()));
+  if (!ptr)
+    return Value();
+  // One value per column replicated down the rows: whatever the broadcast
+  // spelling, the addressed tensor must have a row extent of 1, or the bias is
+  // not column-uniform and folding it per fragment column is wrong.
+  auto ptrTy = dyn_cast<RankedTensorType>(ptr.getType());
+  if (!ptrTy || ptrTy.getRank() != 2 || ptrTy.getShape()[0] != 1)
+    return Value();
+  auto splat = definingOp<tt::SplatOp>(peelBroadcast(ptr.getPtr()));
+  if (!splat || !isa<BlockArgument>(splat.getSrc()))
+    return Value();
+  Value colBase = matchTileIndex(ptr.getOffset());
+  if (!colBase)
+    return Value();
+  ds.biasPtr = splat.getSrc();
+  ds.biasCol = colBase;
+  ds.biasAdd = add;
+  ds.biasCvt = cvt;
+  return add.getResult();
+}
+
 std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   Operation *site = forResult.getDefiningOp();
   auto rej = [&](StringRef why) {
@@ -2277,6 +2380,18 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   Value chain = forResult;
   Type narrowTo;
   arith::TruncFOp narrowOp;
+  DirectStore ds;
+  // addmm's `acc + bias` sits between the accumulator and the output convert.
+  // Folding it into the fragments is what keeps this store direct; without it
+  // the accumulator's user is the add and the whole tile stages through the
+  // pool. The fold reads the bias unmasked, which is sound only because it is
+  // emitted under the full-tile predicate -- the ragged arm keeps the original
+  // masked load.
+  if (Value biased = matchRowBroadcastBias(chain, ds)) {
+    if (!biased.hasOneUse())
+      return rej("bias-add-not-single-use");
+    chain = biased;
+  }
   if (auto tf = dyn_cast<arith::TruncFOp>(*chain.user_begin())) {
     if (!tf.getResult().hasOneUse())
       return rej("narrow-not-single-use");
@@ -2343,7 +2458,6 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
     if (!matchBoundaryMask(store.getMask(), rowBase, colBase, boundM, boundN))
       return rej("mask-not-boundary");
   }
-  DirectStore ds;
   ds.store = store;
   ds.basePtr = splat.getSrc();
   ds.ldc = ldc;

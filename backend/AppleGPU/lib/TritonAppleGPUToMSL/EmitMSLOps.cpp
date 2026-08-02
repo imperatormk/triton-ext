@@ -383,6 +383,11 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
       directStoreHandled[ds->narrowOp] = ft;
     if (ds->cvt)
       directStoreHandled[ds->cvt] = ft;
+    if (ds->biasAdd) {
+      directStoreHandled[ds->biasAdd] = ft;
+      if (ds->biasCvt)
+        directStoreHandled[ds->biasCvt] = ft;
+    }
   }
 
   fusedDot.phase = FusedDotPhase::Readback;

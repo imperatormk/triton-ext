@@ -550,6 +550,12 @@ private:
   // extra users) falls back to the pool readback.
   std::optional<DirectStore> matchDirectStore(Value forResult);
 
+  // Recognise `acc + <row-broadcast bias>`: a bias vector with one value per
+  // column, replicated down every row. Fills ds.bias* and returns the addf
+  // result to continue matching from. Returns null when `v`'s user is not such
+  // an add, leaving `ds` untouched.
+  Value matchRowBroadcastBias(Value v, DirectStore &ds);
+
   static bool isPureBarrierOp(Operation *op);
 
   std::string floatLit(const APFloat &v);

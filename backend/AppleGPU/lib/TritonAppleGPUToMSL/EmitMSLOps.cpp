@@ -525,6 +525,60 @@ int MSLEmitter::accessVectorWidth(Type valueTy, Value ptr) {
   return width;
 }
 
+// `x % c` where the analysis bounds x below 2c is `x >= c ? x - c : x`: one
+// compare and select instead of an integer division, which the hardware has no
+// unit for. The bound is what makes this exact -- a single subtraction only
+// removes one multiple of c.
+std::optional<bool> MSLEmitter::foldBoundedRem(arith::RemSIOp op,
+                                               msl::Type *declTy,
+                                               msl::Block &body) {
+  APInt cst;
+  if (!matchPattern(op.getRhs(), m_ConstantInt(&cst)))
+    return std::nullopt;
+  int64_t c = cst.getSExtValue();
+  if (c <= 0)
+    return std::nullopt;
+  tt::AxisInfo *ai = getAxisInfo().getAxisInfo(op.getLhs());
+  if (!ai)
+    return std::nullopt;
+  // getConstantValue is only set for a uniform value; for a range the upper
+  // bound comes from the tile origin's divisibility and the tile width.
+  auto rt = dyn_cast<RankedTensorType>(op.getType());
+  if (!rt)
+    return std::nullopt;
+  int rank = rt.getRank();
+  int64_t tile = rt.getShape()[rank - 1];
+  int64_t stride = ai->getContiguity(rank - 1);
+  if (stride < tile)
+    return std::nullopt;
+  // x is `origin + 0..tile-1` with origin a multiple of tile. x < 2c needs
+  // origin <= c, i.e. the largest origin the grid can produce is under c. That
+  // is exactly ceil(c/tile)-1 tiles, so the largest x is
+  // (ceil(c/tile)-1)*tile + tile-1 < 2c whenever c >= tile.
+  if (c < tile)
+    return std::nullopt;
+  int64_t maxX = ((c + tile - 1) / tile - 1) * tile + tile - 1;
+  if (maxX >= 2 * c)
+    return std::nullopt;
+
+  auto &src = names(op.getLhs());
+  int rc = regCount(op.getResult());
+  if ((int)src.size() != rc)
+    return std::nullopt;
+  SmallVector<std::string> ids;
+  for (int r = 0; r < rc; ++r) {
+    std::string id = fresh();
+    msl::Expr *x = ctx.var(src[r]);
+    msl::Expr *sel = ctx.ternary(
+        ctx.paren(ctx.binary(B::Ge, x, ctx.i32lit(c))),
+        ctx.paren(ctx.binary(B::Sub, x, ctx.i32lit(c))), x);
+    body.push_back(ctx.declStmt(declTy, id, sel));
+    ids.push_back(id);
+  }
+  bindRegs(op.getResult(), ids);
+  return true;
+}
+
 int MSLEmitter::loadVectorWidth(tt::LoadOp ld) {
   static const bool disabled = getenv("MSL_DISABLE_LOAD_VECTORIZE") != nullptr;
   if (disabled)
@@ -912,6 +966,9 @@ std::optional<bool> MSLEmitter::emitArithBinop(Operation *op,
       declTy = ctx.scalar(msl::Scalar::I1);
     else if (isa<arith::DivUIOp, arith::RemUIOp>(op))
       declTy = unsignedType(resElem);
+    if (auto rem = dyn_cast<arith::RemSIOp>(op))
+      if (auto folded = foldBoundedRem(rem, declTy, body))
+        return *folded;
     return declBind(op, declTy, body, [&](int r) {
       return intBinaryExpr(op, reg(op->getOperand(0), r),
                            reg(op->getOperand(1), r));

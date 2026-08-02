@@ -319,6 +319,10 @@ private:
   int accessVectorWidth(Type valueTy, Value ptr);
   int loadVectorWidth(tt::LoadOp ld);
   int storeVectorWidth(tt::StoreOp st);
+
+  // `x % c` with x provably below 2c: one compare+select, no integer divide.
+  std::optional<bool> foldBoundedRem(arith::RemSIOp op, msl::Type *declTy,
+                                     msl::Block &body);
   void storeBody(tt::StoreOp op, msl::Block &body);
   bool combineN(Region &region, ArrayRef<std::string> aVals,
                 ArrayRef<std::string> bVals, msl::Block &body,

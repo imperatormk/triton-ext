@@ -1477,8 +1477,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       auto mt = cast<ttg::MemDescType>(ac.getResult().getType());
       int64_t eb = byteWidth(mt.getElementType());
       // air.simdgroup_async_copy_2d is issued *per simdgroup*, so every warp
-      // requesting the whole tile moves it numWarps times over -- measured as
-      // ~2x per warp doubling (nw2 0.775, nw4 1.006, nw8 1.915 ms). Apple's own
+      // requesting the whole tile moves it numWarps times over. Apple's own
       // GEMM partitions by simdgroup_index_in_threadgroup; do the same and give
       // warp w the row band [w*band, (w+1)*band).
       int64_t rows = mt.getShape()[0], cols = mt.getShape()[1];
@@ -1554,8 +1553,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     // Mirror the tt.load lowering: a run of registers that is contiguous in
     // device memory is one wide load, and a predicate that holds for every
     // register is hoisted so the run issues unconditionally. Without this the
-    // pipelined staging is one predicated scalar load per element -- measured
-    // 24 scalar copies where the register path issues 6 vector loads.
+    // pipelined staging is one predicated scalar load per element.
     int vw = accessVectorWidth(srcTy, ac.getSrc());
     if (vw < 2 || rc % vw != 0)
       vw = 1;

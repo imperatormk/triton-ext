@@ -82,19 +82,15 @@ struct FusedDotCtx {
 // and the emitter's budget state - no emission, no name allocation - so the
 // choice is one inspectable value instead of six interacting flags.
 // Row padding for the staged A (M x K) and B (K x N) simdgroup-matrix
-// operands. Measured on the emitted 64x64x32 fp32 GEMM: an unpadded row
-// stride makes consecutive rows collide in the threadgroup banks; +4
-// elements recovers ~4%, and the optimum is flat (+2..+8 land within noise).
-// Padding only pays when the row stride is bank-aligned to begin with, and it
-// is dropped outright when the widened tiles would not fit the 32KB cap.
+// operands. An unpadded row stride makes consecutive rows collide in the
+// threadgroup banks; +4 elements clears it, and the optimum is flat. Padding
+// only pays when the row stride is bank-aligned to begin with, and it is
+// dropped outright when the widened tiles would not fit the 32KB cap.
 //
 // It is also dropped when it would cost a threadgroup-residency step, but only
 // while residency is still the binding limit. Past kTGResidencyFloor the pool
 // no longer decides occupancy - registers and warp slots do - so a nominal step
-// costs nothing while the bank conflicts remain real. Measured on an M1 Pro:
-// at 64x64x32 fp32 (4 -> 3 resident) dropping the pad wins, 7.15 -> 6.61 ms;
-// at 32x32x16 (16 -> 13 resident) dropping it loses 8.4% on the column-major
-// 16384x30522x768 addmm, 226.4 -> 260.4 ms.
+// costs nothing while the bank conflicts remain real.
 inline void dotStageRowPads(int64_t M, int64_t N, int64_t K, int64_t aEb,
                             int64_t bEb, int64_t &aPad, int64_t &bPad) {
   aPad = (K % 8 || aEb * K % 64) ? 0 : 4;

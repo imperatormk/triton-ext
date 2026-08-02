@@ -487,15 +487,7 @@ std::optional<DirectStage> MSLEmitter::bDmaCandidate(tt::DotOp op,
   return ds;
 }
 
-// Device-direct A is built and correct but measured a regression at every
-// config tried on the 16384x30522x768 column-major addmm: BM32/nw2 226.3 ->
-// 257.4, BM64/nw4 236.3 -> 261.2, BM64/nw2 279.0 -> 282.2, BM128/nw4 387.7 ->
-// 387.2 (device-event timing, round-robin, per-round minimum, relerr 0 on every
-// arm). The hand-written kernel this was ported from wins 231.9 -> 202.5 with
-// the same structure, and the emitter's K-loop matches it at 0.5
-// simdgroup_load per MMA, so the difference is not the load/MMA ratio and is
-// not yet explained. Off until it is.
-bool MSLEmitter::aDirectEnabled() { return false; }
+bool MSLEmitter::aDirectEnabled() { return true; }
 
 // A's fragments can be simdgroup_load-ed straight off device memory when the
 // operand denotes an unmasked row-major device tile and the warp partition
@@ -508,10 +500,8 @@ bool MSLEmitter::aDirectEnabled() { return false; }
 // off the end of A, which is a silent out-of-bounds read rather than a fault,
 // so boundary tiles keep the staged path.
 //
-// The transposed form is deliberately declined. simdgroup_load's transpose flag
-// is a real mathematical transpose and would compute correctly, but a
-// column-major A has no reuse along the row axis and measured slower than
-// staging it.
+// The transposed form is declined: it computes correctly, but a column-major A
+// has no reuse along the row axis and is slower than staging it.
 std::optional<DirectStage> MSLEmitter::aDirectCandidate(tt::DotOp op, int64_t M,
                                                         int64_t K,
                                                         int64_t numWarps,
@@ -680,8 +670,8 @@ msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
   //
   // `_tr` swaps the source strides, so it also swaps which axis the device
   // walks contiguously. Banding the contiguous axis chops every warp's run into
-  // a scalar strided gather -- 4.15x at 32x32 -- so a transposed source must be
-  // banded on the opposite axis.
+  // a scalar strided gather, so a transposed source must be banded on the
+  // opposite axis.
   int64_t nw = plan.numWarps > 0 ? plan.numWarps : 1;
   bool bandCols = ds.srcTransposed;
   int64_t axis = bandCols ? ds.cols : ds.rows;
@@ -760,8 +750,7 @@ struct WarpTiling {
 // The resulting sgload/MMA ratio is (mi+ni)/fragsPerWarp, minimised at the
 // near-square split: 0.75 at fragsPerWarp=8, 0.50 at 16, 0.375 at 32. A kernel
 // sitting at 0.75 is therefore at its geometric optimum, not on a fallback --
-// only a larger per-warp accumulator tile lowers it. Verified 2026-08-01 across
-// the 12-kernel inductor corpus: every config takes the 2D path.
+// only a larger per-warp accumulator tile lowers it.
 WarpTiling planWarpTiling(int64_t mT, int64_t nT, int64_t numWarps,
                           int64_t nFrag, int64_t fragsPerWarp,
                           bool preferMSplit) {
@@ -1037,9 +1026,7 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // or they would disagree about where C begins -- hence the binding-free form
   // of the candidate test, which depends only on the IR.
   // The second B tile is only worth its footprint when it does not push the
-  // pool past a residency step: measured on an M1 Pro, dropping from three
-  // resident threadgroups to two costs ~20%, which is far more than the copy
-  // saves. Without this the DMA path loses on exactly the tiles it fits.
+  // pool past a residency step, which costs far more than the copy saves.
   p.dmaB = bDma && p.stagedB &&
            p.stagedAB + p.stagedB <= kTGResidentBudgetBytes &&
            tgResidency(p.stagedAB + p.stagedB) >= tgResidency(p.stagedAB);
@@ -1185,17 +1172,12 @@ void MSLEmitter::dotPoolPtrs(msl::Block &body, tt::DotOp op,
     int64_t bandRows = plan.M / plan.numWarps;
     dc.devALda = dmaRowStride(*plan.aDirect);
     dc.devA = fresh();
-    // The tile origin without any per-trip term: dmaTileOrigin's trip term
-    // assumes the induction variable counts K elements, but this loop's counts
-    // K *blocks*, so the K advance is added here instead.
+    // colShift already advances with the K-loop, so the origin carries the
+    // whole per-trip term and must not be given a second one.
     DirectStage stat = *plan.aDirect;
     stat.ptrDelta = Value();
     stat.ptrDeltaLit = std::nullopt;
     msl::Expr *origin = dmaTileOrigin(stat, /*tripVar=*/StringRef());
-    if (StringRef tv = dotDmaTripVar(op); !tv.empty())
-      origin = ctx.binary(
-          B::Add, origin,
-          ctx.paren(ctx.binary(B::Mul, ctx.var(tv), ctx.i32lit(plan.K))));
     msl::Expr *bandOff = ctx.paren(
         ctx.binary(B::Mul,
                    ctx.paren(ctx.binary(B::Mul, ctx.var(warpId),
@@ -1471,8 +1453,7 @@ bool MSLEmitter::emitDotFused(
     // Two B tiles alternate: this trip's MMAs read one while the copy feeding
     // the next trip fills the other. Both the issue and the wait for a given
     // tile therefore sit a full MMA block apart, which is the overlap -- a
-    // single-buffered copy has only A's register scatter to hide behind and
-    // measures ~30% slower than staging B through registers.
+    // single-buffered copy has only A's register scatter to hide behind.
     //
     // The rotation is carried in threadgroup memory, not registers, so the
     // loop-carried state is just the parity flag and the event token.
@@ -1583,12 +1564,17 @@ bool MSLEmitter::emitDotFused(
       int64_t wGridM = numWarps / wt.wGridN;
       // ni = (warpId % wGridN) * niCount + c
       auto niBase = [&]() -> msl::Expr * {
+        if (wt.wGridN == 1)
+          return ctx.i32lit(0);
         msl::Expr *col = ctx.paren(
             ctx.binary(B::Rem, ctx.var(warpId), ctx.i32lit(wt.wGridN)));
         return ctx.paren(ctx.mul(col, ctx.i32lit(wt.niCount)));
       };
-      std::string colKey = "(" + warpId + " % " + std::to_string(wt.wGridN) +
-                           ")*" + std::to_string(wt.niCount);
+      std::string colKey = wt.wGridN == 1
+                               ? std::string("0")
+                               : "(" + warpId + " % " +
+                                     std::to_string(wt.wGridN) + ")*" +
+                                     std::to_string(wt.niCount);
       auto emitRow = [&](int64_t wr, msl::Block &into) {
         SmallVector<Slot> slots;
         for (int64_t r = 0; r < wt.miCount; ++r)
@@ -1600,7 +1586,11 @@ bool MSLEmitter::emitDotFused(
           }
         emitSlots(slots, into);
       };
-      if (wGridM == 1) {
+      // devA is band-relative, so every warp row emits identical addresses and
+      // accumulator slots once the band is miCount fragments tall.
+      int64_t bandFrags = plan.M / (numWarps * 8);
+      bool rowInvariant = !dc.devA.empty() && bandFrags == wt.miCount;
+      if (wGridM == 1 || rowInvariant) {
         emitRow(0, body);
       } else {
         for (int64_t wr = 0; wr < wGridM; ++wr) {
@@ -2066,10 +2056,7 @@ msl::Stmt *MSLEmitter::accFragDecl(msl::MatrixType *frag, StringRef name) {
 // The trailing `transpose` parameter is deliberately never passed:
 // stageOperand always writes operands into threadgroup memory row-major, so
 // the fragment layout is canonical by construction. A column-major B is
-// transposed on the store into TG, not by flagging the load - and note Metal's
-// flag does NOT produce a transposed product: measured against a probe
-// validated to 0.0 on A@B, enabling it matches none of the twelve orientation
-// combinations, so it cannot absorb a column-major operand.
+// transposed on the store into TG, not by flagging the load.
 msl::Stmt *MSLEmitter::sgLoad(StringRef frag, StringRef base, int64_t off,
                               int64_t ld) {
   return ctx.exprStmt(

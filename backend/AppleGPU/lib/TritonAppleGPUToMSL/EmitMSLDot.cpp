@@ -616,13 +616,20 @@ msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
                                       ctx.var(fusedDot.dmaParity)))
                : static_cast<msl::Expr *>(ctx.var(fusedDot.dmaParity));
   // air.simdgroup_async_copy_2d is issued per simdgroup, so letting every warp
-  // request the whole tile would move it numWarps times over. Split it by rows
-  // instead: warp w takes the band [w*bandRows, (w+1)*bandRows).
+  // request the whole tile would move it numWarps times over. Split it instead:
+  // warp w takes the band [w*band, (w+1)*band).
+  //
+  // `_tr` swaps the source strides, so it also swaps which axis the device
+  // walks contiguously. Banding the contiguous axis chops every warp's run into
+  // a scalar strided gather -- 4.15x at 32x32 -- so a transposed source must be
+  // banded on the opposite axis.
   int64_t nw = plan.numWarps > 0 ? plan.numWarps : 1;
-  int64_t band = ds.rows / nw;
-  bool split = band > 0 && ds.rows % nw == 0;
+  bool bandCols = ds.srcTransposed;
+  int64_t axis = bandCols ? ds.cols : ds.rows;
+  int64_t band = axis / nw;
+  bool split = band > 0 && axis % nw == 0;
   if (!split) {
-    band = ds.rows;
+    band = axis;
     nw = 1;
   }
   msl::Expr *dst = ctx.paren(ctx.binary(
@@ -636,19 +643,20 @@ msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
         ctx.paren(ctx.binary(B::Mul, ctx.i32lit(ds.rows),
                              dmaRowStride(ds))));
   if (split) {
-    msl::Expr *wRows =
+    msl::Expr *wOff =
         ctx.paren(ctx.binary(B::Mul, ctx.var(warpId), ctx.i32lit(band)));
     dst = ctx.paren(ctx.binary(
         B::Add, dst,
-        ctx.paren(ctx.binary(B::Mul, wRows, ctx.i32lit(ldb)))));
+        bandCols ? wOff
+                 : ctx.paren(ctx.binary(B::Mul, wOff, ctx.i32lit(ldb)))));
     src = ctx.binary(
-        B::Add, src,
-        ctx.paren(ctx.binary(B::Mul, wRows, dmaRowStride(ds))));
+        B::Add, src, ctx.paren(ctx.binary(B::Mul, wOff, dmaRowStride(ds))));
   }
   msl::Expr *c = ctx.call(
       dmaCallee(eb, ds.srcTransposed),
       {dst, ctx.i32lit(ldb), src, dmaRowStride(ds),
-       ctx.i32lit(band), ctx.i32lit(ds.cols)});
+       ctx.i32lit(bandCols ? ds.rows : band),
+       ctx.i32lit(bandCols ? band : ds.cols)});
   return ctx.assignStmt(ctx.var(handle), c);
 }
 

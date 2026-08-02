@@ -383,7 +383,9 @@ void MSLPrinter::printBlock(const Block &b) {
         // Flush any pending soft barrier, then emit this one verbatim; it never
         // collapses with an adjacent barrier.
         flushBarrier();
-        if (bar->device)
+        if (bar->simdOnly)
+          ind() << "simdgroup_barrier(mem_flags::mem_threadgroup);\n";
+        else if (bar->device)
           ind() << "threadgroup_barrier(mem_flags::mem_threadgroup | "
                    "mem_flags::mem_device);\n";
         else

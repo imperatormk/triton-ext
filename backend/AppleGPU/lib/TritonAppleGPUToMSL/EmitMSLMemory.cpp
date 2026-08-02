@@ -174,6 +174,11 @@ void MSLEmitter::scanPool(Operation *op) {
   if (auto c = dyn_cast<ttg::ConvertLayoutOp>(op)) {
     if (convertLayoutIsDeadDotStage(c) || convertLayoutIsDeadDotStageSource(c))
       return;
+    // The C convert feeding a direct store never runs: the fast arm stores the
+    // fragments straight to device and the ragged arm drains them a fragment at
+    // a time, so neither materialises this tile in the pool.
+    if (convertLayoutIsDirectStoreC(c))
+      return;
     auto srcT = cast<RankedTensorType>(c.getSrc().getType());
     auto resT = cast<RankedTensorType>(c.getResult().getType());
     // Mirrors the emitter's two escapes: an identical layout rebinds and a
@@ -309,6 +314,12 @@ void MSLEmitter::scanPool(Operation *op) {
           // what asked for 45-56KB against a 32KB cap and had the autotuner
           // drop the larger blocks; band it to what actually fits beside them.
           need = cBanded;
+        } else if (int64_t sc = fusedGemmCCompactScratch(d)) {
+          // The ragged arm drains one 8x8 fragment per warp at a time, so it
+          // needs a handful of slots, not the whole C tile. Reserving cFull
+          // here is what set the pool size -- and the pool size is what caps
+          // how many threadgroups stay resident.
+          need = std::max(stagedAB, sc * accBytes);
         } else {
           need = std::max(stagedAB, dmaSlack ? cBanded : cFull);
         }

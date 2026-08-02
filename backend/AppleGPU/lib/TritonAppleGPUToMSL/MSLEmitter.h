@@ -622,6 +622,11 @@ private:
   // pool does not have to reserve it.
   bool fusedGemmCIsShuffled(tt::DotOp d);
   bool fusedGemmCHasFallback(tt::DotOp d);
+  bool convertLayoutIsDirectStoreC(ttg::ConvertLayoutOp c);
+  // Elements of threadgroup scratch the ragged arm needs. It drains one 8x8
+  // fragment per warp at a time, so this is numWarps*64 rather than the whole
+  // MxN tile; 0 when the arm does not take that path.
+  int64_t fusedGemmCCompactScratch(tt::DotOp d);
   bool cStoresDirect(tt::DotOp d);
 
   // Bitmask over lane (or warp) bits that reduce the given axis: a bit reduces

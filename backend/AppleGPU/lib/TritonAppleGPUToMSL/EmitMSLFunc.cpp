@@ -671,12 +671,20 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
   // Pin the threadgroup size the runtime always dispatches (num_warps*32) so
   // the Metal compiler budgets for exactly this size instead of an
   // occupancy-driven ceiling that could reject a valid launch.
+  // Pinning the threadgroup size lets the compiler budget registers for exactly
+  // this launch, which is what keeps a big kernel from being rejected as
+  // OutOfResources -- but it also lets it spend the whole register file on one
+  // threadgroup, so nothing stays resident beside it. That trade only pays when
+  // the kernel is already down to one resident threadgroup for another reason:
+  // a pool over half the per-core budget cannot fit a second one regardless.
+  // Below that, leaving it off is what buys the second threadgroup.
   msl::Attr *maxThreads = nullptr;
+  int64_t launchThreads = 0;
   if (auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps")) {
     int64_t tpw = 32;
     if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.threads-per-warp"))
       tpw = a.getInt();
-    maxThreads = ctx.maxThreadsAttr(nw.getInt() * tpw);
+    launchThreads = nw.getInt() * tpw;
   }
 
   // Params + prologue mint real fresh() names IN ORDER (before the body walk)
@@ -781,6 +789,14 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     prologue.push_back(
         ctx.arrayDeclStmt(ctx.named("threadgroup char"), poolBuf, kernelPool));
   }
+  // Declaring the launch size lets the compiler budget registers for exactly
+  // the threads that will run, which is what keeps a big block from spilling to
+  // "exceeds available stack space". It also lets it spend the whole register
+  // file on one threadgroup, so nothing else stays resident -- pure loss once
+  // the threadgroup memory would have allowed a second one. Pin it only when
+  // the pool has already taken that second threadgroup away.
+  if (launchThreads && tgResidency(kernelPool) < 2)
+    maxThreads = ctx.maxThreadsAttr(launchThreads);
 
   // One DMA event token per async-copy site, declared before the walk: the
   // issue and its wait can land in different scopes, and the loop body is

@@ -323,6 +323,9 @@ struct BarrierStmt : Stmt {
   // paths that spelled `threadgroup_barrier(...)` literally (dot/trans/reduce/
   // convert/...). Soft barriers go through the peephole (async/local_store).
   bool hard;
+  // Ordering only within one simdgroup: cheaper than a threadgroup barrier and
+  // sufficient when the memory each warp touches is private to that warp.
+  bool simdOnly = false;
   BarrierStmt(bool d, bool hard) : Stmt(Kind::Barrier), device(d), hard(hard) {}
   static bool classof(const Stmt *s) { return s->kind == Kind::Barrier; }
 };
@@ -566,6 +569,11 @@ public:
   BarrierStmt *barrier(bool device) { return make<BarrierStmt>(device, false); }
   BarrierStmt *hardBarrier(bool device) {
     return make<BarrierStmt>(device, true);
+  }
+  BarrierStmt *simdBarrier() {
+    auto *b = make<BarrierStmt>(false, true);
+    b->simdOnly = true;
+    return b;
   }
   CompactIfStmt *compactIf(Expr *c, Stmt *t) {
     return make<CompactIfStmt>(c, t, true);

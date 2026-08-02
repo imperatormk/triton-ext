@@ -1810,7 +1810,10 @@ bool MSLEmitter::emitDotFused(
     // The pool image of C is the plain row-major tile (that is what the
     // simdgroup_store above writes), so the ragged arm can stream it to device
     // itself under the same bounds the store's mask carries.
-    bool raggedDirect = !d.alwaysFullTile && d.boundM && d.boundN;
+    // The ragged arm drains a fragment at a time using an offset affine in the
+    // warp id, so it needs the same tiling property the merged fast arm does.
+    bool raggedDirect =
+        !d.alwaysFullTile && d.boundM && d.boundN && mergeWarps;
     if (raggedDirect) {
       directStoreRaggedHandled.insert(
           const_cast<DirectStore &>(d).store.getOperation());
@@ -1829,6 +1832,91 @@ bool MSLEmitter::emitDotFused(
     // Build pool store + gather into elseBody:
     {
       msl::Block &tgt = elseBody;
+      // Draining one fragment at a time through a per-warp 8x8 slot needs
+      // numWarps*64 elements of scratch instead of the whole MxN tile, which is
+      // what otherwise sets the pool size and caps threadgroup residency.
+      // The per-warp drain addresses a fragment as warp-offset + constant,
+      // which is only the right mapping when the warp tiling is affine in the
+      // warp id -- the same condition the merged fast arm needs.
+      if (raggedDirect) {
+        std::string slot = fresh();
+        tgt.push_back(ctx.declStmt(
+            ctx.ptr(ctx.scalar(msl::Scalar::F32), msl::AddrSpace::Threadgroup),
+            slot,
+            ctx.add(ctx.var(dc.tgC),
+                    ctx.mul(ctx.var(warpId), ctx.i32lit(64)))));
+        for (int64_t j = 0; j < fragsPerWarp; ++j) {
+          int64_t mi, ni;
+          wt.frag(0, j, nT, numWarps, mi, ni);
+          if (mi * nT + ni >= nFrag)
+            continue;
+          tgt.push_back(ctx.hardBarrier(false));
+          tgt.push_back(ctx.exprStmt(
+              ctx.call(msl::builtin::sg::Store,
+                       {ctx.var(fusedDot.accNames[j]), ctx.var(slot),
+                        ctx.lit("8")})));
+          tgt.push_back(ctx.hardBarrier(false));
+          // rows/cols this fragment owns, offset by the warp's own subblock
+          msl::Expr *fRow = ctx.addChain(
+              {ctx.var(rowB), ctx.i32lit(mi * 8),
+               ctx.mul(ctx.paren(ctx.binary(B::Div, ctx.var(warpId),
+                                            ctx.i32lit(wt.wGridN))),
+                       ctx.i32lit(wt.miCount * 8))});
+          msl::Expr *fCol = ctx.addChain(
+              {ctx.var(colB), ctx.i32lit(ni * 8),
+               ctx.mul(ctx.paren(ctx.binary(B::Rem, ctx.var(warpId),
+                                            ctx.i32lit(wt.wGridN))),
+                       ctx.i32lit(wt.niCount * 8))});
+          std::string e = fresh(), rr = fresh(), cc2 = fresh();
+          std::string gr = fresh(), gc = fresh();
+          msl::Block loop;
+          loop.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), rr,
+                                      ctx.binary(B::Div, ctx.var(e),
+                                                 ctx.i32lit(8))));
+          loop.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), cc2,
+                                      ctx.binary(B::Rem, ctx.var(e),
+                                                 ctx.i32lit(8))));
+          loop.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), gr,
+                                      ctx.add(fRow, ctx.var(rr))));
+          loop.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), gc,
+                                      ctx.add(fCol, ctx.var(cc2))));
+          msl::Expr *val = ctx.subscript(
+              ctx.var(slot),
+              ctx.add(ctx.mul(ctx.var(rr), ctx.i32lit(8)), ctx.var(cc2)));
+          if (d.biasPtr) {
+            // The bias is indexed from its own tile origin, not from C's.
+            msl::Expr *bCol = ctx.addChain(
+                {ctx.var(scalarName(d.biasCol)), ctx.i32lit(ni * 8),
+                 ctx.mul(ctx.paren(ctx.binary(B::Rem, ctx.var(warpId),
+                                              ctx.i32lit(wt.wGridN))),
+                         ctx.i32lit(wt.niCount * 8)),
+                 ctx.var(cc2)});
+            val = ctx.binary(B::Add, val,
+                             ctx.deref(ctx.paren(ctx.add(
+                                 ctx.var(scalarName(d.biasPtr)), bCol))));
+          }
+          if (d.narrowTo)
+            val = ctx.cast(CS::CStyle, scalarType(d.narrowTo), val);
+          msl::Block guarded;
+          guarded.push_back(ctx.assignStmt(
+              ctx.subscript(ctx.var(base),
+                            ctx.add(ctx.mul(ctx.var(gr), uniform(d.ldc)),
+                                    ctx.var(gc))),
+              val));
+          msl::Expr *inb = ctx.binary(B::Lt, ctx.var(gc), uniform(d.boundN));
+          if (!directStoreRowNeverRagged(d, M))
+            inb = ctx.binary(B::LAnd,
+                             ctx.binary(B::Lt, ctx.var(gr), uniform(d.boundM)),
+                             inb);
+          loop.push_back(ctx.ifScope(inb, std::move(guarded)));
+          tgt.push_back(ctx.forScope(
+              ctx.declStmt(ctx.scalar(msl::Scalar::I32), e, ctx.var(laneId)),
+              ctx.binary(B::Lt, ctx.var(e), ctx.i32lit(64)),
+              ctx.assignStmt(ctx.var(e), ctx.binary(B::Add, ctx.var(e),
+                                                    ctx.i32lit(32))),
+              std::move(loop)));
+        }
+      } else {
       tgt.push_back(ctx.hardBarrier(false));
       if (mergeWarps) {
         msl::Expr *wOff = ctx.paren(ctx.add(
@@ -1867,62 +1955,9 @@ bool MSLEmitter::emitDotFused(
         }
       }
       tgt.push_back(ctx.hardBarrier(false));
-      // The ragged tile is written straight out of the pool, one bounded
-      // element per thread, instead of gathering it back into registers for the
-      // terminal tt.store: that gather scalarises into one predicated store per
-      // element and its sheer size costs the whole kernel, not just this arm.
-      if (raggedDirect) {
-        int64_t nThreads = numWarps * 32;
-        std::string e = fresh();
-        msl::Block loop;
-        std::string r = fresh(), c = fresh();
-        loop.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), r,
-                                    ctx.binary(B::Div, ctx.var(e),
-                                               ctx.i32lit(N))));
-        loop.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), c,
-                                    ctx.binary(B::Rem, ctx.var(e),
-                                               ctx.i32lit(N))));
-        std::string gr = fresh(), gc = fresh();
-        loop.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), gr,
-                                    ctx.add(ctx.var(rowB), ctx.var(r))));
-        loop.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I32), gc,
-                                    ctx.add(ctx.var(colB), ctx.var(c))));
-        msl::Expr *val = ctx.subscript(
-            ctx.var(dc.tgC),
-            ctx.add(ctx.mul(ctx.var(r), ctx.i32lit(N)), ctx.var(c)));
-        if (d.biasPtr)
-          val = ctx.binary(
-              B::Add, val,
-              ctx.deref(ctx.paren(ctx.addChain(
-                  {ctx.var(scalarName(d.biasPtr)),
-                   ctx.var(scalarName(d.biasCol)), ctx.var(c)}))));
-        msl::Expr *dst = ctx.subscript(
-            ctx.var(base),
-            ctx.add(ctx.mul(ctx.var(gr), uniform(d.ldc)), ctx.var(gc)));
-        msl::Type *st = d.narrowTo ? scalarType(d.narrowTo)
-                                   : ctx.scalar(msl::Scalar::F32);
-        if (d.narrowTo)
-          val = ctx.cast(CS::CStyle, st, val);
-        msl::Block guarded;
-        guarded.push_back(ctx.assignStmt(dst, val));
-        msl::Expr *inb = ctx.binary(B::Lt, ctx.var(gc), uniform(d.boundN));
-        if (!directStoreRowNeverRagged(d, M))
-          inb = ctx.binary(B::LAnd,
-                           ctx.binary(B::Lt, ctx.var(gr), uniform(d.boundM)),
-                           inb);
-        loop.push_back(ctx.ifScope(inb, std::move(guarded)));
-        tgt.push_back(ctx.forScope(
-            ctx.declStmt(ctx.scalar(msl::Scalar::I32), e,
-                         ctx.cast(CS::CStyle, ctx.scalar(msl::Scalar::I32),
-                                  ctx.member(ctx.var(tidId), "x"))),
-            ctx.binary(B::Lt, ctx.var(e), ctx.i32lit(M * N)),
-            ctx.assignStmt(ctx.var(e), ctx.binary(B::Add, ctx.var(e),
-                                                  ctx.i32lit(nThreads))),
-            std::move(loop)));
-      } else {
-        readbackInto(tgt, 0, 0, M);
-      }
+      readbackInto(tgt, 0, 0, M);
       tgt.push_back(ctx.hardBarrier(false));
+      }
     }
     if (d.alwaysFullTile) {
       // Unmasked store: the fallback arm is dead. Emitting it anyway keeps a
@@ -2708,6 +2743,63 @@ bool MSLEmitter::fusedGemmCHasFallback(tt::DotOp d) {
   int rk = cTy.getRank();
   return !directStoreNeverRagged(*ds, cTy.getShape()[rk - 2],
                                  cTy.getShape()[rk - 1]);
+}
+
+// A convert on the direct-store C chain never materialises its tile: the fast
+// arm sends the fragments straight to device and the ragged arm drains them one
+// fragment at a time. That covers both the accumulator's own relayout and the
+// row-broadcast bias the fold consumes two scalars of per fragment column.
+bool MSLEmitter::convertLayoutIsDirectStoreC(ttg::ConvertLayoutOp c) {
+  auto fromDot = [&](Value v) -> std::optional<DirectStore> {
+    if (auto tf = v.getDefiningOp<arith::TruncFOp>())
+      v = tf.getOperand();
+    scf::ForOp forOp;
+    unsigned idx = 0;
+    if (auto arg = dyn_cast<BlockArgument>(v)) {
+      forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+      if (!forOp)
+        return std::nullopt;
+      idx = arg.getArgNumber() - forOp.getNumInductionVars();
+    } else if (auto res = dyn_cast<OpResult>(v)) {
+      forOp = dyn_cast<scf::ForOp>(res.getOwner());
+      if (!forOp)
+        return std::nullopt;
+      idx = res.getResultNumber();
+    } else {
+      return std::nullopt;
+    }
+    auto m = matchGemmDotLoop(forOp);
+    if (!m || m->second != idx)
+      return std::nullopt;
+    return matchDirectStore(forOp.getResult(idx));
+  };
+  // acc (or truncf(acc)) -> convert -> store
+  if (fromDot(c.getSrc()))
+    return true;
+  // bias -> convert -> addf(acc, .) : dead when that add is the folded bias
+  for (Operation *u : c.getResult().getUsers()) {
+    auto add = dyn_cast<arith::AddFOp>(u);
+    if (!add)
+      continue;
+    Value other =
+        add.getLhs() == c.getResult() ? add.getRhs() : add.getLhs();
+    if (auto ds = fromDot(other))
+      if (ds->biasAdd == add.getOperation())
+        return true;
+  }
+  return false;
+}
+
+int64_t MSLEmitter::fusedGemmCCompactScratch(tt::DotOp d) {
+  if (!fusedGemmCHasFallback(d))
+    return 0;
+  auto forOp = dyn_cast<scf::ForOp>(d->getParentOp());
+  auto m = matchGemmDotLoop(forOp);
+  auto ds = matchDirectStore(forOp.getResult(m->second));
+  if (!ds || !ds->boundM || !ds->boundN)
+    return 0;
+  auto nw = mod->getAttrOfType<IntegerAttr>("ttg.num-warps");
+  return nw ? nw.getInt() * 64 : 0;
 }
 
 bool MSLEmitter::fusedGemmCIsShuffled(tt::DotOp d) {

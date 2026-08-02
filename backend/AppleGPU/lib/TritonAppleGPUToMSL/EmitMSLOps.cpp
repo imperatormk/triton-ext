@@ -3025,6 +3025,34 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
                 msl::AddrSpace::Device);
     auto &base = names(ap.getPtr());
     auto &offs = names(ap.getOffset());
+    bool uniformBase =
+        base.size() == 1 || llvm::all_of(base, [&](const std::string &b) {
+          return b == base[0];
+        });
+    // `buf + off_r` for each register makes every pointer its own 64-bit
+    // address computation off the raw buffer. Anchoring on register 0 and
+    // deriving the rest as `p0 + (off_r - off_0)` leaves one such computation
+    // and turns the others into index arithmetic the compiler folds into the
+    // access -- worth several percent on a staging loop that runs every trip.
+    if (uniformBase && offs.size() > 1 && regCount(op->getResult(0)) > 1) {
+      int rc = regCount(op->getResult(0));
+      SmallVector<std::string> ids;
+      std::string anchor;
+      for (int r = 0; r < rc; ++r) {
+        std::string id = fresh();
+        msl::Expr *init =
+            r == 0 ? ctx.binary(B::Add, ctx.var(base[0]), ctx.var(offs[0]))
+                   : ctx.binary(B::Add, ctx.var(anchor),
+                                ctx.paren(ctx.binary(B::Sub, ctx.var(offs[r]),
+                                                     ctx.var(offs[0]))));
+        body.push_back(ctx.declStmt(sc, id, init));
+        if (r == 0)
+          anchor = id;
+        ids.push_back(id);
+      }
+      bindRegs(op->getResult(0), ids);
+      return true;
+    }
     return declBind(op, sc, body, [&](int r) {
       return ctx.binary(B::Add, ctx.var(base[base.size() == 1 ? 0 : r]),
                         ctx.var(offs[offs.size() == 1 ? 0 : r]));

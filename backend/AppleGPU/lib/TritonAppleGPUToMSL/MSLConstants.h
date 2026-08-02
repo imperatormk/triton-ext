@@ -29,6 +29,12 @@ inline constexpr int64_t tgPoolForResidency(int64_t n) {
   return n > 0 ? kTGCoreBudgetBytes / n : kTGCoreBudgetBytes;
 }
 
+// The narrowest threadgroup ceiling the Metal compiler has been observed to
+// pick for a kernel it cannot see a launch size for (a register-hungry 3D dot).
+// A launch this size or smaller is admitted without a launch-bounds attribute,
+// so it can skip one and keep the occupancy the attribute would cost.
+inline constexpr int64_t kAlwaysAdmittedThreads = 384;
+
 // How many threadgroups stay resident when a pool of `bytes` is declared.
 inline constexpr int64_t tgResidency(int64_t bytes) {
   return bytes > 0 ? kTGCoreBudgetBytes / bytes : kTGCoreBudgetBytes;

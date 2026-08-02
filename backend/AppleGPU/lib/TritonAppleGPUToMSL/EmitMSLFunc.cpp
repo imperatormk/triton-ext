@@ -789,13 +789,13 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     prologue.push_back(
         ctx.arrayDeclStmt(ctx.named("threadgroup char"), poolBuf, kernelPool));
   }
-  // Declaring the launch size lets the compiler budget registers for exactly
-  // the threads that will run, which is what keeps a big block from spilling to
-  // "exceeds available stack space". It also lets it spend the whole register
-  // file on one threadgroup, so nothing else stays resident -- pure loss once
-  // the threadgroup memory would have allowed a second one. Pin it only when
-  // the pool has already taken that second threadgroup away.
-  if (launchThreads && tgResidency(kernelPool) < 2)
+  // Left undeclared, the compiler budgets registers for a threadgroup it has to
+  // assume the worst about, and caps the pipeline at whatever that budget
+  // allows -- as low as 384 threads on a register-hungry kernel. A launch wider
+  // than the cap is then rejected as OutOfResources, which is fatal, while
+  // declaring the size costs at most one step of occupancy. So the attribute is
+  // the default and only a launch too small to ever hit the cap goes without.
+  if (launchThreads > kAlwaysAdmittedThreads)
     maxThreads = ctx.maxThreadsAttr(launchThreads);
 
   // One DMA event token per async-copy site, declared before the walk: the

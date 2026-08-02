@@ -1701,22 +1701,40 @@ bool MSLEmitter::emitDotFused(
     }
     // acc + bias[biasCol + ni*8 + laneCol + e], into a scratch fragment so the
     // accumulator stays clean for the fallback arm.
+    // The bias is constant down a column, so its two values depend only on the
+    // fragment's ni -- not on which row fragment consumes them. Load each once
+    // and reuse it across every mi, or the same address is fetched once per
+    // accumulator.
+    DenseMap<int64_t, std::array<std::string, 2>> biasVal;
+    // Cached names are only in scope within the block that declared them, so
+    // each emission site starts fresh.
+    auto resetBias = [&] { biasVal.clear(); };
     auto biased = [&](msl::Block &blk, StringRef accName,
                       int64_t ni) -> std::string {
       if (!d.biasPtr)
         return accName.str();
+      auto it = biasVal.find(ni);
+      if (it == biasVal.end()) {
+        std::array<std::string, 2> vs;
+        for (int e = 0; e < 2; ++e) {
+          vs[e] = fresh();
+          msl::Expr *addr =
+              ctx.addChain({ctx.var(scalarName(d.biasPtr)),
+                            ctx.var(scalarName(d.biasCol)),
+                            ctx.i32lit(ni * 8 + e), ctx.var(biasLaneCol)});
+          blk.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::F32), vs[e],
+                                     ctx.deref(ctx.paren(addr))));
+        }
+        it = biasVal.insert({ni, vs}).first;
+      }
       std::string id = fresh();
       blk.push_back(ctx.declStmt(dc.accFragTy, id, ctx.var(accName)));
       for (int e = 0; e < 2; ++e) {
         msl::Expr *slot = ctx.subscript(
             ctx.member(ctx.var(id), msl::builtin::sg::ThreadElements),
             ctx.i32lit(e));
-        msl::Expr *addr =
-            ctx.addChain({ctx.var(scalarName(d.biasPtr)),
-                          ctx.var(scalarName(d.biasCol)),
-                          ctx.i32lit(ni * 8 + e), ctx.var(biasLaneCol)});
         blk.push_back(ctx.assignStmt(
-            slot, ctx.binary(B::Add, slot, ctx.deref(ctx.paren(addr)))));
+            slot, ctx.binary(B::Add, slot, ctx.var(it->second[e]))));
       }
       return id;
     };
@@ -1767,6 +1785,7 @@ bool MSLEmitter::emitDotFused(
     } else {
       for (int64_t w = 0; w < numWarps; ++w) {
         msl::Block inner;
+        resetBias();
         for (int64_t j = 0; j < fragsPerWarp; ++j) {
           int64_t mi, ni;
           wt.frag(w, j, nT, numWarps, mi, ni);

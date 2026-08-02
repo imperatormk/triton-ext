@@ -357,17 +357,22 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
         return u.lit ? static_cast<msl::Expr *>(ctx.i32lit(*u.lit))
                      : ctx.var(scalarName(u.val));
       };
-      // (rowBase + M <= boundM && colBase + N <= boundN)
-      cond = ctx.paren(ctx.binary(
-          B::LAnd,
-          ctx.binary(B::Le,
-                     ctx.binary(B::Add, ctx.var(scalarName(ds->rowBase)),
-                                ctx.lit(std::to_string(M))),
-                     uniform(ds->boundM)),
-          ctx.binary(B::Le,
-                     ctx.binary(B::Add, ctx.var(scalarName(ds->colBase)),
-                                ctx.lit(std::to_string(N))),
-                     uniform(ds->boundN))));
+      auto axis = [&](Value base, int64_t blk,
+                      const UniformInt &bound) -> msl::Expr * {
+        return ctx.binary(B::Le,
+                          ctx.binary(B::Add, ctx.var(scalarName(base)),
+                                     ctx.lit(std::to_string(blk))),
+                          uniform(bound));
+      };
+      bool rowOk = directStoreRowNeverRagged(*ds, M);
+      bool colOk = directStoreColNeverRagged(*ds, N);
+      if (rowOk)
+        cond = ctx.paren(axis(ds->colBase, N, ds->boundN));
+      else if (colOk)
+        cond = ctx.paren(axis(ds->rowBase, M, ds->boundM));
+      else
+        cond = ctx.paren(ctx.binary(B::LAnd, axis(ds->rowBase, M, ds->boundM),
+                                    axis(ds->colBase, N, ds->boundN)));
     } else {
       cond = ctx.lit("true");
       ds->alwaysFullTile = true;
@@ -743,6 +748,13 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
   if (!isa<tt::StoreOp>(op)) {
     auto guarded = directStoreHandled.find(op);
     if (guarded != directStoreHandled.end()) {
+      // The ragged arm wrote the tile straight out of the pool, so this whole
+      // chain -- the convert, the narrowing and the bias add that only ever fed
+      // the scalar fallback store -- has no consumer left.
+      if (directStoreRaggedHandled.count(op)) {
+        directStoreHandled.erase(guarded);
+        return true;
+      }
       std::string ftVar = guarded->second;
       directStoreHandled.erase(guarded);
       msl::Block inner;
@@ -3143,6 +3155,8 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
   if (auto st = dyn_cast<tt::StoreOp>(op)) {
     auto handled = directStoreHandled.find(st.getOperation());
     if (handled != directStoreHandled.end()) {
+      if (directStoreRaggedHandled.count(st.getOperation()))
+        return true;
       msl::Block inner;
       storeBody(st, inner);
       // if (!<fullTile>) { <store body> }

@@ -507,6 +507,7 @@ private:
   // by op), each with the runtime predicate under which it did so. The tt.store
   // handler guards the store on the negation to avoid a double write.
   DenseMap<Operation *, std::string> directStoreHandled;
+  DenseSet<Operation *> directStoreRaggedHandled;
 
   static bool tracesToKernelArg(Value v);
 
@@ -539,6 +540,8 @@ private:
   // are required -- a literal bound alone says nothing about where the tile
   // starts. Anything dynamic or indivisible keeps the fallback arm and its pool
   // reservation.
+  bool directStoreRowNeverRagged(const DirectStore &ds, int64_t M);
+  bool directStoreColNeverRagged(const DirectStore &ds, int64_t N);
   bool directStoreNeverRagged(const DirectStore &ds, int64_t M, int64_t N);
 
   int stageVectorWidth(RankedTensorType stageTy, int regs, int64_t rowPad);

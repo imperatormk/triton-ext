@@ -87,11 +87,23 @@ struct FusedDotCtx {
 // elements recovers ~4%, and the optimum is flat (+2..+8 land within noise).
 // Padding only pays when the row stride is bank-aligned to begin with, and it
 // is dropped outright when the widened tiles would not fit the 32KB cap.
+//
+// It is also dropped when it would cost a threadgroup-residency step, but only
+// while residency is still the binding limit. Past kTGResidencyFloor the pool
+// no longer decides occupancy - registers and warp slots do - so a nominal step
+// costs nothing while the bank conflicts remain real. Measured on an M1 Pro:
+// at 64x64x32 fp32 (4 -> 3 resident) dropping the pad wins, 7.15 -> 6.61 ms;
+// at 32x32x16 (16 -> 13 resident) dropping it loses 8.4% on the column-major
+// 16384x30522x768 addmm, 226.4 -> 260.4 ms.
 inline void dotStageRowPads(int64_t M, int64_t N, int64_t K, int64_t aEb,
                             int64_t bEb, int64_t &aPad, int64_t &bPad) {
   aPad = (K % 8 || aEb * K % 64) ? 0 : 4;
   bPad = (N % 8 || bEb * N % 64) ? 0 : 4;
-  if (M * (K + aPad) * aEb + K * (N + bPad) * bEb > kTGResidentBudgetBytes)
+  int64_t bare = M * K * aEb + K * N * bEb;
+  int64_t padded = M * (K + aPad) * aEb + K * (N + bPad) * bEb;
+  if (padded > kTGResidentBudgetBytes ||
+      (tgResidency(padded) < tgResidency(bare) &&
+       tgResidency(padded) < kTGResidencyFloor))
     aPad = bPad = 0;
 }
 

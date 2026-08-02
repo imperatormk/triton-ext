@@ -18,6 +18,30 @@ namespace mlir::triton::applegpu {
 // through poolBudget(), never a bare literal, so they cannot drift.
 inline constexpr int64_t kTGResidentBudgetBytes = 32768;
 
+// Threadgroup memory a core can hand out across *concurrently resident*
+// threadgroups, which is twice the per-threadgroup cap above. Measured on an
+// M1 Pro by sweeping only the __pool declaration of an otherwise identical
+// kernel: the runtime steps from three resident threadgroups to two between
+// 20480 and 21844 bytes, i.e. exactly at 65536/3, and that step alone costs
+// ~20%. Sizing a pool to the per-threadgroup cap therefore buys footprint with
+// residency, which is usually the worse trade.
+inline constexpr int64_t kTGCoreBudgetBytes = 65536;
+
+// The largest pool that still keeps `n` threadgroups resident on a core.
+inline constexpr int64_t tgPoolForResidency(int64_t n) {
+  return n > 0 ? kTGCoreBudgetBytes / n : kTGCoreBudgetBytes;
+}
+
+// How many threadgroups stay resident when a pool of `bytes` is declared.
+inline constexpr int64_t tgResidency(int64_t bytes) {
+  return bytes > 0 ? kTGCoreBudgetBytes / bytes : kTGCoreBudgetBytes;
+}
+
+// Above this many resident threadgroups the pool has stopped being what limits
+// occupancy - registers and warp slots bind first - so trading tile layout for
+// a further residency step buys nothing.
+inline constexpr int64_t kTGResidencyFloor = 6;
+
 } // namespace mlir::triton::applegpu
 
 namespace mlir::triton::applegpu::msl {

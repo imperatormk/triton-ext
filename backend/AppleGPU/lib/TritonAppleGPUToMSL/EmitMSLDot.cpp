@@ -930,17 +930,29 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
     p.aPad = 0;
   if (p.bInPlace)
     p.bPad = 0;
+  p.phase = fusedDot.phase;
+  // A padded row stride makes the copy's destination pitch differ from its
+  // width, which costs far more in the DMA engine than the bank padding
+  // recovers in simdgroup_load. Apple's own kernel never pads a copy
+  // destination: every one of its 3136 copies has dstStride == cols.
+  bool bDma = p.phase != FusedDotPhase::None && !p.bInPlace &&
+              dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false);
+  if (bDma)
+    p.bPad = 0;
   p.stagedA = p.aInPlace ? 0 : p.M * (p.K + p.aPad) * byteWidth(aElem);
   p.stagedB = p.bInPlace ? 0 : p.K * (p.N + p.bPad) * byteWidth(bElem);
   p.stagedAB = p.stagedA + p.stagedB;
-  p.phase = fusedDot.phase;
   // A second B tile for the in-flight copy, sitting directly after the first,
   // so C (disjoint or banded) starts past both. Every phase must agree on this,
   // or they would disagree about where C begins -- hence the binding-free form
   // of the candidate test, which depends only on the IR.
-  p.dmaB = p.phase != FusedDotPhase::None && p.stagedB &&
-           dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false) &&
-           p.stagedAB + p.stagedB <= kTGResidentBudgetBytes;
+  // The second B tile is only worth its footprint when it does not push the
+  // pool past a residency step: measured on an M1 Pro, dropping from three
+  // resident threadgroups to two costs ~20%, which is far more than the copy
+  // saves. Without this the DMA path loses on exactly the tiles it fits.
+  p.dmaB = bDma && p.stagedB &&
+           p.stagedAB + p.stagedB <= kTGResidentBudgetBytes &&
+           tgResidency(p.stagedAB + p.stagedB) >= tgResidency(p.stagedAB);
   if (p.dmaB)
     p.stagedAB += p.stagedB;
   // The fused epilogue writes C only after the K-loop, behind a barrier, so
@@ -1921,8 +1933,9 @@ msl::Stmt *MSLEmitter::accFragDecl(msl::MatrixType *frag, StringRef name) {
 // stageOperand always writes operands into threadgroup memory row-major, so
 // the fragment layout is canonical by construction. A column-major B is
 // transposed on the store into TG, not by flagging the load - and note Metal's
-// flag means "memory is transposed relative to the matrix's canonical layout",
-// so row_major maps to transpose=false.
+// flag does NOT produce a transposed product: measured against a probe
+// validated to 0.0 on A@B, enabling it matches none of the twelve orientation
+// combinations, so it cannot absorb a column-major operand.
 msl::Stmt *MSLEmitter::sgLoad(StringRef frag, StringRef base, int64_t off,
                               int64_t ld) {
   return ctx.exprStmt(

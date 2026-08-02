@@ -236,10 +236,18 @@ void MSLEmitter::scanPool(Operation *op) {
       // scanPool runs before any fused phase is set, so ask the phase-free
       // candidate test rather than dotDmaStage (which would see phase None and
       // under-reserve the second tile).
-      dmaSlack = (stagedB && dmaStagingEnabled() && bDmaCandidate(d, false) &&
-                  stagedA + stagedB + bBy <= kTGResidentBudgetBytes)
-                     ? bBy
-                     : 0;
+      // Mirrors planDot exactly: an unpadded destination pitch for the copy,
+      // and the second tile only when it does not cost a residency step.
+      if (stagedB && dmaStagingEnabled() && bDmaCandidate(d, false)) {
+        int64_t bNoPad = Kd * N * bEb;
+        int64_t ab = stagedA + bNoPad;
+        if (ab + bNoPad <= kTGResidentBudgetBytes &&
+            tgResidency(ab + bNoPad) >= tgResidency(ab)) {
+          stagedB = bNoPad;
+          bBy = bNoPad;
+          dmaSlack = bNoPad;
+        }
+      }
       int64_t stagedAB = stagedA + stagedB;
       int64_t cFull = M * N * accBytes;
       int64_t cBudget = poolBudget() - dmaSlack;

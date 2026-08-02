@@ -1030,6 +1030,15 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   p.dmaB = bDma && p.stagedB &&
            p.stagedAB + p.stagedB <= kTGResidentBudgetBytes &&
            tgResidency(p.stagedAB + p.stagedB) >= tgResidency(p.stagedAB);
+  if (getenv("TRITON_MSL_DMA_PROBE"))
+    llvm::errs() << "[dma-probe] dmaB bDma=" << (bool)bDma
+                 << " stagedA=" << p.stagedA << " stagedB=" << p.stagedB
+                 << " fits="
+                 << (p.stagedAB + p.stagedB <= kTGResidentBudgetBytes)
+                 << " resid="
+                 << (tgResidency(p.stagedAB + p.stagedB) >=
+                     tgResidency(p.stagedAB))
+                 << " => " << p.dmaB << "\n";
   if (p.dmaB)
     p.stagedAB += p.stagedB;
   // The fused epilogue writes C only after the K-loop, behind a barrier, so

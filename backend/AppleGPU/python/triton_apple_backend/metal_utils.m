@@ -294,13 +294,15 @@ static PyObject *py_compile_source(PyObject *self, PyObject *args) {
   @autoreleasepool {
     MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
     // Safe math is load-bearing: fast-math assumes no NaN/Inf and reassociates
-    // FP, silently miscompiling kernels over Inf/NaN or relying on RTNE. Match
-    // the old xcrun -fmetal-math-mode=safe (safe mode + precise
-    // transcendentals).
+    // FP, silently miscompiling kernels over Inf/NaN or relying on RTNE.
+    // Transcendental accuracy is chosen per-op by the metal::precise::
+    // namespace the emitter selects, which keeps full accuracy even under
+    // MTLMathFloatingPointFunctionsFast; forcing Precise here would override
+    // that for every op at a large throughput cost.
     if (strcmp(math_mode, "safe") == 0) {
       if ([opt respondsToSelector:@selector(setMathMode:)]) {
         opt.mathMode = MTLMathModeSafe;
-        opt.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+        opt.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsFast;
       } else {
         opt.fastMathEnabled = NO;
       }

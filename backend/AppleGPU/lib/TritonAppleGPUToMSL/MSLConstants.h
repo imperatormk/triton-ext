@@ -66,6 +66,9 @@ inline constexpr llvm::StringRef Isnan = "metal::isnan";
 inline constexpr llvm::StringRef Rint = "metal::rint";
 inline constexpr llvm::StringRef Round = "metal::round";
 inline constexpr llvm::StringRef Trunc = "metal::trunc";
+inline constexpr llvm::StringRef Exp2 = "metal::exp2";
+inline constexpr llvm::StringRef Sqrt = "metal::sqrt";
+inline constexpr llvm::StringRef Rsqrt = "metal::rsqrt";
 } // namespace math
 
 // metal::precise:: transcendentals (accuracy-sensitive; safe-math never

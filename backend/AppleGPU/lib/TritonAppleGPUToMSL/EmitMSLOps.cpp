@@ -1434,14 +1434,17 @@ std::optional<bool> MSLEmitter::emitMath(Operation *op, msl::Block &body) {
     StringRef n = op->getName().getStringRef();
     namespace bi = msl::builtin;
     static const llvm::StringMap<StringRef> unary = {
-        {"math.exp", bi::precise::Exp},     {"math.exp2", bi::precise::Exp2},
+        // Default-namespace exp/exp2/sqrt/rsqrt match precise:: within fp32
+        // tolerance; the rest miss it badly (sin/cos, tanh, log), and tan/pow
+        // are composed from those.
+        {"math.exp", bi::math::Exp},        {"math.exp2", bi::math::Exp2},
         {"math.log", bi::precise::Log},     {"math.log2", bi::precise::Log2},
         {"math.log10", bi::precise::Log10}, {"math.sin", bi::precise::Sin},
         {"math.cos", bi::precise::Cos},     {"math.tan", bi::precise::Tan},
         {"math.tanh", bi::precise::Tanh},   {"math.sinh", bi::precise::Sinh},
         {"math.cosh", bi::precise::Cosh},   {"math.asin", bi::precise::Asin},
         {"math.acos", bi::precise::Acos},   {"math.atan", bi::precise::Atan},
-        {"math.sqrt", bi::precise::Sqrt},   {"math.rsqrt", bi::precise::Rsqrt},
+        {"math.sqrt", bi::math::Sqrt},      {"math.rsqrt", bi::math::Rsqrt},
         {"math.cbrt", bi::precise::Cbrt},   {"math.floor", bi::math::Floor},
         {"math.ceil", bi::math::Ceil},      {"math.absf", bi::math::Fabs},
         {"math.absi", bi::math::Abs},       {"math.erf", "tt_erf"},

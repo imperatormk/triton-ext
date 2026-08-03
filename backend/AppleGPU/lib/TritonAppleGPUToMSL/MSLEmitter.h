@@ -557,6 +557,7 @@ private:
   // are required -- a literal bound alone says nothing about where the tile
   // starts. Anything dynamic or indivisible keeps the fallback arm and its pool
   // reservation.
+  bool rowBoundNeverRagged(const DirectStage &ds, int64_t M);
   bool directStoreRowNeverRagged(const DirectStore &ds, int64_t M);
   bool directStoreColNeverRagged(const DirectStore &ds, int64_t N);
   bool directStoreNeverRagged(const DirectStore &ds, int64_t M, int64_t N);

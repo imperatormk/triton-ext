@@ -233,6 +233,8 @@ static Value resolveLoopCarriedPtr(Value v, Value &deltaOut,
 std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
                                             int64_t cols);
 
+static bool axisNeverRagged(const UniformInt &bound, Value origin, int64_t blk);
+
 std::optional<DirectStage> matchDirectStage(Value operand, int64_t rows,
                                             int64_t cols) {
   bool dbg = getenv("TRITON_MSL_DMA_PROBE") != nullptr;
@@ -243,14 +245,16 @@ std::optional<DirectStage> matchDirectStage(Value operand, int64_t rows,
   };
 
   auto ld = definingOp<tt::LoadOp>(operand);
-  // A masked load would need the DMA to honour per-element predicates, which
-  // the intrinsic cannot express; boundary tiles keep the register path.
   if (!ld)
     return bail("operand not defined by a tt.load");
-  if (ld.getMask() || ld.getOther())
-    return bail("masked load (boundary tile keeps the register path)");
 
-  return matchTilePointer(ld.getPtr(), rows, cols);
+  // The intrinsic cannot honour per-element predicates. A mask bounding only
+  // the row axis is a whole-tile property, so it is carried out for the caller
+  // to prove; anything else keeps the register path.
+  auto ds = matchTilePointer(ld.getPtr(), rows, cols);
+  if (ds)
+    ds->rowMask = ld.getMask();
+  return ds;
 }
 
 // The pointer half of matchDirectStage: given the *pointer tensor* of a load or
@@ -471,6 +475,8 @@ std::optional<DirectStage> MSLEmitter::bDmaCandidate(tt::DotOp op,
   auto ds = matchDirectStage(stage, bTy.getShape()[0], bTy.getShape()[1]);
   if (!ds)
     return std::nullopt;
+  if (!rowBoundNeverRagged(*ds, bTy.getShape()[0]))
+    return std::nullopt;
   // The copy spells the base pointer and the strides as MSL scalars, so every
   // one of them must already be bound. A shift defined inside the K-loop (or
   // otherwise not yet emitted) has no name here.
@@ -522,6 +528,8 @@ std::optional<DirectStage> MSLEmitter::aDirectCandidate(tt::DotOp op, int64_t M,
     stage = s;
   auto ds = matchDirectStage(stage, M, K);
   if (!ds || ds->srcTransposed)
+    return std::nullopt;
+  if (!rowBoundNeverRagged(*ds, M))
     return std::nullopt;
   auto bound = [&](Value v) {
     if (!v)
@@ -2777,6 +2785,18 @@ static bool axisNeverRagged(const UniformInt &bound, Value origin,
   if (*bound.lit % blk != 0)
     return false;
   return isMultipleOfBlock(origin, blk);
+}
+
+bool MSLEmitter::rowBoundNeverRagged(const DirectStage &ds, int64_t M) {
+  if (!ds.rowMask)
+    return true;
+  auto cmp = definingOp<arith::CmpIOp>(peelBroadcastExpand(ds.rowMask));
+  if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt)
+    return false;
+  Value origin = matchTileIndex(cmp.getLhs());
+  if (!origin)
+    return false;
+  return axisNeverRagged(matchUniformInt(cmp.getRhs()), origin, M);
 }
 
 bool MSLEmitter::directStoreRowNeverRagged(const DirectStore &ds, int64_t M) {

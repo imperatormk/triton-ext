@@ -145,6 +145,10 @@ struct DirectStage {
   // swap the source strides so such a tile still lands row-major in threadgroup
   // memory, which keeps the transpose out of the MMA entirely.
   bool srcTransposed = false;
+  // The source load's mask, when it had one. A direct read ignores per-element
+  // predicates, so this is only sound once the caller proves the tile is never
+  // ragged along the masked axis.
+  Value rowMask;
 };
 
 struct DotPlan {

@@ -1022,7 +1022,15 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   int64_t nFragEarly = (p.M / 8) * (p.N / 8);
   if (nwEarly > nFragEarly)
     nwEarly = nFragEarly;
-  if (p.phase != FusedDotPhase::None && !p.aInPlace)
+  // The direct path only addresses A by absolute fragment row in the branchless
+  // arm that gives each warp one ni column; elsewhere a warp spans the whole
+  // tile and a device read would repeat every row per warp. Decided here so the
+  // staging pads and every offset derived from them see the final choice.
+  int64_t mTEarly = p.M / 8, nTEarly = p.N / 8;
+  bool directOk = p.phase != FusedDotPhase::None ||
+                  (p.rank == 2 && mTEarly % nwEarly == 0 &&
+                   nTEarly <= nwEarly);
+  if (!p.aInPlace && directOk)
     p.aDirect = aDirectCandidate(op, p.M, p.K, nwEarly, /*requireBound=*/false);
   dotStageRowPads(p.M, p.N, p.K, byteWidth(aElem), byteWidth(bElem), p.aPad,
                   p.bPad, p.aInPlace || p.aDirect.has_value(),
@@ -1238,14 +1246,18 @@ void MSLEmitter::dotPoolPtrs(msl::Block &body, tt::DotOp op,
     stat.ptrDelta = Value();
     stat.ptrDeltaLit = std::nullopt;
     msl::Expr *origin = dmaTileOrigin(stat, /*tripVar=*/StringRef());
-    msl::Expr *bandOff = ctx.paren(
-        ctx.binary(B::Mul,
-                   ctx.paren(ctx.binary(B::Mul, ctx.var(warpId),
-                                        ctx.i32lit(bandRows))),
-                   dc.devALda));
+    msl::Expr *base = origin;
+    if (plan.kind != DotPlan::Kind::Direct) {
+      msl::Expr *bandOff = ctx.paren(
+          ctx.binary(B::Mul,
+                     ctx.paren(ctx.binary(B::Mul, ctx.var(warpId),
+                                          ctx.i32lit(bandRows))),
+                     dc.devALda));
+      base = ctx.binary(B::Add, origin, bandOff);
+    }
     body.push_back(ctx.declStmt(
         ctx.ptr(ctx.named(dc.opScalar), msl::AddrSpace::Device), dc.devA,
-        ctx.binary(B::Add, origin, bandOff)));
+        base));
   }
   if (plan.needAB) {
     if (!plan.aDirect)
@@ -1371,11 +1383,52 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
   // redundant simdgroup_loads each. The cache is cleared per warp block, which
   // is the region the fragments stay live across.
   llvm::DenseMap<std::pair<int64_t, int64_t>, std::string> aFrag, bFrag;
-  std::map<std::string, std::string> bFragExpr;
+  std::map<std::string, std::string> bFragExpr, aFragExpr;
   auto clearFragCache = [&]() {
     aFrag.clear();
     bFrag.clear();
     bFragExpr.clear();
+    aFragExpr.clear();
+  };
+  auto loadAFrag = [&](int64_t mi, int64_t ki, StringRef fa, msl::Block &into) {
+    if (dc.devA.empty()) {
+      into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
+      return;
+    }
+    msl::Expr *off = ctx.paren(
+        ctx.add(ctx.paren(ctx.binary(B::Mul, ctx.i32lit(mi * 8), dc.devALda)),
+                ctx.i32lit(ki * 8)));
+    into.push_back(ctx.exprStmt(
+        ctx.call(msl::builtin::sg::Load,
+                 {ctx.var(fa), ctx.binary(B::Add, ctx.var(dc.devA), off),
+                  dc.devALda})));
+  };
+  auto fragMMABand = [&](StringRef miKey, msl::Expr *miExpr, int64_t ni,
+                         StringRef acc, msl::Block &into) {
+    for (int64_t ki = 0; ki < kT; ++ki) {
+      std::string key = miKey.str() + ":" + std::to_string(ki);
+      auto &fa = aFragExpr[key];
+      if (fa.empty()) {
+        fa = fresh();
+        into.push_back(fragDecl(dc.opFrag, fa));
+        msl::Expr *off = ctx.paren(ctx.add(
+            ctx.paren(ctx.binary(B::Mul, ctx.paren(ctx.mul(miExpr,
+                                                           ctx.i32lit(8))),
+                                 dc.devALda)),
+            ctx.i32lit(ki * 8)));
+        into.push_back(ctx.exprStmt(ctx.call(
+            msl::builtin::sg::Load,
+            {ctx.var(fa), ctx.binary(B::Add, ctx.var(dc.devA), off),
+             dc.devALda})));
+      }
+      auto &fb = bFrag[{ki, ni}];
+      if (fb.empty()) {
+        fb = fresh();
+        into.push_back(fragDecl(dc.opFrag, fb));
+        into.push_back(sgLoad(fb, dc.tgBCur, ki * 8 * ldb + ni * 8, ldb));
+      }
+      into.push_back(sgMultiplyAccumulate(acc, fa, fb));
+    }
   };
   auto fragMMA = [&](int64_t mi, int64_t ni, StringRef acc, msl::Block &into) {
     for (int64_t ki = 0; ki < kT; ++ki) {
@@ -1383,7 +1436,7 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       if (fa.empty()) {
         fa = fresh();
         into.push_back(fragDecl(dc.opFrag, fa));
-        into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
+        loadAFrag(mi, ki, fa, into);
       }
       auto &fb = bFrag[{ki, ni}];
       if (fb.empty()) {
@@ -1402,7 +1455,7 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       if (fa.empty()) {
         fa = fresh();
         into.push_back(fragDecl(dc.opFrag, fa));
-        into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
+        loadAFrag(mi, ki, fa, into);
       }
       std::string key = std::to_string(ki) + ":" + niKey.str();
       auto &fb = bFragExpr[key];
@@ -1434,7 +1487,8 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
     auto guardA = [&](int r) { return batchCond(aStageTy, r, bi); };
     auto guardB = [&](int r) { return batchCond(bStageTy, r, bi); };
     stageOperand(
-        body, dc.tgA, dc.aStage, aStageTy, dc.aNames, (bool)plan.aInPlace,
+        body, dc.tgA, dc.aStage, aStageTy, dc.aNames,
+        (bool)plan.aInPlace || plan.aDirect.has_value(),
         rank == 3 ? llvm::function_ref<msl::Expr *(int)>(guardA) : nullptr,
         plan.aPad);
     stageOperand(
@@ -1444,7 +1498,31 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
     barrier();
 
     if (plan.disjointC) {
-      if (numWarps == nT && nFrag % numWarps == 0 && Bd == 1) {
+      if (plan.aDirect && plan.mT % numWarps == 0 && nT <= numWarps &&
+          nFrag % numWarps == 0 && Bd == 1) {
+        clearFragCache();
+        int64_t mB = plan.mT / numWarps;
+        std::string miKey = "(" + warpId + "*" + std::to_string(mB) + ")";
+        for (int64_t r = 0; r < mB; ++r) {
+          msl::Expr *miExpr = ctx.paren(
+              ctx.add(ctx.mul(ctx.var(warpId), ctx.i32lit(mB)),
+                      ctx.i32lit(r)));
+          for (int64_t ni = 0; ni < nT; ++ni) {
+            std::string acc = fresh();
+            body.push_back(accFragDecl(dc.accFragTy, acc));
+            fragMMABand(miKey + "+" + std::to_string(r), miExpr, ni, acc, body);
+            msl::Expr *off = ctx.paren(ctx.add(
+                ctx.paren(ctx.binary(B::Mul,
+                                     ctx.paren(ctx.mul(miExpr, ctx.i32lit(8))),
+                                     ctx.i32lit(N))),
+                ctx.i32lit(ni * 8)));
+            body.push_back(ctx.exprStmt(ctx.call(
+                msl::builtin::sg::Store,
+                {ctx.var(acc), ctx.binary(B::Add, ctx.var(dc.tgC), off),
+                 ctx.i32lit(N)})));
+          }
+        }
+      } else if (numWarps == nT && nFrag % numWarps == 0 && Bd == 1) {
         clearFragCache();
         std::string niKey = warpId;
         msl::Expr *niExpr = ctx.var(warpId);

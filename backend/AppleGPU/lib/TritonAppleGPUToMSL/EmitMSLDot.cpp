@@ -581,6 +581,20 @@ std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op) {
     nw = nFrag;
   if (!dotIsFusedGemmAcc(op) && !(rk == 2 && nw > 0 && mT % nw == 0))
     return std::nullopt;
+  // When a warp spans every ni, staging is the better arm as long as it can
+  // hold A, B and C at once. Past the cap the staged path loses its warp
+  // tiling and falls back to recomputing the whole tile in every warp, which
+  // costs far more than the direct band's extra loads.
+  if (!dotIsFusedGemmAcc(op) && nT > nw) {
+    auto bTy = dyn_cast<RankedTensorType>(op.getB().getType());
+    if (!bTy)
+      return std::nullopt;
+    int64_t aw = byteWidth(aTy.getElementType());
+    int64_t bw = byteWidth(bTy.getElementType());
+    int64_t staged = M * K * aw + K * N * bw + M * N * 4;
+    if (staged <= kTGResidentBudgetBytes)
+      return std::nullopt;
+  }
   return aDirectCandidate(op, M, K, nw, /*requireBound=*/false);
 }
 

@@ -544,6 +544,31 @@ std::optional<DirectStage> MSLEmitter::aDirectCandidate(tt::DotOp op, int64_t M,
   return ds;
 }
 
+// The direct path addresses A by absolute fragment row, so every warp must own
+// a whole number of fragment rows and read only those; a warp that spans the
+// whole tile would re-read every row once per warp. The fused path partitions
+// A the same way through planWarpTiling, which handles the rest.
+std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op) {
+  auto cTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+  auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
+  if (!cTy || !aTy)
+    return std::nullopt;
+  int rk = cTy.getRank();
+  int64_t M = cTy.getShape()[rk - 2], N = cTy.getShape()[rk - 1];
+  int64_t K = aTy.getShape()[aTy.getRank() - 1];
+  if (M % 8 || N % 8)
+    return std::nullopt;
+  tt::LinearLayout ll = ttg::toLinearLayout(cTy);
+  auto wd = StringAttr::get(op.getContext(), "warp");
+  int64_t nw = ll.hasInDim(wd) ? ll.getInDimSize(wd) : 1;
+  int64_t mT = M / 8, nT = N / 8, nFrag = mT * nT;
+  if (nw > nFrag)
+    nw = nFrag;
+  if (!dotIsFusedGemmAcc(op) && !(rk == 2 && nw > 0 && mT % nw == 0))
+    return std::nullopt;
+  return aDirectCandidate(op, M, K, nw, /*requireBound=*/false);
+}
+
 std::optional<DirectStage> MSLEmitter::dotDmaStage(tt::DotOp op) {
   if (!dmaStagingEnabled())
     return std::nullopt;
@@ -1015,23 +1040,8 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
               dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false);
   // A device-direct A claims no pool at all. Decided here, before stagedA is
   // computed, so the pool sizing and the emission cannot disagree about it.
-  tt::LinearLayout cLLEarly = ttg::toLinearLayout(cTy);
-  auto kWarpDimEarly = StringAttr::get(op.getContext(), "warp");
-  int64_t nwEarly =
-      cLLEarly.hasInDim(kWarpDimEarly) ? cLLEarly.getInDimSize(kWarpDimEarly) : 1;
-  int64_t nFragEarly = (p.M / 8) * (p.N / 8);
-  if (nwEarly > nFragEarly)
-    nwEarly = nFragEarly;
-  // The direct path only addresses A by absolute fragment row in the branchless
-  // arm that gives each warp one ni column; elsewhere a warp spans the whole
-  // tile and a device read would repeat every row per warp. Decided here so the
-  // staging pads and every offset derived from them see the final choice.
-  int64_t mTEarly = p.M / 8, nTEarly = p.N / 8;
-  bool directOk = p.phase != FusedDotPhase::None ||
-                  (p.rank == 2 && mTEarly % nwEarly == 0 &&
-                   nTEarly <= nwEarly);
-  if (!p.aInPlace && directOk)
-    p.aDirect = aDirectCandidate(op, p.M, p.K, nwEarly, /*requireBound=*/false);
+  if (!p.aInPlace)
+    p.aDirect = dotADirect(op);
   dotStageRowPads(p.M, p.N, p.K, byteWidth(aElem), byteWidth(bElem), p.aPad,
                   p.bPad, p.aInPlace || p.aDirect.has_value(),
                   p.bInPlace.has_value() || bDma);
@@ -1182,6 +1192,15 @@ bool MSLEmitter::emitDot(tt::DotOp op, msl::Block &body) {
 // count-based census can see: the MMA and accumulator counts stay correct while
 // one region's stores land inside another's tile.
 void MSLEmitter::checkPoolRegions(Operation *op, ArrayRef<PoolRegion> live) {
+  for (const PoolRegion &r : live) {
+    if (!r.bytes || r.begin + r.bytes <= poolBytes)
+      continue;
+    mslReject(op, "poolRegions",
+              std::string(r.name) + "[" + std::to_string(r.begin) + "," +
+                  std::to_string(r.begin + r.bytes) + ") past pool " +
+                  std::to_string(poolBytes));
+    emitFailed = true;
+  }
   for (size_t i = 0; i < live.size(); ++i)
     for (size_t j = i + 1; j < live.size(); ++j) {
       if (!live[i].bytes || !live[j].bytes)
@@ -1201,6 +1220,10 @@ void MSLEmitter::checkPoolRegions(Operation *op, ArrayRef<PoolRegion> live) {
 }
 
 void MSLEmitter::checkDotPoolRegions(tt::DotOp op, const DotPlan &plan) {
+  // The panel path walks sub-tiles and carries its own region check; the
+  // whole-tile extents below are never laid down for it.
+  if (plan.kind == DotPlan::Kind::Panel)
+    return;
   int64_t aEb = byteWidth(elementScalarType(plan.aStage.getType()));
   int64_t bEb = byteWidth(elementScalarType(plan.bStage.getType()));
   int64_t aBytes = (plan.aInPlace || plan.aDirect)
@@ -1498,8 +1521,8 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
     barrier();
 
     if (plan.disjointC) {
-      if (plan.aDirect && plan.mT % numWarps == 0 && nT <= numWarps &&
-          nFrag % numWarps == 0 && Bd == 1) {
+      if (plan.aDirect && plan.mT % numWarps == 0 && nFrag % numWarps == 0 &&
+          Bd == 1) {
         clearFragCache();
         int64_t mB = plan.mT / numWarps;
         std::string miKey = "(" + warpId + "*" + std::to_string(mB) + ")";
@@ -3166,16 +3189,8 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
     if (dotOperandLocalLoad(found.getB(), K, N))
       stagedB = 0;
   }
-  {
-    tt::LinearLayout ll = ttg::toLinearLayout(cTy);
-    auto wd = StringAttr::get(op.getContext(), "warp");
-    int64_t nw = ll.hasInDim(wd) ? ll.getInDimSize(wd) : 1;
-    int64_t nf = (M / 8) * (N / 8);
-    if (nw > nf)
-      nw = nf;
-    if (stagedA && aDirectCandidate(found, M, K, nw, /*requireBound=*/false))
-      stagedA = 0;
-  }
+  if (stagedA && dotADirect(found))
+    stagedA = 0;
   // The fused epilogue overlays C's accumulators on the dead A/B staging and
   // writes it one row band at a time, so C never needs the whole tile - only a
   // single 8-row band has to fit alongside the staging.

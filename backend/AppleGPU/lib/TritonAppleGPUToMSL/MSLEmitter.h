@@ -370,6 +370,10 @@ private:
   std::optional<DirectStage> aDirectCandidate(tt::DotOp op, int64_t M,
                                               int64_t K, int64_t numWarps,
                                               bool requireBound = true);
+  // The one place the device-direct A decision is made. planDot and scanPool
+  // both route through it, so the pool reservation cannot disagree with the
+  // emission about whether A claims a region.
+  std::optional<DirectStage> dotADirect(tt::DotOp op);
   std::optional<DirectStage> dotDmaStage(tt::DotOp op);
   msl::Stmt *dmaBeginInto(StringRef handle, const DotPlan &plan,
                           const DotEmitCtx &dc, const DirectStage &ds,

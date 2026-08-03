@@ -31,12 +31,20 @@ for _name in ['floor', 'ceil', 'rsqrt', 'erf', 'exp2', 'log2', 'div_rn']:
 
 @triton.jit
 def _log1p(x):
-    return tl.log(1.0 + x)
+    # log(1+x) loses the whole mantissa once x is small enough that 1+x rounds:
+    # rescaling by u = (1+x)-x recovers the discarded low bits.
+    u = 1.0 + x
+    d = u - 1.0
+    return tl.where(u == 1.0, x, tl.log(u) * (x / tl.where(d == 0.0, 1.0, d)))
 
 
 @triton.jit
 def _cbrt(x):
-    return tl.exp(tl.log(x) / 3.0)
+    # exp(log(x)/3) is nan for x < 0; cbrt is defined on all reals.
+    ax = tl.abs(x)
+    r = tl.exp(tl.log(tl.where(ax == 0.0, 1.0, ax)) / 3.0)
+    r = tl.where(ax == 0.0, 0.0, r)
+    return tl.where(x < 0.0, -r, r)
 
 
 @triton.jit
@@ -86,7 +94,21 @@ def _tan(x):
 
 @triton.jit
 def _tanh(x):
-    return (tl.exp(x) - tl.exp(-x)) / (tl.exp(x) + tl.exp(-x))
+    # expm1-style split. The naive (exp(x)-exp(-x))/(exp(x)+exp(-x)) cancels
+    # catastrophically for large |x| and overflows to nan near |x| ~ 89; a plain
+    # 1 - 2/(exp(2|x|)+1) instead cancels for small |x|. Large uses the sign-
+    # folded form, small uses u/(2+u) with u = exp(2|x|)-1, which is
+    # cancellation-free as u -> 0.
+    ax = tl.abs(x)
+    e = tl.exp(ax + ax)
+    big = 1.0 - 2.0 / (e + 1.0)
+    u = e - 1.0
+    small = u / (u + 2.0)
+    t = tl.where(ax > 0.5, big, small)
+    # exp(2x)-1 underflows to 0 well before tanh(x) does, so the series tail
+    # tanh(x) ~ x carries the tiny inputs.
+    t = tl.where(ax < 1e-4, ax, t)
+    return tl.where(x < 0.0, -t, t)
 
 
 @triton.jit
@@ -154,18 +176,45 @@ def _rint(x):
 
 @triton.jit
 def _erfc(x):
-    return 1.0 - tl.math.erf(x)
+    # 1 - erf(x) cancels away the whole result once erf(x) -> 1, so the tail
+    # uses a scaled rational approximation (Numerical Recipes erfcc) evaluated
+    # on exp(-x^2), which stays accurate until it underflows.
+    ax = tl.abs(x)
+    t = 1.0 / (1.0 + 0.5 * ax)
+    poly = (-1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (
+        0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (
+            -1.13520398 + t * (1.48851587 + t * (-0.82215223
+                                                 + t * 0.17087277)))))))))
+    tail = t * tl.exp(-ax * ax + poly)
+    near = 1.0 - tl.math.erf(x)
+    big = tl.where(x >= 0.0, tail, 2.0 - tail)
+    return tl.where(ax < 0.5, near, big)
 
 
 @triton.jit
 def _expm1(x):
-    return tl.exp(x) - 1.0
+    # exp(x)-1 cancels for small x; the same (u-1)/log(u) rescaling that fixes
+    # log1p recovers it, and the series tail carries x where 1+x rounds to 1.
+    u = tl.exp(x)
+    d = u - 1.0
+    lg = tl.log(tl.where(u == 0.0, 1.0, u))
+    return tl.where(u == 1.0, x, d * (x / tl.where(lg == 0.0, 1.0, lg)))
 
 
 @triton.jit
 def _erfcx(x):
-    # Scaled complementary error function: exp(x^2) * erfc(x).
-    return tl.exp(x * x) * (1.0 - tl.math.erf(x))
+    # Scaled complementary error function: exp(x^2) * erfc(x). Going through
+    # _erfc keeps the tail accurate, but exp(x*x) overflows long before erfcx
+    # does, so the positive tail folds the exponential into erfc's own scaled
+    # form instead of multiplying it back out.
+    ax = tl.abs(x)
+    t = 1.0 / (1.0 + 0.5 * ax)
+    poly = (-1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (
+        0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (
+            -1.13520398 + t * (1.48851587 + t * (-0.82215223
+                                                 + t * 0.17087277)))))))))
+    scaled = t * tl.exp(poly)
+    return tl.where(x >= 0.5, scaled, tl.exp(x * x) * _erfc(x))
 
 
 @triton.jit

@@ -594,11 +594,6 @@ std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op) {
     int64_t staged = M * K * aw + K * N * bw + M * N * 4;
     if (staged <= kTGResidentBudgetBytes)
       return std::nullopt;
-    // Past the cap the band is the lesser evil only while it still carries
-    // reuse. The shortest tile the band can split leaves a warp one or two
-    // fragment rows, too few to amortise reading them once per warp.
-    if (mT < 8)
-      return std::nullopt;
   }
   return aDirectCandidate(op, M, K, nw, /*requireBound=*/false);
 }

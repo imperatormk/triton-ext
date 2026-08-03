@@ -563,7 +563,8 @@ std::optional<DirectStage> MSLEmitter::aDirectCandidate(tt::DotOp op, int64_t M,
 // a whole number of fragment rows and read only those; a warp that spans the
 // whole tile would re-read every row once per warp. The fused path partitions
 // A the same way through planWarpTiling, which handles the rest.
-std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op) {
+std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op,
+                                                 bool knownFusedAcc) {
   auto cTy = dyn_cast<RankedTensorType>(op.getResult().getType());
   auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
   if (!cTy || !aTy)
@@ -579,13 +580,14 @@ std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op) {
   int64_t mT = M / 8, nT = N / 8, nFrag = mT * nT;
   if (nw > nFrag)
     nw = nFrag;
-  if (!dotIsFusedGemmAcc(op) && !(rk == 2 && nw > 0 && mT % nw == 0))
+  bool fusedAcc = knownFusedAcc || dotIsFusedGemmAcc(op);
+  if (!fusedAcc && !(rk == 2 && nw > 0 && mT % nw == 0))
     return std::nullopt;
   // When a warp spans every ni, staging is the better arm as long as it can
   // hold A, B and C at once. Past the cap the staged path loses its warp
   // tiling and falls back to recomputing the whole tile in every warp, which
   // costs far more than the direct band's extra loads.
-  if (!dotIsFusedGemmAcc(op) && nT > nw) {
+  if (!fusedAcc && nT > nw) {
     auto bTy = dyn_cast<RankedTensorType>(op.getB().getType());
     if (!bTy)
       return std::nullopt;
@@ -3234,7 +3236,7 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
     if (dotOperandLocalLoad(found.getB(), K, N))
       stagedB = 0;
   }
-  if (stagedA && dotADirect(found))
+  if (stagedA && dotADirect(found, /*knownFusedAcc=*/true))
     stagedA = 0;
   // The fused epilogue overlays C's accumulators on the dead A/B staging and
   // writes it one row band at a time, so C never needs the whole tile - only a

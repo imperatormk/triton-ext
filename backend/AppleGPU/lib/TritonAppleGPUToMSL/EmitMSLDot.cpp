@@ -1322,9 +1322,11 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
   // redundant simdgroup_loads each. The cache is cleared per warp block, which
   // is the region the fragments stay live across.
   llvm::DenseMap<std::pair<int64_t, int64_t>, std::string> aFrag, bFrag;
+  std::map<std::string, std::string> bFragExpr;
   auto clearFragCache = [&]() {
     aFrag.clear();
     bFrag.clear();
+    bFragExpr.clear();
   };
   auto fragMMA = [&](int64_t mi, int64_t ni, StringRef acc, msl::Block &into) {
     for (int64_t ki = 0; ki < kT; ++ki) {
@@ -1339,6 +1341,31 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
         fb = fresh();
         into.push_back(fragDecl(dc.opFrag, fb));
         into.push_back(sgLoad(fb, dc.tgBCur, ki * 8 * ldb + ni * 8, ldb));
+      }
+      into.push_back(sgMultiplyAccumulate(acc, fa, fb));
+    }
+  };
+
+  auto fragMMAExpr = [&](int64_t mi, StringRef niKey, msl::Expr *niExpr,
+                         StringRef acc, msl::Block &into) {
+    for (int64_t ki = 0; ki < kT; ++ki) {
+      auto &fa = aFrag[{mi, ki}];
+      if (fa.empty()) {
+        fa = fresh();
+        into.push_back(fragDecl(dc.opFrag, fa));
+        into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
+      }
+      std::string key = std::to_string(ki) + ":" + niKey.str();
+      auto &fb = bFragExpr[key];
+      if (fb.empty()) {
+        fb = fresh();
+        into.push_back(fragDecl(dc.opFrag, fb));
+        msl::Expr *off = ctx.paren(ctx.add(ctx.i32lit(ki * 8 * ldb),
+                                           ctx.mul(niExpr, ctx.i32lit(8))));
+        into.push_back(ctx.exprStmt(ctx.call(
+            msl::builtin::sg::Load,
+            {ctx.var(fb), ctx.binary(B::Add, ctx.var(dc.tgBCur), off),
+             ctx.i32lit(ldb)})));
       }
       into.push_back(sgMultiplyAccumulate(acc, fa, fb));
     }
@@ -1368,17 +1395,53 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
     barrier();
 
     if (plan.disjointC) {
-      for (int64_t w = 0; w < numWarps; ++w) {
-        msl::Block inner;
+      if (numWarps == nT && nFrag % numWarps == 0 && Bd == 1) {
         clearFragCache();
-        for (int64_t f = w; f < nFrag; f += numWarps) {
-          int64_t mi = f / nT, ni = f % nT;
+        std::string niKey = warpId;
+        msl::Expr *niExpr = ctx.var(warpId);
+        for (int64_t j = 0; j * numWarps < nFrag; ++j) {
+          int64_t mi = (j * numWarps) / nT;
           std::string acc = fresh();
-          inner.push_back(accFragDecl(dc.accFragTy, acc));
-          fragMMA(mi, ni, acc, inner);
-          inner.push_back(sgStore(acc, dc.tgC, mi * 8 * N + ni * 8, N));
+          body.push_back(accFragDecl(dc.accFragTy, acc));
+          fragMMAExpr(mi, niKey, niExpr, acc, body);
+          msl::Expr *off = ctx.paren(ctx.add(ctx.i32lit(mi * 8 * N),
+                                             ctx.mul(niExpr, ctx.i32lit(8))));
+          body.push_back(ctx.exprStmt(ctx.call(
+              msl::builtin::sg::Store,
+              {ctx.var(acc), ctx.binary(B::Add, ctx.var(dc.tgC), off),
+               ctx.i32lit(N)})));
         }
-        warpIf(w, std::move(inner));
+      } else if (nT % numWarps == 0 && nFrag % numWarps == 0 && Bd == 1) {
+        clearFragCache();
+        for (int64_t mi = 0; mi < plan.mT; ++mi)
+          for (int64_t c = 0; c < nT / numWarps; ++c) {
+            std::string niKey =
+                "(" + warpId + "+" + std::to_string(c * numWarps) + ")";
+            msl::Expr *niExpr = ctx.paren(ctx.add(
+                ctx.var(warpId), ctx.i32lit(c * numWarps)));
+            std::string acc = fresh();
+            body.push_back(accFragDecl(dc.accFragTy, acc));
+            fragMMAExpr(mi, niKey, niExpr, acc, body);
+            msl::Expr *off = ctx.paren(ctx.add(ctx.i32lit(mi * 8 * N),
+                                               ctx.mul(niExpr, ctx.i32lit(8))));
+            body.push_back(ctx.exprStmt(ctx.call(
+                msl::builtin::sg::Store,
+                {ctx.var(acc), ctx.binary(B::Add, ctx.var(dc.tgC), off),
+                 ctx.i32lit(N)})));
+          }
+      } else {
+        for (int64_t w = 0; w < numWarps; ++w) {
+          msl::Block inner;
+          clearFragCache();
+          for (int64_t f = w; f < nFrag; f += numWarps) {
+            int64_t mi = f / nT, ni = f % nT;
+            std::string acc = fresh();
+            inner.push_back(accFragDecl(dc.accFragTy, acc));
+            fragMMA(mi, ni, acc, inner);
+            inner.push_back(sgStore(acc, dc.tgC, mi * 8 * N + ni * 8, N));
+          }
+          warpIf(w, std::move(inner));
+        }
       }
       barrier();
       readback(bi, 0, M);

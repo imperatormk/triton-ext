@@ -320,12 +320,19 @@ private:
   int loadVectorWidth(tt::LoadOp ld);
   int storeVectorWidth(tt::StoreOp st);
 
-  // `x % c` with x provably below 2c: one compare+select, no integer divide.
-  std::optional<bool> foldBoundedRem(arith::RemSIOp op, msl::Type *declTy,
-                                     msl::Block &body);
+  // `x % c` with x already known below c: the op is dropped and its result
+  // aliases the input registers.
+  std::optional<bool> foldBoundedRem(arith::RemSIOp op);
   std::optional<bool> clampTileOrigin(arith::MulIOp mul, msl::Type *declTy,
                                       msl::Block &body);
   bool lhsHasClampedOrigin(Value v);
+  bool lhsHasGridBound(Value v, int64_t c);
+  // The extent a `pid * BLOCK` tile origin is indexed against, found by walking
+  // forward to the remainder that consumes it, or 0 if it reaches none.
+  int64_t tileOriginExtent(Value origin, int64_t &block);
+  // Tile origins whose grid is sized by the extent they index into, mapped to
+  // that extent. A remainder by exactly this extent cannot wrap.
+  DenseMap<Value, int64_t> gridBoundedOrigins;
   // Tile origins pulled back so a boundary tile lands inside the dimension;
   // a remainder on one of these can no longer wrap.
   DenseSet<Value> clampedOrigins;

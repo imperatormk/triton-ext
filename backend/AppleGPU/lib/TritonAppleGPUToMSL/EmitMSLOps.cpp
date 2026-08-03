@@ -525,13 +525,9 @@ int MSLEmitter::accessVectorWidth(Type valueTy, Value ptr) {
   return width;
 }
 
-// `x % c` where the analysis bounds x below 2c is `x >= c ? x - c : x`: one
-// compare and select instead of an integer division, which the hardware has no
-// unit for. The bound is what makes this exact -- a single subtraction only
-// removes one multiple of c.
-std::optional<bool> MSLEmitter::foldBoundedRem(arith::RemSIOp op,
-                                               msl::Type *declTy,
-                                               msl::Block &body) {
+// `x % c` is the identity when x is already known to be under c, and dropping
+// it lets the result alias its input registers.
+std::optional<bool> MSLEmitter::foldBoundedRem(arith::RemSIOp op) {
   APInt cst;
   if (!matchPattern(op.getRhs(), m_ConstantInt(&cst)))
     return std::nullopt;
@@ -541,8 +537,6 @@ std::optional<bool> MSLEmitter::foldBoundedRem(arith::RemSIOp op,
   tt::AxisInfo *ai = getAxisInfo().getAxisInfo(op.getLhs());
   if (!ai)
     return std::nullopt;
-  // getConstantValue is only set for a uniform value; for a range the upper
-  // bound comes from the tile origin's divisibility and the tile width.
   auto rt = dyn_cast<RankedTensorType>(op.getType());
   if (!rt)
     return std::nullopt;
@@ -551,41 +545,22 @@ std::optional<bool> MSLEmitter::foldBoundedRem(arith::RemSIOp op,
   int64_t stride = ai->getContiguity(rank - 1);
   if (stride < tile)
     return std::nullopt;
-  // x is `origin + 0..tile-1` with origin a multiple of tile. x < 2c needs
-  // origin <= c, i.e. the largest origin the grid can produce is under c. That
-  // is exactly ceil(c/tile)-1 tiles, so the largest x is
-  // (ceil(c/tile)-1)*tile + tile-1 < 2c whenever c >= tile.
   if (c < tile)
     return std::nullopt;
-  // When c is a whole number of tiles the grid never produces an x that
-  // reaches it, so the remainder is the identity and the op can be dropped
-  // outright. That matters beyond the arithmetic: any surviving operation on
-  // an index feeding the operand loads -- even one the hardware could fold --
-  // moves this kernel to a smaller per-thread register budget and costs a step
-  // of occupancy. Aliasing is what keeps it in the larger one.
-  if (c % tile == 0 || lhsHasClampedOrigin(op.getLhs())) {
-    bindRegs(op.getResult(), names(op.getLhs()));
-    return true;
-  }
-  int64_t maxX = ((c + tile - 1) / tile - 1) * tile + tile - 1;
-  if (maxX >= 2 * c)
+  // Two ways x is known to stay under c, both established by construction
+  // rather than inferred from c's shape: the emitter pulled a boundary tile's
+  // origin back inside the dimension, or the origin walks a grid this same c
+  // sized, whose last tile therefore ends at c. Divisibility of c by the tile
+  // width proves neither on its own -- it holds just as well for a flat index
+  // that `% c` decomposes into coordinates, and that one really does wrap.
+  //
+  // Dropping the op matters beyond the arithmetic it saves: any surviving
+  // operation on an index feeding the operand loads -- even one the hardware
+  // could fold -- moves the kernel to a smaller per-thread register budget and
+  // costs a step of occupancy. Aliasing is what keeps it in the larger one.
+  if (!lhsHasClampedOrigin(op.getLhs()) && !lhsHasGridBound(op.getLhs(), c))
     return std::nullopt;
-
-  auto &src = names(op.getLhs());
-  int rc = regCount(op.getResult());
-  if ((int)src.size() != rc)
-    return std::nullopt;
-  SmallVector<std::string> ids;
-  for (int r = 0; r < rc; ++r) {
-    std::string id = fresh();
-    msl::Expr *x = ctx.var(src[r]);
-    msl::Expr *sel = ctx.ternary(
-        ctx.paren(ctx.binary(B::Ge, x, ctx.i32lit(c))),
-        ctx.paren(ctx.binary(B::Sub, x, ctx.i32lit(c))), x);
-    body.push_back(ctx.declStmt(declTy, id, sel));
-    ids.push_back(id);
-  }
-  bindRegs(op.getResult(), ids);
+  bindRegs(op.getResult(), names(op.getLhs()));
   return true;
 }
 
@@ -613,29 +588,54 @@ bool MSLEmitter::lhsHasClampedOrigin(Value v) {
   return false;
 }
 
-std::optional<bool> MSLEmitter::clampTileOrigin(arith::MulIOp mul,
-                                                msl::Type *declTy,
-                                                msl::Block &body) {
-  if (isa<RankedTensorType>(mul.getType()))
-    return std::nullopt;
-  // `pid * BLOCK`: the block size is the constant side.
+// Whether `v` is a tile of a grid sized by `c` itself. The origin had to reach
+// this same `c` as its extent for the walk to have recorded it, which is what
+// separates a real bound from the coincidence that `c` happens to be a whole
+// number of tiles -- a flat index decomposed by `% c` never passes, because it
+// is not a tile origin indexed against `c`.
+bool MSLEmitter::lhsHasGridBound(Value v, int64_t c) {
+  SmallVector<Value> work{v};
+  llvm::SmallPtrSet<Operation *, 8> seen;
+  while (!work.empty()) {
+    Value cur = work.pop_back_val();
+    auto it = gridBoundedOrigins.find(cur);
+    if (it != gridBoundedOrigins.end() && it->second == c)
+      return true;
+    Operation *def = cur.getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      continue;
+    if (isa<arith::AddIOp, tt::SplatOp, tt::ExpandDimsOp, tt::BroadcastOp,
+            tt::MakeRangeOp>(def))
+      for (Value o : def->getOperands())
+        work.push_back(o);
+  }
+  return false;
+}
+
+// A tile origin is `pid * BLOCK`, and the dimension it walks is whatever a
+// `% extent` downstream reduces its range by. Finding that remainder is what
+// ties the origin to a grid: the launch is sized to cover `extent`, so the
+// largest origin it can produce is the last multiple of BLOCK below `extent`.
+// Returns 0 when the origin reaches no such remainder, in which case nothing is
+// known about how far it travels.
+int64_t MSLEmitter::tileOriginExtent(Value origin, int64_t &block) {
   APInt bc;
-  int64_t block = 0;
+  block = 0;
+  auto mul = origin.getDefiningOp<arith::MulIOp>();
+  if (!mul || isa<RankedTensorType>(mul.getType()))
+    return 0;
   for (Value side : {mul.getRhs(), mul.getLhs()})
     if (matchPattern(side, m_ConstantInt(&bc)))
       block = bc.getSExtValue();
   if (block <= 0)
-    return std::nullopt;
-  // The dimension's extent is whatever a `% extent` downstream reduces this
-  // origin's range by; without one there is no boundary tile to pull back.
-  int64_t extent = 0;
-  for (Operation *u : mul.getResult().getUsers()) {
+    return 0;
+  for (Operation *u : origin.getUsers()) {
     Operation *cur = u;
     for (int hop = 0; cur && hop < 4; ++hop) {
       if (auto rem = dyn_cast<arith::RemSIOp>(cur)) {
         APInt e;
         if (matchPattern(rem.getRhs(), m_ConstantInt(&e)))
-          extent = e.getSExtValue();
+          return e.getSExtValue();
         break;
       }
       if (!isa<arith::AddIOp, tt::SplatOp, tt::ExpandDimsOp, tt::BroadcastOp>(
@@ -644,11 +644,24 @@ std::optional<bool> MSLEmitter::clampTileOrigin(arith::MulIOp mul,
         break;
       cur = *cur->getResult(0).getUsers().begin();
     }
-    if (extent)
-      break;
   }
-  if (extent <= block || extent % block == 0)
+  return 0;
+}
+
+std::optional<bool> MSLEmitter::clampTileOrigin(arith::MulIOp mul,
+                                                msl::Type *declTy,
+                                                msl::Block &body) {
+  int64_t block = 0;
+  int64_t extent = tileOriginExtent(mul.getResult(), block);
+  if (extent <= block)
     return std::nullopt;
+  if (extent % block == 0) {
+    // The grid covers the extent in whole tiles, so the last origin is
+    // `extent - block` and every index it produces is already inside. No clamp
+    // is needed and the remainder that follows is the identity.
+    gridBoundedOrigins[mul.getResult()] = extent;
+    return std::nullopt;
+  }
   // Only sound when a doubled column is harmless: the overhang is recomputed by
   // this tile and its neighbour from the same inputs, so both write the same
   // value. A store that accumulates rather than overwrites would not qualify.
@@ -1051,7 +1064,7 @@ std::optional<bool> MSLEmitter::emitArithBinop(Operation *op,
     else if (isa<arith::DivUIOp, arith::RemUIOp>(op))
       declTy = unsignedType(resElem);
     if (auto rem = dyn_cast<arith::RemSIOp>(op))
-      if (auto folded = foldBoundedRem(rem, declTy, body))
+      if (auto folded = foldBoundedRem(rem))
         return *folded;
     if (auto mul = dyn_cast<arith::MulIOp>(op))
       if (auto clamped = clampTileOrigin(mul, declTy, body))

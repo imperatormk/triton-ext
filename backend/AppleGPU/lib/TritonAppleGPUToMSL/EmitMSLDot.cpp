@@ -1559,7 +1559,8 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
     barrier();
 
     if (plan.disjointC) {
-      if (plan.aDirect && plan.mT % numWarps == 0 && nFrag % numWarps == 0 &&
+      if (plan.aDirect && plan.mT % numWarps == 0 && nT <= numWarps &&
+          nFrag % numWarps == 0 &&
           Bd == 1) {
         clearFragCache();
         int64_t mB = plan.mT / numWarps;

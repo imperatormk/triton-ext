@@ -1,34 +1,58 @@
-triton_extension(ExampleDialect)
+# ---------------------------------------------------------------------------
+# Example — standalone Triton plugin for an out-of-tree MLIR dialect.
+#
+# Builds a single self-contained shared library, bundled into the
+# `triton_example` wheel and loaded on import (see
+# python/triton_example/__init__.py). It provides the `example` dialect
+# (types and ops) and registers it with Triton.
+#
+# Driven by scikit-build-core (`pip install .`), or configured directly:
+#
+#   cmake -S dialect/Example -B dialect/Example/build -G Ninja \
+#       -DLLVM_INSTALL_DIR=$(python ci/pick_local_artifact.py 'llvm-*') \
+#       -DTRITON_WHEEL_DIR=$(python ci/probe_triton_wheel.py)
+#   cmake --build dialect/Example/build
+# ---------------------------------------------------------------------------
+cmake_minimum_required(VERSION 3.20)
+project(example LANGUAGES C CXX)
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/triton-ext.cmake")
+configure_triton_extension()
 
-# Add dialect TableGen; creates `MLIR${dialect}IncGen` target.
-add_mlir_dialect(Example example)
-add_mlir_doc(Example Example Dialects/ -gen-dialect-doc -dialect=example)
+# Extension-specific include: source headers, e.g. `#include "Example.h"`.
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-# Add TableGen files as includes.
-include_directories(${CMAKE_CURRENT_BINARY_DIR})
+# ---------------------------------------------------------------------------
+# TableGen: Example dialect declarations and definitions.
+# ---------------------------------------------------------------------------
+set(LLVM_TARGET_DEFINITIONS src/Example.td)
+mlir_tablegen(ExampleDialect.h.inc   -gen-dialect-decls    -dialect=example)
+mlir_tablegen(ExampleDialect.cpp.inc -gen-dialect-defs     -dialect=example)
+mlir_tablegen(Example.h.inc          -gen-op-decls)
+mlir_tablegen(Example.cpp.inc        -gen-op-defs)
+mlir_tablegen(ExampleTypes.h.inc     -gen-typedef-decls    -typedefs-dialect=example)
+mlir_tablegen(ExampleTypes.cpp.inc   -gen-typedef-defs     -typedefs-dialect=example)
+add_public_tablegen_target(MLIRExampleIncGen)
+add_dependencies(mlir-generic-headers MLIRExampleIncGen)
 
-# Add compile definitions for generated code.
-add_compile_definitions(
-    TRITON_EXT_NAME=${PROJECT_NAME}
-    TRITON_EXT_CLASS=${TRITON_EXT_CLASS}
-)
+# ---------------------------------------------------------------------------
+# Plugin library. src/Example.cpp includes support/ExportDialect.cpp to
+# register the dialect; support/Export.cpp implements tritonGetPluginInfo().
+# ---------------------------------------------------------------------------
+add_library(${TRITON_EXT_NAME} SHARED
+    src/Example.cpp
+    "${TRITON_EXT_SUPPORT_DIR}/Export.cpp")
+add_dependencies(${TRITON_EXT_NAME} MLIRExampleIncGen)
 
-# Build the pass extension library (SHARED).
-add_mlir_library(${PROJECT_NAME}
-    Example.cpp
+target_compile_definitions(${TRITON_EXT_NAME} PRIVATE
+    TRITON_EXT_VERSION="${TRITON_EXT_VERSION}"
+    TRITON_EXT_NAME=${TRITON_EXT_NAME}
+    TRITON_EXT_CLASS=ExampleDialect)
 
-    SHARED
+# Shared compile flags + link-only-against-libtriton (single source of truth).
+target_link_libraries(${TRITON_EXT_NAME} PRIVATE triton_ext::plugin)
 
-    DEPENDS
-    MLIRExampleIncGen
+set_target_properties(${TRITON_EXT_NAME} PROPERTIES
+    PREFIX "lib"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
-    LINK_LIBS PUBLIC
-    TritonExtensionSupport
-    MLIRDialect
-    LLVMSupport
-    MLIRSupport
-)
-
-set_target_properties(${PROJECT_NAME} PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY
-    "${TRITON_EXT_LIBRARY_DIR}")
+install(TARGETS ${TRITON_EXT_NAME} LIBRARY DESTINATION triton_example)

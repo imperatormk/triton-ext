@@ -23,6 +23,30 @@ using namespace mlir;
 using namespace mlir::triton::applegpu;
 
 namespace {
+// A row reduction is warp-local only when one warp owns whole rows.
+bool resultFeedsRowReduction(tt::DotOp dot) {
+  SmallVector<Value, 4> work{dot.getResult()};
+  SmallPtrSet<Operation *, 8> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    for (Operation *u : v.getUsers()) {
+      if (!seen.insert(u).second)
+        continue;
+      if (auto red = dyn_cast<tt::ReduceOp>(u)) {
+        auto srcTy = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
+        if (srcTy && red.getAxis() == srcTy.getRank() - 1)
+          return true;
+        continue;
+      }
+      if (u->hasTrait<OpTrait::Elementwise>() ||
+          isa<ttg::ConvertLayoutOp, tt::BroadcastOp, tt::ExpandDimsOp>(u))
+        for (Value r : u->getResults())
+          work.push_back(r);
+    }
+  }
+  return false;
+}
+
 // warpsPerCTA for a dot shape and warp count. Apple simdgroup tile = 8x8.
 //
 // The wm|tilesM && wn|tilesN divisibility filter can in principle leave warps
@@ -32,7 +56,8 @@ namespace {
 // power-of-two M,N up to 2048 and numWarps up to 64). The residual idleness is
 // nFrag < numWarps - fewer 8x8 fragments than warps - which no choice of split
 // can fix; planDot clamps its warp count to nFrag for exactly this reason.
-SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps) {
+SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps,
+                                        bool preferRowOwnership = false) {
   unsigned tilesM = std::max<int64_t>(1, M / 8);
   unsigned tilesN = std::max<int64_t>(1, N / 8);
 
@@ -40,15 +65,16 @@ SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps) {
   // warps used, then the smallest per-warp A/B working set (negated so bigger
   // wins), then the most balanced ownership, then the squarest warp grid.
   auto rank = [](unsigned product, unsigned operandFrags, unsigned balance,
-                 unsigned warpBalance) {
-    return std::tuple<unsigned, int, int, unsigned>(
-        product, -static_cast<int>(operandFrags), -static_cast<int>(balance),
-        warpBalance);
+                 unsigned warpBalance, unsigned ownsRows = 0) {
+    return std::tuple<unsigned, unsigned, int, int, unsigned>(
+        product, ownsRows, -static_cast<int>(operandFrags),
+        -static_cast<int>(balance), warpBalance);
   };
 
   unsigned bestM = 1, bestN = 1;
   auto best = rank(1, tilesM + tilesN,
-                   std::max(tilesM, tilesN) - std::min(tilesM, tilesN), 1);
+                   std::max(tilesM, tilesN) - std::min(tilesM, tilesN), 1,
+                   preferRowOwnership ? 1 : 0);
 
   // Use as many warps as legally tile the CTA, then pick the split with the
   // smallest per-warp A/B working set (the split changes how many A/B simdgroup
@@ -67,7 +93,8 @@ SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps) {
       unsigned ownN = tilesN / wn;
       auto key =
           rank(product, ownM + ownN,
-               std::max(ownM, ownN) - std::min(ownM, ownN), std::min(wm, wn));
+               std::max(ownM, ownN) - std::min(ownM, ownN), std::min(wm, wn),
+               (preferRowOwnership && wn == 1) ? 1 : 0);
       if (key <= best)
         continue;
 
@@ -126,7 +153,7 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     // MMA encoding on the result only; A/B stay blocked (DotOpToLLVM scatters
     // them through TG), so only one result->blocked ConvertLayoutOp is needed
     // downstream. Oversized tiles fail cleanly via the shared-memory budget.
-    auto wpc = warpsPerTileApple(M, N, numWarps);
+    auto wpc = warpsPerTileApple(M, N, numWarps, resultFeedsRowReduction(dot));
     auto mmaEnc = AppleMmaEncodingAttr::get(ctx, wpc);
 
     auto newCType =

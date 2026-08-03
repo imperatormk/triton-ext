@@ -244,6 +244,19 @@ std::optional<DirectStage> matchDirectStage(Value operand, int64_t rows,
     return std::nullopt;
   };
 
+  // A transposed operand is the same device tile read with its axes swapped,
+  // which simdgroup_load expresses directly, so the transpose is peeled and the
+  // underlying tile matched at its own shape.
+  bool transposed = false;
+  if (auto tr = definingOp<tt::TransOp>(operand)) {
+    auto ord = tr.getOrder();
+    if (ord.size() != 2 || ord[0] != 1 || ord[1] != 0)
+      return bail("trans order not a 2D swap");
+    transposed = true;
+    operand = tr.getSrc();
+    std::swap(rows, cols);
+  }
+
   auto ld = definingOp<tt::LoadOp>(operand);
   if (!ld)
     return bail("operand not defined by a tt.load");
@@ -252,8 +265,10 @@ std::optional<DirectStage> matchDirectStage(Value operand, int64_t rows,
   // the row axis is a whole-tile property, so it is carried out for the caller
   // to prove; anything else keeps the register path.
   auto ds = matchTilePointer(ld.getPtr(), rows, cols);
-  if (ds)
+  if (ds) {
     ds->rowMask = ld.getMask();
+    ds->fragTransposed = transposed;
+  }
   return ds;
 }
 
@@ -567,6 +582,20 @@ std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op) {
   if (!dotIsFusedGemmAcc(op) && !(rk == 2 && nw > 0 && mT % nw == 0))
     return std::nullopt;
   return aDirectCandidate(op, M, K, nw, /*requireBound=*/false);
+}
+
+msl::Stmt *MSLEmitter::bFragLoad(const DotEmitCtx &dc, int64_t ki,
+                                 msl::Expr *niExpr, int64_t niLit,
+                                 StringRef fb, int64_t ldb) {
+  if (niExpr)
+    return ctx.exprStmt(ctx.call(
+        msl::builtin::sg::Load,
+        {ctx.var(fb),
+         ctx.binary(B::Add, ctx.var(dc.tgBCur),
+                    ctx.paren(ctx.add(ctx.i32lit(ki * 8 * ldb),
+                                      ctx.mul(niExpr, ctx.i32lit(8))))),
+         ctx.i32lit(ldb)}));
+  return sgLoad(fb, dc.tgBCur, ki * 8 * ldb + niLit * 8, ldb);
 }
 
 std::optional<DirectStage> MSLEmitter::dotDmaStage(tt::DotOp op) {
@@ -1448,7 +1477,7 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       if (fb.empty()) {
         fb = fresh();
         into.push_back(fragDecl(dc.opFrag, fb));
-        into.push_back(sgLoad(fb, dc.tgBCur, ki * 8 * ldb + ni * 8, ldb));
+        into.push_back(bFragLoad(dc, ki, nullptr, ni, fb, ldb));
       }
       into.push_back(sgMultiplyAccumulate(acc, fa, fb));
     }
@@ -1465,7 +1494,7 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       if (fb.empty()) {
         fb = fresh();
         into.push_back(fragDecl(dc.opFrag, fb));
-        into.push_back(sgLoad(fb, dc.tgBCur, ki * 8 * ldb + ni * 8, ldb));
+        into.push_back(bFragLoad(dc, ki, nullptr, ni, fb, ldb));
       }
       into.push_back(sgMultiplyAccumulate(acc, fa, fb));
     }
@@ -1485,12 +1514,7 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       if (fb.empty()) {
         fb = fresh();
         into.push_back(fragDecl(dc.opFrag, fb));
-        msl::Expr *off = ctx.paren(ctx.add(ctx.i32lit(ki * 8 * ldb),
-                                           ctx.mul(niExpr, ctx.i32lit(8))));
-        into.push_back(ctx.exprStmt(ctx.call(
-            msl::builtin::sg::Load,
-            {ctx.var(fb), ctx.binary(B::Add, ctx.var(dc.tgBCur), off),
-             ctx.i32lit(ldb)})));
+        into.push_back(bFragLoad(dc, ki, niExpr, 0, fb, ldb));
       }
       into.push_back(sgMultiplyAccumulate(acc, fa, fb));
     }
@@ -1767,12 +1791,7 @@ bool MSLEmitter::emitDotFused(
             bFrag[niKey] = fb;
             into.push_back(fragDecl(dc.opFrag, fb));
             // simdgroup_load(fb, tgB + (ki*8*ldb + niExpr * 8), ldb);
-            msl::Expr *off = ctx.paren(ctx.add(
-                ctx.i32lit(ki * 8 * ldb), ctx.mul(pr.niExpr, ctx.i32lit(8))));
-            into.push_back(ctx.exprStmt(
-                ctx.call(msl::builtin::sg::Load,
-                         {ctx.var(fb), ctx.binary(B::Add, ctx.var(dc.tgBCur), off),
-                          ctx.i32lit(ldb)})));
+            into.push_back(bFragLoad(dc, ki, pr.niExpr, 0, fb, ldb));
           }
         }
         for (auto [j, mn] : llvm::enumerate(slots)) {
@@ -2912,6 +2931,17 @@ bool MSLEmitter::cStoresDirect(tt::DotOp d) {
 static bool isMultipleOfBlock(Value origin, int64_t blk) {
   if (blk <= 0)
     return false;
+  // A loop induction variable is a multiple of the block when it starts on one
+  // and steps by one: every trip's tile origin then lands on a block boundary.
+  if (auto arg = dyn_cast<BlockArgument>(origin))
+    if (auto forOp = dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp()))
+      if (arg == forOp.getInductionVar()) {
+        APInt lo, st;
+        if (matchPattern(forOp.getLowerBound(), m_ConstantInt(&lo)) &&
+            matchPattern(forOp.getStep(), m_ConstantInt(&st)))
+          return lo.getSExtValue() % blk == 0 && st.getSExtValue() % blk == 0;
+        return false;
+      }
   auto mul = dyn_cast_or_null<arith::MulIOp>(origin.getDefiningOp());
   if (!mul)
     return false;

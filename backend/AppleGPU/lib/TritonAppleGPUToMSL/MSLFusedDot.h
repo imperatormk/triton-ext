@@ -149,6 +149,9 @@ struct DirectStage {
   // predicates, so this is only sound once the caller proves the tile is never
   // ragged along the masked axis.
   Value rowMask;
+  // A tt.trans was peeled off the operand: rows and cols below describe the
+  // device tile, and the fragment load transposes it.
+  bool fragTransposed = false;
 };
 
 struct DotPlan {

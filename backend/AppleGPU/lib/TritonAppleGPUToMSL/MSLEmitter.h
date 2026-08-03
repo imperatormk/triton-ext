@@ -566,6 +566,8 @@ private:
     int64_t begin;
     int64_t bytes;
   };
+  msl::Stmt *bFragLoad(const DotEmitCtx &dc, int64_t ki, msl::Expr *niExpr,
+                       int64_t niLit, StringRef fb, int64_t ldb);
   void checkPoolRegions(Operation *op, ArrayRef<PoolRegion> live);
   void checkDotPoolRegions(tt::DotOp op, const DotPlan &plan);
   bool rowBoundNeverRagged(const DirectStage &ds, int64_t M);

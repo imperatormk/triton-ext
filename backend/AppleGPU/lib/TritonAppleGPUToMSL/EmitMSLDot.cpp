@@ -1170,11 +1170,52 @@ bool MSLEmitter::emitDot(tt::DotOp op, msl::Block &body) {
 }
 
 // Declare the three threadgroup pool pointers A/B/C. All three ids are minted
+// Overlap between two simultaneously live pool regions is a miscompile no
+// count-based census can see: the MMA and accumulator counts stay correct while
+// one region's stores land inside another's tile.
+void MSLEmitter::checkPoolRegions(Operation *op, ArrayRef<PoolRegion> live) {
+  for (size_t i = 0; i < live.size(); ++i)
+    for (size_t j = i + 1; j < live.size(); ++j) {
+      if (!live[i].bytes || !live[j].bytes)
+        continue;
+      int64_t ie = live[i].begin + live[i].bytes;
+      int64_t je = live[j].begin + live[j].bytes;
+      if (live[i].begin < je && live[j].begin < ie) {
+        std::string why = std::string(live[i].name) + "[" +
+                          std::to_string(live[i].begin) + "," +
+                          std::to_string(ie) + ") overlaps " + live[j].name +
+                          "[" + std::to_string(live[j].begin) + "," +
+                          std::to_string(je) + ")";
+        mslReject(op, "poolRegions", why);
+        emitFailed = true;
+      }
+    }
+}
+
+void MSLEmitter::checkDotPoolRegions(tt::DotOp op, const DotPlan &plan) {
+  int64_t aEb = byteWidth(elementScalarType(plan.aStage.getType()));
+  int64_t bEb = byteWidth(elementScalarType(plan.bStage.getType()));
+  int64_t aBytes = (plan.aInPlace || plan.aDirect)
+                       ? 0
+                       : plan.M * (plan.K + plan.aPad) * aEb;
+  int64_t bTiles = plan.dmaB ? 2 : 1;
+  int64_t bBytes =
+      plan.bInPlace ? 0 : plan.K * (plan.N + plan.bPad) * bEb * bTiles;
+  // A C that overlays the staging is published only once A and B are dead, so
+  // it is not live alongside them.
+  int64_t cBytes =
+      (plan.needC && plan.disjointC) ? plan.bandRows * plan.N * 4 : 0;
+  checkPoolRegions(op, {{"A", 0, aBytes},
+                        {"B", plan.stagedA, bBytes},
+                        {"C", plan.stagedAB, cBytes}});
+}
+
 // unconditionally even when a phase suppresses the matching decl - the fused
 // phases share one id numbering, so skipping a fresh() here would renumber
 // every later name.
 void MSLEmitter::dotPoolPtrs(msl::Block &body, tt::DotOp op,
                              const DotPlan &plan, DotEmitCtx &dc) {
+  checkDotPoolRegions(op, plan);
   auto tgPtr = [&](StringRef scalar) {
     return ctx.ptr(ctx.named(scalar), msl::AddrSpace::Threadgroup);
   };
@@ -2093,6 +2134,9 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
     return ctx.ptr(ctx.named(s), msl::AddrSpace::Threadgroup);
   };
   std::string pA = fresh(), pB = fresh(), pC = fresh();
+  checkPoolRegions(op, {{"A", 0, aPanelBytes},
+                        {"B", aPanelBytes, bPanelBytes},
+                        {"C", aPanelBytes + bPanelBytes, mp * np * accBytes}});
   body.push_back(
       ctx.declStmt(tgPtr(dc.opScalar), pA, poolRegion(0, dc.opScalar)));
   body.push_back(ctx.declStmt(tgPtr(dc.opScalar), pB,

@@ -557,6 +557,13 @@ private:
   // are required -- a literal bound alone says nothing about where the tile
   // starts. Anything dynamic or indivisible keeps the fallback arm and its pool
   // reservation.
+  struct PoolRegion {
+    const char *name;
+    int64_t begin;
+    int64_t bytes;
+  };
+  void checkPoolRegions(Operation *op, ArrayRef<PoolRegion> live);
+  void checkDotPoolRegions(tt::DotOp op, const DotPlan &plan);
   bool rowBoundNeverRagged(const DirectStage &ds, int64_t M);
   bool directStoreRowNeverRagged(const DirectStore &ds, int64_t M);
   bool directStoreColNeverRagged(const DirectStore &ds, int64_t N);

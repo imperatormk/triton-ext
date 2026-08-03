@@ -2859,20 +2859,14 @@ std::optional<std::pair<tt::DotOp, unsigned>>
 MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   Block *body = op.getBody();
   auto yield = cast<scf::YieldOp>(body->getTerminator());
-  tt::DotOp found;
-  int nDots = 0;
+  SmallVector<tt::DotOp> dots;
   for (Operation &o : body->without_terminator())
-    if (auto d = dyn_cast<tt::DotOp>(&o)) {
-      found = d;
-      ++nDots;
-    }
-  if (!found)
+    if (auto d = dyn_cast<tt::DotOp>(&o))
+      dots.push_back(d);
+  if (dots.empty())
     return std::nullopt;
-  if (nDots != 1) {
-    mslReject(op, "matchGemmDotLoop", "nDots!=1");
-    return std::nullopt;
-  }
 
+  tt::DotOp found = dots.front();
   auto cArg = dyn_cast<BlockArgument>(found.getC());
   if (!cArg || cArg.getOwner() != body) {
     mslReject(op, "matchGemmDotLoop", "acc-not-iter-arg");
@@ -2882,23 +2876,40 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
   if (idx == 0)
     return std::nullopt; // arg 0 is the induction var
   unsigned iterIdx = idx - 1;
-  if (yield.getOperand(iterIdx) != found.getResult()) {
+
+  tt::DotOp last = dots.back();
+  for (size_t i = 1; i < dots.size(); ++i)
+    if (dots[i].getC() != dots[i - 1].getResult()) {
+      mslReject(op, "matchGemmDotLoop", "dots-not-one-acc-chain");
+      return std::nullopt;
+    }
+  if (yield.getOperand(iterIdx) != last.getResult()) {
     mslReject(op, "matchGemmDotLoop", "yield-not-dot-result");
     return std::nullopt;
   }
-  // The iter-arg feeds the dot's C and nothing else; the dot result feeds the
-  // yield and nothing else. This keeps the accumulator purely register-carried.
   for (Operation *u : cArg.getUsers())
     if (u != found.getOperation()) {
       mslReject(op, "matchGemmDotLoop", "acc-extra-user");
       return std::nullopt;
     }
-  for (Operation *u : found.getResult().getUsers())
+  for (size_t i = 0; i + 1 < dots.size(); ++i)
+    for (Operation *u : dots[i].getResult().getUsers())
+      if (u != dots[i + 1].getOperation()) {
+        mslReject(op, "matchGemmDotLoop", "dot-result-extra-user");
+        return std::nullopt;
+      }
+  for (Operation *u : last.getResult().getUsers())
     if (u != yield.getOperation()) {
       mslReject(op, "matchGemmDotLoop", "dot-result-extra-user");
       return std::nullopt;
     }
+  for (tt::DotOp d : dots)
+    if (d.getResult().getType() != last.getResult().getType()) {
+      mslReject(op, "matchGemmDotLoop", "dot-acc-type-mismatch");
+      return std::nullopt;
+    }
 
+  found = last;
   auto cTy = dyn_cast<RankedTensorType>(found.getResult().getType());
   if (!cTy || cTy.getRank() != 2) {
     mslReject(op, "matchGemmDotLoop", "acc-rank!=2");
@@ -2911,11 +2922,24 @@ MSLEmitter::matchGemmDotLoop(scf::ForOp op) {
     return std::nullopt;
   }
   int64_t M = cTy.getShape()[0], N = cTy.getShape()[1];
-  int64_t K = cast<RankedTensorType>(found.getA().getType()).getShape()[1];
+  int64_t K = 0;
+  for (tt::DotOp d : dots) {
+    auto aTy = cast<RankedTensorType>(d.getA().getType());
+    if (aTy.getElementType() != aElem) {
+      mslReject(op, "matchGemmDotLoop", "elem-type-unsupported");
+      return std::nullopt;
+    }
+    K = std::max(K, aTy.getShape()[1]);
+  }
   if (M % 8 || N % 8 || K % 8) {
     mslReject(op, "matchGemmDotLoop", "MNK-not-multiple-of-8");
     return std::nullopt;
   }
+  for (tt::DotOp d : dots)
+    if (cast<RankedTensorType>(d.getA().getType()).getShape()[1] % 8) {
+      mslReject(op, "matchGemmDotLoop", "MNK-not-multiple-of-8");
+      return std::nullopt;
+    }
 
   // Gate: the fused path needs a warp-tile of <= 32 simdgroup_float8x8
   // accumulators per warp AND a pool that holds the staged operands.

@@ -625,10 +625,10 @@ private:
   static bool isDatalessType(Type t);
 
   // Recognise the register-resident GEMM shape: a loop-carried #mma iter-arg
-  // that is the C operand of exactly one tt.dot in the body and whose only
-  // other use is being yielded back as that same iter-arg (the standard
-  // accumulating `acc = tl.dot(a, b, acc)` K-loop). Returns the dot and the
-  // iter-arg index, or nullopt.
+  // that is the C operand of the first tt.dot in the body, where each further
+  // dot accumulates into the previous one's result and the last result is
+  // yielded back as that same iter-arg. Returns the last dot of the chain
+  // (the one the epilogue reads) and the iter-arg index, or nullopt.
   std::optional<std::pair<tt::DotOp, unsigned>> matchGemmDotLoop(scf::ForOp op);
 
   // True when this dot is the accumulator of a fused GEMM K-loop, i.e. the

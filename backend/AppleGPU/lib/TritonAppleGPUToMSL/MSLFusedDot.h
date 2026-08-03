@@ -76,6 +76,9 @@ struct DirectStore {
 struct FusedDotCtx {
   FusedDotPhase phase = FusedDotPhase::None;
   SmallVector<std::string> accNames;
+  // Every dot in a chain shares accNames, so they must agree on the warp
+  // tiling; the Decl phase pins the input that selects it.
+  std::optional<bool> warpTilingMSplit;
   SmallVector<std::string> ids;
   SmallVector<std::string> baseNames;
   std::string tgA, tgB, tgC;

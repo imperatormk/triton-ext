@@ -1688,8 +1688,11 @@ bool MSLEmitter::emitDotFused(
   const int64_t nFrag = plan.nFrag, numWarps = plan.numWarps;
   const int64_t lda = K + plan.aPad, ldb = N + plan.bPad;
   int64_t fragsPerWarp = (nFrag + numWarps - 1) / numWarps;
-  WarpTiling wt = planWarpTiling(plan.mT, nT, numWarps, nFrag, fragsPerWarp,
-                                 plan.aDirect.has_value());
+  if (fusedDot.phase == FusedDotPhase::Decl)
+    fusedDot.warpTilingMSplit = plan.aDirect.has_value();
+  WarpTiling wt = planWarpTiling(
+      plan.mT, nT, numWarps, nFrag, fragsPerWarp,
+      fusedDot.warpTilingMSplit.value_or(plan.aDirect.has_value()));
   auto barrier = [&] { body.push_back(ctx.hardBarrier(false)); };
 
   if (fusedDot.phase == FusedDotPhase::Decl) {

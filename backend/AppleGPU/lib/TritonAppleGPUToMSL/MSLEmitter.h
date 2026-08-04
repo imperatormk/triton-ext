@@ -808,6 +808,14 @@ private:
 
   static int64_t dotCBandRows(int64_t M, int64_t N, int64_t cBudget,
                               int64_t accBytes);
+
+  // Simdgroup-matrix registers a warp block may keep live before reload
+  // traffic becomes the cheaper trade.
+  static constexpr int64_t kTargetLiveFrags = 16;
+
+  // Columns per fragment-cache scope: the widest divisor of nT whose chunk*kT
+  // B fragments stay under kTargetLiveFrags.
+  static int64_t dotColChunk(int64_t nT, int64_t kT);
 };
 
 } // namespace mlir::triton::applegpu

@@ -1486,8 +1486,10 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
   const int64_t lda = K + plan.aPad, ldb = N + plan.bPad;
   // A fragment (mi, ki) is shared by every column this warp owns, and B (ki,
   // ni) by every row, so reloading per (mi, ni) pair costs nT-1 (resp. mT-1)
-  // redundant simdgroup_loads each. The cache is cleared per warp block, which
-  // is the region the fragments stay live across.
+  // redundant simdgroup_loads each. Caching them across a whole warp block
+  // removes those reloads but keeps nT*kT B fragments live at once; past a
+  // handful of live fragments that costs far more than the reloads it saves,
+  // so the column axis is walked in chunks and the cache spans one chunk.
   llvm::DenseMap<std::pair<int64_t, int64_t>, std::string> aFrag, bFrag;
   std::map<std::string, std::string> bFragExpr, aFragExpr;
   auto clearFragCache = [&]() {
@@ -1496,6 +1498,11 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
     bFragExpr.clear();
     aFragExpr.clear();
   };
+  // Columns per cache scope. Every disjointC arm asks here so the bound is
+  // decided once; the accumulators those arms build are short-lived (declared,
+  // filled and stored inside the chunk), so the live set is chunk*kT B
+  // fragments plus the chunk's accumulators.
+  const int64_t colChunk = dotColChunk(nT, kT);
   auto loadAFrag = [&](int64_t mi, int64_t ki, StringRef fa, msl::Block &into) {
     if (dc.devA.empty()) {
       into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
@@ -1602,26 +1609,31 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       if (plan.aDirect && plan.mT % numWarps == 0 && nT <= numWarps &&
           nFrag % numWarps == 0 &&
           Bd == 1) {
-        clearFragCache();
         int64_t mB = plan.mT / numWarps;
         std::string miKey = "(" + warpId + "*" + std::to_string(mB) + ")";
-        for (int64_t r = 0; r < mB; ++r) {
-          msl::Expr *miExpr = ctx.paren(
-              ctx.add(ctx.mul(ctx.var(warpId), ctx.i32lit(mB)),
-                      ctx.i32lit(r)));
-          for (int64_t ni = 0; ni < nT; ++ni) {
-            std::string acc = fresh();
-            body.push_back(accFragDecl(dc.accFragTy, acc));
-            fragMMABand(miKey + "+" + std::to_string(r), miExpr, ni, acc, body);
-            msl::Expr *off = ctx.paren(ctx.add(
-                ctx.paren(ctx.binary(B::Mul,
-                                     ctx.paren(ctx.mul(miExpr, ctx.i32lit(8))),
-                                     ctx.i32lit(N))),
-                ctx.i32lit(ni * 8)));
-            body.push_back(ctx.exprStmt(ctx.call(
-                msl::builtin::sg::Store,
-                {ctx.var(acc), ctx.binary(B::Add, ctx.var(dc.tgC), off),
-                 ctx.i32lit(N)})));
+        for (int64_t n0 = 0; n0 < nT; n0 += colChunk) {
+          clearFragCache();
+          int64_t n1 = std::min<int64_t>(n0 + colChunk, nT);
+          for (int64_t r = 0; r < mB; ++r) {
+            msl::Expr *miExpr = ctx.paren(
+                ctx.add(ctx.mul(ctx.var(warpId), ctx.i32lit(mB)),
+                        ctx.i32lit(r)));
+            for (int64_t ni = n0; ni < n1; ++ni) {
+              std::string acc = fresh();
+              body.push_back(accFragDecl(dc.accFragTy, acc));
+              fragMMABand(miKey + "+" + std::to_string(r), miExpr, ni, acc,
+                          body);
+              msl::Expr *off = ctx.paren(ctx.add(
+                  ctx.paren(ctx.binary(B::Mul,
+                                       ctx.paren(ctx.mul(miExpr,
+                                                         ctx.i32lit(8))),
+                                       ctx.i32lit(N))),
+                  ctx.i32lit(ni * 8)));
+              body.push_back(ctx.exprStmt(ctx.call(
+                  msl::builtin::sg::Store,
+                  {ctx.var(acc), ctx.binary(B::Add, ctx.var(dc.tgC), off),
+                   ctx.i32lit(N)})));
+            }
           }
         }
       } else if (numWarps == nT && nFrag % numWarps == 0 && Bd == 1) {
@@ -1641,33 +1653,46 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
                ctx.i32lit(N)})));
         }
       } else if (nT % numWarps == 0 && nFrag % numWarps == 0 && Bd == 1) {
-        clearFragCache();
-        for (int64_t mi = 0; mi < plan.mT; ++mi)
-          for (int64_t c = 0; c < nT / numWarps; ++c) {
-            std::string niKey =
-                "(" + warpId + "+" + std::to_string(c * numWarps) + ")";
-            msl::Expr *niExpr = ctx.paren(ctx.add(
-                ctx.var(warpId), ctx.i32lit(c * numWarps)));
-            std::string acc = fresh();
-            body.push_back(accFragDecl(dc.accFragTy, acc));
-            fragMMAExpr(mi, niKey, niExpr, acc, body);
-            msl::Expr *off = ctx.paren(ctx.add(ctx.i32lit(mi * 8 * N),
-                                               ctx.mul(niExpr, ctx.i32lit(8))));
-            body.push_back(ctx.exprStmt(ctx.call(
-                msl::builtin::sg::Store,
-                {ctx.var(acc), ctx.binary(B::Add, ctx.var(dc.tgC), off),
-                 ctx.i32lit(N)})));
-          }
+        // Each warp owns nT/numWarps columns; chunk that axis, not nT.
+        const int64_t cols = nT / numWarps;
+        const int64_t cChunk = dotColChunk(cols, kT);
+        for (int64_t c0 = 0; c0 < cols; c0 += cChunk) {
+          clearFragCache();
+          int64_t c1 = std::min<int64_t>(c0 + cChunk, cols);
+          for (int64_t mi = 0; mi < plan.mT; ++mi)
+            for (int64_t c = c0; c < c1; ++c) {
+              std::string niKey =
+                  "(" + warpId + "+" + std::to_string(c * numWarps) + ")";
+              msl::Expr *niExpr = ctx.paren(ctx.add(
+                  ctx.var(warpId), ctx.i32lit(c * numWarps)));
+              std::string acc = fresh();
+              body.push_back(accFragDecl(dc.accFragTy, acc));
+              fragMMAExpr(mi, niKey, niExpr, acc, body);
+              msl::Expr *off = ctx.paren(
+                  ctx.add(ctx.i32lit(mi * 8 * N),
+                          ctx.mul(niExpr, ctx.i32lit(8))));
+              body.push_back(ctx.exprStmt(ctx.call(
+                  msl::builtin::sg::Store,
+                  {ctx.var(acc), ctx.binary(B::Add, ctx.var(dc.tgC), off),
+                   ctx.i32lit(N)})));
+            }
+        }
       } else {
+        // f strides by numWarps, so a window of colChunk*numWarps consecutive
+        // f values spans at most colChunk distinct columns.
+        const int64_t fWindow = colChunk * numWarps;
         for (int64_t w = 0; w < numWarps; ++w) {
           msl::Block inner;
-          clearFragCache();
-          for (int64_t f = w; f < nFrag; f += numWarps) {
-            int64_t mi = f / nT, ni = f % nT;
-            std::string acc = fresh();
-            inner.push_back(accFragDecl(dc.accFragTy, acc));
-            fragMMA(mi, ni, acc, inner);
-            inner.push_back(sgStore(acc, dc.tgC, mi * 8 * N + ni * 8, N));
+          for (int64_t f0 = w; f0 < nFrag; f0 += fWindow) {
+            clearFragCache();
+            for (int64_t f = f0; f < std::min(f0 + fWindow, nFrag);
+                 f += numWarps) {
+              int64_t mi = f / nT, ni = f % nT;
+              std::string acc = fresh();
+              inner.push_back(accFragDecl(dc.accFragTy, acc));
+              fragMMA(mi, ni, acc, inner);
+              inner.push_back(sgStore(acc, dc.tgC, mi * 8 * N + ni * 8, N));
+            }
           }
           warpIf(w, std::move(inner));
         }
@@ -1683,11 +1708,14 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
     };
     for (int64_t f = 0; f < nFrag; ++f)
       body.push_back(accFragDecl(dc.accFragTy, accName(f / nT, f % nT)));
+    const int64_t fWindow = colChunk * numWarps;
     for (int64_t w = 0; w < numWarps; ++w) {
       msl::Block inner;
-      clearFragCache();
-      for (int64_t f = w; f < nFrag; f += numWarps)
-        fragMMA(f / nT, f % nT, accName(f / nT, f % nT), inner);
+      for (int64_t f0 = w; f0 < nFrag; f0 += fWindow) {
+        clearFragCache();
+        for (int64_t f = f0; f < std::min(f0 + fWindow, nFrag); f += numWarps)
+          fragMMA(f / nT, f % nT, accName(f / nT, f % nT), inner);
+      }
       warpIf(w, std::move(inner));
     }
     for (int64_t r0 = 0; r0 < M; r0 += plan.bandRows) {
@@ -3753,6 +3781,19 @@ void MSLEmitter::dotPanelDims(int64_t M, int64_t N, int64_t K,
 bool MSLEmitter::dotNeedsPanel(int64_t M, int64_t N, int64_t K,
                                int64_t elemBytes, int64_t accBytes) {
   return M * K * elemBytes + K * N * elemBytes > kTGResidentBudgetBytes;
+}
+
+int64_t MSLEmitter::dotColChunk(int64_t nT, int64_t kT) {
+  if (nT <= 1 || kT <= 0)
+    return nT < 1 ? 1 : nT;
+  int64_t chunk = kTargetLiveFrags / kT;
+  if (chunk < 1)
+    chunk = 1;
+  if (chunk > nT)
+    chunk = nT;
+  while (chunk > 1 && nT % chunk)
+    --chunk;
+  return chunk;
 }
 
 int64_t MSLEmitter::dotCBandRows(int64_t M, int64_t N, int64_t cBudget,

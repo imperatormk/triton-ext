@@ -603,6 +603,21 @@ std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op,
 msl::Stmt *MSLEmitter::bFragLoad(const DotEmitCtx &dc, int64_t ki,
                                  msl::Expr *niExpr, int64_t niLit,
                                  StringRef fb, int64_t ldb) {
+  // Staged pre-transpose, B's tile is N x K: fragment (ki, ni) starts at row
+  // ni, column ki, and the flag swaps the axes on the way into the fragment.
+  if (dc.bStageTransposed) {
+    int64_t ld = dc.bStageLd;
+    if (niExpr)
+      return ctx.exprStmt(ctx.call(
+          msl::builtin::sg::Load,
+          {ctx.var(fb),
+           ctx.binary(B::Add, ctx.var(dc.tgBCur),
+                      ctx.paren(ctx.add(ctx.i32lit(ki * 8),
+                                        ctx.mul(niExpr, ctx.i32lit(8 * ld))))),
+           ctx.i32lit(ld), ctx.raw("ulong2(0, 0)"), ctx.lit("true")}));
+    return sgLoad(fb, dc.tgBCur, niLit * 8 * ld + ki * 8, ld,
+                  /*transpose=*/true);
+  }
   if (niExpr)
     return ctx.exprStmt(ctx.call(
         msl::builtin::sg::Load,
@@ -1090,9 +1105,29 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   dotStageRowPads(p.M, p.N, p.K, byteWidth(aElem), byteWidth(bElem), p.aPad,
                   p.bPad, p.aInPlace || p.aDirect.has_value(),
                   p.bInPlace.has_value() || bDma);
+  // The panel path stages B against its own K x N offset arithmetic, so the
+  // pre-transpose order is only available to the whole-tile paths.
+  if (!p.bInPlace && p.rank == 2 &&
+      !dotNeedsPanel(p.M, p.N, p.K, byteWidth(aElem), accBytes))
+    if (auto tr = p.bStage.getDefiningOp<tt::TransOp>()) {
+      auto ord = tr.getOrder();
+      auto srcTy = dyn_cast<RankedTensorType>(tr.getSrc().getType());
+      if (ord.size() == 2 && ord[0] == 1 && ord[1] == 0 && srcTy &&
+          srcTy.getShape()[0] == p.N && srcTy.getShape()[1] == p.K) {
+        p.bStage = tr.getSrc();
+        p.bStageTransposed = true;
+      }
+    }
+  // The transposed staging addresses B at pitch K exactly, so it cannot carry
+  // a row pad.
+  if (p.bStageTransposed)
+    p.bPad = 0;
   p.stagedA =
       (p.aInPlace || p.aDirect) ? 0 : p.M * (p.K + p.aPad) * byteWidth(aElem);
-  p.stagedB = p.bInPlace ? 0 : p.K * (p.N + p.bPad) * byteWidth(bElem);
+  p.stagedB = p.bInPlace ? 0
+              : p.bStageTransposed
+                  ? p.N * p.K * byteWidth(bElem)
+                  : p.K * (p.N + p.bPad) * byteWidth(bElem);
   p.stagedAB = p.stagedA + p.stagedB;
   // A second B tile for the in-flight copy, sitting directly after the first,
   // so C (disjoint or banded) starts past both. Every phase must agree on this,
@@ -1184,6 +1219,9 @@ bool MSLEmitter::emitDot(tt::DotOp op, msl::Block &body) {
   dc.bStage = plan.bStage;
   dc.aNames = names(dc.aStage);
   dc.bNames = names(dc.bStage);
+  dc.bStageTransposed = plan.bStageTransposed;
+  if (plan.bStageTransposed)
+    dc.bStageLd = plan.K;
 
   // The pipeline's parity/handle names must exist before dotPoolPtrs, which
   // derives the read-side B pointer from the parity. Mint them on the first
@@ -2555,17 +2593,21 @@ msl::Stmt *MSLEmitter::accFragDecl(msl::MatrixType *frag, StringRef name) {
   return ctx.declStmt(frag, name, ctx.call(ctorName, {ctx.lit("0.0f")}));
 }
 
-// `simdgroup_load(frag, base + off, ld);`
+// `simdgroup_load(frag, base + off, ld[, origin, transpose]);`
 //
-// The trailing `transpose` parameter is deliberately never passed:
-// stageOperand always writes operands into threadgroup memory row-major, so
-// the fragment layout is canonical by construction. A column-major B is
-// transposed on the store into TG, not by flagging the load.
+// stageOperand writes operands into threadgroup memory row-major, so the
+// fragment layout is canonical and the transpose flag is normally left off. An
+// operand the IR transposes is staged in its untransposed order instead and
+// read back through the flag, which the hardware honours for free.
 msl::Stmt *MSLEmitter::sgLoad(StringRef frag, StringRef base, int64_t off,
-                              int64_t ld) {
-  return ctx.exprStmt(
-      ctx.call(msl::builtin::sg::Load, {ctx.var(frag), fragAddr(base, off),
-                                        ctx.lit(std::to_string(ld))}));
+                              int64_t ld, bool transpose) {
+  SmallVector<msl::Expr *, 5> args{ctx.var(frag), fragAddr(base, off),
+                                   ctx.lit(std::to_string(ld))};
+  if (transpose) {
+    args.push_back(ctx.raw("ulong2(0, 0)"));
+    args.push_back(ctx.lit("true"));
+  }
+  return ctx.exprStmt(ctx.call(msl::builtin::sg::Load, args));
 }
 
 // `simdgroup_store(acc, base + off, ld);`

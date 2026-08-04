@@ -180,6 +180,10 @@ struct DotPlan {
   // The value whose registers get staged - the operand itself, or the source
   // of a convert_layout the staging makes redundant.
   Value aStage, bStage;
+  // B is staged in the pre-transpose order and read back through
+  // simdgroup_load's transpose flag, which costs nothing, rather than being
+  // permuted element by element on the way into threadgroup memory.
+  bool bStageTransposed = false;
 
   // Pool layout: A at 0, B at stagedA, C at stagedAB (disjoint) or 0 (aliased
   // over A/B, which forces the banded C round-trip).
@@ -222,6 +226,10 @@ struct DotEmitCtx {
   // With double-buffered DMA staging tgB is the base of the tile pair and
   // tgBCur is the one this trip reads; otherwise they are the same.
   std::string tgBCur;
+  // B sits in threadgroup memory in its pre-transpose order, so its fragments
+  // are read through simdgroup_load's transpose flag at pitch bStageLd.
+  bool bStageTransposed = false;
+  int64_t bStageLd = 0;
   // Device pointer to this warp's A rows, when A bypasses threadgroup memory.
   // Empty on the staged path, where the A fragments read tgA instead.
   std::string devA;

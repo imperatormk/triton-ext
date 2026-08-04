@@ -47,6 +47,28 @@ bool resultFeedsRowReduction(tt::DotOp dot) {
   return false;
 }
 
+// A dot consuming another dot's result as its A operand has to agree with the
+// producer's warp tiling, or the result crosses between them through
+// threadgroup memory instead of staying in registers.
+bool operandComesFromDot(tt::DotOp dot) {
+  SmallVector<Value, 4> work{dot.getA()};
+  SmallPtrSet<Operation *, 8> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    Operation *def = v.getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      continue;
+    if (isa<tt::DotOp>(def))
+      return true;
+    if (def->hasTrait<OpTrait::Elementwise>() ||
+        isa<ttg::ConvertLayoutOp, tt::BroadcastOp, tt::ExpandDimsOp,
+            tt::FpToFpOp>(def))
+      for (Value o : def->getOperands())
+        work.push_back(o);
+  }
+  return false;
+}
+
 // warpsPerCTA for a dot shape and warp count. Apple simdgroup tile = 8x8.
 //
 // The wm|tilesM && wn|tilesN divisibility filter can in principle leave warps
@@ -153,7 +175,9 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     // MMA encoding on the result only; A/B stay blocked (DotOpToLLVM scatters
     // them through TG), so only one result->blocked ConvertLayoutOp is needed
     // downstream. Oversized tiles fail cleanly via the shared-memory budget.
-    auto wpc = warpsPerTileApple(M, N, numWarps, resultFeedsRowReduction(dot));
+    auto wpc = warpsPerTileApple(
+        M, N, numWarps,
+        resultFeedsRowReduction(dot) || operandComesFromDot(dot));
     auto mmaEnc = AppleMmaEncodingAttr::get(ctx, wpc);
 
     auto newCType =

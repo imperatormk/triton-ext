@@ -26,21 +26,14 @@ add_mlir_library(${PROJECT_NAME}
     TritonExtensionSupport
 )
 
-if(APPLE)
-    target_link_libraries(${PROJECT_NAME}
-      PUBLIC
-        TritonExtensionSupport
-        ${TRITON_LIB}
-    )
-else()
-    target_link_libraries(${PROJECT_NAME}
-      PUBLIC
-        TritonExtensionSupport
-        -Wl,--no-as-needed
-        ${TRITON_LIB}
-        -Wl,--as-needed
-    )
-endif()
+target_link_libraries(${PROJECT_NAME}
+  PUBLIC
+    TritonExtensionSupport
+    -Wl,--no-as-needed
+    ${TRITON_LIB}
+    -Wl,--as-needed
+    # ... MLIR libs ...
+)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY

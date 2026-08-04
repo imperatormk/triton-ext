@@ -1996,20 +1996,34 @@ bool MSLEmitter::emitDotFused(
         return accName.str();
       std::string id = fresh();
       blk.push_back(ctx.declStmt(dc.accFragTy, id, ctx.var(accName)));
+      Value accVal = d.elementwiseAcc;
       for (int e = 0; e < 2; ++e) {
-        auto slot = [&] {
-          return ctx.subscript(
-              ctx.member(ctx.var(id), msl::builtin::sg::ThreadElements),
-              ctx.i32lit(e));
-        };
+        msl::Expr *slot = ctx.subscript(
+            ctx.member(ctx.var(id), msl::builtin::sg::ThreadElements),
+            ctx.i32lit(e));
+        // The region is a DAG, so each member's result gets its own name and
+        // operands resolve through this map rather than a single slot.
+        DenseMap<Value, msl::Expr *> bound;
+        bound[accVal] = slot;
+        std::string last;
         for (Operation *op : d.elementwise) {
-          msl::Expr *rhs = nullptr;
-          for (Value o : op->getOperands())
-            if (msl::Expr *u = uniformSplatScalar(o))
-              rhs = u;
-          blk.push_back(
-              ctx.assignStmt(slot(), scalarEpilogueExpr(op, slot(), rhs)));
+          // Operand order is preserved, so a non-commutative form (sub, div)
+          // keeps its sides.
+          auto resolve = [&](Value o) -> msl::Expr * {
+            if (auto it = bound.find(o); it != bound.end())
+              return it->second;
+            return uniformSplatScalar(o);
+          };
+          msl::Expr *cur = resolve(op->getOperand(0));
+          msl::Expr *rhs =
+              op->getNumOperands() > 1 ? resolve(op->getOperand(1)) : nullptr;
+          std::string nm = fresh();
+          blk.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::F32), nm,
+                                     scalarEpilogueExpr(op, cur, rhs)));
+          bound[op->getResult(0)] = ctx.var(nm);
+          last = nm;
         }
+        blk.push_back(ctx.assignStmt(slot, ctx.var(last)));
       }
       return id;
     };
@@ -2895,10 +2909,15 @@ msl::Expr *MSLEmitter::uniformSplatScalar(Value v) {
   return nullptr;
 }
 
-// One elementwise epilogue op rendered against a fragment slot. `rhs` is the
-// tile-uniform operand for the binary forms, null for the unary ones.
-msl::Expr *MSLEmitter::scalarEpilogueExpr(Operation *op, msl::Expr *cur,
-                                          msl::Expr *rhs) {
+// One elementwise epilogue op rendered on scalars. `a` and `b` are its operands
+// in IR order, so a non-commutative form keeps its sides; `b` is null for the
+// unary ops.
+msl::Expr *MSLEmitter::scalarEpilogueExpr(Operation *op, msl::Expr *a,
+                                          msl::Expr *b) {
+  msl::Expr *cur = a;
+  msl::Expr *rhs = b;
+  if (!cur)
+    return nullptr;
   if (isa<arith::AddFOp>(op) && rhs)
     return ctx.binary(B::Add, cur, rhs);
   if (isa<arith::SubFOp>(op) && rhs)
@@ -2921,46 +2940,110 @@ msl::Expr *MSLEmitter::scalarEpilogueExpr(Operation *op, msl::Expr *cur,
   return nullptr;
 }
 
-// An op that maps each element of `chain` to one output element, with every
-// other operand uniform over the tile. Such an op can run on a fragment's
-// thread_elements() without knowing where the lane sits in the tile.
-static bool isElementwiseEpilogue(Operation *op, Value chain) {
+// True for a value that is the same for every element of the tile, so emission
+// can read it once per fragment instead of per element.
+static bool isTileUniform(Value v) {
+  Value src = peelBroadcast(v);
+  if (definingOp<tt::SplatOp>(src))
+    return true;
+  if (auto cst = src.getDefiningOp<arith::ConstantOp>())
+    return isa<SplatElementsAttr>(cst.getValue());
+  return false;
+}
+
+// An op scalarEpilogueExpr can render, in the accumulator's own layout. The two
+// lists must not drift, or a matched op reaches emission with no expression.
+static bool isElementwiseEpilogueOp(Operation *op, RankedTensorType accTy) {
   if (!op || op->getNumResults() != 1)
     return false;
-  if (isa<arith::TruncFOp>(op))
-    return false;
-  // Only ops scalarEpilogueExpr can render; the two lists must not drift, or a
-  // matched op reaches emission with no expression for it.
   if (!isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
            tt::PreciseDivFOp, math::ExpOp, math::Exp2Op, math::LogOp,
            math::SqrtOp, math::RsqrtOp, math::TanhOp, math::ErfOp,
            math::AbsFOp, math::FloorOp, math::CeilOp>(op))
     return false;
   auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-  auto chainTy = dyn_cast<RankedTensorType>(chain.getType());
-  if (!resTy || !chainTy || resTy.getShape() != chainTy.getShape() ||
-      resTy.getEncoding() != chainTy.getEncoding())
+  if (!resTy || resTy.getShape() != accTy.getShape() ||
+      resTy.getEncoding() != accTy.getEncoding())
     return false;
-  bool binary = op->getNumOperands() == 2;
-  int chainUses = 0, uniformOperands = 0;
-  for (Value o : op->getOperands()) {
-    if (o == chain) {
-      ++chainUses;
-      continue;
-    }
-    Value src = peelBroadcast(o);
-    bool uniform = definingOp<tt::SplatOp>(src) != nullptr;
-    if (auto cst = src.getDefiningOp<arith::ConstantOp>())
-      uniform |= isa<SplatElementsAttr>(cst.getValue());
-    if (!uniform)
+  return true;
+}
+
+// Collect the elementwise region hanging off `acc`, in topological order.
+//
+// The region may be a DAG rather than a chain -- gelu reads the accumulator
+// twice and rejoins -- but it must be closed: every operand of a member is
+// either the accumulator, another member, or tile-uniform, and every member's
+// result is consumed inside the region except the single one that leaves it.
+// That keeps the whole thing expressible as arithmetic on a fragment's
+// thread_elements(), with no cross-element or cross-lane dependency.
+static bool collectElementwiseRegion(Value acc, RankedTensorType accTy,
+                                     SmallVectorImpl<Operation *> &ordered,
+                                     Value &result) {
+  SmallVector<Operation *> worklist;
+  SetVector<Operation *> members;
+  for (Operation *u : acc.getUsers()) {
+    if (!isElementwiseEpilogueOp(u, accTy))
       return false;
-    ++uniformOperands;
+    worklist.push_back(u);
   }
-  // The chain has to flow through exactly once, and a binary form needs its
-  // other side to be the uniform value emission will read.
-  if (chainUses != 1)
+  if (worklist.empty())
     return false;
-  return binary ? uniformOperands == 1 : uniformOperands == 0;
+
+  while (!worklist.empty()) {
+    Operation *op = worklist.pop_back_val();
+    if (!members.insert(op))
+      continue;
+    for (Value o : op->getOperands()) {
+      if (o == acc || isTileUniform(o))
+        continue;
+      Operation *def = o.getDefiningOp();
+      if (!def || !isElementwiseEpilogueOp(def, accTy))
+        return false;
+      worklist.push_back(def);
+    }
+    for (Operation *u : op->getResult(0).getUsers())
+      if (isElementwiseEpilogueOp(u, accTy))
+        worklist.push_back(u);
+  }
+
+  // Exactly one member may escape the region, and it must escape exactly once.
+  Operation *sink = nullptr;
+  for (Operation *op : members) {
+    bool escapes = false;
+    for (Operation *u : op->getResult(0).getUsers())
+      if (!members.contains(u))
+        escapes = true;
+    if (!escapes)
+      continue;
+    if (sink || !op->getResult(0).hasOneUse())
+      return false;
+    sink = op;
+  }
+  if (!sink)
+    return false;
+
+  // Topological order, so emission never reads a value it has not produced.
+  DenseSet<Operation *> done;
+  std::function<bool(Operation *)> visit = [&](Operation *op) -> bool {
+    if (done.contains(op))
+      return true;
+    for (Value o : op->getOperands()) {
+      if (o == acc || isTileUniform(o))
+        continue;
+      Operation *def = o.getDefiningOp();
+      if (!def || !members.contains(def) || !visit(def))
+        return false;
+    }
+    done.insert(op);
+    ordered.push_back(op);
+    return true;
+  };
+  for (Operation *op : members)
+    if (!visit(op))
+      return false;
+
+  result = sink->getResult(0);
+  return true;
 }
 
 std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
@@ -2970,8 +3053,17 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
       mslReject(site, "matchDirectStore", why);
     return std::nullopt;
   };
-  if (!forResult.hasOneUse())
-    return rej("acc-not-single-use");
+  // Several uses are fine when they all land inside one elementwise region --
+  // gelu reads the accumulator twice and rejoins -- since the region is then
+  // folded into the fragments and nothing else observes the raw accumulator.
+  if (!forResult.hasOneUse()) {
+    SmallVector<Operation *> probeOps;
+    Value probeOut;
+    auto accTy = dyn_cast<RankedTensorType>(forResult.getType());
+    if (!accTy ||
+        !collectElementwiseRegion(forResult, accTy, probeOps, probeOut))
+      return rej("acc-not-single-use");
+  }
   // The f32 accumulator may be narrowed to the output dtype before the layout
   // convert. simdgroup_store cannot narrow, so the fragment is converted
   // elementwise through thread_elements() and stored as a narrow fragment.
@@ -2999,28 +3091,25 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   // threadgroup fallback arm that streams the pool image written by the fast
   // arm, and that image is post-epilogue, so the ragged tile would have the
   // epilogue applied twice.
-  SmallVector<Operation *> chainOps;
-  Value elemChain = chain;
-  while (true) {
-    Operation *user = *elemChain.user_begin();
-    if (!isElementwiseEpilogue(user, elemChain))
-      break;
-    if (!user->getResult(0).hasOneUse())
-      break;
-    chainOps.push_back(user);
-    elemChain = user->getResult(0);
-  }
-  if (!chainOps.empty()) {
-    Value probe = elemChain;
-    if (auto tf = dyn_cast<arith::TruncFOp>(*probe.user_begin()))
-      probe = tf.getResult();
-    if (auto cv = dyn_cast<ttg::ConvertLayoutOp>(*probe.user_begin()))
-      if (auto st = dyn_cast<tt::StoreOp>(*cv.getResult().user_begin()))
-        if (!st.getMask()) {
-          ds.elementwise = chainOps;
-          chain = elemChain;
-        }
-  }
+  SmallVector<Operation *> regionOps;
+  Value regionOut;
+  if (auto accTy = dyn_cast<RankedTensorType>(chain.getType()))
+    if (collectElementwiseRegion(chain, accTy, regionOps, regionOut)) {
+      Value probe = regionOut;
+      if (auto tf = dyn_cast<arith::TruncFOp>(*probe.user_begin()))
+        probe = tf.getResult();
+      // The ragged fallback arm streams the pool image the fast arm wrote, and
+      // that image is already post-epilogue, so a tile that can go ragged would
+      // apply the epilogue twice. An unmasked store has no such arm; a masked
+      // one only qualifies once the bounds prove it never goes ragged.
+      if (auto cv = dyn_cast<ttg::ConvertLayoutOp>(*probe.user_begin()))
+        if (auto st = dyn_cast<tt::StoreOp>(*cv.getResult().user_begin()))
+          if (!st.getMask()) {
+            ds.elementwise = regionOps;
+            ds.elementwiseAcc = chain;
+            chain = regionOut;
+          }
+    }
 
   if (auto tf = dyn_cast<arith::TruncFOp>(*chain.user_begin())) {
     if (!tf.getResult().hasOneUse())

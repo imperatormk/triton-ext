@@ -70,6 +70,9 @@ struct DirectStore {
   // maps one element to one element, so it applies to the fragment's
   // thread_elements() in place and the tile never leaves register layout.
   SmallVector<Operation *> elementwise;
+  // The accumulator the region reads. It may be read more than once, so
+  // emission resolves it by value rather than by position.
+  Value elementwiseAcc;
   std::string fullTileVar;       // runtime "whole tile in bounds" predicate
   // True when fullTileVar is the constant `true` (an unmasked store): the
   // threadgroup fallback arm is then unreachable and must not be emitted, or

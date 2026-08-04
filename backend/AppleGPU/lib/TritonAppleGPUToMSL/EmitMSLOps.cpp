@@ -1467,8 +1467,19 @@ std::optional<bool> MSLEmitter::emitMath(Operation *op, msl::Block &body) {
         return ctx.paren(ctx.binary(B::And, ctx.var(reg(op->getOperand(0), r)),
                                     ctx.lit("0x7f")));
       });
+    // f64 narrows to float here, so a default-namespace call would answer an
+    // explicit request for more-than-fp32 accuracy with less of it.
+    static const llvm::StringMap<StringRef> unaryF64 = {
+        {"math.exp", bi::precise::Exp},
+        {"math.exp2", bi::precise::Exp2},
+        {"math.sqrt", bi::precise::Sqrt},
+        {"math.rsqrt", bi::precise::Rsqrt}};
     if (auto it = unary.find(n); it != unary.end()) {
       StringRef fn = it->second;
+      if (op->getNumOperands() &&
+          elementScalarType(op->getOperand(0).getType()).isF64())
+        if (auto p = unaryF64.find(n); p != unaryF64.end())
+          fn = p->second;
       return declBind(op, sc, body, [&](int r) {
         return unaryExpr(fn, sc, reg(op->getOperand(0), r));
       });

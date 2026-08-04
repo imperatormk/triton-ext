@@ -393,6 +393,13 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
       if (ds->biasCvt)
         directStoreHandled[ds->biasCvt] = ft;
     }
+    // A folded region reaches a ragged tile only through the per-warp drain,
+    // which reapplies it scalar-side; that arm needs both bounds and a warp
+    // tiling affine in the warp id. Otherwise the fold is dropped and the
+    // region emits as ordinary tensor ops on both arms.
+    if (!ds->elementwise.empty() && !ds->alwaysFullTile &&
+        !(ds->boundM && ds->boundN && dotRaggedDrainAffine(dot)))
+      ds->elementwise.clear();
     for (Operation *e : ds->elementwise)
       directStoreHandled[e] = ft;
   }

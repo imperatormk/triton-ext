@@ -2186,6 +2186,8 @@ bool MSLEmitter::emitDotFused(
         directStoreRaggedHandled.insert(d.biasAdd);
       if (d.biasCvt)
         directStoreRaggedHandled.insert(d.biasCvt);
+      for (Operation *e : d.elementwise)
+        directStoreRaggedHandled.insert(e);
     }
     // if (fullTileVar) { <ifBody> } else { <pool store + gather> }
     msl::Block elseBody;
@@ -2255,6 +2257,38 @@ bool MSLEmitter::emitDotFused(
             val = ctx.binary(B::Add, val,
                              ctx.deref(ctx.paren(ctx.add(
                                  ctx.var(scalarName(d.biasPtr)), bCol))));
+          }
+          // The fast arm folds the epilogue into the fragments; this arm reads
+          // the raw accumulator out of the slot, so it applies the same region
+          // scalar-side to land on the identical value. The accumulator is
+          // bound to a name first: a DAG reads it more than once, and `val` is
+          // an expression tree that would otherwise be recomputed per read.
+          if (!d.elementwise.empty()) {
+            std::string accNm = fresh();
+            loop.push_back(
+                ctx.declStmt(ctx.scalar(msl::Scalar::F32), accNm, val));
+            val = ctx.var(accNm);
+            DenseMap<Value, msl::Expr *> bound;
+            bound[d.elementwiseAcc] = val;
+            for (Operation *eop : d.elementwise) {
+              auto resolve = [&](Value o) -> msl::Expr * {
+                if (auto it = bound.find(o); it != bound.end())
+                  return it->second;
+                return uniformSplatScalar(o);
+              };
+              msl::Expr *lhs = resolve(eop->getOperand(0));
+              msl::Expr *rhs = eop->getNumOperands() > 1
+                                   ? resolve(eop->getOperand(1))
+                                   : nullptr;
+              msl::Expr *r = scalarEpilogueExpr(eop, lhs, rhs);
+              if (!r)
+                break;
+              std::string nm = fresh();
+              loop.push_back(
+                  ctx.declStmt(ctx.scalar(msl::Scalar::F32), nm, r));
+              bound[eop->getResult(0)] = ctx.var(nm);
+              val = ctx.var(nm);
+            }
           }
           if (d.narrowTo)
             val = ctx.cast(CS::CStyle, scalarType(d.narrowTo), val);
@@ -3229,10 +3263,13 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   // qualifies only when its bounds prove the tile is never ragged -- the same
   // proof the emission site uses to decide the arm is unreachable.
   if (!regionOps.empty()) {
+    // A ragged tile is safe when the fallback arm drains the raw accumulator
+    // itself and reapplies the region scalar-side; that arm needs both bounds.
+    bool raggedHandles = ds.boundM && ds.boundN;
     bool neverRagged =
         !store.getMask() ||
         directStoreNeverRagged(ds, cTy.getShape()[0], cTy.getShape()[1]);
-    if (!neverRagged)
+    if (!neverRagged && !raggedHandles)
       return rej("epilogue-store-may-be-ragged");
     ds.elementwise = regionOps;
     ds.elementwiseAcc = regionAcc;
@@ -3250,6 +3287,42 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
 // be reclaimed even though the full-tile path stores straight to device.
 // True when this dot's C goes straight to device with no threadgroup fallback
 // arm, so the readback never touches the pool.
+// True when the ragged C drain addresses a fragment as warp-offset plus a
+// constant, which is what lets that arm stream the tile itself. Both the fold
+// gate and the drain read this, so the two cannot disagree about which arm runs.
+bool MSLEmitter::dotRaggedDrainAffine(tt::DotOp d) {
+  auto cTy = dyn_cast<RankedTensorType>(d.getResult().getType());
+  if (!cTy || cTy.getRank() != 2)
+    return false;
+  int64_t M = cTy.getShape()[0], N = cTy.getShape()[1];
+  if (M % 8 || N % 8)
+    return false;
+  tt::LinearLayout ll = ttg::toLinearLayout(cTy);
+  auto wd = StringAttr::get(d.getContext(), "warp");
+  int64_t nw = ll.hasInDim(wd) ? ll.getInDimSize(wd) : 1;
+  int64_t mT = M / 8, nT = N / 8, nFrag = mT * nT;
+  if (nw > nFrag)
+    nw = nFrag;
+  if (nw == 1)
+    return true;
+  int64_t fragsPerWarp = (nFrag + nw - 1) / nw;
+  WarpTiling wt = planWarpTiling(mT, nT, nw, nFrag, fragsPerWarp,
+                                 dotADirect(d).has_value());
+  if (!wt.twoD)
+    return false;
+  for (int64_t w = 0; w < nw; ++w)
+    for (int64_t j = 0; j < fragsPerWarp; ++j) {
+      int64_t mi, ni, mi0, ni0;
+      wt.frag(w, j, nT, nw, mi, ni);
+      wt.frag(0, j, nT, nw, mi0, ni0);
+      if (mi != mi0 + (w / wt.wGridN) * wt.miCount ||
+          ni != ni0 + (w % wt.wGridN) * wt.niCount ||
+          (mi * nT + ni >= nFrag) != (mi0 * nT + ni0 >= nFrag))
+        return false;
+    }
+  return true;
+}
+
 bool MSLEmitter::cStoresDirect(tt::DotOp d) {
   auto forOp = dyn_cast<scf::ForOp>(d->getParentOp());
   if (!forOp)

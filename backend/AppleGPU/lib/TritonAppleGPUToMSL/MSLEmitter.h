@@ -575,6 +575,7 @@ private:
   void checkPoolRegions(Operation *op, ArrayRef<PoolRegion> live);
   void checkDotPoolRegions(tt::DotOp op, const DotPlan &plan);
   bool rowBoundNeverRagged(const DirectStage &ds, int64_t M);
+  bool dotRaggedDrainAffine(tt::DotOp d);
   bool directStoreRowNeverRagged(const DirectStore &ds, int64_t M);
   bool directStoreColNeverRagged(const DirectStore &ds, int64_t N);
   bool directStoreNeverRagged(const DirectStore &ds, int64_t M, int64_t N);

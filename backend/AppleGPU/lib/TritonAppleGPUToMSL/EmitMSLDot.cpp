@@ -1346,12 +1346,17 @@ void MSLEmitter::dotPoolPtrs(msl::Block &body, tt::DotOp op,
     int64_t bandRows = plan.M / plan.numWarps;
     dc.devALda = dmaRowStride(*plan.aDirect);
     dc.devA = fresh();
-    // colShift already advances with the K-loop, so the origin carries the
-    // whole per-trip term and must not be given a second one.
+    // The IV may count trips rather than K elements, so the per-trip advance is
+    // rescaled by the loop's step.
     DirectStage stat = *plan.aDirect;
-    stat.ptrDelta = Value();
-    stat.ptrDeltaLit = std::nullopt;
-    msl::Expr *origin = dmaTileOrigin(stat, /*tripVar=*/StringRef());
+    if (auto forOp = dyn_cast_or_null<scf::ForOp>(op->getParentOp())) {
+      APInt stepVal;
+      if (matchPattern(forOp.getStep(), m_ConstantInt(&stepVal)) &&
+          stepVal.getSExtValue() > 0 && stat.ptrDeltaLit)
+        stat.ptrDeltaLit = *stat.ptrDeltaLit * stat.cols /
+                           stepVal.getSExtValue();
+    }
+    msl::Expr *origin = dmaTileOrigin(stat, dotDmaTripVar(op));
     msl::Expr *base = origin;
     if (plan.kind != DotPlan::Kind::Direct) {
       msl::Expr *bandOff = ctx.paren(

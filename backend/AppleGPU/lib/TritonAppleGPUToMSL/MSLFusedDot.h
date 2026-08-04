@@ -66,6 +66,10 @@ struct DirectStore {
   Value biasCol;   // global col of the tile's first bias element (scalar)
   Operation *biasAdd = nullptr; // the elided arith.addf
   Operation *biasCvt = nullptr; // the elided layout convert, when present
+  // A pure elementwise epilogue between the accumulator and the store. Each op
+  // maps one element to one element, so it applies to the fragment's
+  // thread_elements() in place and the tile never leaves register layout.
+  SmallVector<Operation *> elementwise;
   std::string fullTileVar;       // runtime "whole tile in bounds" predicate
   // True when fullTileVar is the constant `true` (an unmasked store): the
   // threadgroup fallback arm is then unreachable and must not be emitted, or

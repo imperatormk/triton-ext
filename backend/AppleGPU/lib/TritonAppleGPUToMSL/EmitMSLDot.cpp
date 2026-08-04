@@ -1989,6 +1989,30 @@ bool MSLEmitter::emitDotFused(
                       ctx.i32lit(1))),
                   ctx.i32lit(2))))));
     }
+    // A pure elementwise epilogue applied to the fragment's two slots, so the
+    // tile never leaves register layout on its way to device memory.
+    auto elementwised = [&](msl::Block &blk, StringRef accName) -> std::string {
+      if (d.elementwise.empty())
+        return accName.str();
+      std::string id = fresh();
+      blk.push_back(ctx.declStmt(dc.accFragTy, id, ctx.var(accName)));
+      for (int e = 0; e < 2; ++e) {
+        auto slot = [&] {
+          return ctx.subscript(
+              ctx.member(ctx.var(id), msl::builtin::sg::ThreadElements),
+              ctx.i32lit(e));
+        };
+        for (Operation *op : d.elementwise) {
+          msl::Expr *rhs = nullptr;
+          for (Value o : op->getOperands())
+            if (msl::Expr *u = uniformSplatScalar(o))
+              rhs = u;
+          blk.push_back(
+              ctx.assignStmt(slot(), scalarEpilogueExpr(op, slot(), rhs)));
+        }
+      }
+      return id;
+    };
     // acc + bias[biasCol + ni*8 + laneCol + e], into a scratch fragment so the
     // accumulator stays clean for the fallback arm.
     // The bias is constant down a column, so its two values depend only on the
@@ -2066,7 +2090,7 @@ bool MSLEmitter::emitDotFused(
              ctx.paren(ctx.addChain({ctx.var(colB), wCol,
                                      ctx.i32lit(ni * 8)}))});
         std::string sv =
-            narrowed(inner, biased(inner, fusedDot.accNames[j], ni));
+            narrowed(inner, elementwised(inner, biased(inner, fusedDot.accNames[j], ni)));
         inner.push_back(ctx.exprStmt(ctx.call(
             msl::builtin::sg::Store, {ctx.var(sv), off, uniform(d.ldc)})));
       }
@@ -2088,7 +2112,7 @@ bool MSLEmitter::emitDotFused(
                        uniform(d.ldc)),
                ctx.paren(ctx.add(ctx.var(colB), ctx.i32lit(ni * 8)))});
           std::string sv =
-              narrowed(inner, biased(inner, fusedDot.accNames[j], ni));
+              narrowed(inner, elementwised(inner, biased(inner, fusedDot.accNames[j], ni)));
           inner.push_back(ctx.exprStmt(ctx.call(
               msl::builtin::sg::Store, {ctx.var(sv), off, uniform(d.ldc)})));
         }
@@ -2853,6 +2877,92 @@ Value MSLEmitter::matchRowBroadcastBias(Value v, DirectStore &ds) {
   return add.getResult();
 }
 
+// The scalar behind a tile-uniform operand: a splat of a scalar, or a splat
+// constant. Null when the value varies across the tile.
+msl::Expr *MSLEmitter::uniformSplatScalar(Value v) {
+  if (!isa<RankedTensorType>(v.getType()))
+    return nullptr;
+  Value src = peelBroadcast(v);
+  if (auto sp = definingOp<tt::SplatOp>(src))
+    return ctx.var(scalarName(sp.getSrc()));
+  if (auto cst = src.getDefiningOp<arith::ConstantOp>())
+    if (auto se = dyn_cast<SplatElementsAttr>(cst.getValue())) {
+      auto f = dyn_cast<FloatAttr>(se.getSplatValue<Attribute>());
+      if (!f)
+        return nullptr;
+      return floatLitExpr(f.getValue(), f.getType());
+    }
+  return nullptr;
+}
+
+// One elementwise epilogue op rendered against a fragment slot. `rhs` is the
+// tile-uniform operand for the binary forms, null for the unary ones.
+msl::Expr *MSLEmitter::scalarEpilogueExpr(Operation *op, msl::Expr *cur,
+                                          msl::Expr *rhs) {
+  if (isa<arith::AddFOp>(op) && rhs)
+    return ctx.binary(B::Add, cur, rhs);
+  if (isa<arith::SubFOp>(op) && rhs)
+    return ctx.binary(B::Sub, cur, rhs);
+  if (isa<arith::MulFOp>(op) && rhs)
+    return ctx.binary(B::Mul, cur, rhs);
+  if (isa<arith::DivFOp, tt::PreciseDivFOp>(op) && rhs)
+    return ctx.binary(B::Div, cur, rhs);
+  namespace bi = msl::builtin;
+  StringRef n = op->getName().getStringRef();
+  static const llvm::StringMap<StringRef> unary = {
+      {"math.exp", bi::math::Exp},      {"math.exp2", bi::math::Exp2},
+      {"math.log", bi::precise::Log},   {"math.sqrt", bi::math::Sqrt},
+      {"math.rsqrt", bi::math::Rsqrt},  {"math.tanh", bi::precise::Tanh},
+      {"math.erf", "tt_erf"},           {"math.absf", bi::math::Fabs},
+      {"math.floor", bi::math::Floor},  {"math.ceil", bi::math::Ceil}};
+  auto it = unary.find(n);
+  if (it != unary.end())
+    return ctx.call(it->second, {cur});
+  return nullptr;
+}
+
+// An op that maps each element of `chain` to one output element, with every
+// other operand uniform over the tile. Such an op can run on a fragment's
+// thread_elements() without knowing where the lane sits in the tile.
+static bool isElementwiseEpilogue(Operation *op, Value chain) {
+  if (!op || op->getNumResults() != 1)
+    return false;
+  if (isa<arith::TruncFOp>(op))
+    return false;
+  // Only ops scalarEpilogueExpr can render; the two lists must not drift, or a
+  // matched op reaches emission with no expression for it.
+  if (!isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+           tt::PreciseDivFOp, math::ExpOp, math::Exp2Op, math::LogOp,
+           math::SqrtOp, math::RsqrtOp, math::TanhOp, math::ErfOp,
+           math::AbsFOp, math::FloorOp, math::CeilOp>(op))
+    return false;
+  auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  auto chainTy = dyn_cast<RankedTensorType>(chain.getType());
+  if (!resTy || !chainTy || resTy.getShape() != chainTy.getShape() ||
+      resTy.getEncoding() != chainTy.getEncoding())
+    return false;
+  bool binary = op->getNumOperands() == 2;
+  int chainUses = 0, uniformOperands = 0;
+  for (Value o : op->getOperands()) {
+    if (o == chain) {
+      ++chainUses;
+      continue;
+    }
+    Value src = peelBroadcast(o);
+    bool uniform = definingOp<tt::SplatOp>(src) != nullptr;
+    if (auto cst = src.getDefiningOp<arith::ConstantOp>())
+      uniform |= isa<SplatElementsAttr>(cst.getValue());
+    if (!uniform)
+      return false;
+    ++uniformOperands;
+  }
+  // The chain has to flow through exactly once, and a binary form needs its
+  // other side to be the uniform value emission will read.
+  if (chainUses != 1)
+    return false;
+  return binary ? uniformOperands == 1 : uniformOperands == 0;
+}
+
 std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   Operation *site = forResult.getDefiningOp();
   auto rej = [&](StringRef why) {
@@ -2880,6 +2990,38 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
       return rej("bias-add-not-single-use");
     chain = biased;
   }
+  // A pure elementwise epilogue keeps the tile in fragment layout: every op
+  // maps one element to one element, so it runs on thread_elements() in place.
+  // Operands other than the chain must be uniform across the tile (a splat or a
+  // scalar constant), or the fragment would need a second per-element source.
+  //
+  // Only the unmasked store can carry it. A boundary-masked store keeps a
+  // threadgroup fallback arm that streams the pool image written by the fast
+  // arm, and that image is post-epilogue, so the ragged tile would have the
+  // epilogue applied twice.
+  SmallVector<Operation *> chainOps;
+  Value elemChain = chain;
+  while (true) {
+    Operation *user = *elemChain.user_begin();
+    if (!isElementwiseEpilogue(user, elemChain))
+      break;
+    if (!user->getResult(0).hasOneUse())
+      break;
+    chainOps.push_back(user);
+    elemChain = user->getResult(0);
+  }
+  if (!chainOps.empty()) {
+    Value probe = elemChain;
+    if (auto tf = dyn_cast<arith::TruncFOp>(*probe.user_begin()))
+      probe = tf.getResult();
+    if (auto cv = dyn_cast<ttg::ConvertLayoutOp>(*probe.user_begin()))
+      if (auto st = dyn_cast<tt::StoreOp>(*cv.getResult().user_begin()))
+        if (!st.getMask()) {
+          ds.elementwise = chainOps;
+          chain = elemChain;
+        }
+  }
+
   if (auto tf = dyn_cast<arith::TruncFOp>(*chain.user_begin())) {
     if (!tf.getResult().hasOneUse())
       return rej("narrow-not-single-use");

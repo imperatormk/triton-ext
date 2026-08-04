@@ -233,6 +233,8 @@ private:
   msl::Stmt *accFragDecl(msl::MatrixType *frag, StringRef name);
   msl::Stmt *sgLoad(StringRef frag, StringRef base, int64_t off, int64_t ld,
                     bool transpose = false);
+  msl::Expr *uniformSplatScalar(Value v);
+  msl::Expr *scalarEpilogueExpr(Operation *op, msl::Expr *cur, msl::Expr *rhs);
   msl::Stmt *sgStore(StringRef acc, StringRef base, int64_t off, int64_t ld);
   msl::Stmt *sgMultiplyAccumulate(StringRef acc, StringRef a, StringRef b);
   msl::Expr *readbackValue(StringRef buf, msl::Expr *off, StringRef base);

@@ -3078,8 +3078,17 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   // emitted under the full-tile predicate -- the ragged arm keeps the original
   // masked load.
   if (Value biased = matchRowBroadcastBias(chain, ds)) {
-    if (!biased.hasOneUse())
-      return rej("bias-add-not-single-use");
+    // As for the accumulator itself, several uses are fine when they all land
+    // inside one elementwise region -- addmm followed by gelu reads the biased
+    // value twice and rejoins.
+    if (!biased.hasOneUse()) {
+      SmallVector<Operation *> probeOps;
+      Value probeOut;
+      auto biasedTy = dyn_cast<RankedTensorType>(biased.getType());
+      if (!biasedTy ||
+          !collectElementwiseRegion(biased, biasedTy, probeOps, probeOut))
+        return rej("bias-add-not-single-use");
+    }
     chain = biased;
   }
   // A pure elementwise epilogue keeps the tile in fragment layout: every op
@@ -3091,24 +3100,17 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   // threadgroup fallback arm that streams the pool image written by the fast
   // arm, and that image is post-epilogue, so the ragged tile would have the
   // epilogue applied twice.
+  // Whether the fold is legal cannot be decided here: it turns on the store's
+  // bounds, which are only matched further down. The region is carried through
+  // so the rest of the walk sees the store, and the fold is committed at the
+  // end once raggedness is known.
   SmallVector<Operation *> regionOps;
   Value regionOut;
+  Value regionAcc;
   if (auto accTy = dyn_cast<RankedTensorType>(chain.getType()))
     if (collectElementwiseRegion(chain, accTy, regionOps, regionOut)) {
-      Value probe = regionOut;
-      if (auto tf = dyn_cast<arith::TruncFOp>(*probe.user_begin()))
-        probe = tf.getResult();
-      // The ragged fallback arm streams the pool image the fast arm wrote, and
-      // that image is already post-epilogue, so a tile that can go ragged would
-      // apply the epilogue twice. An unmasked store has no such arm; a masked
-      // one only qualifies once the bounds prove it never goes ragged.
-      if (auto cv = dyn_cast<ttg::ConvertLayoutOp>(*probe.user_begin()))
-        if (auto st = dyn_cast<tt::StoreOp>(*cv.getResult().user_begin()))
-          if (!st.getMask()) {
-            ds.elementwise = regionOps;
-            ds.elementwiseAcc = chain;
-            chain = regionOut;
-          }
+      regionAcc = chain;
+      chain = regionOut;
     }
 
   if (auto tf = dyn_cast<arith::TruncFOp>(*chain.user_begin())) {
@@ -3187,6 +3189,21 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   ds.narrowTo = narrowTo;
   ds.narrowOp = narrowOp;
   ds.cvt = cvt;
+
+  // The ragged fallback arm streams the pool image the fast arm wrote, and that
+  // image is already post-epilogue, so a tile that can go ragged would apply
+  // the epilogue twice. An unmasked store has no such arm, and a masked one
+  // qualifies only when its bounds prove the tile is never ragged -- the same
+  // proof the emission site uses to decide the arm is unreachable.
+  if (!regionOps.empty()) {
+    bool neverRagged =
+        !store.getMask() ||
+        directStoreNeverRagged(ds, cTy.getShape()[0], cTy.getShape()[1]);
+    if (!neverRagged)
+      return rej("epilogue-store-may-be-ragged");
+    ds.elementwise = regionOps;
+    ds.elementwiseAcc = regionAcc;
+  }
   return ds;
 }
 

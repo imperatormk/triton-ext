@@ -2070,8 +2070,11 @@ bool MSLEmitter::emitDotFused(
     // Cached names are only in scope within the block that declared them, so
     // each emission site starts fresh.
     auto resetBias = [&] { biasVal.clear(); };
-    auto biased = [&](msl::Block &blk, StringRef accName,
-                      int64_t ni) -> std::string {
+    // `warpCol` is the emitting warp's own column offset when one block covers
+    // every warp; the bias is indexed from its own tile origin, so it has to
+    // carry the same offset the store does or every warp reads warp 0's slice.
+    auto biased = [&](msl::Block &blk, StringRef accName, int64_t ni,
+                      msl::Expr *warpCol) -> std::string {
       if (!d.biasPtr)
         return accName.str();
       auto it = biasVal.find(ni);
@@ -2079,10 +2082,13 @@ bool MSLEmitter::emitDotFused(
         std::array<std::string, 2> vs;
         for (int e = 0; e < 2; ++e) {
           vs[e] = fresh();
-          msl::Expr *addr =
-              ctx.addChain({ctx.var(scalarName(d.biasPtr)),
-                            ctx.var(scalarName(d.biasCol)),
-                            ctx.i32lit(ni * 8 + e), ctx.var(biasLaneCol)});
+          SmallVector<msl::Expr *> parts{ctx.var(scalarName(d.biasPtr)),
+                                         ctx.var(scalarName(d.biasCol))};
+          if (warpCol)
+            parts.push_back(warpCol);
+          parts.push_back(ctx.i32lit(ni * 8 + e));
+          parts.push_back(ctx.var(biasLaneCol));
+          msl::Expr *addr = ctx.addChain(parts);
           blk.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::F32), vs[e],
                                      ctx.deref(ctx.paren(addr))));
         }
@@ -2136,8 +2142,9 @@ bool MSLEmitter::emitDotFused(
                      uniform(d.ldc)),
              ctx.paren(ctx.addChain({ctx.var(colB), wCol,
                                      ctx.i32lit(ni * 8)}))});
-        std::string sv =
-            narrowed(inner, elementwised(inner, biased(inner, fusedDot.accNames[j], ni)));
+        std::string sv = narrowed(
+            inner, elementwised(inner, biased(inner, fusedDot.accNames[j], ni,
+                                              wCol)));
         inner.push_back(ctx.exprStmt(ctx.call(
             msl::builtin::sg::Store, {ctx.var(sv), off, uniform(d.ldc)})));
       }
@@ -2158,8 +2165,9 @@ bool MSLEmitter::emitDotFused(
                ctx.mul(ctx.paren(ctx.add(ctx.var(rowB), ctx.i32lit(mi * 8))),
                        uniform(d.ldc)),
                ctx.paren(ctx.add(ctx.var(colB), ctx.i32lit(ni * 8)))});
-          std::string sv =
-              narrowed(inner, elementwised(inner, biased(inner, fusedDot.accNames[j], ni)));
+          std::string sv = narrowed(
+              inner, elementwised(inner, biased(inner, fusedDot.accNames[j], ni,
+                                                nullptr)));
           inner.push_back(ctx.exprStmt(ctx.call(
               msl::builtin::sg::Store, {ctx.var(sv), off, uniform(d.ldc)})));
         }

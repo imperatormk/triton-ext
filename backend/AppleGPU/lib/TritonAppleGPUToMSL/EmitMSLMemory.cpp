@@ -276,7 +276,11 @@ void MSLEmitter::scanPool(Operation *op) {
       int64_t cFull = M * N * accBytes;
       int64_t cBudget = poolBudget() - dmaSlack;
       int64_t cBanded = std::min(cFull, cBudget);
-      if (stagedAB == aBy + bBy &&
+      // Mirrors planDot's panel gate exactly. Testing "nothing was staged
+      // free" instead lets a device-direct A (which zeroes stagedA but leaves
+      // stagedB at the cap) reserve panel dims here while planDot emits a
+      // whole-tile fused dot, and the dot then runs off the end of the pool.
+      if (stagedAB > kTGResidentBudgetBytes &&
           dotNeedsPanel(M, N, Kd, elemBytes, accBytes)) {
         int64_t mp, np;
         dotPanelDims(M, N, Kd, elemBytes, accBytes, mp, np);

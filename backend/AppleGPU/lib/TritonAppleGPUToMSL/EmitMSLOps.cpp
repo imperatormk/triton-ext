@@ -320,7 +320,15 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
       carried.push_back({});
       continue;
     }
-    auto &initNames = names(init);
+    // An init the walk has not named yet has no registers to copy from, and
+    // indexing its (empty) name list is an out-of-bounds read rather than a
+    // diagnosable failure.
+    auto it = valMap.find(init);
+    if (it == valMap.end() || it->second.empty()) {
+      mslReject(op, "emitFusedGemm", "iter-arg-init-unbound");
+      return false;
+    }
+    auto &initNames = it->second;
     if (i == iterIdx) {
       SmallVector<std::string> ids = declResultVars(res, body);
       initBase.assign(initNames.begin(), initNames.end());
@@ -331,6 +339,10 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
       continue;
     }
     SmallVector<std::string> vars = declResultVars(res, body);
+    if (initNames.size() != 1 && initNames.size() < vars.size()) {
+      mslReject(op, "emitFusedGemm", "iter-arg-init-arity");
+      return false;
+    }
     for (size_t r = 0; r < vars.size(); ++r)
       body.push_back(ctx.assignStmt(
           ctx.var(vars[r]), ctx.var(initNames[initNames.size() == 1 ? 0 : r])));
@@ -360,7 +372,14 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
   for (auto [i, operand] : llvm::enumerate(term->getOperands())) {
     if (i == iterIdx || carried[i].empty())
       continue;
-    auto &src = names(operand);
+    auto srcIt = valMap.find(operand);
+    if (srcIt == valMap.end() || srcIt->second.empty() ||
+        (srcIt->second.size() != 1 &&
+         srcIt->second.size() < carried[i].size())) {
+      mslReject(op, "emitFusedGemm", "yield-operand-unbound");
+      return false;
+    }
+    auto &src = srcIt->second;
     for (size_t r = 0; r < carried[i].size(); ++r)
       loopBody.push_back(ctx.assignStmt(ctx.var(carried[i][r]),
                                         ctx.var(src[src.size() == 1 ? 0 : r])));

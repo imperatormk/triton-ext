@@ -377,6 +377,11 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
       cond = ctx.lit("true");
       ds->alwaysFullTile = true;
     }
+    if (ds->tileGuard) {
+      cond = ctx.paren(
+          ctx.binary(B::LAnd, cond, ctx.var(scalarName(ds->tileGuard))));
+      ds->alwaysFullTile = false;
+    }
     body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), ft, cond));
     fusedDot.direct = ds;
     directStoreHandled[ds->store.getOperation()] = ft;

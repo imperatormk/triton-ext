@@ -557,7 +557,8 @@ private:
   // The store boundary mask `(row < boundM) && (col < boundN)`, with row/col
   // the same per-tile indices as the address. Extracts the two bounds.
   bool matchBoundaryMask(Value m, Value rowBase, Value colBase,
-                         UniformInt &boundM, UniformInt &boundN);
+                         UniformInt &boundM, UniformInt &boundN,
+                         Value &tileGuard);
 
   // True when a boundary-masked store can never actually be ragged: both bounds
   // are compile-time literals, and each tile origin is provably a multiple of

@@ -50,6 +50,9 @@ enum class FusedDotPhase { None, Decl, MMA, Readback };
 struct DirectStore {
   tt::StoreOp store;
   Value basePtr;     // C matrix base pointer (scalar kernel arg)
+  Value baseOffIdx;          // tile-uniform element offset (bmm's batch term),
+  UniformInt baseOffStride;  // factored as idx * stride; idx null when folded
+  Value tileGuard;    // tile-uniform store predicate (bmm's idx_q < BATCH)
   UniformInt ldc;    // row stride, col stride is 1 (row-major)
   Value rowBase;     // global row of the tile's top-left element (scalar)
   Value colBase;     // global col of the tile's top-left element (scalar)

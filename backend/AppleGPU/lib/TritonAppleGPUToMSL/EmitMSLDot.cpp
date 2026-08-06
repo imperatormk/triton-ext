@@ -1974,6 +1974,21 @@ bool MSLEmitter::emitDotFused(
       return u.lit ? static_cast<msl::Expr *>(ctx.i32lit(*u.lit))
                    : ctx.var(scalarName(u.val));
     };
+    if (d.baseOffStride) {
+      msl::Type *et = d.narrowTo ? scalarType(d.narrowTo)
+                                 : ctx.scalar(msl::Scalar::F32);
+      std::string shifted = fresh();
+      msl::Expr *off =
+          d.baseOffIdx
+              ? ctx.paren(ctx.binary(B::Mul,
+                                     ctx.var(scalarName(d.baseOffIdx)),
+                                     ctx.i32lit(*d.baseOffStride.lit)))
+              : static_cast<msl::Expr *>(ctx.i32lit(*d.baseOffStride.lit));
+      body.push_back(
+          ctx.declStmt(ctx.ptr(et, msl::AddrSpace::Device), shifted,
+                       ctx.binary(B::Add, ctx.var(base), off)));
+      base = shifted;
+    }
     // simdgroup_store requires the destination scalar to match the fragment's
     // element type, so a narrow output needs a narrow fragment: each thread
     // owns two elements, converted through thread_elements().
@@ -2900,10 +2915,26 @@ bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, UniformInt &ldc,
 // whenever the IR happened to emit them the other way round, which only shows
 // up when both axes are ragged AND M != N.
 bool MSLEmitter::matchBoundaryMask(Value m, Value rowBase, Value colBase,
-                                   UniformInt &boundM, UniformInt &boundN) {
+                                   UniformInt &boundM, UniformInt &boundN,
+                                   Value &tileGuard) {
   auto conj = definingOp<arith::AndIOp>(m);
   if (!conj)
     return false;
+  // bmm ands in a tile-uniform `idx_q < BATCH`, which guards the whole tile
+  // rather than an axis; the row/col pair sits in the conjunction under it.
+  auto peelUniform = [&](Value uni, Value rest) {
+    auto sp = definingOp<tt::SplatOp>(uni);
+    auto in = definingOp<arith::AndIOp>(rest);
+    if (!sp || !in)
+      return false;
+    if (isa<RankedTensorType>(sp.getSrc().getType()))
+      return false;
+    tileGuard = sp.getSrc();
+    conj = in;
+    return true;
+  };
+  peelUniform(conj.getRhs(), conj.getLhs()) ||
+      peelUniform(conj.getLhs(), conj.getRhs());
   auto cmpBound = [&](Value side, Value &axis) -> UniformInt {
     Value c = peelBroadcastExpand(side);
     auto cmp = definingOp<arith::CmpIOp>(c);
@@ -3268,6 +3299,43 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
     return rej("ptr-base-not-block-arg");
   Value rowBase, colBase;
   UniformInt ldc;
+  // bmm's batch term is uniform across the tile, so it belongs on the base
+  // pointer; left in place neither term of the outer add matches a row or col.
+  Value tileOff = ptr.getOffset();
+  if (!rowOff) {
+    if (auto outer = definingOp<arith::AddIOp>(tileOff)) {
+      // A folded batch offset arrives as a literal; otherwise it stays factored
+      // as `idx * stride`, because the product itself is never named -- its only
+      // user is the splat this path elides.
+      auto take = [&](const UniformInt &u) {
+        if (u.lit) {
+          ds.baseOffStride = u;
+          return true;
+        }
+        if (!u.val)
+          return false;
+        auto mul = dyn_cast_or_null<arith::MulIOp>(u.val.getDefiningOp());
+        if (!mul)
+          return false;
+        UniformInt s = matchUniformInt(mul.getRhs());
+        Value idx = mul.getLhs();
+        if (!s) {
+          s = matchUniformInt(mul.getLhs());
+          idx = mul.getRhs();
+        }
+        if (!s.lit || valMap.find(idx) == valMap.end())
+          return false;
+        ds.baseOffIdx = idx;
+        ds.baseOffStride = s;
+        return true;
+      };
+      if (UniformInt u = matchUniformInt(outer.getRhs()); take(u)) {
+        tileOff = outer.getLhs();
+      } else if (UniformInt u2 = matchUniformInt(outer.getLhs()); take(u2)) {
+        tileOff = outer.getRhs();
+      }
+    }
+  }
   if (rowOff) {
     Value cb = matchTileIndex(ptr.getOffset());
     auto mul = definingOp<arith::MulIOp>(peelBroadcastExpand(rowOff));
@@ -3287,12 +3355,13 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
     rowBase = rb;
     colBase = cb;
     ldc = stride;
-  } else if (!matchRowMajorOffset(ptr.getOffset(), rowBase, ldc, colBase)) {
+  } else if (!matchRowMajorOffset(tileOff, rowBase, ldc, colBase)) {
     return rej("offset-not-row-major");
   }
   UniformInt boundM, boundN;
   if (store.getMask()) {
-    if (!matchBoundaryMask(store.getMask(), rowBase, colBase, boundM, boundN))
+    if (!matchBoundaryMask(store.getMask(), rowBase, colBase, boundM, boundN,
+                           ds.tileGuard))
       return rej("mask-not-boundary");
   }
   ds.store = store;
@@ -3462,6 +3531,10 @@ bool MSLEmitter::fusedGemmCHasFallback(tt::DotOp d) {
   auto ds = matchDirectStore(forOp.getResult(m->second));
   if (!ds || !ds->boundM)
     return false;
+  // A tile-uniform guard keeps the fallback arm live even when neither axis can
+  // be ragged, so C still needs its pool reservation.
+  if (ds->tileGuard)
+    return true;
   auto cTy = cast<RankedTensorType>(d.getResult().getType());
   int rk = cTy.getRank();
   return !directStoreNeverRagged(*ds, cTy.getShape()[rk - 2],

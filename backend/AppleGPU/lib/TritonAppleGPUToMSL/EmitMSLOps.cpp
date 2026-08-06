@@ -2297,13 +2297,22 @@ std::optional<bool> MSLEmitter::emitAtomicRMW(Operation *op, msl::Block &body) {
       warpFree = masks.lookup(StringAttr::get(c, "warp"));
       regFree = masks.lookup(StringAttr::get(c, "register"));
     }
-    std::string threadPred;
+    // Built as real nodes rather than concatenated text: a ctx.var() holding a
+    // whole expression string reads as a variable named "((v6 & 31) == 0)",
+    // which matches no declaration, so dead-local elimination never sees the
+    // use of laneId/warpId and drops their decls out from under this.
+    auto freeIsZero = [&](const std::string &name, unsigned mask) -> msl::Expr * {
+      return ctx.paren(ctx.binary(
+          B::Eq, ctx.paren(ctx.binary(B::And, ctx.var(name), ctx.i32lit(mask))),
+          ctx.i32lit(0)));
+    };
+    msl::Expr *threadPred = nullptr;
     if (laneFree)
-      threadPred = "((" + laneId + " & " + std::to_string(laneFree) + ") == 0)";
+      threadPred = freeIsZero(laneId, laneFree);
     if (warpFree) {
-      std::string wp =
-          "((" + warpId + " & " + std::to_string(warpFree) + ") == 0)";
-      threadPred = threadPred.empty() ? wp : threadPred + " && " + wp;
+      msl::Expr *wp = freeIsZero(warpId, warpFree);
+      threadPred =
+          threadPred ? ctx.binary(B::LAnd, threadPred, wp) : wp;
     }
     tt::MemSemantic sem = ar.getSem();
 
@@ -2321,8 +2330,8 @@ std::optional<bool> MSLEmitter::emitAtomicRMW(Operation *op, msl::Block &body) {
       if (uniform)
         guard =
             ctx.binary(B::Eq, ctx.member(ctx.var(tidId), "x"), ctx.lit("0"));
-      else if (!threadPred.empty())
-        guard = ctx.var(threadPred);
+      else if (threadPred)
+        guard = threadPred;
       if (hasMask) {
         const std::string &m = (*mask)[mask->size() == 1 ? 0 : r];
         guard = guard ? static_cast<msl::Expr *>(
@@ -2375,8 +2384,15 @@ std::optional<bool> MSLEmitter::emitAtomicRMW(Operation *op, msl::Block &body) {
         for (msl::Stmt *s : inner)
           body.push_back(s);
       if (!uniform && laneFree) {
-        std::string src =
-            "(uint)(" + laneId + " & " + std::to_string(~laneFree & 31) + ")";
+        // shuffle() takes its lane operand as text, so the laneId use has to be
+        // materialised into a real local for dead-local elimination to see it.
+        std::string src = fresh();
+        msl::Type *u32 = ctx.scalar(msl::Scalar::U32);
+        body.push_back(ctx.declStmt(
+            u32, src,
+            ctx.cast(CS::CStyle, u32,
+                     ctx.paren(ctx.binary(B::And, ctx.var(laneId),
+                                          ctx.i32lit(~laneFree & 31))))));
         id = shuffle(msl::builtin::simd::Shuffle, sc, id, src, body);
       }
       ids[r] = id;

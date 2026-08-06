@@ -824,6 +824,27 @@ void MSLEmitter::emitTileRoundTrip(
   int64_t elemBytes = byteWidth(resTy.getElementType());
   int64_t total = tileSize(resTy);
 
+  // When every register lands on the slot it is read back from, each thread
+  // recovers exactly the values it wrote and the pool traffic is pure overhead:
+  // the permutation was already absorbed into the result encoding. Comparing the
+  // rendered index expressions is conservative -- it proves the addresses agree
+  // for every (lane, warp) without reasoning about the layouts.
+  if (srcRc == resRc && srcNames.size() == (size_t)srcRc) {
+    auto render = [&](msl::Expr *e) {
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      msl::MSLPrinter(os).printExpr(e);
+      return os.str();
+    };
+    bool identity = true;
+    for (int r = 0; r < resRc && identity; ++r)
+      identity = render(srcOff(r)) == render(layout.flatTileOffset(resTy, r));
+    if (identity) {
+      bindRegs(res, srcNames);
+      return;
+    }
+  }
+
   std::string buf = fresh();
   body.push_back(ctx.declStmt(ctx.ptr(scTy, msl::AddrSpace::Threadgroup), buf,
                               poolRegion(0, sc)));

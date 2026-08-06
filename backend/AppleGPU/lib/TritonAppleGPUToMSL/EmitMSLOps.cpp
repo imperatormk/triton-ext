@@ -281,6 +281,30 @@ void MSLEmitter::emitMapCFG(Region &region, ArrayRef<std::string> capture,
   body.push_back(mapCFGStateMachine(state, cases));
 }
 
+// inductor defines the batch offset and tile guard *after* the K-loop, so the
+// walk has not named them when the epilogue needs them. Hoist their chains.
+bool MSLEmitter::preEmitScalarChain(Value v, msl::Block &body) {
+  if (!v || valMap.count(v))
+    return true;
+  if (isa<BlockArgument>(v))
+    return false;
+  Operation *def = v.getDefiningOp();
+  if (!def || def->getNumResults() != 1 || !isPure(def))
+    return false;
+  if (isa<RankedTensorType>(v.getType()))
+    return false;
+  if (!isa<arith::ArithDialect>(def->getDialect()) &&
+      !isa<tt::GetProgramIdOp>(def))
+    return false;
+  for (Value o : def->getOperands())
+    if (!preEmitScalarChain(o, body))
+      return false;
+  if (!emitOp(def, body))
+    return false;
+  preEmitted.insert(def);
+  return true;
+}
+
 // Fused GEMM K-loop: carry iter-args, run the dot Decl phase, the K-loop with
 // the MMA-phase dot in its body, the non-acc carry, direct-store setup, then
 // the Readback-phase dot.
@@ -347,6 +371,10 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
   // Matched during the pool scan, before scalars bind; only here is it known
   // whether the walk actually named them.
   auto named = [&](Value v) { return !v || valMap.count(v); };
+  if (ds) {
+    preEmitScalarChain(ds->baseOff.val, body);
+    preEmitScalarChain(ds->tileGuard, body);
+  }
   if (ds && (!named(ds->baseOff.val) || !named(ds->tileGuard)))
     ds.reset();
   if (ds) {
@@ -386,7 +414,6 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
     if (ds->tileGuard) {
       cond = ctx.paren(
           ctx.binary(B::LAnd, cond, ctx.var(scalarName(ds->tileGuard))));
-      ds->alwaysFullTile = false;
     }
     body.push_back(ctx.declStmt(ctx.scalar(msl::Scalar::I1), ft, cond));
     fusedDot.direct = ds;

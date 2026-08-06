@@ -533,6 +533,11 @@ private:
   // handler guards the store on the negation to avoid a double write.
   DenseMap<Operation *, std::string> directStoreHandled;
   DenseSet<Operation *> directStoreRaggedHandled;
+  // Scalar defs hoisted ahead of the walk so the fused epilogue can name them;
+  // the walk must not emit them a second time.
+  DenseSet<Operation *> preEmitted;
+
+  bool preEmitScalarChain(Value v, msl::Block &body);
 
   static bool tracesToKernelArg(Value v);
 

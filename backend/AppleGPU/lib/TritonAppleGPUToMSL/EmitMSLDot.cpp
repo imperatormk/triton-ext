@@ -3506,10 +3506,9 @@ bool MSLEmitter::fusedGemmCHasFallback(tt::DotOp d) {
   auto ds = matchDirectStore(forOp.getResult(m->second));
   if (!ds || !ds->boundM)
     return false;
-  // A tile-uniform guard keeps the fallback arm live even when neither axis can
-  // be ragged, and emission may decline the direct path outright; either way C
-  // still needs its pool reservation.
-  if (ds->tileGuard || ds->baseOff)
+  // Emission may decline the direct path outright, so C still needs its pool
+  // reservation whenever the batch offset is in play.
+  if (ds->baseOff)
     return true;
   auto cTy = cast<RankedTensorType>(d.getResult().getType());
   int rk = cTy.getRank();

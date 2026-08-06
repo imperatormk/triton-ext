@@ -270,6 +270,8 @@ msl::Block MSLEmitter::walkBlock(Block &blk, unsigned depth) {
     // fused-dot MMA phase emits it at that point.
     if (deferPrefetchLoad(&op))
       continue;
+    if (preEmitted.count(&op))
+      continue;
     if (emitOp(&op, body))
       continue;
     // No real-kernel op family falls through: emitOp is exhaustive. An

@@ -1974,19 +1974,13 @@ bool MSLEmitter::emitDotFused(
       return u.lit ? static_cast<msl::Expr *>(ctx.i32lit(*u.lit))
                    : ctx.var(scalarName(u.val));
     };
-    if (d.baseOffStride) {
+    if (d.baseOff) {
       msl::Type *et = d.narrowTo ? scalarType(d.narrowTo)
                                  : ctx.scalar(msl::Scalar::F32);
       std::string shifted = fresh();
-      msl::Expr *off =
-          d.baseOffIdx
-              ? ctx.paren(ctx.binary(B::Mul,
-                                     ctx.var(scalarName(d.baseOffIdx)),
-                                     ctx.i32lit(*d.baseOffStride.lit)))
-              : static_cast<msl::Expr *>(ctx.i32lit(*d.baseOffStride.lit));
       body.push_back(
           ctx.declStmt(ctx.ptr(et, msl::AddrSpace::Device), shifted,
-                       ctx.binary(B::Add, ctx.var(base), off)));
+                       ctx.binary(B::Add, ctx.var(base), uniform(d.baseOff))));
       base = shifted;
     }
     // simdgroup_store requires the destination scalar to match the fragment's
@@ -3302,31 +3296,12 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
   // bmm's batch term is uniform across the tile, so it belongs on the base
   // pointer; left in place neither term of the outer add matches a row or col.
   Value tileOff = ptr.getOffset();
-  if (!rowOff) {
+  {
     if (auto outer = definingOp<arith::AddIOp>(tileOff)) {
-      // A folded batch offset arrives as a literal; otherwise it stays factored
-      // as `idx * stride`, because the product itself is never named -- its only
-      // user is the splat this path elides.
       auto take = [&](const UniformInt &u) {
-        if (u.lit) {
-          ds.baseOffStride = u;
-          return true;
-        }
-        if (!u.val)
+        if (!u)
           return false;
-        auto mul = dyn_cast_or_null<arith::MulIOp>(u.val.getDefiningOp());
-        if (!mul)
-          return false;
-        UniformInt s = matchUniformInt(mul.getRhs());
-        Value idx = mul.getLhs();
-        if (!s) {
-          s = matchUniformInt(mul.getLhs());
-          idx = mul.getRhs();
-        }
-        if (!s.lit || valMap.find(idx) == valMap.end())
-          return false;
-        ds.baseOffIdx = idx;
-        ds.baseOffStride = s;
+        ds.baseOff = u;
         return true;
       };
       if (UniformInt u = matchUniformInt(outer.getRhs()); take(u)) {
@@ -3532,8 +3507,9 @@ bool MSLEmitter::fusedGemmCHasFallback(tt::DotOp d) {
   if (!ds || !ds->boundM)
     return false;
   // A tile-uniform guard keeps the fallback arm live even when neither axis can
-  // be ragged, so C still needs its pool reservation.
-  if (ds->tileGuard)
+  // be ragged, and emission may decline the direct path outright; either way C
+  // still needs its pool reservation.
+  if (ds->tileGuard || ds->baseOff)
     return true;
   auto cTy = cast<RankedTensorType>(d.getResult().getType());
   int rk = cTy.getRank();

@@ -343,7 +343,13 @@ bool MSLEmitter::emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
   }
   body.push_back(forScope(op, std::move(loopBody), iv, ivTy));
 
-  if (auto ds = matchDirectStore(op.getResult(iterIdx))) {
+  auto ds = matchDirectStore(op.getResult(iterIdx));
+  // Matched during the pool scan, before scalars bind; only here is it known
+  // whether the walk actually named them.
+  auto named = [&](Value v) { return !v || valMap.count(v); };
+  if (ds && (!named(ds->baseOff.val) || !named(ds->tileGuard)))
+    ds.reset();
+  if (ds) {
     int64_t M = cast<RankedTensorType>(dot.getResult().getType()).getShape()[0];
     int64_t N = cast<RankedTensorType>(dot.getResult().getType()).getShape()[1];
     std::string ft = fresh();

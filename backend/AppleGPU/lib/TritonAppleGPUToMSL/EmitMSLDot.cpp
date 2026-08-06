@@ -3150,6 +3150,22 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
       mslReject(site, "matchDirectStore", why);
     return std::nullopt;
   };
+  // The direct path stores the raw MMA fragments, which hold only what this
+  // loop accumulated. Anything the accumulator started from is folded in by the
+  // pool readback, so a non-zero init (mm_plus_mm chains one loop's result into
+  // the next) would be dropped silently.
+  if (auto forOp = dyn_cast_or_null<scf::ForOp>(forResult.getDefiningOp())) {
+    Value init =
+        forOp.getInitArgs()[cast<OpResult>(forResult).getResultNumber()];
+    DenseElementsAttr initAttr;
+    if (!matchPattern(init, m_Constant(&initAttr)) || !initAttr.isSplat())
+      return rej("acc-init-not-zero");
+    Attribute splat = initAttr.getSplatValue<Attribute>();
+    auto fp = dyn_cast<FloatAttr>(splat);
+    auto in = dyn_cast<IntegerAttr>(splat);
+    if (!(fp && fp.getValue().isZero()) && !(in && in.getValue().isZero()))
+      return rej("acc-init-not-zero");
+  }
   // Several uses are fine when they all land inside one elementwise region --
   // gelu reads the accumulator twice and rejoins -- since the region is then
   // folded into the fragments and nothing else observes the raw accumulator.

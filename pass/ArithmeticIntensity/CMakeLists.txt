@@ -26,13 +26,22 @@ add_mlir_library(${PROJECT_NAME}
     TritonExtensionSupport
 )
 
+# --as-needed is GNU ld only; ld64 links every library on the line regardless,
+# so the whitelist it protects is already the default there.
+if(APPLE)
+  set(_ai_keep_all "")
+  set(_ai_keep_all_end "")
+else()
+  set(_ai_keep_all "-Wl,--no-as-needed")
+  set(_ai_keep_all_end "-Wl,--as-needed")
+endif()
+
 target_link_libraries(${PROJECT_NAME}
   PUBLIC
     TritonExtensionSupport
-    -Wl,--no-as-needed
+    ${_ai_keep_all}
     ${TRITON_LIB}
-    -Wl,--as-needed
-    # ... MLIR libs ...
+    ${_ai_keep_all_end}
 )
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

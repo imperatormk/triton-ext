@@ -2803,6 +2803,22 @@ Value MSLEmitter::peelBroadcastExpand(Value v) {
   return v;
 }
 
+// The tensor axis a broadcast index term varies along, or -1 when no
+// expand_dims establishes it.
+static int broadcastVaryingAxis(Value v) {
+  while (v) {
+    Operation *def = v.getDefiningOp();
+    if (auto b = dyn_cast_or_null<tt::BroadcastOp>(def)) {
+      v = b.getSrc();
+      continue;
+    }
+    if (auto e = dyn_cast_or_null<tt::ExpandDimsOp>(def))
+      return e.getAxis() == 1 ? 0 : 1;
+    return -1;
+  }
+  return -1;
+}
+
 Value MSLEmitter::matchTileIndex(Value v) {
   v = peelBroadcastExpand(v);
   auto add = definingOp<arith::AddIOp>(v);
@@ -2847,6 +2863,12 @@ bool MSLEmitter::matchRowMajorOffset(Value off, Value &rowBase, UniformInt &ldc,
   if (!add)
     return false;
   auto tryTerm = [&](Value rowT, Value colT) {
+    // A column-major store spells the same shape with the axes swapped
+    // (`m*1 + n*ldc`), so matching on which term carries the multiply would
+    // bind rowBase to N and store the fragments transposed.
+    int rowAxis = broadcastVaryingAxis(rowT), colAxis = broadcastVaryingAxis(colT);
+    if (rowAxis == 1 || colAxis == 0)
+      return false;
     Value cb = matchTileIndex(colT);
     if (!cb)
       return false;
@@ -3235,6 +3257,9 @@ std::optional<DirectStore> MSLEmitter::matchDirectStore(Value forResult) {
     auto mul = definingOp<arith::MulIOp>(peelBroadcastExpand(rowOff));
     if (!cb || !mul)
       return rej("split-offset-shape");
+    if (broadcastVaryingAxis(rowOff) == 1 ||
+        broadcastVaryingAxis(ptr.getOffset()) == 0)
+      return rej("split-offset-axes-swapped");
     Value rb = matchTileIndex(mul.getLhs());
     UniformInt stride = matchUniformInt(mul.getRhs());
     if (!rb || !stride) {

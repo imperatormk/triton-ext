@@ -528,7 +528,15 @@ int MSLEmitter::accessVectorWidth(Type valueTy, Value ptr) {
   if (!ai)
     return 1;
   int64_t contig = ai->getContiguity(dim);
+  // AxisInfo states a tensor-of-pointers' divisibility in BYTES while its
+  // contiguity stays in elements, so the two cannot be compared against the
+  // same width. An f16 operand addressed through an odd row stride reports
+  // divisibility 2 -- one element, not two -- and reading that as elements
+  // vectorises a load whose odd rows are misaligned.
   int64_t align = ai->getDivisibility(dim);
+  if (auto pt = dyn_cast<RankedTensorType>(ptr.getType()))
+    if (isa<tt::PointerType>(pt.getElementType()))
+      align = std::max<int64_t>(align / std::max<unsigned>(bits / 8, 1), 1);
   while (width > 1 && (contig < width || align < width))
     width >>= 1;
   return width;

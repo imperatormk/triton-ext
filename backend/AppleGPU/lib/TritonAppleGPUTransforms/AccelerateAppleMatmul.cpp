@@ -77,7 +77,8 @@ bool operandComesFromDot(tt::DotOp dot) {
 // reaches product == min(nFrag, numWarps) (verified exhaustively over all
 // power-of-two M,N up to 2048 and numWarps up to 64). The residual idleness is
 // nFrag < numWarps - fewer 8x8 fragments than warps - which no choice of split
-// can fix; planDot clamps its warp count to nFrag for exactly this reason.
+// can fix; planDot clamps its warp count to nFrag for exactly this reason. The
+// returned warp dims still account for every warp, though: see below.
 SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps,
                                         bool preferRowOwnership = false) {
   unsigned tilesM = std::max<int64_t>(1, M / 8);
@@ -125,6 +126,14 @@ SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps,
       bestN = wn;
     }
   }
+
+  // A tile with fewer 8x8 fragments than warps leaves the surplus warps out of
+  // the encoding entirely, and a slice of that layout has no valid encoding --
+  // tl.max(qk, 1) over a 16x16 dot at numWarps=8 is rejected outright. Grow the
+  // row axis past the fragment count so the warp dim covers every warp; the
+  // extra warps own no rows, which is what they already did implicitly.
+  while (bestM * bestN < (unsigned)numWarps)
+    bestM *= 2;
 
   return {bestM, bestN};
 }

@@ -71,10 +71,15 @@ def _pow_mag(ax, y):
 @triton.jit
 def _pow(x, y):
     # exp(y*log(x)) is only valid for x > 0. x < 0: |x|**y, negated for odd
-    # integer y, NaN for non-integer y (IEEE / metal::pow). x == 0 handled via
-    # exp2(y*log2(0)) -> 0 / inf.
+    # integer y, NaN for non-integer y (IEEE / metal::pow).
     ax = tl.abs(x)
     mag = _pow_mag(ax, y)
+    # x == 0 cannot go through _pow_mag: log2(0) is -inf, and its compensated
+    # product computes fma(y, -inf, +inf), which is NaN for every y. IEEE
+    # pow(0, y) is 1 for y == 0, +inf for y < 0, and 0 otherwise.
+    zero_mag = tl.where(y == 0.0, 1.0,
+                        tl.where(y < 0.0, float("inf"), 0.0))
+    mag = tl.where(ax == 0.0, zero_mag, mag)
     # Sign for negative base: -1 when y is an odd integer, +1 when even, NaN
     # when y is not an integer.
     y_rounded = _round_to_int(y)

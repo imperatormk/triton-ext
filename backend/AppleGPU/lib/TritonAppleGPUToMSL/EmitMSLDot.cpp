@@ -1182,8 +1182,9 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   if (p.numWarps > p.nFrag)
     p.numWarps = p.nFrag;
 
-  p.kind = dotNeedsPanel(p.M, p.N, p.K, byteWidth(aElem), accBytes)
-               ? DotPlan::Kind::Panel
+  bool needsPanel = dotNeedsPanel(p.M, p.N, p.K, byteWidth(aElem), accBytes) &&
+                    p.stagedAB > kTGResidentBudgetBytes;
+  p.kind = needsPanel ? DotPlan::Kind::Panel
            : p.phase != FusedDotPhase::None ? DotPlan::Kind::Fused
                                             : DotPlan::Kind::Direct;
   if (p.kind == DotPlan::Kind::Panel)
@@ -3962,8 +3963,9 @@ int64_t MSLEmitter::dotColChunk(int64_t nT, int64_t kT) {
   if (nT <= 1 || kT <= 0)
     return nT < 1 ? 1 : nT;
   int64_t chunk = kTargetLiveFrags / kT;
-  if (chunk < 1)
-    chunk = 1;
+  // At chunk 1 the cache is cleared every column, so no A reuse survives.
+  if (chunk < 2)
+    chunk = 2;
   if (chunk > nT)
     chunk = nT;
   while (chunk > 1 && nT % chunk)

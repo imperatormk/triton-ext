@@ -2220,6 +2220,9 @@ bool MSLEmitter::emitDotFused(
       // which is only the right mapping when the warp tiling is affine in the
       // warp id -- the same condition the merged fast arm needs.
       if (raggedDirect) {
+        // The drain slots overlay the A/B staging, so every warp must be past
+        // its last staging read before any slot write lands.
+        tgt.push_back(ctx.hardBarrier(false));
         std::string slot = fresh();
         tgt.push_back(ctx.declStmt(
             ctx.ptr(ctx.scalar(msl::Scalar::F32), msl::AddrSpace::Threadgroup),
@@ -2231,23 +2234,65 @@ bool MSLEmitter::emitDotFused(
           wt.frag(0, j, nT, numWarps, mi, ni);
           if (mi * nT + ni >= nFrag)
             continue;
-          tgt.push_back(ctx.hardBarrier(false));
-          tgt.push_back(ctx.exprStmt(
+          // rows/cols this fragment owns, offset by the warp's own subblock
+          msl::Expr *wRowOff =
+              ctx.mul(ctx.paren(ctx.binary(B::Div, ctx.var(warpId),
+                                           ctx.i32lit(wt.wGridN))),
+                      ctx.i32lit(wt.miCount * 8));
+          msl::Expr *wColOff =
+              ctx.mul(ctx.paren(ctx.binary(B::Rem, ctx.var(warpId),
+                                           ctx.i32lit(wt.wGridN))),
+                      ctx.i32lit(wt.niCount * 8));
+          std::string fr = fresh(), fc = fresh();
+          tgt.push_back(ctx.declStmt(
+              ctx.scalar(msl::Scalar::I32), fr,
+              ctx.addChain({ctx.var(rowB), ctx.i32lit(mi * 8), wRowOff})));
+          tgt.push_back(ctx.declStmt(
+              ctx.scalar(msl::Scalar::I32), fc,
+              ctx.addChain({ctx.var(colB), ctx.i32lit(ni * 8), wColOff})));
+          // A fragment wholly inside the bounds stores straight to device and
+          // one wholly outside is skipped; only a straddling fragment takes
+          // the slot round-trip. The conditions are warp-uniform, not
+          // threadgroup-uniform, so the straddle arm may only use simdgroup
+          // barriers -- which suffice, since the slot is per-warp.
+          msl::Expr *fullIn =
+              ctx.binary(B::Le, ctx.paren(ctx.add(ctx.var(fc), ctx.i32lit(8))),
+                         uniform(d.boundN));
+          msl::Expr *anyIn =
+              ctx.binary(B::Lt, ctx.var(fc), uniform(d.boundN));
+          if (!directStoreRowNeverRagged(d, M)) {
+            fullIn = ctx.binary(
+                B::LAnd,
+                ctx.binary(B::Le,
+                           ctx.paren(ctx.add(ctx.var(fr), ctx.i32lit(8))),
+                           uniform(d.boundM)),
+                fullIn);
+            anyIn = ctx.binary(
+                B::LAnd, ctx.binary(B::Lt, ctx.var(fr), uniform(d.boundM)),
+                anyIn);
+          }
+          msl::Block dir;
+          resetBias();
+          std::string dv = narrowed(
+              dir,
+              elementwised(dir,
+                           biased(dir, fusedDot.accNames[j], ni, wColOff)));
+          dir.push_back(ctx.exprStmt(ctx.call(
+              msl::builtin::sg::Store,
+              {ctx.var(dv),
+               ctx.addChain({ctx.var(base),
+                             ctx.mul(ctx.paren(ctx.var(fr)), uniform(d.ldc)),
+                             ctx.var(fc)}),
+               uniform(d.ldc)})));
+          msl::Block drain;
+          drain.push_back(ctx.simdBarrier());
+          drain.push_back(ctx.exprStmt(
               ctx.call(msl::builtin::sg::Store,
                        {ctx.var(fusedDot.accNames[j]), ctx.var(slot),
                         ctx.lit("8")})));
-          tgt.push_back(ctx.hardBarrier(false));
-          // rows/cols this fragment owns, offset by the warp's own subblock
-          msl::Expr *fRow = ctx.addChain(
-              {ctx.var(rowB), ctx.i32lit(mi * 8),
-               ctx.mul(ctx.paren(ctx.binary(B::Div, ctx.var(warpId),
-                                            ctx.i32lit(wt.wGridN))),
-                       ctx.i32lit(wt.miCount * 8))});
-          msl::Expr *fCol = ctx.addChain(
-              {ctx.var(colB), ctx.i32lit(ni * 8),
-               ctx.mul(ctx.paren(ctx.binary(B::Rem, ctx.var(warpId),
-                                            ctx.i32lit(wt.wGridN))),
-                       ctx.i32lit(wt.niCount * 8))});
+          drain.push_back(ctx.simdBarrier());
+          msl::Expr *fRow = ctx.var(fr);
+          msl::Expr *fCol = ctx.var(fc);
           std::string e = fresh(), rr = fresh(), cc2 = fresh();
           std::string gr = fresh(), gc = fresh();
           msl::Block loop;
@@ -2322,12 +2367,16 @@ bool MSLEmitter::emitDotFused(
                              ctx.binary(B::Lt, ctx.var(gr), uniform(d.boundM)),
                              inb);
           loop.push_back(ctx.ifScope(inb, std::move(guarded)));
-          tgt.push_back(ctx.forScope(
+          drain.push_back(ctx.forScope(
               ctx.declStmt(ctx.scalar(msl::Scalar::I32), e, ctx.var(laneId)),
               ctx.binary(B::Lt, ctx.var(e), ctx.i32lit(64)),
               ctx.assignStmt(ctx.var(e), ctx.binary(B::Add, ctx.var(e),
                                                     ctx.i32lit(32))),
               std::move(loop)));
+          msl::Block offEdge;
+          offEdge.push_back(ctx.ifScope(anyIn, std::move(drain)));
+          tgt.push_back(
+              ctx.ifElseScope(fullIn, std::move(dir), std::move(offEdge)));
         }
       } else {
       tgt.push_back(ctx.hardBarrier(false));

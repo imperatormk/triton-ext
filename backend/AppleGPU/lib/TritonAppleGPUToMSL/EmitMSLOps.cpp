@@ -532,7 +532,7 @@ tt::ModuleAxisInfoAnalysis &MSLEmitter::getAxisInfo() {
 // are adjacent along a single tensor dim, (b) the pointer is contiguous and
 // w-aligned along that dim, and (c) the run does not straddle a lane/warp
 // boundary -- all three are exactly what the register bases below encode.
-int MSLEmitter::accessVectorWidth(Type valueTy, Value ptr) {
+int MSLEmitter::accessVectorWidth(Type valueTy, Value ptr, bool *packed) {
   auto rt = dyn_cast<RankedTensorType>(valueTy);
   if (!rt)
     return 1;
@@ -594,8 +594,22 @@ int MSLEmitter::accessVectorWidth(Type valueTy, Value ptr) {
   if (auto pt = dyn_cast<RankedTensorType>(ptr.getType()))
     if (isa<tt::PointerType>(pt.getElementType()))
       align = std::max<int64_t>(align / std::max<unsigned>(bits / 8, 1), 1);
-  while (width > 1 && (contig < width || align < width))
+  while (width > 1 && contig < width)
     width >>= 1;
+  if (width > 1 && align < width) {
+    // A contiguous run whose base is only element-aligned can still go wide
+    // through MSL's packed vector types (alignment = the element's), for f32
+    // and f16 where those types exist. Callers that cannot use packed types
+    // (the async-copy path) pass no out-flag and keep the strict demotion.
+    msl::Scalar sc = cast<msl::ScalarType>(scalarType(elem))->s;
+    bool packable = sc == msl::Scalar::F32 || sc == msl::Scalar::F16;
+    if (packed && packable) {
+      *packed = true;
+    } else {
+      while (width > 1 && align < width)
+        width >>= 1;
+    }
+  }
   return width;
 }
 
@@ -750,11 +764,11 @@ std::optional<bool> MSLEmitter::clampTileOrigin(arith::MulIOp mul,
   return true;
 }
 
-int MSLEmitter::loadVectorWidth(tt::LoadOp ld) {
+int MSLEmitter::loadVectorWidth(tt::LoadOp ld, bool *packed) {
   static const bool disabled = getenv("MSL_DISABLE_LOAD_VECTORIZE") != nullptr;
   if (disabled)
     return 1;
-  return accessVectorWidth(ld.getResult().getType(), ld.getPtr());
+  return accessVectorWidth(ld.getResult().getType(), ld.getPtr(), packed);
 }
 
 int MSLEmitter::storeVectorWidth(tt::StoreOp st) {
@@ -3352,7 +3366,8 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
     SmallVector<std::string> *other =
         ld.getOther() ? &names(ld.getOther()) : nullptr;
     int rc = regCount(res);
-    int vw = loadVectorWidth(ld);
+    bool vwPacked = false;
+    int vw = loadVectorWidth(ld, &vwPacked);
     if (vw < 2 || rc % vw != 0)
       vw = 1;
 
@@ -3400,7 +3415,7 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
           continue;
         }
         auto *scTy = cast<msl::ScalarType>(sc);
-        msl::Type *vecTy = ctx.vector(scTy->s, vw);
+        msl::Type *vecTy = ctx.vector(scTy->s, vw, vwPacked);
         msl::Type *vecPtr = ctx.ptr(vecTy, msl::AddrSpace::Device);
         std::string vid = fresh();
         hot.push_back(ctx.declStmt(
@@ -3425,7 +3440,7 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
         continue;
       }
       auto *scTy = cast<msl::ScalarType>(sc);
-      msl::Type *vecTy = ctx.vector(scTy->s, vw);
+      msl::Type *vecTy = ctx.vector(scTy->s, vw, vwPacked);
       msl::Type *vecPtr = ctx.ptr(vecTy, msl::AddrSpace::Device);
       std::string vid = fresh();
       msl::Block hot;

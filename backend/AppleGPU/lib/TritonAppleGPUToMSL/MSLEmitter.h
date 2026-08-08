@@ -319,8 +319,8 @@ private:
   // Largest power-of-two run of consecutive registers of a tensor of type
   // `valueTy` accessed through `ptr` that is contiguous in memory, hence
   // transferable as one vecN. 1 = no vectorization.
-  int accessVectorWidth(Type valueTy, Value ptr);
-  int loadVectorWidth(tt::LoadOp ld);
+  int accessVectorWidth(Type valueTy, Value ptr, bool *packed = nullptr);
+  int loadVectorWidth(tt::LoadOp ld, bool *packed = nullptr);
   int storeVectorWidth(tt::StoreOp st);
 
   // `x % c` with x already known below c: the op is dropped and its result

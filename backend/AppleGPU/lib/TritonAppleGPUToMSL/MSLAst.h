@@ -52,7 +52,9 @@ struct ScalarType : Type {
 struct VectorType : Type {
   Scalar elem;
   unsigned n;
-  VectorType(Scalar e, unsigned n) : Type(Kind::Vector), elem(e), n(n) {}
+  bool packed;
+  VectorType(Scalar e, unsigned n, bool packed = false)
+      : Type(Kind::Vector), elem(e), n(n), packed(packed) {}
   static bool classof(const Type *t) { return t->kind == Kind::Vector; }
 };
 
@@ -492,7 +494,9 @@ public:
 
   // --- Types ---
   ScalarType *scalar(Scalar s) { return make<ScalarType>(s); }
-  VectorType *vector(Scalar e, unsigned n) { return make<VectorType>(e, n); }
+  VectorType *vector(Scalar e, unsigned n, bool packed = false) {
+    return make<VectorType>(e, n, packed);
+  }
   MatrixType *matrix(MatrixType::Elem e) { return make<MatrixType>(e); }
   AtomicType *atomic(Scalar e) { return make<AtomicType>(e); }
   PointerType *ptr(Type *p, AddrSpace as, bool coherent = false,

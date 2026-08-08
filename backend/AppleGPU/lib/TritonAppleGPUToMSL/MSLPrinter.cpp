@@ -95,6 +95,8 @@ void MSLPrinter::printType(const Type *t) {
     return;
   case Type::Kind::Vector: {
     auto *v = llvm::cast<VectorType>(t);
+    if (v->packed)
+      os << "packed_";
     os << scalarName(v->elem) << v->n;
     return;
   }

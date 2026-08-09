@@ -3548,6 +3548,15 @@ std::optional<bool> MSLEmitter::emitControlFlow(Operation *op,
       }
       auto &initNames = names(init);
       SmallVector<std::string> vars = declResultVars(res, body);
+      // initNames broadcasts at size 1, otherwise it is indexed per result
+      // register. An init value the walk never materialised register-per-
+      // element gives a shorter list, and indexing it by r reads past the end.
+      // emitFusedGemm already guards this; the generic loop must too.
+      if (initNames.size() != 1 && initNames.size() < vars.size()) {
+        mslReject(forOp, "emitFor", "iter-arg-init-arity");
+        emitFailed = true;
+        return {};
+      }
       for (size_t r = 0; r < vars.size(); ++r)
         body.push_back(
             ctx.assignStmt(ctx.var(vars[r]),
@@ -3581,6 +3590,11 @@ std::optional<bool> MSLEmitter::emitControlFlow(Operation *op,
     for (auto [i, init] : llvm::enumerate(wh.getInits())) {
       auto &initNames = names(init);
       SmallVector<std::string> vars = declResultVars(init, body);
+      if (initNames.size() != 1 && initNames.size() < vars.size()) {
+        mslReject(wh, "emitWhile", "iter-arg-init-arity");
+        emitFailed = true;
+        return {};
+      }
       for (size_t r = 0; r < vars.size(); ++r)
         body.push_back(
             ctx.assignStmt(ctx.var(vars[r]),

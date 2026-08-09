@@ -81,9 +81,23 @@ msl::WhileScope *MSLEmitter::whileScope(scf::WhileOp op, msl::Block body) {
 // Per-register `dst[r] = src[bcast]` with the size==1 splat broadcast.
 void MSLEmitter::copyRegs(msl::Block &out, ArrayRef<std::string> dst,
                           ArrayRef<std::string> src) {
-  for (size_t r = 0; r < dst.size(); ++r)
-    out.push_back(
-        ctx.assignStmt(ctx.var(dst[r]), ctx.var(src[src.size() == 1 ? 0 : r])));
+  // src broadcasts at size 1, otherwise it is indexed per destination register.
+  // A branch operand the walk bound to fewer registers than the successor's
+  // block argument declares would index past the end, so copy only the
+  // registers src actually has and flag the shortfall as an emit failure
+  // rather than reading out of bounds.
+  if (src.empty()) {
+    emitFailed = true;
+    return;
+  }
+  if (src.size() != 1 && src.size() < dst.size())
+    emitFailed = true;
+  for (size_t r = 0; r < dst.size(); ++r) {
+    size_t s = src.size() == 1 ? 0 : r;
+    if (s >= src.size())
+      break;
+    out.push_back(ctx.assignStmt(ctx.var(dst[r]), ctx.var(src[s])));
+  }
 }
 
 msl::Block MSLEmitter::branchEdge(Block *succ, Operation::operand_range args,
@@ -183,6 +197,20 @@ MSLEmitter::walkBlock2(Block &blk,
       if (it == hoist.end())
         continue;
       auto &cur = names(res);
+      // The hoist set is built from the op's TYPE before the walk runs, but an
+      // emitter may bind a result dataless (convertLayout does this for a dead
+      // dot-stage, via bindDataless). Such a value has no registers to spill,
+      // and indexing cur by the declared slot count aborts inside SmallVector.
+      // Nothing reads the hoisted slots of a dataless value, so skip it.
+      if (cur.empty())
+        continue;
+      if (cur.size() != 1 && cur.size() < it->second.size()) {
+        op.emitError("EmitMSL: CFG hoist of '" + op.getName().getStringRef() +
+                     "' has " + Twine(cur.size()) + " registers for " +
+                     Twine(it->second.size()) + " hoisted slots");
+        emitFailed = true;
+        break;
+      }
       for (size_t r = 0; r < it->second.size(); ++r)
         body.push_back(ctx.assignStmt(ctx.var(it->second[r]),
                                       ctx.var(cur[cur.size() == 1 ? 0 : r])));

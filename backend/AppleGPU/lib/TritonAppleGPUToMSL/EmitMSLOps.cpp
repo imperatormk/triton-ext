@@ -2646,7 +2646,9 @@ std::optional<bool> MSLEmitter::emitAtomicPoll(Operation *op,
   return std::nullopt;
 }
 
-// tt.atomic_cas: int32/float32/packed16 compare-exchange + uniform spinlock.
+// tt.atomic_cas: 32-bit int/float and packed 16-bit compare-exchange, plus the
+// uniform spinlock. Metal has no 16-bit cmpxchg, so 16-bit types of either kind
+// go through a 32-bit word CAS on the containing aligned word.
 std::optional<bool> MSLEmitter::emitAtomicCAS(Operation *op, msl::Block &body) {
   if (auto ca = dyn_cast<tt::AtomicCASOp>(op)) {
     Value res = ca.getResult();
@@ -2655,7 +2657,7 @@ std::optional<bool> MSLEmitter::emitAtomicCAS(Operation *op, msl::Block &body) {
     msl::Type *scTy = scalarType(scalarTy);
     bool isFloat = isa<FloatType>(scalarTy);
     unsigned bw = scalarTy.getIntOrFloatBitWidth();
-    bool packed16 = isFloat && bw == 16;
+    bool packed16 = bw == 16;
     bool word32 = bw == 32;
     if (!packed16 && !word32)
       return false;

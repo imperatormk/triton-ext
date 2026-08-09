@@ -462,8 +462,13 @@ private:
   bool deferPrefetchLoad(Operation *op);
   void emitPendingPrefetchLoads(msl::Block &body);
 
-  // The single register name of a scalar / single-register value.
-  StringRef scalarName(Value v) { return valMap[v][0]; }
+  // The single register name of a scalar / single-register value. Callers must
+  // not pass a value bound dataless: it has no register to name.
+  StringRef scalarName(Value v) {
+    auto &nm = valMap[v];
+    assert(!nm.empty() && "scalarName on a dataless value");
+    return nm[0];
+  }
 
   // Broadcast-aware per-register operand pick: a splat has 1 name, a tensor
   // has regCount names.

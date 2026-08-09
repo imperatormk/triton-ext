@@ -3069,8 +3069,14 @@ msl::Expr *MSLEmitter::uniformSplatScalar(Value v) {
   if (!isa<RankedTensorType>(v.getType()))
     return nullptr;
   Value src = peelBroadcast(v);
-  if (auto sp = definingOp<tt::SplatOp>(src))
+  if (auto sp = definingOp<tt::SplatOp>(src)) {
+    // A splat of a value the emitter bound dataless (convertLayout does this
+    // for a dead dot-stage) has no register to name, so it is not a scalar the
+    // caller can use.
+    if (names(sp.getSrc()).empty())
+      return nullptr;
     return ctx.var(scalarName(sp.getSrc()));
+  }
   if (auto cst = src.getDefiningOp<arith::ConstantOp>())
     if (auto se = dyn_cast<SplatElementsAttr>(cst.getValue())) {
       auto f = dyn_cast<FloatAttr>(se.getSplatValue<Attribute>());

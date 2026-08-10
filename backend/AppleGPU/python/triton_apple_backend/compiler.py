@@ -30,8 +30,18 @@ _ASYNC_COPY_SHIM_AIR = os.path.join(os.path.dirname(__file__),
                                     'async_copy_shim.air')
 # The shim and the kernel must come out of the same toolchain: linking an object
 # built by a different Metal frontend fails with a truncated "Cannot link symbol"
-# that names neither the symbol nor the reason.
+# that names neither the symbol nor the reason. TRITON_MSL_TOOLCHAIN_BIN selects a
+# toolchain xcrun cannot reach, for hosts whose Xcode ships a frontend older than
+# the one the shim needs.
 _METAL_SDK = os.environ.get('TRITON_MSL_SDK', 'macosx')
+_METAL_BIN = os.environ.get('TRITON_MSL_TOOLCHAIN_BIN')
+
+
+def _metal_cmd(tool, *args):
+    if _METAL_BIN:
+        return [os.path.join(_METAL_BIN, tool), '-isysroot', _METAL_SDK, *args] \
+            if tool == 'metal' else [os.path.join(_METAL_BIN, tool), *args]
+    return ['xcrun', '-sdk', _METAL_SDK, tool, *args]
 
 
 def _compile_and_link_shim(msl):
@@ -54,12 +64,10 @@ def _compile_and_link_shim(msl):
         with open(src, 'w') as f:
             f.write(msl)
         subprocess.run(
-            ['xcrun', '-sdk', _METAL_SDK, 'metal', '-c',
-             '-fmetal-math-mode=safe', src, '-o', air],
+            _metal_cmd('metal', '-c', '-fmetal-math-mode=safe', src, '-o', air),
             check=True, capture_output=True)
         subprocess.run(
-            ['xcrun', '-sdk', _METAL_SDK, 'metallib', air,
-             _ASYNC_COPY_SHIM_AIR, '-o', lib],
+            _metal_cmd('metallib', air, _ASYNC_COPY_SHIM_AIR, '-o', lib),
             check=True, capture_output=True)
         with open(lib, 'rb') as f:
             return f.read()

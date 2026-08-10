@@ -1077,15 +1077,23 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
       // to come from the IR, through the per-site map.
       if (auto w = dyn_cast<ttg::AsyncWaitOp>(op)) {
         // A token reaches the wait as a loop iter-arg, so resolve block
-        // arguments back to the commit the loop yields for that slot.
+        // arguments back to the commits that can reach that slot. Both the
+        // init and the yielded value do: on trip 0 the iter-arg still holds
+        // the peeled prologue's commit, and a rotating pipeline yields a
+        // *different* stage's token into it, so following the yield alone
+        // leaves trip 0 reading a tile whose copy was never waited on.
         llvm::SmallVector<std::string> waits;
+        llvm::DenseSet<void *> seen;
         std::function<void(Value)> collect = [&](Value tok) {
+          if (!seen.insert(tok.getAsOpaquePointer()).second)
+            return;
           if (auto arg = dyn_cast<BlockArgument>(tok)) {
             auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
             if (!forOp || arg.getArgNumber() == 0)
               return;
             auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
             collect(yield.getOperand(arg.getArgNumber() - 1));
+            collect(forOp.getInitArgs()[arg.getArgNumber() - 1]);
             return;
           }
           auto commit = dyn_cast_or_null<ttg::AsyncCommitGroupOp>(

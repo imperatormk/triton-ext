@@ -587,6 +587,32 @@ bool MSLEmitter::computeDmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac) {
   return ok && dot != nullptr;
 }
 
+// The pipeline stage a copy fills, as the index of the loop-carried token it
+// ultimately feeds. A peeled prologue copy commits into a for-loop init
+// operand; an in-loop copy commits into a yield operand. Copies sharing an
+// index are the same stage and share one event token; -1 is "no loop", which
+// makes every such copy its own stage.
+int MSLEmitter::dmaStageSlot(ttg::AsyncCopyGlobalToLocalOp ac) {
+  Value tok;
+  for (Operation *u : ac.getToken().getUsers())
+    if (auto commit = dyn_cast<ttg::AsyncCommitGroupOp>(u))
+      tok = commit.getAsyncToken();
+  if (!tok)
+    return -1;
+  for (OpOperand &use : tok.getUses()) {
+    Operation *owner = use.getOwner();
+    if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
+      int idx = (int)use.getOperandNumber() -
+                (int)forOp.getNumControlOperands();
+      if (idx >= 0)
+        return idx;
+    }
+    if (isa<scf::YieldOp>(owner))
+      return (int)use.getOperandNumber();
+  }
+  return -1;
+}
+
 std::optional<DirectStage>
 MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac, bool requireBound) {
   if (!dmaStagingEnabled() || !dmaCopyEligible(ac))
@@ -1302,9 +1328,13 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // Other consumers of A still read the staged tile (flash reads P for its l_i
   // reduction), so staging is only dropped when the dot is the sole reader.
   p.aFragOnly = p.aFrag && op.getA().hasOneUse();
+  // aNoStage/bNoStage rather than aInPlace/bInPlace: the in-place answer needs
+  // a memdescMap entry the body walk has not made yet in the Decl phase, so
+  // asking it here sizes A's pad differently per phase and the pool the Decl
+  // phase reserved no longer covers what the MMA phase lays down.
   dotStageRowPads(p.M, p.N, p.K, byteWidth(aElem), byteWidth(bElem), p.aPad,
-                  p.bPad, p.aInPlace || p.aDirect.has_value() || p.aFragOnly,
-                  p.bInPlace.has_value() || bDma);
+                  p.bPad, p.aNoStage || p.aDirect.has_value() || p.aFragOnly,
+                  p.bNoStage || bDma);
   // The panel path stages B against its own K x N offset arithmetic, so the
   // pre-transpose order is only available to the whole-tile paths.
   if (!p.bInPlace && p.rank == 2 &&

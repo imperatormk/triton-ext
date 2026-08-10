@@ -840,17 +840,22 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     // the peeled prologue copy fills what trip 0 waits on, the in-loop copy
     // fills what later trips wait on. They must share a token, or trip 0 waits
     // on a null one and reads an unfilled tile.
-    llvm::DenseMap<void *, std::string> stageTok;
+    //
+    // The slot -- not the allocation -- is the stage. A depth-2 pipeline aims
+    // two prologue copies and one in-loop copy at one allocation but at two
+    // different iter-args; keying on the allocation collapses them onto a
+    // single token, so the last issue overwrites the others and every trip's
+    // wait blocks on the copy it was supposed to be overlapping.
+    llvm::DenseMap<std::pair<void *, int>, std::string> stageTok;
     func.walk([&](ttg::AsyncCopyGlobalToLocalOp ac) {
       if (dmaHandleFor.count(ac.getOperation()))
         return;
       if (!dmaCopyEligible(ac))
         return;
-      // Stage key: the memdesc allocation this copy targets.
       Value dst = ac.getResult();
       while (auto mi = dst.getDefiningOp<ttg::MemDescIndexOp>())
         dst = mi.getSrc();
-      std::string &tok = stageTok[dst.getAsOpaquePointer()];
+      std::string &tok = stageTok[{dst.getAsOpaquePointer(), dmaStageSlot(ac)}];
       if (tok.empty()) {
         tok = fresh();
         prologue.push_back(

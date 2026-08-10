@@ -396,6 +396,7 @@ private:
   std::optional<DirectStage>
   asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac, bool requireBound = true);
   bool dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac);
+  int dmaStageSlot(ttg::AsyncCopyGlobalToLocalOp ac);
   bool dmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac);
   bool computeDmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac);
   DenseMap<Operation *, bool> dmaStoreTrCache;

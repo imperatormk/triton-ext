@@ -560,6 +560,10 @@ bool MSLEmitter::computeDmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac) {
 
   tt::DotOp dot = nullptr;
   bool ok = true;
+  // This decides the buffer's shape, so it must answer the same way whether it
+  // is asked while planning the pool or while emitting the copy. Whether a
+  // shift already has an MSL name is a property of emission order, not of the
+  // tile, so the binding test is not applied here.
   scope->getParentOp()->walk([&](ttg::AsyncCopyGlobalToLocalOp other) {
     if (!ok)
       return;
@@ -568,7 +572,7 @@ bool MSLEmitter::computeDmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac) {
       dst = idx.getSrc();
     if (dst != buf)
       return;
-    auto ds = asyncCopyDma(other);
+    auto ds = asyncCopyDma(other, /*requireBound=*/false);
     if (!ds || !ds->srcTransposed) {
       ok = false;
       return;
@@ -583,11 +587,14 @@ bool MSLEmitter::computeDmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac) {
   return ok && dot != nullptr;
 }
 
-std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac) {
+std::optional<DirectStage>
+MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac, bool requireBound) {
   if (!dmaStagingEnabled() || !dmaCopyEligible(ac))
     return std::nullopt;
   auto mt = cast<ttg::MemDescType>(ac.getResult().getType());
   auto ds = matchTilePointer(ac.getSrc(), mt.getShape()[0], mt.getShape()[1]);
+  if (!ds)
+    return std::nullopt;
   // All-or-nothing per loop: staging one operand by DMA and the other through
   // registers mixes two layouts for the same MMA block and computes garbage.
   if (auto forOp = dyn_cast_or_null<scf::ForOp>(ac->getParentOp())) {
@@ -605,8 +612,9 @@ std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalO
     auto it = valMap.find(v);
     return it != valMap.end() && it->second.size() == 1;
   };
-  if (!bound(ds->basePtr) || !(ds->rowStrideLit || bound(ds->rowStride)) ||
-      !bound(ds->rowShift) || !bound(ds->colShift))
+  if (requireBound &&
+      (!bound(ds->basePtr) || !(ds->rowStrideLit || bound(ds->rowStride)) ||
+       !bound(ds->rowShift) || !bound(ds->colShift)))
     return std::nullopt;
   return ds;
 }

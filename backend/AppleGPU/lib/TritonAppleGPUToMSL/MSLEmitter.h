@@ -394,7 +394,7 @@ private:
   msl::Expr *dmaRowStride(const DirectStage &ds);
   msl::Stmt *dmaWait(StringRef handle);
   std::optional<DirectStage>
-  asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac);
+  asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac, bool requireBound = true);
   bool dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac);
   bool dmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac);
   bool computeDmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac);

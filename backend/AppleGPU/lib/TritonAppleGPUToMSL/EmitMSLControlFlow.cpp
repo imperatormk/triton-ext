@@ -125,8 +125,11 @@ msl::Stmt *MSLEmitter::condBranch(Value cond, msl::Block thenB,
 msl::Block MSLEmitter::yieldAssign(Operation *term,
                                    ArrayRef<SmallVector<std::string>> dsts) {
   msl::Block out;
-  for (auto [i, operand] : llvm::enumerate(term->getOperands()))
+  for (auto [i, operand] : llvm::enumerate(term->getOperands())) {
+    if (isDatalessType(operand.getType()))
+      continue;
     copyRegs(out, dsts[i], names(operand));
+  }
   return out;
 }
 

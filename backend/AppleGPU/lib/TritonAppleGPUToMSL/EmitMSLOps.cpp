@@ -2037,7 +2037,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       return isPtr ? ctx.cast(CS::CStyle, ptrDeclTy, slot) : slot;
     };
 
-    int64_t convCap = poolBudget();
+    int64_t convCap = std::max<int64_t>(poolBytes, 0);
     if (tileBytes > convCap && rank >= 2) {
       int64_t N = shape[rank - 1];
       int64_t bandRows = convCap / (N * elemBytes);

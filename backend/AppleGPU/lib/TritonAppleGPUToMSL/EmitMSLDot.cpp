@@ -1184,8 +1184,11 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // disjoint region. Keeping C disjoint there doubles the threadgroup
   // footprint and costs residency.
   bool fusedEpilogueC = p.phase != FusedDotPhase::None;
-  p.disjointC =
-      !fusedEpilogueC && p.stagedAB + p.M * p.N * accBytes <= poolBudget();
+  auto it = dotCReserved.find(op);
+  int64_t cRoom = it == dotCReserved.end()
+                      ? std::max<int64_t>(poolBytes - p.stagedAB, 0)
+                      : it->second;
+  p.disjointC = !fusedEpilogueC && p.M * p.N * accBytes <= cRoom;
   p.bandRows = p.M;
   if (!p.disjointC) {
     // C overlays the dead A/B staging in the fused epilogue, so a band that
@@ -1194,9 +1197,8 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
     // to one threadgroup per core, which costs far more than the extra bands.
     int64_t budget = fusedEpilogueC
                          ? std::max(p.stagedAB, (int64_t)8 * p.N * accBytes)
-                         : poolBudget();
-    p.bandRows =
-        dotCBandRows(p.M, p.N, std::min(budget, poolBudget()), accBytes);
+                         : cRoom;
+    p.bandRows = dotCBandRows(p.M, p.N, std::min(budget, cRoom), accBytes);
   }
 
   p.needAB = p.phase == FusedDotPhase::None || p.phase == FusedDotPhase::MMA;

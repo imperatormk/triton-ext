@@ -339,6 +339,7 @@ void MSLEmitter::scanPool(Operation *op) {
         !cStoresDirect(d))
       need = N * 4;
     poolBytes = std::max(poolBytes, need + dmaSlack);
+    dotCReserved[d] = std::max<int64_t>(need - (aBy + bBy), 0);
   } else if (auto r = dyn_cast<tt::ReduceOp>(op)) {
     auto st = cast<RankedTensorType>(r.getOperand(0).getType());
     tt::LinearLayout ll = ttg::toLinearLayout(st);

@@ -718,6 +718,7 @@ private:
   int64_t poolBytes = 0;
   int64_t globalPoolBytes = 0;
   int64_t liveTgBytes = 0;
+  llvm::DenseMap<Operation *, int64_t> dotCReserved;
   bool moduleHasDevFuncs = false;
 
   // Threadgroup budget left for the reused pool after the always-live

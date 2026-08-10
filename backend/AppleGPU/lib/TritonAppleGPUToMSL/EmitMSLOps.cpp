@@ -1744,13 +1744,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
   // ttg.async_copy_global_to_local: synchronous masked per-thread stage +
   // barrier.
   if (auto ac = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
-    // Warps in this threadgroup, from the module attribute the launch uses.
-    auto numWarpsForOp = [&](Operation *o) -> int64_t {
-      if (auto mod = o->getParentOfType<ModuleOp>())
-        if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
-          return a.getInt();
-      return 1;
-    };
+    auto numWarpsForOp = [&](Operation *o) { return moduleNumWarps(o); };
     // On hardware this copy is asynchronous and only lands at the matching
     // async_wait, so the pipeliner is free to issue it into a slot the current
     // trip is still reading -- with numBuffers==1 it always does. We lower it
@@ -1779,11 +1773,10 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       // warp w the row band [w*band, (w+1)*band).
       int64_t rows = mt.getShape()[0], cols = mt.getShape()[1];
       int64_t nw = numWarpsForOp(ac);
-      // `_tr` swaps which source axis is contiguous, so dmaRowStride is the
-      // column stride there. Banding by rows would then step the destination
-      // down rows while the source walks columns, and each warp stages a tile
-      // that is not the one it writes.
-      bool bandCols = ds->srcTransposed;
+      bool storeTr = ds->srcTransposed && dmaStoreTransposed(ac);
+      if (storeTr)
+        std::swap(rows, cols);
+      bool bandCols = ds->srcTransposed && !storeTr;
       int64_t axis = bandCols ? cols : rows;
       int64_t band = (nw > 0 && axis % nw == 0) ? axis / nw : axis;
       bool split = band != axis;
@@ -1815,7 +1808,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       }
       msl::Stmt *issue = ctx.assignStmt(
           ctx.var(h),
-          ctx.call(dmaCallee(eb, ds->srcTransposed),
+          ctx.call(dmaCallee(eb, ds->srcTransposed && !storeTr),
                    {dstPtr, ctx.i32lit(cols), srcPtr,
                     dmaRowStride(*ds), ctx.i32lit(bandCols ? rows : band),
                     ctx.i32lit(bandCols ? band : cols)}));

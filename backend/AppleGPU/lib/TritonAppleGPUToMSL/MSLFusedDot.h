@@ -144,6 +144,8 @@ struct DirectStage {
   std::optional<int64_t> rowStrideLit;
   Value rowShift;
   Value colShift;
+  std::optional<int64_t> rowShiftLit;
+  std::optional<int64_t> colShiftLit;
   Value ptrDelta;
   // Elements the tile origin advances per K-trip. Either a scalar SSA value
   // (ptrDelta) or, when the recurrence steps by a splat constant, a literal.
@@ -193,8 +195,7 @@ struct DotPlan {
   // simdgroup_load's transpose flag, which costs nothing, rather than being
   // permuted element by element on the way into threadgroup memory.
   bool bStageTransposed = false;
-  // Operand reaches the MMA out of its own allocation, so it claims no pool
-  // bytes even when the rotating slot has no memdescMap entry yet.
+  // Read out of its own allocation, so it claims no pool bytes.
   bool aNoStage = false;
   bool bNoStage = false;
 

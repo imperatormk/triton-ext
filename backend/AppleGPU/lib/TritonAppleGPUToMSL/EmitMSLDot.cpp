@@ -97,8 +97,8 @@ bool isUniformTensor(Value v) {
 // block's N-origin). Any such shift is uniform across the tile, so it moves the
 // tile origin rather than breaking contiguity; it is returned in `shiftOut` to
 // be folded into the base pointer.
-bool isUnitRange(Value v, Value *shiftOut = nullptr,
-                 int64_t tileRows = 0) {
+bool isUnitRange(Value v, Value *shiftOut = nullptr, int64_t tileRows = 0,
+                 std::optional<int64_t> *shiftLitOut = nullptr) {
   Value s = peelBroadcast(v);
   // `rm % M` keeps a ragged trailing tile in bounds by wrapping it. That wrap
   // is only harmless when it can never fall inside a tile: with a run-time
@@ -121,17 +121,25 @@ bool isUnitRange(Value v, Value *shiftOut = nullptr,
     int64_t extent = dense.getSplatValue<APInt>().getSExtValue();
     if (extent <= 0 || extent % tileRows != 0)
       return false;
-    return isUnitRange(rem.getLhs(), shiftOut, tileRows);
+    return isUnitRange(rem.getLhs(), shiftOut, tileRows, shiftLitOut);
   }
   if (auto add = definingOp<arith::AddIOp>(s)) {
     Value a = add.getLhs(), b = add.getRhs();
     for (int i = 0; i < 2; ++i) {
-      if (auto sp = definingOp<tt::SplatOp>(peelBroadcast(a)))
+      Value pa = peelBroadcast(a);
+      if (auto sp = definingOp<tt::SplatOp>(pa))
         if (isUnitRange(b, nullptr, tileRows)) {
           if (shiftOut)
             *shiftOut = sp.getSrc();
           return true;
         }
+      if (auto cst = definingOp<arith::ConstantOp>(pa))
+        if (auto dense = dyn_cast<DenseElementsAttr>(cst.getValue()))
+          if (dense.isSplat() && isUnitRange(b, nullptr, tileRows)) {
+            if (shiftLitOut)
+              *shiftLitOut = dense.getSplatValue<APInt>().getSExtValue();
+            return true;
+          }
       std::swap(a, b);
     }
     return false;
@@ -148,13 +156,14 @@ bool isUnitRange(Value v, Value *shiftOut = nullptr,
 // reports whichever form it found; `strideLit` is set only for the latter.
 Value matchRowStride(Value v, Value *shiftOut = nullptr, int64_t tileRows = 0,
                      std::optional<int64_t> *strideLit = nullptr,
-                     bool *matched = nullptr) {
+                     bool *matched = nullptr,
+                     std::optional<int64_t> *shiftLitOut = nullptr) {
   auto mul = definingOp<arith::MulIOp>(peelBroadcast(v));
   if (!mul)
     return nullptr;
   Value a = mul.getLhs(), b = mul.getRhs();
   for (int i = 0; i < 2; ++i) {
-    if (isUnitRange(a, shiftOut, tileRows)) {
+    if (isUnitRange(a, shiftOut, tileRows, shiftLitOut)) {
       Value pb = peelBroadcast(b);
       if (auto sp = definingOp<tt::SplatOp>(pb)) {
         if (matched)
@@ -362,14 +371,15 @@ std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
   // divides the operand extent, so each axis is checked against its own dim.
   Value rowShift, colShift;
   std::optional<int64_t> rowStrideLit, colStrideLit;
+  std::optional<int64_t> rowShiftLit, colShiftLit;
   bool rowMatched = false, colMatched = false;
-  Value rowStride =
-      matchRowStride(rowAxis, &rowShift, rows, &rowStrideLit, &rowMatched);
-  Value colStride =
-      matchRowStride(colAxis, &colShift, cols, &colStrideLit, &colMatched);
-  if (!rowMatched && !isUnitRange(rowAxis, &rowShift, rows))
+  Value rowStride = matchRowStride(rowAxis, &rowShift, rows, &rowStrideLit,
+                                   &rowMatched, &rowShiftLit);
+  Value colStride = matchRowStride(colAxis, &colShift, cols, &colStrideLit,
+                                   &colMatched, &colShiftLit);
+  if (!rowMatched && !isUnitRange(rowAxis, &rowShift, rows, &rowShiftLit))
     return bail("row offset neither iota nor iota*splat(stride)");
-  if (!colMatched && !isUnitRange(colAxis, &colShift, cols))
+  if (!colMatched && !isUnitRange(colAxis, &colShift, cols, &colShiftLit))
     return bail("column offset neither iota nor iota*splat(stride)");
 
   // Row-major means the column axis is the contiguous one -- i.e. it carries no
@@ -387,6 +397,8 @@ std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
   out.rowStride = stride;
   out.rowShift = rowShift;
   out.colShift = colShift;
+  out.rowShiftLit = rowShiftLit;
+  out.colShiftLit = colShiftLit;
   out.ptrDelta = delta;
   out.rowStrideLit = strideLit;
   out.ptrDeltaLit = deltaLit;
@@ -438,6 +450,137 @@ bool MSLEmitter::dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac) {
   if (!matchTilePointer(ac.getSrc(), rows, cols).has_value())
     DMA_NO("tile-pointer");
   return true;
+}
+
+int64_t moduleNumWarps(Operation *o) {
+  if (auto mod = o->getParentOfType<ModuleOp>())
+    if (auto a = mod->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+      return a.getInt();
+  return 1;
+}
+
+tt::DotOp MSLEmitter::dmaCopyConsumerB(ttg::AsyncCopyGlobalToLocalOp ac) {
+  auto mt = dyn_cast<ttg::MemDescType>(ac.getResult().getType());
+  if (!mt || mt.getRank() != 2)
+    return nullptr;
+  Value buf = ac.getResult();
+  while (auto idx = buf.getDefiningOp<ttg::MemDescIndexOp>())
+    buf = idx.getSrc();
+  Operation *scope = buf.getDefiningOp();
+  if (!scope)
+    return nullptr;
+  scope = scope->getParentOp();
+  if (!scope)
+    return nullptr;
+  int64_t K = mt.getShape()[0], N = mt.getShape()[1];
+  tt::DotOp found = nullptr;
+  bool ambiguous = false;
+  scope->walk([&](tt::DotOp dot) {
+    if (ambiguous)
+      return;
+    auto ll = dotOperandLocalLoad(dot.getB(), K, N);
+    if (!ll)
+      return;
+    Value src = ll.getSrc();
+    while (auto idx = src.getDefiningOp<ttg::MemDescIndexOp>())
+      src = idx.getSrc();
+    if (src != buf)
+      return;
+    if (found)
+      ambiguous = true;
+    found = dot;
+  });
+  return ambiguous ? nullptr : found;
+}
+
+ttg::AsyncCopyGlobalToLocalOp MSLEmitter::dotBFillCopy(tt::DotOp op, int64_t K,
+                                                       int64_t N) {
+  auto ll = dotOperandLocalLoad(op.getB(), K, N);
+  if (!ll)
+    return nullptr;
+  Value buf = ll.getSrc();
+  while (auto idx = buf.getDefiningOp<ttg::MemDescIndexOp>())
+    buf = idx.getSrc();
+  Operation *scope = buf.getDefiningOp();
+  if (!scope)
+    return nullptr;
+  scope = scope->getParentOp();
+  if (!scope)
+    return nullptr;
+  ttg::AsyncCopyGlobalToLocalOp found = nullptr;
+  bool ambiguous = false;
+  scope->walk([&](ttg::AsyncCopyGlobalToLocalOp ac) {
+    if (ambiguous)
+      return;
+    Value dst = ac.getResult();
+    while (auto idx = dst.getDefiningOp<ttg::MemDescIndexOp>())
+      dst = idx.getSrc();
+    if (dst != buf)
+      return;
+    auto mt = dyn_cast<ttg::MemDescType>(ac.getResult().getType());
+    if (!mt || mt.getRank() != 2 || mt.getShape()[0] != K ||
+        mt.getShape()[1] != N)
+      ambiguous = true;
+    if (!found)
+      found = ac;
+  });
+  return ambiguous ? nullptr : found;
+}
+
+bool MSLEmitter::dmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac) {
+  Value buf = ac.getResult();
+  while (auto idx = buf.getDefiningOp<ttg::MemDescIndexOp>())
+    buf = idx.getSrc();
+  Operation *key = buf.getDefiningOp();
+  if (!key)
+    return false;
+  auto cached = dmaStoreTrCache.find(key);
+  if (cached != dmaStoreTrCache.end())
+    return cached->second;
+  bool r = computeDmaStoreTransposed(ac);
+  dmaStoreTrCache[key] = r;
+  return r;
+}
+
+bool MSLEmitter::computeDmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac) {
+  auto mt = dyn_cast<ttg::MemDescType>(ac.getResult().getType());
+  if (!mt || mt.getRank() != 2)
+    return false;
+  int64_t K = mt.getShape()[0], N = mt.getShape()[1];
+  if (!(K % 8 == 0 && N % 8 == 0 && moduleNumWarps(ac) > 0 &&
+        N % moduleNumWarps(ac) == 0))
+    return false;
+
+  Value buf = ac.getResult();
+  while (auto idx = buf.getDefiningOp<ttg::MemDescIndexOp>())
+    buf = idx.getSrc();
+  Operation *scope = buf.getDefiningOp();
+  if (!scope || !scope->getParentOp())
+    return false;
+
+  tt::DotOp dot = nullptr;
+  bool ok = true;
+  scope->getParentOp()->walk([&](ttg::AsyncCopyGlobalToLocalOp other) {
+    if (!ok)
+      return;
+    Value dst = other.getResult();
+    while (auto idx = dst.getDefiningOp<ttg::MemDescIndexOp>())
+      dst = idx.getSrc();
+    if (dst != buf)
+      return;
+    auto ds = asyncCopyDma(other);
+    if (!ds || !ds->srcTransposed) {
+      ok = false;
+      return;
+    }
+    tt::DotOp d = dmaCopyConsumerB(other);
+    if (!d || (dot && d != dot)) {
+      ok = false;
+      return;
+    }
+    dot = d;
+  });
+  return ok && dot != nullptr;
 }
 
 std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac) {
@@ -710,11 +853,18 @@ msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
   // contiguous and shifts by one element. Transposing swaps which is which.
   Value pitched = ds.srcTransposed ? ds.colShift : ds.rowShift;
   Value unitAxis = ds.srcTransposed ? ds.rowShift : ds.colShift;
+  auto pitchedLit = ds.srcTransposed ? ds.colShiftLit : ds.rowShiftLit;
+  auto unitLit = ds.srcTransposed ? ds.rowShiftLit : ds.colShiftLit;
   if (pitched)
     add(ctx.paren(ctx.binary(B::Mul, ctx.var(scalarName(pitched)),
                              dmaRowStride(ds))));
+  if (pitchedLit && *pitchedLit)
+    add(ctx.paren(
+        ctx.binary(B::Mul, ctx.i32lit(*pitchedLit), dmaRowStride(ds))));
   if (unitAxis)
     add(ctx.var(scalarName(unitAxis)));
+  if (unitLit && *unitLit)
+    add(ctx.i32lit(*unitLit));
   // The K-loop IV counts K elements, and the operand advances one row per K
   // element, so the per-trip origin offset is exactly iv*rowStride -- no need
   // to divide the IV by the loop step and rescale by ptrDelta.
@@ -1096,10 +1246,6 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   if (p.rank == 2 && aBytes + bBytes <= kTGResidentBudgetBytes) {
     p.aInPlace = dotOperandInPlaceBuf(op.getA(), p.M, p.K);
     p.bInPlace = dotOperandInPlaceBuf(op.getB(), p.K, p.N);
-    // The pipeliner's rotating slot has no memdescMap entry until the body walk
-    // reaches it, so the lookup above fails on exactly the operands scanPool
-    // already sized as unstaged. Sizing has to agree with it or the regions run
-    // off a pool that was never reserved for them.
     p.aNoStage = p.aInPlace.has_value() ||
                  dotOperandInLocalAlloc(op.getA(), p.M, p.K);
     p.bNoStage = p.bInPlace.has_value() ||
@@ -1164,6 +1310,14 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
         p.bStageTransposed = true;
       }
     }
+  // The pipelined copy may store a column-major B in its own N x K shape; the
+  // fragment loads then have to read it back with the transpose flag. Decided
+  // from the copy, not the phase, so every phase of one dot agrees.
+  if (!p.bStageTransposed && p.rank == 2)
+    if (auto ac = dotBFillCopy(op, p.K, p.N))
+      if (auto ds = asyncCopyDma(ac))
+        if (ds->srcTransposed && dmaStoreTransposed(ac))
+          p.bStageTransposed = true;
   // The transposed staging addresses B at pitch K exactly, so it cannot carry
   // a row pad.
   if (p.bStageTransposed)
@@ -1438,7 +1592,10 @@ void MSLEmitter::dotPoolPtrs(msl::Block &body, tt::DotOp op,
       dc.tgBCur = dc.tgB;
     }
   }
-  if (plan.needC)
+  // A direct, unmasked store never reaches threadgroup memory, so scanPool
+  // reserves nothing; naming a pool that was never declared emits a cast of
+  // nothing.
+  if (plan.needC && !poolBuf.empty())
     body.push_back(
         ctx.declStmt(tgPtr("float"), dc.tgC,
                      poolRegion(plan.disjointC ? plan.stagedAB : 0, "float")));
@@ -4007,11 +4164,8 @@ MSLEmitter::dotOperandInPlaceBuf(Value operand, int64_t rows, int64_t cols) {
   return InPlaceOperand{it->second.buf, it->second.baseOffset};
 }
 
-// Whether the operand is read straight out of a local_alloc, ignoring *where*
-// in it. The pipeliner indexes its buffer by a rotating slot, so the memdesc
-// the dot loads from has no entry in memdescMap until the body walk reaches it
-// -- but scanPool runs before that and only needs to know the operand never
-// reaches the pool, not the offset it lands at.
+// Whether the operand comes out of a local_alloc at all, ignoring which slot:
+// the rotating slot has no memdescMap entry until the body walk reaches it.
 bool MSLEmitter::dotOperandInLocalAlloc(Value operand, int64_t rows,
                                         int64_t cols) {
   ttg::LocalLoadOp ll = dotOperandLocalLoad(operand, rows, cols);

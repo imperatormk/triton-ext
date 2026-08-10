@@ -165,6 +165,8 @@ private:
   llvm::raw_ostream *sink;
 };
 
+int64_t moduleNumWarps(Operation *o);
+
 // Per-value symbol table: maps an SSA Value to its MSL identifier. For tensor
 // values we store one identifier per register (per-thread element).
 class MSLEmitter {
@@ -394,6 +396,12 @@ private:
   std::optional<DirectStage>
   asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac);
   bool dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac);
+  bool dmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac);
+  bool computeDmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac);
+  DenseMap<Operation *, bool> dmaStoreTrCache;
+  tt::DotOp dmaCopyConsumerB(ttg::AsyncCopyGlobalToLocalOp ac);
+  ttg::AsyncCopyGlobalToLocalOp dotBFillCopy(tt::DotOp op, int64_t K,
+                                             int64_t N);
   SmallVector<std::string> dotResultIds(msl::Block &body, tt::DotOp op,
                                         const DotPlan &plan);
   void dotReadback(msl::Block &tgt, RankedTensorType cTy, StringRef tgC,

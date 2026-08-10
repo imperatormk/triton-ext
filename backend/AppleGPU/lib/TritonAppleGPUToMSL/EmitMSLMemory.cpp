@@ -220,8 +220,8 @@ void MSLEmitter::scanPool(Operation *op) {
     // asks exactly what planDot asks.
     bool aUnstaged = false, bUnstaged = false;
     if (rk == 2 && M * Kd * aEb + Kd * N * bEb <= kTGResidentBudgetBytes) {
-      aUnstaged = (bool)dotOperandLocalLoad(d.getA(), M, Kd);
-      bUnstaged = (bool)dotOperandLocalLoad(d.getB(), Kd, N);
+      aUnstaged = (bool)dotOperandInPlaceBuf(d.getA(), M, Kd);
+      bUnstaged = (bool)dotOperandInPlaceBuf(d.getB(), Kd, N);
     }
     if (!aUnstaged)
       aUnstaged = (bool)dotADirect(d);
@@ -241,9 +241,9 @@ void MSLEmitter::scanPool(Operation *op) {
       int64_t elemBytes = byteWidth(aTy.getElementType());
       int64_t stagedA = aBy, stagedB = bBy;
       if (rk == 2 && aBy + bBy <= kTGResidentBudgetBytes) {
-        if (dotOperandLocalLoad(d.getA(), M, Kd))
+        if (dotOperandInPlaceBuf(d.getA(), M, Kd))
           stagedA = 0;
-        if (dotOperandLocalLoad(d.getB(), Kd, N))
+        if (dotOperandInPlaceBuf(d.getB(), Kd, N))
           stagedB = 0;
       }
       // Mirrors planDot: a device-direct A claims no pool. Both sides ask the

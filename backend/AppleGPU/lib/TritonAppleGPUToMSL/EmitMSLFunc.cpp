@@ -645,9 +645,7 @@ LogicalResult MSLEmitter::emit() {
       auto mt = cast<ttg::MemDescType>(la.getResult().getType());
       liveTgBytes += memdescFlatSize(mt) * byteWidth(mt.getElementType());
     });
-    for (Block &blk : func.getBody())
-      for (Operation &op : blk)
-        scanPool(&op);
+    func.walk([&](Operation *op) { scanPool(op); });
     globalPoolBytes = std::max(globalPoolBytes, poolBytes);
   }
   moduleHasDevFuncs = !devFuncs.empty();
@@ -780,9 +778,7 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     auto mt = cast<ttg::MemDescType>(la.getResult().getType());
     liveTgBytes += memdescFlatSize(mt) * byteWidth(mt.getElementType());
   });
-  for (Block &blk : func.getBody())
-    for (Operation &op : blk)
-      scanPool(&op);
+  func.walk([&](Operation *op) { scanPool(op); });
   int64_t kernelPool = moduleHasDevFuncs ? globalPoolBytes : poolBytes;
   if (kernelPool > 0) {
     poolBuf = "__pool";

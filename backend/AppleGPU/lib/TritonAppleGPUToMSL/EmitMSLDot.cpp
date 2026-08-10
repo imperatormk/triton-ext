@@ -1338,14 +1338,8 @@ void MSLEmitter::checkDotPoolRegions(tt::DotOp op, const DotPlan &plan) {
   // whole-tile extents below are never laid down for it.
   if (plan.kind == DotPlan::Kind::Panel)
     return;
-  int64_t aEb = byteWidth(elementScalarType(plan.aStage.getType()));
-  int64_t bEb = byteWidth(elementScalarType(plan.bStage.getType()));
-  int64_t aBytes = (plan.aInPlace || plan.aDirect)
-                       ? 0
-                       : plan.M * (plan.K + plan.aPad) * aEb;
-  int64_t bTiles = plan.dmaB ? 2 : 1;
-  int64_t bBytes =
-      plan.bInPlace ? 0 : plan.K * (plan.N + plan.bPad) * bEb * bTiles;
+  int64_t aBytes = plan.stagedA;
+  int64_t bBytes = plan.stagedB * (plan.dmaB ? 2 : 1);
   // A C that overlays the staging is published only once A and B are dead, so
   // it is not live alongside them.
   int64_t cBytes =

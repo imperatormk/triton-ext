@@ -402,22 +402,29 @@ std::optional<DirectStage> matchTilePointer(Value ptr, int64_t rows,
 // buffer, which is exactly what the pipeliner allocates.
 
 // Shared by the copy itself and the sibling walk, so the two cannot disagree.
+#define DMA_NO(why)                                                            \
+  do {                                                                         \
+    if (getenv("TRITON_MSL_DMA_PROBE"))                                        \
+      llvm::errs() << "[dma-elig] no: " << (why) << "\n";                      \
+    return false;                                                              \
+  } while (0)
+
 bool MSLEmitter::dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac) {
   // The intrinsic takes no predicate, so a per-element mask would read past a
   // ragged operand; a uniform one just guards the whole call.
   if (Value m = ac.getMask())
     if (!definingOp<tt::SplatOp>(peelBroadcast(m)))
-      return false;
+      DMA_NO("masked");
   auto srcTy = dyn_cast<RankedTensorType>(ac.getSrc().getType());
   auto mt = dyn_cast<ttg::MemDescType>(ac.getResult().getType());
   if (!srcTy || !mt || srcTy.getRank() != 2 || mt.getRank() != 2)
-    return false;
+    DMA_NO("rank");
   Type e = mt.getElementType();
   if (!(e.isF32() || e.isF16() || e.isBF16()))
-    return false;
+    DMA_NO("dtype");
   // A non-row-major destination cannot be expressed as (dstStride, dims).
   if (!memdescStrides(mt).empty())
-    return false;
+    DMA_NO("dst-not-rowmajor");
   // Asynchronous, so one buffer lets trip N+1's request overwrite the tile trip
   // N is still reading -- the register path survives that only by being
   // synchronous and barrier-ordered.
@@ -426,9 +433,11 @@ bool MSLEmitter::dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac) {
     buf = idx.getSrc();
   auto bt = dyn_cast<ttg::MemDescType>(buf.getType());
   if (!bt || bt.getRank() < 3 || bt.getShape()[0] < 2)
-    return false;
+    DMA_NO("single-buffered");
   int64_t rows = mt.getShape()[0], cols = mt.getShape()[1];
-  return matchTilePointer(ac.getSrc(), rows, cols).has_value();
+  if (!matchTilePointer(ac.getSrc(), rows, cols).has_value())
+    DMA_NO("tile-pointer");
+  return true;
 }
 
 std::optional<DirectStage> MSLEmitter::asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac) {

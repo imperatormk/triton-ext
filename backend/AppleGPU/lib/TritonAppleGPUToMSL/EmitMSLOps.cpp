@@ -1779,8 +1779,14 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       // warp w the row band [w*band, (w+1)*band).
       int64_t rows = mt.getShape()[0], cols = mt.getShape()[1];
       int64_t nw = numWarpsForOp(ac);
-      int64_t band = (nw > 0 && rows % nw == 0) ? rows / nw : rows;
-      bool split = band != rows;
+      // `_tr` swaps which source axis is contiguous, so dmaRowStride is the
+      // column stride there. Banding by rows would then step the destination
+      // down rows while the source walks columns, and each warp stages a tile
+      // that is not the one it writes.
+      bool bandCols = ds->srcTransposed;
+      int64_t axis = bandCols ? cols : rows;
+      int64_t band = (nw > 0 && axis % nw == 0) ? axis / nw : axis;
+      bool split = band != axis;
 
       msl::Expr *dstPtr = ctx.var(di.buf);
       if (di.baseOffset)
@@ -1797,22 +1803,22 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       const std::string &h = hit->second;
       srcPtr = dmaTileOrigin(*ds, dotDmaTripVar(ac));
       if (split) {
-        msl::Expr *wRows =
+        msl::Expr *wOff =
             ctx.paren(ctx.binary(B::Mul, ctx.var(warpId), ctx.i32lit(band)));
         dstPtr = ctx.paren(ctx.binary(
             B::Add, dstPtr,
-            ctx.paren(ctx.binary(B::Mul, wRows, ctx.i32lit(cols)))));
+            bandCols ? wOff
+                     : ctx.paren(ctx.binary(B::Mul, wOff, ctx.i32lit(cols)))));
         srcPtr = ctx.binary(
             B::Add, srcPtr,
-            ctx.paren(ctx.binary(B::Mul, wRows,
-                                 dmaRowStride(*ds))));
+            ctx.paren(ctx.binary(B::Mul, wOff, dmaRowStride(*ds))));
       }
       msl::Stmt *issue = ctx.assignStmt(
           ctx.var(h),
           ctx.call(dmaCallee(eb, ds->srcTransposed),
                    {dstPtr, ctx.i32lit(cols), srcPtr,
-                    dmaRowStride(*ds), ctx.i32lit(band),
-                    ctx.i32lit(cols)}));
+                    dmaRowStride(*ds), ctx.i32lit(bandCols ? rows : band),
+                    ctx.i32lit(bandCols ? band : cols)}));
       // A uniform mask guards the whole issue; the token stays 0 when the trip
       // is out of range, and waiting on a null token is a no-op.
       if (Value m = ac.getMask())

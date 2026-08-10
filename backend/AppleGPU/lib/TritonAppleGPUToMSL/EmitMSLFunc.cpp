@@ -806,6 +806,8 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     func.walk([&](ttg::AsyncCopyGlobalToLocalOp ac) {
       if (dmaHandleFor.count(ac.getOperation()))
         return;
+      if (!dmaCopyEligible(ac))
+        return;
       // Stage key: the memdesc allocation this copy targets.
       Value dst = ac.getResult();
       while (auto mi = dst.getDefiningOp<ttg::MemDescIndexOp>())

@@ -510,6 +510,30 @@ std::optional<DirectStage> MSLEmitter::bDmaCandidate(tt::DotOp op,
 
 bool MSLEmitter::aDirectEnabled() { return true; }
 
+// A produced in #mma already sits in simdgroup_matrix storage: register 2*f+e
+// is fragment f's thread_elements()[e]. Past mT == numWarps the layout
+// replicates instead of partitioning, and the missing rows are in no lane's
+// registers at all.
+bool MSLEmitter::aFragEligible(tt::DotOp op, const DotPlan &plan) {
+  auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
+  if (!aTy || aTy.getRank() != 2 || !aTy.getElementType().isF32())
+    return false;
+  auto cTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+  if (!cTy || aTy.getEncoding() != cTy.getEncoding())
+    return false;
+  if (plan.K % 8 || plan.M != aTy.getShape()[0] || plan.K != aTy.getShape()[1])
+    return false;
+  if (plan.mT != plan.numWarps)
+    return false;
+  auto ll = ttg::toLinearLayout(aTy);
+  auto kReg = StringAttr::get(op.getContext(), "register");
+  if (ll.getInDimSize(kReg) != 2 * (plan.K / 8))
+    return false;
+  auto outs = llvm::to_vector(ll.getOutDimNames());
+  return ll.getBasis(kReg, 0, outs[0]) == 0 &&
+         ll.getBasis(kReg, 0, outs[1]) == 1;
+}
+
 // A's fragments can be simdgroup_load-ed straight off device memory when the
 // operand denotes an unmasked row-major device tile and the warp partition
 // splits along M alone. The second condition is what makes A warp-private: warp
@@ -1102,8 +1126,13 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // computed, so the pool sizing and the emission cannot disagree about it.
   if (!p.aInPlace)
     p.aDirect = dotADirect(op);
+  if (!p.aInPlace && !p.aDirect)
+    p.aFrag = aFragEligible(op, p);
+  // Other consumers of A still read the staged tile (flash reads P for its l_i
+  // reduction), so staging is only dropped when the dot is the sole reader.
+  p.aFragOnly = p.aFrag && op.getA().hasOneUse();
   dotStageRowPads(p.M, p.N, p.K, byteWidth(aElem), byteWidth(bElem), p.aPad,
-                  p.bPad, p.aInPlace || p.aDirect.has_value(),
+                  p.bPad, p.aInPlace || p.aDirect.has_value() || p.aFragOnly,
                   p.bInPlace.has_value() || bDma);
   // The panel path stages B against its own K x N offset arithmetic, so the
   // pre-transpose order is only available to the whole-tile paths.
@@ -1122,8 +1151,9 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // a row pad.
   if (p.bStageTransposed)
     p.bPad = 0;
-  p.stagedA =
-      (p.aInPlace || p.aDirect) ? 0 : p.M * (p.K + p.aPad) * byteWidth(aElem);
+  p.stagedA = (p.aInPlace || p.aDirect || p.aFragOnly)
+                  ? 0
+                  : p.M * (p.K + p.aPad) * byteWidth(aElem);
   p.stagedB = p.bInPlace ? 0
               : p.bStageTransposed
                   ? p.N * p.K * byteWidth(bElem)
@@ -1510,6 +1540,15 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
   // fragments plus the chunk's accumulators.
   const int64_t colChunk = dotColChunk(nT, kT);
   auto loadAFrag = [&](int64_t mi, int64_t ki, StringRef fa, msl::Block &into) {
+    if (plan.aFrag) {
+      for (int e = 0; e < 2; ++e)
+        into.push_back(ctx.assignStmt(
+            ctx.subscript(ctx.member(ctx.var(fa),
+                                     msl::builtin::sg::ThreadElements),
+                          ctx.i32lit(e)),
+            ctx.var(dc.aNames[2 * ki + e])));
+      return;
+    }
     if (dc.devA.empty()) {
       into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
       return;
@@ -1816,8 +1855,9 @@ bool MSLEmitter::emitDotFused(
           std::move(prime)));
     }
     stageOperand(body, dc.tgA, dc.aStage, aStageTy, dc.aNames,
-                 (bool)plan.aInPlace || plan.aDirect.has_value(), nullptr,
-                 plan.aPad);
+                 (bool)plan.aInPlace || plan.aDirect.has_value() ||
+                     plan.aFragOnly,
+                 nullptr, plan.aPad);
     stageOperand(body, dc.tgB, dc.bStage, bStageTy, dc.bNames,
                  (bool)plan.bInPlace || bDma.has_value(), nullptr, plan.bPad);
     // A's register scatter is independent of B's tile, so it overlaps the

@@ -206,6 +206,11 @@ struct DotPlan {
   // the rows it owns and A is never shared. Requires an unmasked row-major
   // operand; `aDirect` carries the tile origin the loads address off.
   std::optional<DirectStage> aDirect;
+  // A arrives in #mma registers (a preceding dot's result), so its fragments
+  // are assembled from those registers instead of staged and reloaded.
+  bool aFrag = false;
+  // aFrag AND no other reader of A, so the staging can be dropped outright.
+  bool aFragOnly = false;
   bool disjointC = false;
   int64_t bandRows = 0;
 

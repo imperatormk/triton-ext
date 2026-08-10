@@ -370,6 +370,7 @@ private:
   std::optional<DirectStage> bDmaCandidate(tt::DotOp op,
                                            bool requireBound = true);
   static bool aDirectEnabled();
+  bool aFragEligible(tt::DotOp op, const DotPlan &plan);
   std::optional<DirectStage> aDirectCandidate(tt::DotOp op, int64_t M,
                                               int64_t K, int64_t numWarps,
                                               bool requireBound = true);

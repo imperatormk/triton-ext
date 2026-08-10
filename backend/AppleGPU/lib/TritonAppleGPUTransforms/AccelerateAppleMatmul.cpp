@@ -214,6 +214,17 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     Value newA = stripDotOpEnc(dot.getA());
     Value newB = stripDotOpEnc(dot.getB());
 
+    // A chained dot's A is the previous dot's accumulator, which is
+    // bit-identical to an A-operand fragment: retyping it to this #mma lets the
+    // emitter read those registers instead of restaging the tile.
+    if (auto aTy = dyn_cast<RankedTensorType>(newA.getType())) {
+      if (aTy.getEncoding() != mmaEnc && operandComesFromDot(dot)) {
+        auto aMmaTy =
+            RankedTensorType::get(aTy.getShape(), aTy.getElementType(), mmaEnc);
+        newA = ttg::ConvertLayoutOp::create(rewriter, loc, aMmaTy, newA);
+      }
+    }
+
     Value newC = dot.getC();
     if (auto cvt = newC.getDefiningOp<ttg::ConvertLayoutOp>()) {
       if (cvt.getSrc().getType() == newCType)
@@ -234,7 +245,8 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     SmallVector<ttg::ConvertLayoutOp> passthroughCasts;
     for (OpOperand &use : dot->getUses()) {
       auto *owner = use.getOwner();
-      if (isa<tt::DotOp>(owner) && use.getOperandNumber() == 2) {
+      if (isa<tt::DotOp>(owner) &&
+          (use.getOperandNumber() == 2 || use.getOperandNumber() == 0)) {
         mmaUses.push_back(&use);
         continue;
       }
@@ -270,6 +282,35 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
   }
 };
 
+// A chained dot only learns its A is #mma after the producing dot converts, and
+// BlockedToAppleMma will not revisit a dot whose C is already #mma. Drop the
+// convert here instead.
+struct DropMmaAConvert : public OpRewritePattern<tt::DotOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tt::DotOp dot,
+                                PatternRewriter &rewriter) const override {
+    auto cTy = dyn_cast<RankedTensorType>(dot.getC().getType());
+    if (!cTy || !isa<AppleMmaEncodingAttr>(cTy.getEncoding()))
+      return failure();
+
+    auto cvt = dot.getA().getDefiningOp<ttg::ConvertLayoutOp>();
+    if (!cvt)
+      return failure();
+    auto srcTy = dyn_cast<RankedTensorType>(cvt.getSrc().getType());
+    // Both dots must agree on warp tiling, or warp w would need fragments it
+    // does not own.
+    if (!srcTy || !isa<AppleMmaEncodingAttr>(srcTy.getEncoding()) ||
+        cast<AppleMmaEncodingAttr>(srcTy.getEncoding()).getWarpsPerCTA() !=
+            cast<AppleMmaEncodingAttr>(cTy.getEncoding()).getWarpsPerCTA())
+      return failure();
+
+    rewriter.modifyOpInPlace(dot,
+                             [&] { dot.getAMutable().assign(cvt.getSrc()); });
+    return success();
+  }
+};
+
 struct AccelerateAppleMatmul
     : public ::impl::AccelerateAppleMatmulBase<AccelerateAppleMatmul> {
 
@@ -280,6 +321,7 @@ struct AccelerateAppleMatmul
 
     RewritePatternSet patterns(&getContext());
     patterns.add<BlockedToAppleMma>(&getContext(), numWarps);
+    patterns.add<DropMmaAConvert>(&getContext());
 
     if (failed(applyPatternsGreedily(mod, std::move(patterns))))
       signalPassFailure();

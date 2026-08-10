@@ -240,6 +240,12 @@ class MPSBackend(BaseBackend):
             # assign_latencies first nothing is ever marked for rotation and
             # the pass is a no-op.
             passes.ttgpuir.add_assign_latencies(pm, options.num_stages)
+            # The pipeliner stages every latency-carrying load in threadgroup
+            # memory, which costs A the device-direct read dotADirect gives it
+            # on the default path. Dropping A's latency keeps that read while B
+            # still rotates.
+            if os.environ.get('TRITON_MSL_UNPIPELINE_A'):
+                _plugin.add_unpipeline_dot_a(pm)
             # Multi-buffering only happens with this pass. The env var is an
             # escape hatch for bisecting a suspected layout recurrence.
             if not os.environ.get('TRITON_MSL_NO_SCHED'):

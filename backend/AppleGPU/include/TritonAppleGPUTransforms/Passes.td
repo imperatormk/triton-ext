@@ -120,4 +120,27 @@ def SimplifyGatherLayout : Pass<"triton-apple-simplify-gather", "mlir::ModuleOp"
   ];
 }
 
+def UnpipelineDotA : Pass<"triton-apple-unpipeline-dot-a", "mlir::ModuleOp"> {
+  let summary = "Keep the A dot operand out of the software pipeline";
+
+  let description = [{
+    The pipeliner allocates a multi-buffer and an async copy for every load that
+    carries a latency attribute (createAsyncCopy in LowerLoops.cpp is
+    unconditional once a load reaches asyncLoads). For a GEMM that stages both
+    operands in threadgroup memory, re-adding the device->threadgroup round trip
+    that `dotADirect` removes on the default path by reading A straight out of
+    device memory at its runtime stride.
+
+    Clearing the latency attribute on A's load leaves `tt.load -> tt.dot`
+    intact, which is the shape `dotADirect` matches, while B keeps its latency
+    and still rotates. Runs after assign_latencies and before schedule_loops.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 #endif // TRITON_APPLE_GPU_TRANSFORMS_PASSES

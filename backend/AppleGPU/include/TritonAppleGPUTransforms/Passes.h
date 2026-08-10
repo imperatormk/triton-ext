@@ -23,6 +23,10 @@ std::unique_ptr<mlir::Pass> createPrefetchDotOperandPass();
 // Triton's software pipeliner will multi-buffer them.
 std::unique_ptr<mlir::Pass> createShareDotOperandsPass();
 
+// Clear the A operand load's latency so the pipeliner leaves it out of the
+// rotation and it can still be read device-direct.
+std::unique_ptr<mlir::Pass> createUnpipelineDotAPass();
+
 } // namespace mlir::triton::applegpu
 
 // Generated pass declarations

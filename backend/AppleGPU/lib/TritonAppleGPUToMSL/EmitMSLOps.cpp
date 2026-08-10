@@ -1756,15 +1756,9 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
     // and only then waits, so the requests overlap in the queue. Match that:
     // fence once ahead of the batch, not between its members. The copies of a
     // batch write disjoint buffers and nothing reads them until the wait.
-    // A real async copy lands at its wait, not at the issue, and the slot it
-    // fills is the one this trip is not reading. Nothing here can clobber a
-    // live read, so the fence that the synchronous lowering needs would only
-    // pin the issue behind the whole MMA block and expose the copy's latency.
-    bool isDma = asyncCopyDma(ac).has_value();
-    if (!isDma && !asyncCopyFenced && !barrierCoversTail(body))
+    if (!asyncCopyFenced && !barrierCoversTail(body))
       body.push_back(ctx.hardBarrier(false));
-    if (!isDma)
-      asyncCopyFenced = true;
+    asyncCopyFenced = true;
 
     // True device->threadgroup DMA: air.simdgroup_async_copy_2d moves the tile
     // without it ever entering registers, so the whole load+scatter disappears.

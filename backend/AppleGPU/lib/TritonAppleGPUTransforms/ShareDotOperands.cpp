@@ -100,7 +100,14 @@ struct ShareDotOperandsPass
       forOp.walk([&](tt::DotOp dot) {
         if (dot->getParentOp() != forOp.getOperation())
           return;
-        for (Value operand : {dot.getA(), dot.getB()})
+        SmallVector<Value> operands;
+        // Wrapping A hands it to the pipeliner, which then stages it in
+        // threadgroup memory and costs it the device-direct read dotADirect
+        // gives it on the default path.
+        if (!getenv("TRITON_MSL_UNPIPELINE_A"))
+          operands.push_back(dot.getA());
+        operands.push_back(dot.getB());
+        for (Value operand : operands)
           if (tt::LoadOp ld = operandLoad(operand, forOp))
             if (!llvm::is_contained(todo, ld))
               todo.push_back(ld);

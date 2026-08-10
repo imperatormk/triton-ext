@@ -33,6 +33,10 @@ static void addShareDotOperands(mlir::PassManager *pm,
                                 const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createShareDotOperandsPass());
 }
+static void addUnpipelineDotA(mlir::PassManager *pm,
+                              const std::vector<std::string> &) {
+  pm->addPass(mlir::triton::applegpu::createUnpipelineDotAPass());
+}
 static void addEmitMSL(mlir::PassManager *pm,
                        const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createEmitMSLPass());
@@ -67,6 +71,11 @@ static void registerShareDotOperands() {
     return mlir::triton::applegpu::createShareDotOperandsPass();
   });
 }
+static void registerUnpipelineDotA() {
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::triton::applegpu::createUnpipelineDotAPass();
+  });
+}
 static void registerEmitMSL() {
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return mlir::triton::applegpu::createEmitMSLPass();
@@ -98,6 +107,8 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
        registerPrefetchDotOperand},
       {"share_dot_operands", "0.1.0", addShareDotOperands,
        registerShareDotOperands},
+      {"unpipeline_dot_a", "0.1.0", addUnpipelineDotA,
+       registerUnpipelineDotA},
       {"emit_msl", "0.1.0", addEmitMSL, registerEmitMSL},
   };
 

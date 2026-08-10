@@ -79,9 +79,13 @@ if(APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend/async_copy_shim.ll")
     set(ASYNC_COPY_SHIM_AIR
         "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend/async_copy_shim.air")
+    if(NOT DEFINED TRITON_MSL_SDK)
+        set(TRITON_MSL_SDK "macosx")
+    endif()
     add_custom_command(
         OUTPUT "${ASYNC_COPY_SHIM_AIR}"
-        COMMAND xcrun metal-as "${ASYNC_COPY_SHIM_SRC}" -o "${ASYNC_COPY_SHIM_AIR}"
+        COMMAND xcrun -sdk "${TRITON_MSL_SDK}" metal-as "${ASYNC_COPY_SHIM_SRC}"
+                -o "${ASYNC_COPY_SHIM_AIR}"
         DEPENDS "${ASYNC_COPY_SHIM_SRC}"
         COMMENT "Assembling AppleGPU threadgroup async-copy shim")
     add_custom_target(AppleGPUAsyncCopyShim ALL

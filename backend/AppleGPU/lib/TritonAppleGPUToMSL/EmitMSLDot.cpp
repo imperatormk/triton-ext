@@ -1096,6 +1096,14 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   if (p.rank == 2 && aBytes + bBytes <= kTGResidentBudgetBytes) {
     p.aInPlace = dotOperandInPlaceBuf(op.getA(), p.M, p.K);
     p.bInPlace = dotOperandInPlaceBuf(op.getB(), p.K, p.N);
+    // The pipeliner's rotating slot has no memdescMap entry until the body walk
+    // reaches it, so the lookup above fails on exactly the operands scanPool
+    // already sized as unstaged. Sizing has to agree with it or the regions run
+    // off a pool that was never reserved for them.
+    p.aNoStage = p.aInPlace.has_value() ||
+                 dotOperandInLocalAlloc(op.getA(), p.M, p.K);
+    p.bNoStage = p.bInPlace.has_value() ||
+                 dotOperandInLocalAlloc(op.getB(), p.K, p.N);
   }
   p.aStage = op.getA();
   p.bStage = op.getB();
@@ -1160,10 +1168,10 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // a row pad.
   if (p.bStageTransposed)
     p.bPad = 0;
-  p.stagedA = (p.aInPlace || p.aDirect || p.aFragOnly)
+  p.stagedA = (p.aInPlace || p.aNoStage || p.aDirect || p.aFragOnly)
                   ? 0
                   : p.M * (p.K + p.aPad) * byteWidth(aElem);
-  p.stagedB = p.bInPlace ? 0
+  p.stagedB = (p.bInPlace || p.bNoStage) ? 0
               : p.bStageTransposed
                   ? p.N * p.K * byteWidth(bElem)
                   : p.K * (p.N + p.bPad) * byteWidth(bElem);
@@ -3997,6 +4005,26 @@ MSLEmitter::dotOperandInPlaceBuf(Value operand, int64_t rows, int64_t cols) {
   if (it == memdescMap.end() || !it->second.bufStrides.empty())
     return std::nullopt;
   return InPlaceOperand{it->second.buf, it->second.baseOffset};
+}
+
+// Whether the operand is read straight out of a local_alloc, ignoring *where*
+// in it. The pipeliner indexes its buffer by a rotating slot, so the memdesc
+// the dot loads from has no entry in memdescMap until the body walk reaches it
+// -- but scanPool runs before that and only needs to know the operand never
+// reaches the pool, not the offset it lands at.
+bool MSLEmitter::dotOperandInLocalAlloc(Value operand, int64_t rows,
+                                        int64_t cols) {
+  ttg::LocalLoadOp ll = dotOperandLocalLoad(operand, rows, cols);
+  if (!ll)
+    return false;
+  Value src = ll.getSrc();
+  while (auto mi = src.getDefiningOp<ttg::MemDescIndexOp>())
+    src = mi.getSrc();
+  auto alloc = src.getDefiningOp<ttg::LocalAllocOp>();
+  if (!alloc)
+    return false;
+  auto mt = dyn_cast<ttg::MemDescType>(ll.getSrc().getType());
+  return mt && memdescStrides(mt).empty();
 }
 
 Value MSLEmitter::dotOperandConvertSource(tt::DotOp d, Value operand) {

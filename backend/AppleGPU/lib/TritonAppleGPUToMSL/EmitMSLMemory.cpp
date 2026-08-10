@@ -220,8 +220,8 @@ void MSLEmitter::scanPool(Operation *op) {
     // asks exactly what planDot asks.
     bool aUnstaged = false, bUnstaged = false;
     if (rk == 2 && M * Kd * aEb + Kd * N * bEb <= kTGResidentBudgetBytes) {
-      aUnstaged = (bool)dotOperandInPlaceBuf(d.getA(), M, Kd);
-      bUnstaged = (bool)dotOperandInPlaceBuf(d.getB(), Kd, N);
+      aUnstaged = dotOperandInLocalAlloc(d.getA(), M, Kd);
+      bUnstaged = dotOperandInLocalAlloc(d.getB(), Kd, N);
     }
     if (!aUnstaged)
       aUnstaged = (bool)dotADirect(d);
@@ -229,8 +229,8 @@ void MSLEmitter::scanPool(Operation *op) {
       bUnstaged = true;
     int64_t aPad, bPad;
     dotStageRowPads(M, N, Kd, aEb, bEb, aPad, bPad, aUnstaged, bUnstaged);
-    int64_t aBy = M * (Kd + aPad) * aEb;
-    int64_t bBy = Kd * (N + bPad) * bEb;
+    int64_t aBy = aUnstaged ? 0 : M * (Kd + aPad) * aEb;
+    int64_t bBy = bUnstaged ? 0 : Kd * (N + bPad) * bEb;
     Type cE = cTy.getElementType();
     int64_t need;
     int64_t dmaSlack = 0;
@@ -302,7 +302,9 @@ void MSLEmitter::scanPool(Operation *op) {
           // the pool. Reserving the whole C tile on top of those buffers is
           // what asked for 45-56KB against a 32KB cap and had the autotuner
           // drop the larger blocks; band it to what actually fits beside them.
-          need = cBanded;
+          // A C that stores straight to device never reaches the pool at all,
+          // so the band is pure footprint on top of buffers already at the cap.
+          need = cStoresDirect(d) && !fusedGemmCHasFallback(d) ? 0 : cBanded;
         } else if (int64_t sc = fusedGemmCCompactScratch(d)) {
           // The ragged arm drains one 8x8 fragment per warp at a time, so it
           // needs a handful of slots, not the whole C tile. Reserving cFull

@@ -778,6 +778,44 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     auto mt = cast<ttg::MemDescType>(la.getResult().getType());
     liveTgBytes += memdescFlatSize(mt) * byteWidth(mt.getElementType());
   });
+
+  // Declare every local_alloc's buffer up front. planDot decides whether a dot
+  // can read its operand straight out of the allocation, and it runs while the
+  // loop's Decl phase is emitted -- before the body walk would have reached an
+  // alloc sitting inside (or hoisted just before) that loop. Registering them
+  // here keeps the pool sizing, which already assumes those operands need no
+  // staging, and the emitter in agreement.
+  func.walk([&](ttg::LocalAllocOp la) {
+    if (memdescMap.count(la.getResult()))
+      return;
+    auto mt = cast<ttg::MemDescType>(la.getResult().getType());
+    msl::Type *scTy =
+        ctx.named("threadgroup " + mslScalarType(mt.getElementType()));
+    std::string buf = "__tg_buf_" + std::to_string(tgScratchId++);
+    prologue.push_back(ctx.arrayDeclStmt(scTy, buf, memdescFlatSize(mt)));
+    memdescMap[la.getResult()] = {buf, nullptr, memdescStrides(mt)};
+  });
+  // A pipelined operand reaches its dot through memdesc_index (the buffer slot
+  // for this trip), and that is the value the dot looks up, not the allocation.
+  // Resolve those here too so planDot sees the operand as already resident.
+  func.walk([&](ttg::MemDescIndexOp mi) {
+    if (memdescMap.count(mi.getResult()) || !memdescMap.count(mi.getSrc()))
+      return;
+    // The index is an SSA value with no MSL name yet at prescan time, so only
+    // a constant slot can be resolved here; a rotating slot is registered when
+    // the body walk reaches it.
+    APInt slot;
+    if (!matchPattern(mi.getIndex(), m_ConstantInt(&slot)))
+      return;
+    auto resMt = cast<ttg::MemDescType>(mi.getResult().getType());
+    MemDescInfo parent = memdescMap[mi.getSrc()];
+    int64_t byteOff = slot.getSExtValue() * memdescFlatSize(resMt);
+    msl::Expr *base =
+        byteOff == 0 ? nullptr
+                     : static_cast<msl::Expr *>(ctx.lit(std::to_string(byteOff)));
+    memdescMap[mi.getResult()] = {parent.buf, base, parent.bufStrides};
+  });
+
   func.walk([&](Operation *op) { scanPool(op); });
   int64_t kernelPool = moduleHasDevFuncs ? globalPoolBytes : poolBytes;
   if (kernelPool > 0) {
@@ -821,43 +859,6 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
       dmaHandleFor[ac.getOperation()] = tok;
     });
   }
-
-  // Declare every local_alloc's buffer up front. planDot decides whether a dot
-  // can read its operand straight out of the allocation, and it runs while the
-  // loop's Decl phase is emitted -- before the body walk would have reached an
-  // alloc sitting inside (or hoisted just before) that loop. Registering them
-  // here keeps the pool sizing, which already assumes those operands need no
-  // staging, and the emitter in agreement.
-  func.walk([&](ttg::LocalAllocOp la) {
-    if (memdescMap.count(la.getResult()))
-      return;
-    auto mt = cast<ttg::MemDescType>(la.getResult().getType());
-    msl::Type *scTy =
-        ctx.named("threadgroup " + mslScalarType(mt.getElementType()));
-    std::string buf = "__tg_buf_" + std::to_string(tgScratchId++);
-    prologue.push_back(ctx.arrayDeclStmt(scTy, buf, memdescFlatSize(mt)));
-    memdescMap[la.getResult()] = {buf, nullptr, memdescStrides(mt)};
-  });
-  // A pipelined operand reaches its dot through memdesc_index (the buffer slot
-  // for this trip), and that is the value the dot looks up, not the allocation.
-  // Resolve those here too so planDot sees the operand as already resident.
-  func.walk([&](ttg::MemDescIndexOp mi) {
-    if (memdescMap.count(mi.getResult()) || !memdescMap.count(mi.getSrc()))
-      return;
-    // The index is an SSA value with no MSL name yet at prescan time, so only
-    // a constant slot can be resolved here; a rotating slot is registered when
-    // the body walk reaches it.
-    APInt slot;
-    if (!matchPattern(mi.getIndex(), m_ConstantInt(&slot)))
-      return;
-    auto resMt = cast<ttg::MemDescType>(mi.getResult().getType());
-    MemDescInfo parent = memdescMap[mi.getSrc()];
-    int64_t byteOff = slot.getSExtValue() * memdescFlatSize(resMt);
-    msl::Expr *base =
-        byteOff == 0 ? nullptr
-                     : static_cast<msl::Expr *>(ctx.lit(std::to_string(byteOff)));
-    memdescMap[mi.getResult()] = {parent.buf, base, parent.bufStrides};
-  });
 
   Region &region = func.getBody();
   msl::Block body = region.hasOneBlock() ? walkBlock(region.front(), indent)

@@ -193,6 +193,10 @@ struct DotPlan {
   // simdgroup_load's transpose flag, which costs nothing, rather than being
   // permuted element by element on the way into threadgroup memory.
   bool bStageTransposed = false;
+  // Operand reaches the MMA out of its own allocation, so it claims no pool
+  // bytes even when the rotating slot has no memdescMap entry yet.
+  bool aNoStage = false;
+  bool bNoStage = false;
 
   // Pool layout: A at 0, B at stagedA, C at stagedAB (disjoint) or 0 (aliased
   // over A/B, which forces the banded C round-trip).

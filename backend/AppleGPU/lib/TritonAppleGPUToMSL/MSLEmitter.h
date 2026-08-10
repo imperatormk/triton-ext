@@ -781,6 +781,8 @@ private:
   std::optional<InPlaceOperand>
   dotOperandInPlaceBuf(Value operand, int64_t rows, int64_t cols);
 
+  bool dotOperandInLocalAlloc(Value operand, int64_t rows, int64_t cols);
+
   msl::Expr *inPlaceBase(const InPlaceOperand &op);
 
   // A dot operand reached through a convert_layout of a rank-2 distributed

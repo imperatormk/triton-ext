@@ -65,7 +65,22 @@ how a fragment is addressed has to be made, and tested, four times.
 Three steps, each independently landable and independently revertable. Do them
 in order; step 1 is the one that pays for itself immediately.
 
-### Step 1 — one question, one answer, one place
+### Step 1 — one question, one answer, one place — **LANDED (`d6f39c8`)**
+
+Implemented, with one correction to the plan below. `scanPool` runs to
+completion *before* the body walk reaches `planDot` — it is what computes
+`poolBytes` — so the two cannot share anything downstream of the budget.
+`DotFacts` therefore holds only the IR-derived half (shape, element widths,
+A/B residency, in-place/no-stage, device-direct A, the phase-free B DMA
+candidate). The budget-dependent fields the sketch below lists — `aPad`,
+`bPad`, `stagedA`, `stagedB`, `cReserved` — stay with whichever pass decides
+them, because `scanPool` necessarily works against a provisional budget.
+
+That still covers all four bugs in the table: every one was an *IR-derived*
+predicate asked twice. Verified byte-identical MSL across five GEMM configs.
+
+Original sketch follows.
+
 
 **Problem.** Predicates like "is B in place", "is A staged", "does this store go
 direct", "does this copy store transposed" are each computed in two or three

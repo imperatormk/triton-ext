@@ -217,8 +217,6 @@ private:
   // Set once a batch of async copies has been fenced, cleared at the wait that
   // closes the batch, so its members share a single fence.
   bool asyncCopyFenced = false;
-  // Event tokens of DMA copies issued since the last wait.
-  SmallVector<std::string> pendingDmaHandles;
   // Tokens needing a prologue declaration (issue and wait can be in different
   // scopes).
   SmallVector<std::string> dmaHandleDecls;

@@ -1113,7 +1113,6 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
         for (const std::string &h : waits)
           body.push_back(dmaWait(h));
       }
-      pendingDmaHandles.clear();
       if (!barrierCoversTail(body))
         body.push_back(ctx.barrier(/*device=*/false));
       // The batch ends here; the next copy opens a new one and fences again.
@@ -1825,7 +1824,6 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       if (Value m = ac.getMask())
         issue = ctx.compactIf(ctx.var(names(m)[0]), issue);
       body.push_back(issue);
-      pendingDmaHandles.push_back(h);
       bindDataless(ac.getResult());
       return true;
     }

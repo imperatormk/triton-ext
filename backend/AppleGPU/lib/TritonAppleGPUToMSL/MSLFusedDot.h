@@ -168,6 +168,36 @@ struct DirectStage {
   bool fragTransposed = false;
 };
 
+// The questions about a dot that both the pool-sizing pass and the layout pass
+// need, and that neither may answer for itself.
+//
+// scanPool runs to completion before the body walk reaches planDot, so the two
+// cannot share anything that depends on poolBytes -- scanPool is what computes
+// it. What they can share is everything derivable from the IR alone, which is
+// where all four of the pool bugs lived: each was one of these predicates
+// evaluated twice, at points where its inputs were not yet equal.
+//
+// Every field here must be a pure function of the IR. Anything that needs a
+// budget, a phase, or a bound MSL name is not a fact -- it is a decision, and
+// it belongs to whichever pass is making it.
+struct DotFacts {
+  bool usable = false; // shape and element types are on the simdgroup path
+
+  int rank = 0;
+  int64_t M = 0, N = 0, K = 0;
+  int64_t aElemBytes = 0, bElemBytes = 0, accBytes = 4;
+  bool intOperands = false;
+
+  // Whole unstaged A+B fits the hard cap, which is the precondition for any of
+  // the aliasing answers below being offered at all.
+  bool abResident = false;
+
+  std::optional<InPlaceOperand> aInPlace, bInPlace;
+  bool aNoStage = false, bNoStage = false;
+  std::optional<DirectStage> aDirect;
+  bool bDma = false;
+};
+
 struct DotPlan {
   enum class Kind {
     Unsupported, // shape/element type outside the simdgroup-matrix path

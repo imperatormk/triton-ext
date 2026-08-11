@@ -207,26 +207,19 @@ void MSLEmitter::scanPool(Operation *op) {
     poolBytes = std::max(poolBytes, tileSize(st) * byteWidth(e));
   } else if (auto d = dyn_cast<tt::DotOp>(op)) {
     auto aTy = cast<RankedTensorType>(d.getA().getType());
-    auto bTy = cast<RankedTensorType>(d.getB().getType());
     auto cTy = cast<RankedTensorType>(d.getResult().getType());
-    int rk = cTy.getRank();
-    int64_t M = cTy.getShape()[rk - 2];
-    int64_t N = cTy.getShape()[rk - 1];
-    int64_t Kd = aTy.getShape()[rk - 1];
-    int64_t aEb = byteWidth(aTy.getElementType());
-    int64_t bEb = byteWidth(bTy.getElementType());
-    // The pad decision weighs the pool footprint, so it has to know which
-    // operands reach the pool at all. Both predicates are phase-free, so this
-    // asks exactly what planDot asks.
-    bool aUnstaged = false, bUnstaged = false;
-    if (rk == 2 && M * Kd * aEb + Kd * N * bEb <= kTGResidentBudgetBytes) {
-      aUnstaged = dotOperandInLocalAlloc(d.getA(), M, Kd);
-      bUnstaged = dotOperandInLocalAlloc(d.getB(), Kd, N);
-    }
-    if (!aUnstaged)
-      aUnstaged = (bool)dotADirect(d);
-    if (!bUnstaged && dmaStagingEnabled() && bDmaCandidate(d, false))
-      bUnstaged = true;
+    // Shape and eligibility come from the shared facts, so this pass and
+    // planDot cannot answer the same question differently -- four pool bugs
+    // were exactly that divergence.
+    const DotFacts &f = dotFacts(d);
+    int rk = f.rank;
+    int64_t M = f.M, N = f.N, Kd = f.K;
+    int64_t aEb = f.aElemBytes, bEb = f.bElemBytes;
+    // planDot pads with aNoStage/bNoStage, which fold in the in-place answer;
+    // matching that here keeps the pad this pass reserves for and the pad the
+    // emission uses identical.
+    bool aUnstaged = f.aNoStage || f.aDirect.has_value();
+    bool bUnstaged = f.bNoStage || f.bDma;
     int64_t aPad, bPad;
     dotStageRowPads(M, N, Kd, aEb, bEb, aPad, bPad, aUnstaged, bUnstaged);
     int64_t aBy = aUnstaged ? 0 : M * (Kd + aPad) * aEb;

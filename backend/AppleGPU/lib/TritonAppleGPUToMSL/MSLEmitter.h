@@ -347,6 +347,9 @@ private:
   // emission and no fresh() consumption. emitDot is a dispatch over the
   // returned plan.
   DotPlan planDot(tt::DotOp op);
+  // IR-derived answers shared by scanPool and planDot; computed on first ask.
+  const DotFacts &dotFacts(tt::DotOp op);
+  llvm::DenseMap<Operation *, DotFacts> dotFactsCache;
   bool emitDot(tt::DotOp op, msl::Block &body);
   bool emitFusedGemm(scf::ForOp op, tt::DotOp dot, unsigned iterIdx,
                      msl::Block &body);

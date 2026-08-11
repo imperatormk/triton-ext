@@ -1230,6 +1230,52 @@ int MSLEmitter::stageVectorWidth(RankedTensorType stageTy, int regs,
 // decided in the same order emitDot used to fall through its guards:
 // integer operands -> Scalar, unsupported shape/type -> Unsupported, A+B alone
 // over budget -> Panel, an active fused-GEMM phase -> Fused, else Direct.
+const DotFacts &MSLEmitter::dotFacts(tt::DotOp op) {
+  auto it = dotFactsCache.find(op.getOperation());
+  if (it != dotFactsCache.end())
+    return it->second;
+
+  DotFacts f;
+  auto aTy = cast<RankedTensorType>(op.getA().getType());
+  auto bTy = cast<RankedTensorType>(op.getB().getType());
+  auto cTy = cast<RankedTensorType>(op.getResult().getType());
+  Type aElem = aTy.getElementType();
+  Type bElem = bTy.getElementType();
+  Type cElem = cTy.getElementType();
+
+  f.rank = cTy.getRank();
+  f.M = cTy.getShape()[f.rank - 2];
+  f.N = cTy.getShape()[f.rank - 1];
+  f.K = aTy.getShape()[f.rank - 1];
+  f.aElemBytes = byteWidth(aElem);
+  f.bElemBytes = byteWidth(bElem);
+  f.intOperands =
+      isa<IntegerType>(aElem) || isa<IntegerType>(bElem) || isa<IntegerType>(cElem);
+  f.usable = !f.intOperands && (f.rank == 2 || f.rank == 3) &&
+             isDotOperandElem(aElem) && isDotOperandElem(bElem) &&
+             aElem == bElem && (cElem.isF32() || cElem.isF16()) &&
+             !(f.M % 8) && !(f.N % 8) && !(f.K % 8);
+
+  f.abResident = f.rank == 2 && f.M * f.K * f.aElemBytes +
+                                        f.K * f.N * f.bElemBytes <=
+                                    kTGResidentBudgetBytes;
+  if (f.abResident) {
+    f.aInPlace = dotOperandInPlaceBuf(op.getA(), f.M, f.K);
+    f.bInPlace = dotOperandInPlaceBuf(op.getB(), f.K, f.N);
+    f.aNoStage =
+        f.aInPlace.has_value() || dotOperandInLocalAlloc(op.getA(), f.M, f.K);
+    f.bNoStage =
+        f.bInPlace.has_value() || dotOperandInLocalAlloc(op.getB(), f.K, f.N);
+  }
+  if (!f.aInPlace)
+    f.aDirect = dotADirect(op);
+  // The phase-free candidate test: scanPool runs before any fused phase is
+  // set, so asking dotDmaStage here would see phase None and disagree.
+  f.bDma = dmaStagingEnabled() && bDmaCandidate(op, false).has_value();
+
+  return dotFactsCache.insert({op.getOperation(), f}).first->second;
+}
+
 DotPlan MSLEmitter::planDot(tt::DotOp op) {
   DotPlan p;
   auto aTy = cast<RankedTensorType>(op.getA().getType());
@@ -1270,21 +1316,17 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
     return p;
   }
 
-  int64_t aBytes = p.M * p.K * byteWidth(aElem);
-  int64_t bBytes = p.N * p.K * byteWidth(bElem);
   int64_t accBytes = 4;
 
   // In-place aliasing is only offered when the whole A+B tile is resident, so
   // this tests the unstaged footprint against the hard 32KB cap, not the
-  // (smaller) live pool budget that sizes the staged regions below.
-  if (p.rank == 2 && aBytes + bBytes <= kTGResidentBudgetBytes) {
-    p.aInPlace = dotOperandInPlaceBuf(op.getA(), p.M, p.K);
-    p.bInPlace = dotOperandInPlaceBuf(op.getB(), p.K, p.N);
-    p.aNoStage = p.aInPlace.has_value() ||
-                 dotOperandInLocalAlloc(op.getA(), p.M, p.K);
-    p.bNoStage = p.bInPlace.has_value() ||
-                 dotOperandInLocalAlloc(op.getB(), p.K, p.N);
-  }
+  // (smaller) live pool budget that sizes the staged regions below. Taken from
+  // dotFacts so scanPool cannot answer it differently.
+  const DotFacts &facts = dotFacts(op);
+  p.aInPlace = facts.aInPlace;
+  p.bInPlace = facts.bInPlace;
+  p.aNoStage = facts.aNoStage;
+  p.bNoStage = facts.bNoStage;
   p.aStage = op.getA();
   p.bStage = op.getB();
   if (!p.aInPlace)
@@ -1319,10 +1361,9 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   // destination: every one of its 3136 copies has dstStride == cols.
   bool bDma = p.phase != FusedDotPhase::None && !p.bInPlace &&
               dmaStagingEnabled() && bDmaCandidate(op, /*requireBound=*/false);
-  // A device-direct A claims no pool at all. Decided here, before stagedA is
-  // computed, so the pool sizing and the emission cannot disagree about it.
-  if (!p.aInPlace)
-    p.aDirect = dotADirect(op);
+  // A device-direct A claims no pool at all. Taken from dotFacts, which is
+  // also what scanPool reserves against, so the two cannot disagree about it.
+  p.aDirect = facts.aDirect;
   if (!p.aInPlace && !p.aDirect)
     p.aFrag = aFragEligible(op, p);
   // Other consumers of A still read the staged tile (flash reads P for its l_i

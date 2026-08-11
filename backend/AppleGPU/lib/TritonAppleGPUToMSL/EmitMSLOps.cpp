@@ -2075,35 +2075,48 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
         }
         return expr ? expr : ctx.lit("0");
       };
+      // The row coordinate depends only on (type, register) -- not on the band
+      // -- so it is named once and reused by every band's two comparisons,
+      // rather than rebuilt twice per register per band.
+      msl::Type *i32Ty = ctx.scalar(msl::Scalar::I32);
+      auto rowNames = [&](RankedTensorType rt, StringAttr dim, int n) {
+        SmallVector<std::string> out(n);
+        for (int r = 0; r < n; ++r) {
+          out[r] = fresh();
+          body.push_back(
+              ctx.declStmt(i32Ty, out[r], layout.layoutCoordExpr(rt, r, dim)));
+        }
+        return out;
+      };
+      auto inBand = [&](StringRef rowc, int64_t r0, int64_t r1) -> msl::Expr * {
+        return ctx.binary(
+            B::LAnd,
+            ctx.binary(B::Ge, ctx.var(rowc), ctx.lit(std::to_string(r0))),
+            ctx.binary(B::Lt, ctx.var(rowc), ctx.lit(std::to_string(r1))));
+      };
+      SmallVector<std::string> srcRow =
+          rowNames(srcTy, srcRowDim, regCount(src));
+      SmallVector<std::string> resRow =
+          rowNames(resTy, resRowDim, regCount(res));
+      for (int r = 0, n = regCount(res); r < n; ++r) {
+        ids[r] = fresh();
+        body.push_back(ctx.declStmt(ptrDeclTy, ids[r], nullptr));
+      }
       for (int64_t r0 = 0; r0 < rowsTotal; r0 += bandRows) {
         int64_t r1 = std::min<int64_t>(r0 + bandRows, rowsTotal);
         body.push_back(ctx.hardBarrier(false));
-        for (int r = 0, n = regCount(src); r < n; ++r) {
-          msl::Expr *rowc = layout.layoutCoordExpr(srcTy, r, srcRowDim);
-          msl::Expr *cond = ctx.binary(
-              B::LAnd, ctx.binary(B::Ge, rowc, ctx.lit(std::to_string(r0))),
-              ctx.binary(B::Lt, layout.layoutCoordExpr(srcTy, r, srcRowDim),
-                         ctx.lit(std::to_string(r1))));
+        for (int r = 0, n = regCount(src); r < n; ++r)
           body.push_back(ctx.compactIf(
-              cond, ctx.assignStmt(
-                        ctx.subscript(ctx.var(buf), bandOffset(srcTy, r, r0)),
-                        scatterVal(srcNames[r]))));
-        }
+              inBand(srcRow[r], r0, r1),
+              ctx.assignStmt(
+                  ctx.subscript(ctx.var(buf), bandOffset(srcTy, r, r0)),
+                  scatterVal(srcNames[r]))));
         body.push_back(ctx.hardBarrier(false));
         for (int r = 0, n = regCount(res); r < n; ++r) {
-          if (ids[r].empty()) {
-            ids[r] = fresh();
-            body.push_back(ctx.declStmt(ptrDeclTy, ids[r], nullptr));
-          }
-          msl::Expr *rowc = layout.layoutCoordExpr(resTy, r, resRowDim);
-          msl::Expr *cond = ctx.binary(
-              B::LAnd, ctx.binary(B::Ge, rowc, ctx.lit(std::to_string(r0))),
-              ctx.binary(B::Lt, layout.layoutCoordExpr(resTy, r, resRowDim),
-                         ctx.lit(std::to_string(r1))));
           msl::Expr *rd =
               gatherVal(ctx.subscript(ctx.var(buf), bandOffset(resTy, r, r0)));
-          body.push_back(
-              ctx.compactIf(cond, ctx.assignStmt(ctx.var(ids[r]), rd)));
+          body.push_back(ctx.compactIf(inBand(resRow[r], r0, r1),
+                                       ctx.assignStmt(ctx.var(ids[r]), rd)));
         }
       }
       bindRegs(res, ids);

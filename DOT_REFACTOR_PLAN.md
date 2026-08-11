@@ -146,23 +146,54 @@ painful, the honest smaller move is to widen `fragMMABand` to cover Fused
 not four. Measure first that Fused's fragment addressing really is congruent;
 that was not verified here.
 
-### Step 3 — split the file
+### Step 3 — split the file — **measured, and smaller than proposed**
 
-Now the *only* remaining step, since step 2 is withdrawn. It no longer depends
-on step 2: `DotMatch` and `DotDma` were already near-separable, and step 1
-landing means the fact computation has an owner. The four emitters move as they
-are.
+Step 2 is withdrawn, so this is the only remaining step. Before doing it I
+measured the actual cross-boundary edges at `7221bda`. The proposed four-way
+split does not survive them either, though less badly than step 2.
 
-- `DotFacts.cpp` — the fact computation from step 1
-- `DotMatch.cpp` — `matchTileIndex` .. `matchDirectStore`, pure IR pattern
-  matching with no emitter state
-- `DotDma.cpp` — the async-copy staging path (~900 lines, already cohesive)
-- `DotEmit.cpp` — the four emitters plus the shared MMA block
+**What the file actually looks like** (4354 lines):
 
-`DotMatch` and `DotDma` are already near-separable; the other two are not until
-step 1 exists.
+| block | lines | ~size |
+|---|---|---|
+| anonymous namespace (IR match helpers) | 25–423 | 400 |
+| DMA plumbing (`dmaCopyEligible` .. `stageVectorWidth`) | 424–1232 | 810 |
+| facts / plan / the four emitters | 1233–3030 | 1800 |
+| fragment primitives + matchers + policy | 3031–4354 | 1320 |
 
-**Risk:** low, mechanical. Do it last so the moves are pure.
+**Two problems with the proposed seams:**
+
+1. **The anonymous namespace is shared across the DMA/match boundary.**
+   `peelBroadcast` is used once by DMA and 5 times by the matchers;
+   `matchDirectStage` twice by DMA and once by the emitters. Splitting forces
+   them into a shared header, converting internal-linkage helpers into a
+   published interface between files. `DotDma.cpp` would not be self-contained
+   after all.
+
+2. **`DotEmit` and `DotMatch` are not two units.** The emit block makes **51
+   calls** into what the plan calls `DotMatch`, and 31 of them are the fragment
+   primitives (`fragDecl` 10, `accFragDecl` 7, `sgStore` 5,
+   `sgMultiplyAccumulate` 5, `sgLoad` 4) — the emitters' own vocabulary, not a
+   separate concern. Another 6 are tiling policy (`dotNeedsPanel`,
+   `dotColChunk`, `dotCBandRows`, `dotPanelDims`) the emitters must consult.
+
+**What the real seams are**, if this is done at all:
+
+- `DotFragments.cpp` — `sgFragType` .. `sgMultiplyAccumulate` (~65 lines).
+  Genuinely a leaf: pure AST builders over `msl::`, no emitter state beyond
+  `ctx`. This one is clean and could move today.
+- `DotDma.cpp` — the 810-line DMA block, **but only after** `peelBroadcast` and
+  `matchDirectStage` move to a shared internal header. That is the price, and
+  it should be paid deliberately.
+- Everything else stays. `planDot` + the four emitters + the policy helpers
+  they call are one unit whether or not they live in one file.
+
+**Recommendation:** move `DotFragments.cpp` if someone wants the win; leave the
+rest. A 4354-line file that is *correctly grouped* — and it is, the four blocks
+above are contiguous and in dependency order — costs less than a split that
+publishes three new internal interfaces. Revisit if the file grows past ~6000
+lines or if the DMA path is ever revived (it ships off, see
+`CLAUDE.local.md`).
 
 ## What NOT to do
 
@@ -183,8 +214,20 @@ step 1 exists.
 3. The corpus rebench (see `REBENCH_2026_08_11.md`) as the perf gate — no row
    may regress beyond its measured spread.
 
-## Sequencing note
+## Outcome
 
-Step 1 is worth doing even if 2 and 3 never happen. It is the step that maps
-directly onto the observed failure mode, and it is the one that makes the other
-two safe.
+Step 1 said it was worth doing even if 2 and 3 never happened. That turned out
+to be the whole plan: **step 1 landed (`d6f39c8`), step 2 was withdrawn as
+false, step 3 shrank to one optional 65-line move.**
+
+The reason is the same in both withdrawals. Step 1 was derived from four
+observed bugs — it described something that had actually gone wrong four times.
+Steps 2 and 3 were derived from reading line counts and guessing at structure,
+and both dissolved on contact with the call graph: the emitters do not share an
+MMA shape, and the file's blocks do not separate without publishing new internal
+interfaces.
+
+Worth remembering when the file next "feels convoluted": measure the edges
+(`fragMMABand` usage, cross-block call counts, anon-namespace sharing) before
+proposing a shape. Those measurements took under an hour and refuted two of
+three steps.

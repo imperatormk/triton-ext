@@ -103,19 +103,45 @@ Four bugs, all this shape:
 | `cb7173d` | a transposed-store query answered differently while planning vs emitting |
 | `1eef2f7` | A's pad sized with `bInPlace`, which is false during the Decl phase |
 
-### The safety net, and why it is not enough
+### The safety net, and the one thing wrong with it
 
-`checkPoolRegions` (`EmitMSLDot.cpp:1519`) walks the live regions and fails the
-function if any extends past `poolBytes`. It works — it caught `1eef2f7` — but:
+`checkPoolRegions` (`EmitMSLDot.cpp:1519`) is better than I first assumed when
+writing this file. It checks **both** failure modes:
 
-1. **It reports the wrong thing.** A failure sets `emitFailed`, which unwinds to
-   `emitOp` returning false, which surfaces as `EmitMSL: unhandled op 'scf.for'`
-   — naming the enclosing loop rather than the dot whose arithmetic was wrong.
-   That message cost real time before the cause was found.
-2. **It only catches overruns.** A layout that fits but is *wrong* (two regions
-   overlapping inside the pool) passes, and no count-based census sees it —
-   MMA and accumulator counts stay correct while one region's stores land in
-   another's tile.
+- **overrun** — any region extending past `poolBytes` (lines 1520-1528)
+- **overlap** — any two simultaneously live regions intersecting (lines
+  1529-1544), which is the silent-miscompile case no count-based census can
+  see, since MMA and accumulator counts stay correct while one region's stores
+  land inside another's tile
+
+Both produce a precise message naming the region, its byte extent, and what it
+collided with. `checkDotPoolRegions` feeds it the three live extents and
+correctly excludes the panel path (which carries its own check) and an overlaid
+C (not live alongside A and B).
+
+**The defect is that the message is thrown away by default.** `mslReject`
+(`MSLReject.cpp:131`) opens with:
+
+```cpp
+if (!mslLogReject())
+  return;
+```
+
+so unless `MSL_LOG_REJECT` is set, the diagnosis is computed and discarded,
+while `emitFailed = true` still unwinds to `emitOp` returning false — which
+surfaces as **`EmitMSL: unhandled op 'scf.for'`**, naming the enclosing loop
+rather than the dot whose budget arithmetic was wrong.
+
+That is exactly what happened with `1eef2f7`: the emitter knew precisely what
+was wrong (`A[0,18432) past pool 16384`) and said nothing useful. Hours went
+into "why can't the emitter handle this loop" when the answer was one env var
+away.
+
+**Suggested fix:** a check that sets `emitFailed` is not a routing rejection,
+it is a bug in our own arithmetic — it should print unconditionally. Either
+call `llvm::errs()` directly in `checkPoolRegions`, or give `mslReject` a
+severity so hard failures bypass the `mslLogReject()` gate while ordinary
+"this gate declined" messages stay behind it.
 
 ## What would actually fix it
 

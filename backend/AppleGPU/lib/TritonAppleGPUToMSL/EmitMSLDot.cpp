@@ -1517,14 +1517,22 @@ bool MSLEmitter::emitDot(tt::DotOp op, msl::Block &body) {
 // count-based census can see: the MMA and accumulator counts stay correct while
 // one region's stores land inside another's tile.
 void MSLEmitter::checkPoolRegions(Operation *op, ArrayRef<PoolRegion> live) {
+  // A failure here is our own layout arithmetic disagreeing with the size
+  // scanPool reserved, not a gate declining to handle an op, so it is reported
+  // whether or not reject logging is on. Silently, the caller only sees the
+  // enclosing op fail to emit, which names the wrong operation entirely.
+  auto fail = [&](const std::string &why) {
+    mslReject(op, "poolRegions", why);
+    if (!mslLogReject())
+      llvm::errs() << "MSL-POOL\t" << why << '\t' << *op << '\n';
+    emitFailed = true;
+  };
   for (const PoolRegion &r : live) {
     if (!r.bytes || r.begin + r.bytes <= poolBytes)
       continue;
-    mslReject(op, "poolRegions",
-              std::string(r.name) + "[" + std::to_string(r.begin) + "," +
-                  std::to_string(r.begin + r.bytes) + ") past pool " +
-                  std::to_string(poolBytes));
-    emitFailed = true;
+    fail(std::string(r.name) + "[" + std::to_string(r.begin) + "," +
+         std::to_string(r.begin + r.bytes) + ") past pool " +
+         std::to_string(poolBytes));
   }
   for (size_t i = 0; i < live.size(); ++i)
     for (size_t j = i + 1; j < live.size(); ++j) {
@@ -1533,13 +1541,10 @@ void MSLEmitter::checkPoolRegions(Operation *op, ArrayRef<PoolRegion> live) {
       int64_t ie = live[i].begin + live[i].bytes;
       int64_t je = live[j].begin + live[j].bytes;
       if (live[i].begin < je && live[j].begin < ie) {
-        std::string why = std::string(live[i].name) + "[" +
-                          std::to_string(live[i].begin) + "," +
-                          std::to_string(ie) + ") overlaps " + live[j].name +
-                          "[" + std::to_string(live[j].begin) + "," +
-                          std::to_string(je) + ")";
-        mslReject(op, "poolRegions", why);
-        emitFailed = true;
+        fail(std::string(live[i].name) + "[" +
+             std::to_string(live[i].begin) + "," + std::to_string(ie) +
+             ") overlaps " + live[j].name + "[" +
+             std::to_string(live[j].begin) + "," + std::to_string(je) + ")");
       }
     }
 }

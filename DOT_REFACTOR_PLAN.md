@@ -113,26 +113,45 @@ cheapest step: the predicates already exist, they just need one owner.
 **Risk:** low. No codegen change intended; verify with a byte-identical MSL diff
 across the corpus.
 
-### Step 2 — extract the MMA block
+### Step 2 — extract the MMA block — **NOT DONE, and the premise is wrong**
 
-**Problem.** The five-step sequence above is written out four times.
+**The claim below ("the five-step sequence is written out four times") does not
+survive reading the emitters.** They are not four copies of one loop; they are
+three different *addressing strategies*, and the difference is load-bearing:
 
-**Change.** One `emitMmaBlock(const MmaShape&, const OperandSource&, ...)` that
-owns fragment declaration, the `ki`/`ni` loop nest, and the accumulate. The four
-emitters keep their *own* concerns — panel splitting, K-loop rotation, epilogue
-choice — and call into it for the inner block.
+| emitter | fragment index | offsets | shared helper |
+|---|---|---|---|
+| Panel | C++ `int64_t` (`mi`, `ni`) | literals (`mi * 8 * K`) | none |
+| Direct | runtime expr (`warpId * mB + r`) | built AST nodes | `fragMMABand` + frag cache |
+| Fused | runtime, accumulator persists across the K-loop | built AST nodes | none |
 
-Define `OperandSource` as a small closed enum, since it is exactly the axis that
-has been growing: `{ Pool, DevicePtr, InPlaceBuf, DmaBuf }`. Today that axis is
-encoded as five booleans consulted in different orders by different emitters,
-which is why `aNoStage`/`bNoStage` had to be bolted on.
+Counted at `d6f39c8`: `fragMMABand`/`clearFragCache` appears **9 times in
+Direct and 0 times in Fused and Panel**. So the shared abstraction already
+exists — it covers exactly one emitter, because the other two do not have a
+shape it fits.
 
-**Risk:** medium. This moves real codegen. Land behind the 294-case ragged gate
-plus a corpus MSL diff, and expect to iterate.
+An `emitMmaBlock` spanning all three would have to be generic over "is this
+index a compile-time constant or an AST expression". Templating it buys
+nothing; pushing everything through the expression path would **change Panel's
+codegen**, turning literal offsets into expression trees the Metal compiler has
+to re-fold. That is a real regression risk taken on to satisfy a line count.
+
+This is the same failure the "What NOT to do" section below warns about, one
+level down: forcing one function over paths that differ in structure rather
+than in detail produces exactly the boolean soup the plan exists to remove.
+
+**Recommendation: do not do this as stated.** If the duplication becomes
+painful, the honest smaller move is to widen `fragMMABand` to cover Fused
+(which shares Direct's runtime-index style) and leave Panel alone — two paths,
+not four. Measure first that Fused's fragment addressing really is congruent;
+that was not verified here.
 
 ### Step 3 — split the file
 
-Only after 1 and 2, because the seams are wrong today:
+Now the *only* remaining step, since step 2 is withdrawn. It no longer depends
+on step 2: `DotMatch` and `DotDma` were already near-separable, and step 1
+landing means the fact computation has an owner. The four emitters move as they
+are.
 
 - `DotFacts.cpp` — the fact computation from step 1
 - `DotMatch.cpp` — `matchTileIndex` .. `matchDirectStore`, pure IR pattern

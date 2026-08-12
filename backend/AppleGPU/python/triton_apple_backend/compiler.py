@@ -15,7 +15,14 @@ from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes
 
 # Libdevice patching: see _LibdevicePatchFinder in __init__.py
+#
+# passes.plugin is an empty shell libtriton always creates, so its mere
+# presence doesn't mean a plugin loaded. add_simplify_gather is synthesized
+# onto it only if the AppleGPU plugin dylib registered a "simplify_gather"
+# pass (see ExportAppleGPU.cpp), so that attribute is what actually signals
+# a successful load.
 _plugin = getattr(passes, 'plugin', None)
+_plugin_loaded = bool(_plugin) and hasattr(_plugin, 'add_simplify_gather')
 
 # EmitMSL hands its output path to the C++ pass through the process-global
 # TRITON_MSL_OUT env var. Inductor autotuning precompiles choices on a thread
@@ -119,7 +126,7 @@ class MPSBackend(BaseBackend):
         super().__init__(target)
         self.target = target
         self.binary_ext = "metallib"
-        if not _plugin:
+        if not _plugin_loaded:
             raise RuntimeError(
                 "Apple GPU plugin not loaded. Set TRITON_PLUGIN_PATHS to "
                 "the libapplegpu_backend dylib built from triton-ext.")

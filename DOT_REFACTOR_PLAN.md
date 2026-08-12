@@ -1,6 +1,8 @@
 # DOT_REFACTOR_PLAN
 
-Status: proposal, nothing implemented. Written 2026-08-11 against `1eef2f7`.
+Status: executed. Written 2026-08-11 against `1eef2f7` as a proposal; step 1
+landed in `d6f39c8`, step 2 was withdrawn, step 3 landed in `2eb18fa` +
+`395d242`. Section headings record each outcome inline.
 
 ## Why now
 
@@ -145,7 +147,7 @@ shares Direct's runtime-index style) and leave Panel alone — two paths, not
 four. Measure first that Fused's fragment addressing really is congruent; that
 was not verified here.
 
-### Step 3 — split the file — **measured, and smaller than proposed**
+### Step 3 — split the file — **LANDED (`2eb18fa` + `395d242`)**
 
 Step 2 is withdrawn, so this is the only remaining step. Before doing it I
 measured the actual cross-boundary edges at `7221bda`. The proposed four-way
@@ -187,11 +189,12 @@ split does not survive them either, though less badly than step 2.
 - Everything else stays. `planDot` + the four emitters + the policy helpers they
   call are one unit whether or not they live in one file.
 
-**Recommendation:** move `DotFragments.cpp` if someone wants the win; leave the
-rest. A 4354-line file that is *correctly grouped* — and it is, the four blocks
-above are contiguous and in dependency order — costs less than a split that
-publishes three new internal interfaces. Revisit if the file grows past ~6000
-lines or if the DMA path is ever revived (it ships off, see `CLAUDE.local.md`).
+**Recommendation** (superseded — the DMA half landed too, see below): move
+`DotFragments.cpp` if someone wants the win; leave the rest. A 4354-line file
+that is *correctly grouped* — and it is, the four blocks above are contiguous and
+in dependency order — costs less than a split that publishes three new internal
+interfaces. Revisit if the file grows past ~6000 lines or if the DMA path is ever
+revived (it ships off, see `CLAUDE.local.md`).
 
 **DONE (`2eb18fa`).** The fragment move landed as `EmitMSLDotFragments.cpp` (89
 lines; `EmitMSLDot.cpp` 4354 → 4282). It was as clean as predicted: the
@@ -203,6 +206,46 @@ across 8 GEMM configs (fp32/fp16/bf16, even-K and ragged, four tilings).
 The `DotDma.cpp` half was **not** done, for the reason given above: it requires
 promoting `peelBroadcast` and `matchDirectStage` to a shared header. That price
 has not been paid, so the DMA block stays put.
+
+**DONE (`395d242`) — and the price was overstated.** Measuring the edges before
+paying it showed most of the cost was already paid. Of the four things the DMA
+block reaches for, only one needed anything:
+
+| dependency                        | actual state                                     |
+| --------------------------------- | ------------------------------------------------ |
+| `matchTilePointer`                | already outside the anon namespace                |
+| `matchDirectStage`                | already outside; `DirectStage` in `MSLFusedDot.h` |
+| `moduleNumWarps`                  | already declared in `MSLEmitter.h:168`            |
+| `peelBroadcast`                   | the only one — anon ns, one use (the mask guard)  |
+
+So the split publishes **no new header and no new interface**: the new TU
+forward-declares the three recognisers it consults, and every moved method was
+already declared on `MSLEmitter`. The single edit to `EmitMSLDot.cpp` is
+reopening the anonymous namespace after `peelBroadcast`; the 618 moved lines are
+byte-identical to the lines removed. `EmitMSLDot.cpp` 4282 → 3662.
+
+`stageOperand`/`stageVectorWidth` deliberately did **not** move — they are the
+register-scatter path all four emitters use, not DMA. Likewise `WarpTiling` /
+`planWarpTiling`, which the emitters call.
+
+**Verification, at the machine-code level rather than by inspection.** The MSL
+dump gate was unavailable (see below), so equivalence was established on the
+built dylib: of its 14416 exported symbols exactly one differs — `peelBroadcast`
+going internal → external — and its 59-instruction body is unchanged. Comparing
+per-symbol *opcode sequences* before and after, the only deltas are that symbol,
+the anon-namespace `definingOp<SplatOp>` instantiation (13 instructions, now
+emitted once per TU rather than once), and the linker's `__stubs`/`__stub_helper`.
+Every other emitter function is instruction-identical. This is a stronger check
+than an MSL diff over a fixed kernel set: it covers every path in the emitter,
+including the DMA path itself, which ships off and which no default-config dump
+would have exercised.
+
+A third trap, on top of the two below: **the emitted-MSL gate does not currently
+run.** `TRITON_MSL_DUMP=<dir>` is the dump knob (`compiler.py`), but the Python
+path loads `libtriton.so` from the `triton-main` tree, which is stale against
+this repo's `compiler.py` — `add_simplify_gather` is missing and every kernel
+fails in `make_ttgir`. It reproduces with these changes stashed, so it predates
+them, but it means "verify byte-identical MSL" needs that tree rebuilt first.
 
 Two things worth knowing for whoever picks this up next:
 
@@ -237,18 +280,23 @@ Two things worth knowing for whoever picks this up next:
 ## Outcome
 
 Step 1 said it was worth doing even if 2 and 3 never happened. That turned out
-to be the whole plan: **step 1 landed (`d6f39c8`), step 2 was withdrawn as
-false, step 3 shrank to one 65-line move — which landed in `2eb18fa`.** The plan
-is now fully executed, and what it delivered is step 1 plus a file move.
+to be most of the plan: **step 1 landed (`d6f39c8`), step 2 was withdrawn as
+false, and step 3 landed in two pieces — the 65-line fragment move (`2eb18fa`)
+and the 618-line DMA move (`395d242`).** `EmitMSLDot.cpp` is 4354 → 3662.
 
-The reason is the same in both withdrawals. Step 1 was derived from four
-observed bugs — it described something that had actually gone wrong four times.
-Steps 2 and 3 were derived from reading line counts and guessing at structure,
-and both dissolved on contact with the call graph: the emitters do not share an
-MMA shape, and the file's blocks do not separate without publishing new internal
-interfaces.
+Step 1 was derived from four observed bugs — it described something that had
+actually gone wrong four times. Steps 2 and 3 were derived from reading line
+counts and guessing at structure, and step 2 dissolved on contact with the call
+graph: the emitters do not share an MMA shape.
+
+**Measure the edges — in both directions.** The same habit that refuted step 2
+also refuted the *objection* to step 3's second half. The DMA block was left in
+place on the estimate that extracting it meant publishing `peelBroadcast` and
+`matchDirectStage`; counting the actual references showed both matchers were
+already external and only `peelBroadcast` cost anything. An estimate of a
+refactor's price is worth no more than an estimate of its benefit, and this plan
+got one of each wrong in opposite directions.
 
 Worth remembering when the file next "feels convoluted": measure the edges
 (`fragMMABand` usage, cross-block call counts, anon-namespace sharing) before
-proposing a shape. Those measurements took under an hour and refuted two of
-three steps.
+proposing a shape — and re-measure before accepting a previous refusal.

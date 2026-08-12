@@ -2091,25 +2091,30 @@ bool MSLEmitter::emitDotFused(
   }
 
   // Non-direct readback: pool store + gather. The drain overlays the dead A/B
-  // staging, so it has to happen in one pass -- a second band's stores would
-  // land on the region the first is still gathering from.
-  barrier();
-  for (int64_t w = 0; w < numWarps; ++w) {
-    msl::Block inner;
-    for (int64_t j = 0; j < fragsPerWarp; ++j) {
-      int64_t mi, ni;
-      wt.frag(w, j, nT, numWarps, mi, ni);
-      if (mi * nT + ni >= nFrag)
-        continue;
-      inner.push_back(
-          sgStore(fusedDot.accNames[j], dc.tgC, mi * 8 * N + ni * 8, N));
+  // staging, so each band must be gathered before the next band's stores land
+  // on it -- hence the barrier on both sides of every band.
+  for (int64_t r0 = 0; r0 < M; r0 += plan.bandRows) {
+    int64_t r1 = std::min<int64_t>(r0 + plan.bandRows, M);
+    barrier();
+    for (int64_t w = 0; w < numWarps; ++w) {
+      msl::Block inner;
+      for (int64_t j = 0; j < fragsPerWarp; ++j) {
+        int64_t mi, ni;
+        wt.frag(w, j, nT, numWarps, mi, ni);
+        if (mi * nT + ni >= nFrag)
+          continue;
+        if (mi * 8 < r0 || mi * 8 >= r1)
+          continue;
+        inner.push_back(sgStore(fusedDot.accNames[j], dc.tgC,
+                                (mi * 8 - r0) * N + ni * 8, N));
+      }
+      body.push_back(ctx.ifScope(
+          ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
+          std::move(inner)));
     }
-    body.push_back(ctx.ifScope(
-        ctx.binary(B::Eq, ctx.var(warpId), ctx.lit(std::to_string(w))),
-        std::move(inner)));
+    barrier();
+    readbackInto(body, 0, r0, r1);
   }
-  barrier();
-  readbackInto(body, 0, 0, M);
   barrier();
   return true;
 }

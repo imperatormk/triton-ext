@@ -3589,6 +3589,19 @@ Value MSLEmitter::dotOperandConvertSource(tt::DotOp d, Value operand) {
   return src;
 }
 
+// A transpose changes neither the operand's tensor type nor its register linear
+// layout, so a path deciding eligibility from the type alone cannot see it.
+// Every A/B fast path must ask here rather than testing it privately.
+bool MSLEmitter::dotOperandTransposed(tt::DotOp d, Value operand) {
+  if (Value s = dotOperandConvertSource(d, operand))
+    operand = s;
+  auto tr = definingOp<tt::TransOp>(operand);
+  if (!tr)
+    return false;
+  auto ord = tr.getOrder();
+  return ord.size() == 2 && ord[0] == 1 && ord[1] == 0;
+}
+
 bool MSLEmitter::convertLayoutIsDeadDotStageSource(ttg::ConvertLayoutOp c) {
   if (c.getResult().use_empty())
     return false;

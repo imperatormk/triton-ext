@@ -817,6 +817,10 @@ private:
   // round-trip dead weight. Returns the source value to stage, or null.
   static Value dotOperandConvertSource(tt::DotOp d, Value operand);
 
+  // Whether a dot operand comes from a 2D tt.trans, after peeling any
+  // convert_layout. The single answer every A/B fast path must use.
+  static bool dotOperandTransposed(tt::DotOp d, Value operand);
+
   // The convert_layout is dead when every use is a dot that will stage the
   // convert source directly (dotOperandConvertSource matches). Emitting its
   // round-trip is then pure waste.

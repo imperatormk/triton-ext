@@ -331,6 +331,11 @@ bool MSLEmitter::aFragEligible(tt::DotOp op, const DotPlan &plan) {
   auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
   if (!aTy || aTy.getRank() != 2 || !aTy.getElementType().isF32())
     return false;
+  // Every test below passes for a transposed A, which would then be read in the
+  // untransposed order. B peels its transpose (bStageTransposed) and
+  // aDirectCandidate declines one; this path had neither.
+  if (dotOperandTransposed(op, op.getA()))
+    return false;
   auto cTy = dyn_cast<RankedTensorType>(op.getResult().getType());
   if (!cTy || aTy.getEncoding() != cTy.getEncoding())
     return false;
@@ -374,6 +379,8 @@ std::optional<DirectStage> MSLEmitter::aDirectCandidate(tt::DotOp op, int64_t M,
     return std::nullopt;
   // Warps must tile M alone, in equal whole-fragment bands.
   if (numWarps < 1 || M % (numWarps * 8))
+    return std::nullopt;
+  if (dotOperandTransposed(op, op.getA()))
     return std::nullopt;
   Value stage = op.getA();
   if (Value s = dotOperandConvertSource(op, op.getA()))

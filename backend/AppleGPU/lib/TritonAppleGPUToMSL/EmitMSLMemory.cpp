@@ -307,7 +307,10 @@ void MSLEmitter::scanPool(Operation *op) {
           // how many threadgroups stay resident.
           need = std::max(stagedAB, sc * accBytes);
         } else {
-          need = std::max(stagedAB, dmaSlack ? cBanded : cFull);
+          // cFull is only reservable when it fits; past the budget the readback
+          // bands the tile anyway, so reserving the whole thing just sizes the
+          // pool past the cap and makes the config unlaunchable.
+          need = std::max(stagedAB, cBanded);
         }
         // With both operands read in place (pipelined into their own
         // allocations) stagedAB is zero. The readback still declares a

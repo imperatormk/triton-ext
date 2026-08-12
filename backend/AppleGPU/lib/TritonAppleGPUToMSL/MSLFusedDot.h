@@ -49,23 +49,23 @@ enum class FusedDotPhase { None, Decl, MMA, Readback };
 // gather). Populated when matchDirectStore succeeds; empty otherwise.
 struct DirectStore {
   tt::StoreOp store;
-  Value basePtr;     // C matrix base pointer (scalar kernel arg)
+  Value basePtr;      // C matrix base pointer (scalar kernel arg)
   UniformInt baseOff; // tile-uniform element offset (bmm's batch term)
   Value tileGuard;    // tile-uniform store predicate (bmm's idx_q < BATCH)
-  UniformInt ldc;    // row stride, col stride is 1 (row-major)
-  Value rowBase;     // global row of the tile's top-left element (scalar)
-  Value colBase;     // global col of the tile's top-left element (scalar)
-  UniformInt boundM; // store-mask row bound, unset when unmasked
-  UniformInt boundN; // store-mask col bound, unset when unmasked
-  Type narrowTo;     // f16/bf16 output element type, null when f32
+  UniformInt ldc;     // row stride, col stride is 1 (row-major)
+  Value rowBase;      // global row of the tile's top-left element (scalar)
+  Value colBase;      // global col of the tile's top-left element (scalar)
+  UniformInt boundM;  // store-mask row bound, unset when unmasked
+  UniformInt boundN;  // store-mask col bound, unset when unmasked
+  Type narrowTo;      // f16/bf16 output element type, null when f32
   Operation *narrowOp = nullptr; // the elided truncf, when narrowing
   Operation *cvt = nullptr;      // the layout convert feeding the store
   // An `acc + bias` epilogue whose bias is one value per column, broadcast down
   // the rows (the addmm bias). Folded into the fragments before the store, so
   // it costs 8 device loads per fragment column instead of a whole tile round
   // trip. Null when the accumulator reaches the store unmodified.
-  Value biasPtr;   // bias base pointer (scalar kernel arg)
-  Value biasCol;   // global col of the tile's first bias element (scalar)
+  Value biasPtr; // bias base pointer (scalar kernel arg)
+  Value biasCol; // global col of the tile's first bias element (scalar)
   Operation *biasAdd = nullptr; // the elided arith.addf
   Operation *biasCvt = nullptr; // the elided layout convert, when present
   // A pure elementwise epilogue between the accumulator and the store. Each op
@@ -75,7 +75,7 @@ struct DirectStore {
   // The accumulator the region reads. It may be read more than once, so
   // emission resolves it by value rather than by position.
   Value elementwiseAcc;
-  std::string fullTileVar;       // runtime "whole tile in bounds" predicate
+  std::string fullTileVar; // runtime "whole tile in bounds" predicate
   // True when fullTileVar is the constant `true` (an unmasked store): the
   // threadgroup fallback arm is then unreachable and must not be emitted, or
   // it forces a C pool reservation that is never indexed.

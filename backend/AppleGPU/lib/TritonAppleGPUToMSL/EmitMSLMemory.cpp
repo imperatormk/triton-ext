@@ -8,7 +8,6 @@
 
 #include "MSLConstants.h"
 
-
 #include "MSLEmitter.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"

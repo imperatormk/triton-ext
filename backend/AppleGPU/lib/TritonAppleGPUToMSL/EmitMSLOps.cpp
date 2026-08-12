@@ -754,11 +754,11 @@ std::optional<bool> MSLEmitter::clampTileOrigin(arith::MulIOp mul,
   // this tile and its neighbour from the same inputs, so both write the same
   // value. A store that accumulates rather than overwrites would not qualify.
   std::string id = fresh();
-  body.push_back(ctx.declStmt(
-      declTy, id,
-      ctx.call("min", {intBinaryExpr(mul, names(mul.getLhs())[0],
-                                     names(mul.getRhs())[0]),
-                       ctx.i32lit(extent - block)})));
+  body.push_back(
+      ctx.declStmt(declTy, id,
+                   ctx.call("min", {intBinaryExpr(mul, names(mul.getLhs())[0],
+                                                  names(mul.getRhs())[0]),
+                                    ctx.i32lit(extent - block)})));
   bindRegs(mul.getResult(), {id});
   clampedOrigins.insert(mul.getResult());
   return true;
@@ -840,9 +840,9 @@ void MSLEmitter::emitTileRoundTrip(
 
   // When every register lands on the slot it is read back from, each thread
   // recovers exactly the values it wrote and the pool traffic is pure overhead:
-  // the permutation was already absorbed into the result encoding. Comparing the
-  // rendered index expressions is conservative -- it proves the addresses agree
-  // for every (lane, warp) without reasoning about the layouts.
+  // the permutation was already absorbed into the result encoding. Comparing
+  // the rendered index expressions is conservative -- it proves the addresses
+  // agree for every (lane, warp) without reasoning about the layouts.
   if (srcRc == resRc && srcNames.size() == (size_t)srcRc) {
     auto render = [&](msl::Expr *e) {
       std::string s;
@@ -1096,8 +1096,8 @@ bool MSLEmitter::emitOp(Operation *op, msl::Block &body) {
             collect(forOp.getInitArgs()[arg.getArgNumber() - 1]);
             return;
           }
-          auto commit = dyn_cast_or_null<ttg::AsyncCommitGroupOp>(
-              tok.getDefiningOp());
+          auto commit =
+              dyn_cast_or_null<ttg::AsyncCommitGroupOp>(tok.getDefiningOp());
           if (!commit)
             return;
           for (Value inner : commit.getInputTokens())
@@ -1712,8 +1712,9 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       body.push_back(ctx.hardBarrier(false));
       for (int r = 0, n = regCount(init); r < n; ++r)
         body.push_back(ctx.assignStmt(
-            ctx.subscript(ctx.var(buf),
-                          memdescElemAddr(memdescMap[la.getResult()], srcTy, r)),
+            ctx.subscript(
+                ctx.var(buf),
+                memdescElemAddr(memdescMap[la.getResult()], srcTy, r)),
             ctx.var(vals[r])));
       body.push_back(ctx.hardBarrier(false));
     }
@@ -1815,15 +1816,15 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
             B::Add, dstPtr,
             bandCols ? wOff
                      : ctx.paren(ctx.binary(B::Mul, wOff, ctx.i32lit(cols)))));
-        srcPtr = ctx.binary(
-            B::Add, srcPtr,
-            ctx.paren(ctx.binary(B::Mul, wOff, dmaRowStride(*ds))));
+        srcPtr =
+            ctx.binary(B::Add, srcPtr,
+                       ctx.paren(ctx.binary(B::Mul, wOff, dmaRowStride(*ds))));
       }
       msl::Stmt *issue = ctx.assignStmt(
           ctx.var(h),
           ctx.call(dmaCallee(eb, ds->srcTransposed && !storeTr),
-                   {dstPtr, ctx.i32lit(cols), srcPtr,
-                    dmaRowStride(*ds), ctx.i32lit(bandCols ? rows : band),
+                   {dstPtr, ctx.i32lit(cols), srcPtr, dmaRowStride(*ds),
+                    ctx.i32lit(bandCols ? rows : band),
                     ctx.i32lit(bandCols ? band : cols)}));
       // A uniform mask guards the whole issue; the token stays 0 when the trip
       // is out of range, and waiting on a null token is a no-op.
@@ -1910,8 +1911,8 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       std::string vid = fresh();
       into.push_back(ctx.declStmt(
           vecTy, vid,
-          ctx.deref(ctx.paren(
-              ctx.cast(CS::CStyle, vecPtr, ctx.var(ptrs[base]))))));
+          ctx.deref(
+              ctx.paren(ctx.cast(CS::CStyle, vecPtr, ctx.var(ptrs[base]))))));
       // The run's threadgroup slots are consecutive (verified: a vw-run maps to
       // slots s..s+vw-1 for every lane/warp), so the scatter is one vector
       // store through a threadgroup vector pointer rather than vw scalar
@@ -1929,10 +1930,10 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
       // Strided run (a column-major operand lays its registers down a column):
       // the wide device load still holds, only the scatter is per lane.
       for (int k = 0; k < vw; ++k)
-        into.push_back(ctx.assignStmt(
-            ctx.subscript(ctx.var(dst.buf),
-                          memdescElemAddr(dst, srcTy, base + k)),
-            ctx.subscript(ctx.var(vid), ctx.i32lit(k))));
+        into.push_back(
+            ctx.assignStmt(ctx.subscript(ctx.var(dst.buf),
+                                         memdescElemAddr(dst, srcTy, base + k)),
+                           ctx.subscript(ctx.var(vid), ctx.i32lit(k))));
     };
 
     if (hasMask && rc >= kMaskFastPathMinRegs) {
@@ -2425,7 +2426,8 @@ std::optional<bool> MSLEmitter::emitAtomicRMW(Operation *op, msl::Block &body) {
     // whole expression string reads as a variable named "((v6 & 31) == 0)",
     // which matches no declaration, so dead-local elimination never sees the
     // use of laneId/warpId and drops their decls out from under this.
-    auto freeIsZero = [&](const std::string &name, unsigned mask) -> msl::Expr * {
+    auto freeIsZero = [&](const std::string &name,
+                          unsigned mask) -> msl::Expr * {
       return ctx.paren(ctx.binary(
           B::Eq, ctx.paren(ctx.binary(B::And, ctx.var(name), ctx.i32lit(mask))),
           ctx.i32lit(0)));
@@ -2435,8 +2437,7 @@ std::optional<bool> MSLEmitter::emitAtomicRMW(Operation *op, msl::Block &body) {
       threadPred = freeIsZero(laneId, laneFree);
     if (warpFree) {
       msl::Expr *wp = freeIsZero(warpId, warpFree);
-      threadPred =
-          threadPred ? ctx.binary(B::LAnd, threadPred, wp) : wp;
+      threadPred = threadPred ? ctx.binary(B::LAnd, threadPred, wp) : wp;
     }
     tt::MemSemantic sem = ar.getSem();
 
@@ -3348,9 +3349,8 @@ std::optional<bool> MSLEmitter::emitCallReturn(Operation *op,
     auto &base = names(ap.getPtr());
     auto &offs = names(ap.getOffset());
     bool uniformBase =
-        base.size() == 1 || llvm::all_of(base, [&](const std::string &b) {
-          return b == base[0];
-        });
+        base.size() == 1 ||
+        llvm::all_of(base, [&](const std::string &b) { return b == base[0]; });
     // `buf + off_r` for each register makes every pointer its own 64-bit
     // address computation off the raw buffer. Anchoring on register 0 and
     // deriving the rest as `p0 + (off_r - off_0)` leaves one such computation

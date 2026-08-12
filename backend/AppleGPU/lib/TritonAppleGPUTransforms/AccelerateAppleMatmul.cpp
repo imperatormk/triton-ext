@@ -114,10 +114,9 @@ SmallVector<unsigned> warpsPerTileApple(int64_t M, int64_t N, int numWarps,
 
       unsigned ownM = tilesM / wm;
       unsigned ownN = tilesN / wn;
-      auto key =
-          rank(product, ownM + ownN,
-               std::max(ownM, ownN) - std::min(ownM, ownN), std::min(wm, wn),
-               (preferRowOwnership && wn == 1) ? 1 : 0);
+      auto key = rank(
+          product, ownM + ownN, std::max(ownM, ownN) - std::min(ownM, ownN),
+          std::min(wm, wn), (preferRowOwnership && wn == 1) ? 1 : 0);
       if (key <= best)
         continue;
 
@@ -184,9 +183,9 @@ struct BlockedToAppleMma : public OpRewritePattern<tt::DotOp> {
     // MMA encoding on the result only; A/B stay blocked (DotOpToLLVM scatters
     // them through TG), so only one result->blocked ConvertLayoutOp is needed
     // downstream. Oversized tiles fail cleanly via the shared-memory budget.
-    auto wpc = warpsPerTileApple(
-        M, N, numWarps,
-        resultFeedsRowReduction(dot) || operandComesFromDot(dot));
+    auto wpc = warpsPerTileApple(M, N, numWarps,
+                                 resultFeedsRowReduction(dot) ||
+                                     operandComesFromDot(dot));
     auto mmaEnc = AppleMmaEncodingAttr::get(ctx, wpc);
 
     auto newCType =

@@ -394,8 +394,8 @@ private:
   static std::string dmaCallee(int64_t elemBytes, bool transposed);
   msl::Expr *dmaRowStride(const DirectStage &ds);
   msl::Stmt *dmaWait(StringRef handle);
-  std::optional<DirectStage>
-  asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac, bool requireBound = true);
+  std::optional<DirectStage> asyncCopyDma(ttg::AsyncCopyGlobalToLocalOp ac,
+                                          bool requireBound = true);
   bool dmaCopyEligible(ttg::AsyncCopyGlobalToLocalOp ac);
   int dmaStageSlot(ttg::AsyncCopyGlobalToLocalOp ac);
   bool dmaStoreTransposed(ttg::AsyncCopyGlobalToLocalOp ac);
@@ -583,10 +583,10 @@ private:
 
   // True when a boundary-masked store can never actually be ragged: both bounds
   // are compile-time literals, and each tile origin is provably a multiple of
-  // its block size (`pid * BLOCK`), which the bound divides exactly. Both halves
-  // are required -- a literal bound alone says nothing about where the tile
-  // starts. Anything dynamic or indivisible keeps the fallback arm and its pool
-  // reservation.
+  // its block size (`pid * BLOCK`), which the bound divides exactly. Both
+  // halves are required -- a literal bound alone says nothing about where the
+  // tile starts. Anything dynamic or indivisible keeps the fallback arm and its
+  // pool reservation.
   struct PoolRegion {
     const char *name;
     int64_t begin;

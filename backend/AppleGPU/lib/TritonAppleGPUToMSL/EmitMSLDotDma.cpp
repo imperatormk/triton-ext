@@ -229,8 +229,8 @@ int MSLEmitter::dmaStageSlot(ttg::AsyncCopyGlobalToLocalOp ac) {
   for (OpOperand &use : tok.getUses()) {
     Operation *owner = use.getOwner();
     if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
-      int idx = (int)use.getOperandNumber() -
-                (int)forOp.getNumControlOperands();
+      int idx =
+          (int)use.getOperandNumber() - (int)forOp.getNumControlOperands();
       if (idx >= 0)
         return idx;
     }
@@ -289,7 +289,7 @@ bool MSLEmitter::dmaStagingEnabled() {
 // any planDot call: planDot itself needs this to size the pool, so the two
 // would otherwise recurse.
 std::optional<DirectStage> MSLEmitter::bDmaCandidate(tt::DotOp op,
-                                                    bool requireBound) {
+                                                     bool requireBound) {
   auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
   auto bTy = dyn_cast<RankedTensorType>(op.getB().getType());
   if (!aTy || !bTy || aTy.getRank() != 2 || bTy.getRank() != 2)
@@ -315,8 +315,8 @@ std::optional<DirectStage> MSLEmitter::bDmaCandidate(tt::DotOp op,
     return it != valMap.end() && it->second.size() == 1;
   };
   if (requireBound &&
-      (!bound(ds->basePtr) || !(ds->rowStrideLit || bound(ds->rowStride)) || !bound(ds->rowShift) ||
-       !bound(ds->colShift)))
+      (!bound(ds->basePtr) || !(ds->rowStrideLit || bound(ds->rowStride)) ||
+       !bound(ds->rowShift) || !bound(ds->colShift)))
     return std::nullopt;
   return ds;
 }
@@ -408,7 +408,7 @@ std::optional<DirectStage> MSLEmitter::aDirectCandidate(tt::DotOp op, int64_t M,
 // whole tile would re-read every row once per warp. The fused path partitions
 // A the same way through planWarpTiling, which handles the rest.
 std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op,
-                                                 bool knownFusedAcc) {
+                                                  bool knownFusedAcc) {
   auto cTy = dyn_cast<RankedTensorType>(op.getResult().getType());
   auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
   if (!cTy || !aTy)
@@ -445,8 +445,8 @@ std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op,
 }
 
 msl::Stmt *MSLEmitter::bFragLoad(const DotEmitCtx &dc, int64_t ki,
-                                 msl::Expr *niExpr, int64_t niLit,
-                                 StringRef fb, int64_t ldb) {
+                                 msl::Expr *niExpr, int64_t niLit, StringRef fb,
+                                 int64_t ldb) {
   // Staged pre-transpose, B's tile is N x K: fragment (ki, ni) starts at row
   // ni, column ki, and the flag swaps the axes on the way into the fragment.
   if (dc.bStageTransposed) {
@@ -488,8 +488,8 @@ std::optional<DirectStage> MSLEmitter::dotDmaStage(tt::DotOp op) {
 // The K-loop induction variable, as an MSL name, when this dot sits directly in
 // one. The recognised operand pointer advances by `ptrDelta` per trip, and the
 // loop IV counts K elements per trip, so the origin's offset is
-// (iv / step) * ptrDelta. Empty when the dot is not in a loop, in which case the
-// tile origin has no per-trip term.
+// (iv / step) * ptrDelta. Empty when the dot is not in a loop, in which case
+// the tile origin has no per-trip term.
 StringRef MSLEmitter::dotDmaTripVar(Operation *op) {
   auto forOp = dyn_cast_or_null<scf::ForOp>(op->getParentOp());
   if (!forOp)
@@ -514,9 +514,7 @@ msl::Expr *MSLEmitter::dmaRowStride(const DirectStage &ds) {
 // the result is threadgroup-uniform -- which the DMA requires.
 msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
   msl::Expr *off = nullptr;
-  auto add = [&](msl::Expr *e) {
-    off = off ? ctx.binary(B::Add, off, e) : e;
-  };
+  auto add = [&](msl::Expr *e) { off = off ? ctx.binary(B::Add, off, e) : e; };
   // rowStride is the pitch of whichever axis is strided; the other axis is
   // contiguous and shifts by one element. Transposing swaps which is which.
   Value pitched = ds.srcTransposed ? ds.colShift : ds.rowShift;
@@ -524,8 +522,8 @@ msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
   auto pitchedLit = ds.srcTransposed ? ds.colShiftLit : ds.rowShiftLit;
   auto unitLit = ds.srcTransposed ? ds.rowShiftLit : ds.colShiftLit;
   if (pitched)
-    add(ctx.paren(ctx.binary(B::Mul, ctx.var(scalarName(pitched)),
-                             dmaRowStride(ds))));
+    add(ctx.paren(
+        ctx.binary(B::Mul, ctx.var(scalarName(pitched)), dmaRowStride(ds))));
   if (pitchedLit && *pitchedLit)
     add(ctx.paren(
         ctx.binary(B::Mul, ctx.i32lit(*pitchedLit), dmaRowStride(ds))));
@@ -549,8 +547,8 @@ msl::Expr *MSLEmitter::dmaTileOrigin(const DirectStage &ds, StringRef tripVar) {
         int64_t perK = *ds.ptrDeltaLit / step;
         msl::Expr *t = ctx.var(tripVar);
         if (ds.aheadSteps)
-          t = ctx.paren(ctx.binary(
-              B::Add, t, ctx.i32lit(ds.aheadSteps * ds.cols)));
+          t = ctx.paren(
+              ctx.binary(B::Add, t, ctx.i32lit(ds.aheadSteps * ds.cols)));
         if (perK != 1)
           t = ctx.paren(ctx.binary(B::Mul, t, ctx.i32lit(perK)));
         add(ctx.paren(t));
@@ -587,34 +585,32 @@ msl::Stmt *MSLEmitter::dmaBegin(StringRef handle, StringRef tgBuf,
                                 int64_t pitch, msl::Expr *src,
                                 const DirectStage &ds, int64_t elemBytes) {
   std::string callee = dmaCallee(elemBytes, ds.srcTransposed);
-  msl::Expr *c = ctx.call(
-      callee, {ctx.var(tgBuf), ctx.i32lit(pitch), src,
-               dmaRowStride(ds), ctx.i32lit(ds.rows),
-               ctx.i32lit(ds.cols)});
+  msl::Expr *c = ctx.call(callee, {ctx.var(tgBuf), ctx.i32lit(pitch), src,
+                                   dmaRowStride(ds), ctx.i32lit(ds.rows),
+                                   ctx.i32lit(ds.cols)});
   return ctx.declStmt(ctx.named("ulong"), handle, c);
 }
 
 msl::Stmt *MSLEmitter::dmaWait(StringRef handle) {
-  return ctx.exprStmt(ctx.call("__triton_tg_async_copy_wait",
-                               {ctx.var(handle)}));
+  return ctx.exprStmt(
+      ctx.call("__triton_tg_async_copy_wait", {ctx.var(handle)}));
 }
 
 // `h = begin(tgBbase + parity*stagedB, ...)` for the trip after the current
 // one. The destination is the tile the current MMAs are not reading, selected
 // by the parity flag the caller has already flipped.
 msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
-                                    const DotEmitCtx &dc,
-                                    const DirectStage &ds,
+                                    const DotEmitCtx &dc, const DirectStage &ds,
                                     RankedTensorType bStageTy, int64_t ldb,
                                     StringRef tripVar, bool nextTrip) {
   int64_t eb = byteWidth(bStageTy.getElementType());
   // The parity names the tile this trip READS. The priming copy fills that
   // tile; the in-loop copy fills the other one, for the next trip to read
   // after the top-of-trip flip.
-  msl::Expr *slot =
-      nextTrip ? ctx.paren(ctx.binary(B::Sub, ctx.i32lit(1),
-                                      ctx.var(fusedDot.dmaParity)))
-               : static_cast<msl::Expr *>(ctx.var(fusedDot.dmaParity));
+  msl::Expr *slot = nextTrip
+                        ? ctx.paren(ctx.binary(B::Sub, ctx.i32lit(1),
+                                               ctx.var(fusedDot.dmaParity)))
+                        : static_cast<msl::Expr *>(ctx.var(fusedDot.dmaParity));
   // air.simdgroup_async_copy_2d is issued per simdgroup, so letting every warp
   // request the whole tile would move it numWarps times over. Split it instead:
   // warp w takes the band [w*band, (w+1)*band).
@@ -638,12 +634,11 @@ msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
   // The next trip's tile starts one K-block further down B's rows.
   msl::Expr *src = dmaTileOrigin(ds, tripVar);
   if (nextTrip)
-    src = ctx.binary(
-        B::Add, src,
-        ds.srcTransposed
-            ? static_cast<msl::Expr *>(ctx.i32lit(ds.rows))
-            : ctx.paren(ctx.binary(B::Mul, ctx.i32lit(ds.rows),
-                                   dmaRowStride(ds))));
+    src = ctx.binary(B::Add, src,
+                     ds.srcTransposed
+                         ? static_cast<msl::Expr *>(ctx.i32lit(ds.rows))
+                         : ctx.paren(ctx.binary(B::Mul, ctx.i32lit(ds.rows),
+                                                dmaRowStride(ds))));
   if (split) {
     msl::Expr *wOff =
         ctx.paren(ctx.binary(B::Mul, ctx.var(warpId), ctx.i32lit(band)));
@@ -651,14 +646,13 @@ msl::Stmt *MSLEmitter::dmaBeginInto(StringRef handle, const DotPlan &plan,
         B::Add, dst,
         bandCols ? wOff
                  : ctx.paren(ctx.binary(B::Mul, wOff, ctx.i32lit(ldb)))));
-    src = ctx.binary(
-        B::Add, src, ctx.paren(ctx.binary(B::Mul, wOff, dmaRowStride(ds))));
+    src = ctx.binary(B::Add, src,
+                     ctx.paren(ctx.binary(B::Mul, wOff, dmaRowStride(ds))));
   }
-  msl::Expr *c = ctx.call(
-      dmaCallee(eb, ds.srcTransposed),
-      {dst, ctx.i32lit(ldb), src, dmaRowStride(ds),
-       ctx.i32lit(bandCols ? ds.rows : band),
-       ctx.i32lit(bandCols ? band : ds.cols)});
+  msl::Expr *c = ctx.call(dmaCallee(eb, ds.srcTransposed),
+                          {dst, ctx.i32lit(ldb), src, dmaRowStride(ds),
+                           ctx.i32lit(bandCols ? ds.rows : band),
+                           ctx.i32lit(bandCols ? band : ds.cols)});
   return ctx.assignStmt(ctx.var(handle), c);
 }
 

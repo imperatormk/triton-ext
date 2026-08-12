@@ -107,8 +107,7 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
        registerPrefetchDotOperand},
       {"share_dot_operands", "0.1.0", addShareDotOperands,
        registerShareDotOperands},
-      {"unpipeline_dot_a", "0.1.0", addUnpipelineDotA,
-       registerUnpipelineDotA},
+      {"unpipeline_dot_a", "0.1.0", addUnpipelineDotA, registerUnpipelineDotA},
       {"emit_msl", "0.1.0", addEmitMSL, registerEmitMSL},
   };
 

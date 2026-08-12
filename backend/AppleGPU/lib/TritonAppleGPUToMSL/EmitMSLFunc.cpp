@@ -249,7 +249,8 @@ bool initHasCall(msl::Expr *e) {
   return true;
 }
 
-unsigned dropDeadDecls(msl::Block &b, const llvm::DenseSet<llvm::StringRef> &used);
+unsigned dropDeadDecls(msl::Block &b,
+                       const llvm::DenseSet<llvm::StringRef> &used);
 
 unsigned dropDeadDeclsIn(msl::Stmt *s,
                          const llvm::DenseSet<llvm::StringRef> &used) {
@@ -288,9 +289,9 @@ unsigned dropDeadDeclsIn(msl::Stmt *s,
 // removes them even when nothing else reads either. Collect the pairs whose
 // names are read exactly twice -- once in the advance, once in the carry --
 // which means every read is internal to the cycle.
-void findDeadInductionCycles(const msl::Block &b,
-                             const llvm::DenseMap<llvm::StringRef, unsigned> &reads,
-                             llvm::DenseSet<llvm::StringRef> &dead) {
+void findDeadInductionCycles(
+    const msl::Block &b, const llvm::DenseMap<llvm::StringRef, unsigned> &reads,
+    llvm::DenseSet<llvm::StringRef> &dead) {
   // adv name -> base name, for `adv = base + step;` decls in this block.
   llvm::DenseMap<llvm::StringRef, llvm::StringRef> advOf;
   for (const msl::Stmt *s : b) {
@@ -823,8 +824,9 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     MemDescInfo parent = memdescMap[mi.getSrc()];
     int64_t byteOff = slot.getSExtValue() * memdescFlatSize(resMt);
     msl::Expr *base =
-        byteOff == 0 ? nullptr
-                     : static_cast<msl::Expr *>(ctx.lit(std::to_string(byteOff)));
+        byteOff == 0
+            ? nullptr
+            : static_cast<msl::Expr *>(ctx.lit(std::to_string(byteOff)));
     memdescMap[mi.getResult()] = {parent.buf, base, parent.bufStrides};
   });
 
@@ -870,8 +872,7 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
       std::string &tok = stageTok[{dst.getAsOpaquePointer(), dmaStageSlot(ac)}];
       if (tok.empty()) {
         tok = fresh();
-        prologue.push_back(
-            ctx.declStmt(ctx.named("ulong"), tok, ctx.lit("0")));
+        prologue.push_back(ctx.declStmt(ctx.named("ulong"), tok, ctx.lit("0")));
       }
       dmaHandleFor[ac.getOperation()] = tok;
     });

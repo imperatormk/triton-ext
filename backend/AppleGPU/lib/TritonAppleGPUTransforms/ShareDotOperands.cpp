@@ -75,13 +75,13 @@ void routeThroughShared(tt::LoadOp load) {
     order.push_back((unsigned)d);
   (void)blocked;
   auto ctaLayout = ttg::getCGALayout(ty.getEncoding());
-  auto shared = ttg::SwizzledSharedEncodingAttr::get(ctx, /*vec=*/1,
-                                                     /*perPhase=*/1,
-                                                     /*maxPhase=*/1, order,
-                                                     ctaLayout);
+  auto shared =
+      ttg::SwizzledSharedEncodingAttr::get(ctx, /*vec=*/1,
+                                           /*perPhase=*/1,
+                                           /*maxPhase=*/1, order, ctaLayout);
   auto space = ttg::SharedMemorySpaceAttr::get(ctx);
-  auto memTy = ttg::MemDescType::get(ty.getShape(), ty.getElementType(), shared,
-                                     space);
+  auto memTy =
+      ttg::MemDescType::get(ty.getShape(), ty.getElementType(), shared, space);
 
   OpBuilder b(load);
   b.setInsertionPointAfter(load);

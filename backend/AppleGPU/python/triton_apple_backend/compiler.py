@@ -121,8 +121,8 @@ class MPSBackend(BaseBackend):
         self.binary_ext = "metallib"
         if not _plugin:
             raise RuntimeError(
-                "Apple GPU plugin not loaded. Set TRITON_PASS_PLUGIN_PATH to "
-                "the TritonAppleGPUBackend dylib built from triton-ext.")
+                "Apple GPU plugin not loaded. Set TRITON_PLUGIN_PATHS to "
+                "the libapplegpu_backend dylib built from triton-ext.")
 
     def parse_options(self, opts) -> MPSOptions:
         args = {
@@ -152,7 +152,7 @@ class MPSBackend(BaseBackend):
         return f"mps:{options.arch}"
 
     def load_dialects(self, ctx):
-        # Plugin dialect is registered automatically via TRITON_PASS_PLUGIN_PATH
+        # Plugin dialect is registered automatically via TRITON_PLUGIN_PATHS
         ir.load_dialects(ctx)
 
     def hash(self):
@@ -191,7 +191,7 @@ class MPSBackend(BaseBackend):
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
-        # Apple plugin passes (loaded via TRITON_PASS_PLUGIN_PATH)
+        # Apple plugin passes (loaded via TRITON_PLUGIN_PATHS)
         _plugin.add_simplify_gather(pm)
         _plugin.add_accelerate_matmul(pm)
 

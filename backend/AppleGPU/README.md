@@ -103,7 +103,6 @@ must come from the same build.
 
 ```bash
 export TRITON_PLUGIN_PATHS=$PWD/build/lib/libapplegpu_backend.dylib
-export TRITON_PASS_PLUGIN_PATH=$TRITON_PLUGIN_PATHS
 export PYTHONPATH=$PWD/backend/AppleGPU/python
 ```
 

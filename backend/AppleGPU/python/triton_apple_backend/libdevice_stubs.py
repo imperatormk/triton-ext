@@ -314,6 +314,12 @@ def _div_rz(x, y):
 
 
 @triton.jit
+def _mul_rn(x, y):
+    # Rounds the product before any later add, so it cannot contract into an FMA.
+    return tl.fma(x, y, 0.0)
+
+
+@triton.jit
 def _fast_gelu(x):
     return 0.5 * x * (1.0 + _tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
 
@@ -576,6 +582,7 @@ COMPOSITES = {
     'finitef': _finitef,
     'isfinited': _finitef,
     'div_rz': _div_rz,
+    'mul_rn': _mul_rn,
     'fast_tanh': _tanh,
     'fast_erf': DIRECT.get('erf', _tanh),
     'fast_gelu': _fast_gelu,

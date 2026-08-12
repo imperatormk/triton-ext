@@ -193,6 +193,8 @@ void MSLEmitter::scanPool(Operation *op) {
     poolBytes = std::max(poolBytes, tgScratchBytes(st, /*band2D=*/true));
   } else if (auto t = dyn_cast<tt::TransOp>(op)) {
     auto rt = cast<RankedTensorType>(t.getResult().getType());
+    if (shuffleReshapeCovers(t.getSrc(), t.getResult(), t.getOrder()))
+      return;
     poolBytes = std::max(poolBytes, tgScratchBytes(rt, /*band2D=*/false));
   } else if (auto c = dyn_cast<tt::CatOp>(op)) {
     auto rt = cast<RankedTensorType>(c.getResult().getType());
@@ -200,6 +202,8 @@ void MSLEmitter::scanPool(Operation *op) {
     poolBytes = std::max(poolBytes, tileSize(rt) * byteWidth(e));
   } else if (auto rs = dyn_cast<tt::ReshapeOp>(op)) {
     auto rt = cast<RankedTensorType>(rs.getResult().getType());
+    if (shuffleReshapeCovers(rs.getSrc(), rs.getResult(), {}))
+      return;
     poolBytes = std::max(poolBytes, tgScratchBytes(rt, /*band2D=*/false));
   } else if (auto g = dyn_cast<tt::GatherOp>(op)) {
     auto st = cast<RankedTensorType>(g.getSrc().getType());

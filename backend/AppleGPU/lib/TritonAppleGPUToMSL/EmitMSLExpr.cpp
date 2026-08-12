@@ -331,36 +331,28 @@ msl::Expr *MSLEmitter::aliasElem(StringRef name) { return ctx.var(name); }
 // Intra-warp convert_layout
 //===----------------------------------------------------------------------===//
 
-bool MSLEmitter::emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl,
-                                             msl::Block &body) {
-  auto srcTy = cast<RankedTensorType>(cl.getSrc().getType());
-  auto resTy = cast<RankedTensorType>(cl.getResult().getType());
-  // simd_shuffle takes a scalar of a known width; pointer payloads would need
-  // the ulong path plus a cast back. scanPool mirrors this bail.
-  if (isa<tt::PointerType>(resTy.getElementType()))
-    return false;
+// Shared emission for both the convert_layout and the trans/reshape entries:
+// `plan` is already accepted, this only renders the lane index and shuffles.
+bool MSLEmitter::emitShufflePlan(Value src, Value res, const ShufflePlan &plan,
+                                 msl::Block &body) {
+  auto resTy = cast<RankedTensorType>(res.getType());
 
-  auto plan = planIntraWarpShuffle(srcTy, resTy);
-  if (!plan)
+  auto &srcNames = names(src);
+  if ((int)srcNames.size() != (int)regCount(src))
     return false;
-
-  // Without one shared lane index every register needs its own index
-  // computation, at which point the shuffles stop being obviously cheaper than
-  // the round-trip they replace.
-  if (!plan->uniformLanePerm || !plan->lanePermLinear)
-    return false;
-
-  auto &srcNames = names(cl.getSrc());
-  if ((int)srcNames.size() != (int)regCount(cl.getSrc()))
-    return false;
+  // Checked up front: emission below appends to `body`, so a late bail would
+  // leave orphan statements in front of the caller's fallback.
+  for (auto &step : plan.steps)
+    if (step.srcReg < 0 || step.srcReg >= (int)srcNames.size())
+      return false;
 
   std::string scStr = mslStorageType(resTy);
   msl::Type *declTy = storageType(resTy);
 
   // srcLane = XOR over the set bits of laneId of the permutation's basis.
   msl::Expr *laneIdx = nullptr;
-  for (size_t b = 0; b < plan->laneBasis.size(); ++b) {
-    int32_t basis = plan->laneBasis[b];
+  for (size_t b = 0; b < plan.laneBasis.size(); ++b) {
+    int32_t basis = plan.laneBasis[b];
     if (basis == 0)
       continue;
     msl::Expr *bit = ctx.paren(ctx.binary(
@@ -381,9 +373,7 @@ bool MSLEmitter::emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl,
   }
 
   SmallVector<std::string> ids;
-  for (auto &step : plan->steps) {
-    if (step.srcReg < 0 || step.srcReg >= (int)srcNames.size())
-      return false;
+  for (auto &step : plan.steps) {
     StringRef srcName = srcNames[step.srcReg];
     if (step.identity || laneVar.empty()) {
       ids.push_back(srcName.str());
@@ -395,8 +385,57 @@ bool MSLEmitter::emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl,
         shuffleExpr(msl::builtin::simd::Shuffle, scStr, srcName, laneVar)));
     ids.push_back(id);
   }
-  bindRegs(cl.getResult(), ids);
+  bindRegs(res, ids);
   return true;
+}
+
+// Without one shared lane index every register needs its own index
+// computation, at which point the shuffles stop being obviously cheaper than
+// the round-trip they replace.
+static bool planIsEmittable(const ShufflePlan &p) {
+  return p.uniformLanePerm && p.lanePermLinear;
+}
+
+bool MSLEmitter::emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl,
+                                             msl::Block &body) {
+  auto srcTy = cast<RankedTensorType>(cl.getSrc().getType());
+  auto resTy = cast<RankedTensorType>(cl.getResult().getType());
+  // simd_shuffle takes a scalar of a known width; pointer payloads would need
+  // the ulong path plus a cast back. scanPool mirrors this bail.
+  if (isa<tt::PointerType>(resTy.getElementType()))
+    return false;
+  auto plan = planIntraWarpShuffle(srcTy, resTy);
+  if (!plan || !planIsEmittable(*plan))
+    return false;
+  return emitShufflePlan(cl.getSrc(), cl.getResult(), *plan, body);
+}
+
+static std::optional<ShufflePlan> reshapeShufflePlan(Value src, Value res,
+                                                     ArrayRef<int32_t> perm) {
+  auto srcTy = dyn_cast<RankedTensorType>(src.getType());
+  auto resTy = dyn_cast<RankedTensorType>(res.getType());
+  if (!srcTy || !resTy)
+    return std::nullopt;
+  if (isa<tt::PointerType>(resTy.getElementType()))
+    return std::nullopt;
+  auto plan = planIntraWarpShufflePermuted(srcTy, resTy, perm);
+  if (!plan || !planIsEmittable(*plan))
+    return std::nullopt;
+  return plan;
+}
+
+bool MSLEmitter::shuffleReshapeCovers(Value src, Value res,
+                                      ArrayRef<int32_t> perm) {
+  return reshapeShufflePlan(src, res, perm).has_value();
+}
+
+bool MSLEmitter::emitIntraWarpShuffleReshape(Value src, Value res,
+                                             ArrayRef<int32_t> perm,
+                                             msl::Block &body) {
+  auto plan = reshapeShufflePlan(src, res, perm);
+  if (!plan)
+    return false;
+  return emitShufflePlan(src, res, *plan, body);
 }
 
 } // namespace mlir::triton::applegpu

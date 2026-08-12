@@ -44,6 +44,14 @@ struct ShufflePlan {
 std::optional<ShufflePlan> planIntraWarpShuffle(RankedTensorType srcTy,
                                                 RankedTensorType dstTy);
 
+// Same, for a shape-changing op (tt.trans / tt.reshape). `perm` maps a result
+// axis to the source axis it came from; pass an empty `perm` for a plain
+// reshape. Both sides are compared as row-major flat element indices, which is
+// the coordinate the threadgroup round-trip these replace keys on.
+std::optional<ShufflePlan> planIntraWarpShufflePermuted(RankedTensorType srcTy,
+                                                        RankedTensorType dstTy,
+                                                        ArrayRef<int32_t> perm);
+
 } // namespace mlir::triton::applegpu
 
 #endif // MSL_SHUFFLE_PLAN_H

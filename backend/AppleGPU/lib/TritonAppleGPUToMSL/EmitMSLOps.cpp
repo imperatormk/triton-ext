@@ -1654,6 +1654,9 @@ std::optional<bool> MSLEmitter::emitReshape(Operation *op, msl::Block &body) {
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
     auto perm = tr.getOrder();
+    if (emitIntraWarpShuffleReshape(src, res, perm, body))
+      return true;
+    mslReject(tr, "trans", "threadgroup-roundtrip");
     emitTileRoundTrip(res, src, srcTy, resTy, body, [&](int r) {
       return layout.transFlatOffset(srcTy, perm, resTy.getShape(), r);
     });
@@ -1669,6 +1672,9 @@ std::optional<bool> MSLEmitter::emitReshape(Operation *op, msl::Block &body) {
     Value res = rs.getResult();
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto resTy = cast<RankedTensorType>(res.getType());
+    if (emitIntraWarpShuffleReshape(src, res, /*perm=*/{}, body))
+      return true;
+    mslReject(rs, "reshape", "threadgroup-roundtrip");
     emitTileRoundTrip(res, src, srcTy, resTy, body,
                       [&](int r) { return layout.flatTileOffset(srcTy, r); });
     return true;

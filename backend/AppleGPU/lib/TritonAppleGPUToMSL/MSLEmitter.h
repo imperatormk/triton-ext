@@ -715,6 +715,20 @@ private:
   // through to the threadgroup round-trip.
   bool emitIntraWarpShuffleConvert(ttg::ConvertLayoutOp cl, msl::Block &body);
 
+  // Same lane-permutation lowering for a shape-changing op: `perm` maps a
+  // result axis to its source axis (empty for tt.reshape).
+  bool emitIntraWarpShuffleReshape(Value src, Value res, ArrayRef<int32_t> perm,
+                                   msl::Block &body);
+
+  bool emitShufflePlan(Value src, Value res, const ShufflePlan &plan,
+                       msl::Block &body);
+
+  // The pool reservation and the emission must answer "does the shuffle path
+  // take this op" identically -- a scanPool that under-reserves overwrites the
+  // staging underneath it. Both call this.
+  static bool shuffleReshapeCovers(Value src, Value res,
+                                   ArrayRef<int32_t> perm);
+
   int tgScratchId = 0;
 
   // A single per-kernel threadgroup pool shared by every barrier-separated

@@ -279,9 +279,7 @@ void MSLEmitter::scanPool(Operation *op) {
       // whole-tile fused dot, and the dot then runs off the end of the pool.
       if (stagedAB > kTGResidentBudgetBytes &&
           dotNeedsPanel(M, N, Kd, elemBytes, accBytes)) {
-        int64_t mp, np;
-        dotPanelDims(M, N, Kd, elemBytes, accBytes, mp, np);
-        need = mp * Kd * elemBytes + Kd * np * elemBytes + mp * np * accBytes;
+        need = dotPanelPlan(M, N, Kd, elemBytes, accBytes).bytes();
       } else if (dotIsFusedGemmAcc(d)) {
         // Fused K-loop: C lands only in the post-loop epilogue, after a
         // barrier, so it overlays the dead A/B staging. When the epilogue's

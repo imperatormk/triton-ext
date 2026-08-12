@@ -2145,9 +2145,9 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
   const int64_t Bd = plan.Bd, M = plan.M, N = plan.N, K = plan.K;
   const int64_t numWarps = plan.numWarps;
   int64_t elemBytes = byteWidth(aElem), accBytes = 4;
-  int64_t mp, np;
-  dotPanelDims(M, N, K, elemBytes, accBytes, mp, np);
-  int64_t aPanelBytes = mp * K * elemBytes, bPanelBytes = K * np * elemBytes;
+  DotPanel pan = dotPanelPlan(M, N, K, elemBytes, accBytes);
+  const int64_t mp = pan.mp, np = pan.np, kp = pan.kp;
+  int64_t aPanelBytes = pan.aBytes, bPanelBytes = pan.bBytes;
   auto aOut = llvm::to_vector(ttg::toLinearLayout(aStageTy).getOutDimNames());
   StringAttr aRowDim = aOut[rank - 2], aColDim = aOut[rank - 1];
   auto bOut = llvm::to_vector(ttg::toLinearLayout(bStageTy).getOutDimNames());
@@ -2160,7 +2160,7 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
   std::string pA = fresh(), pB = fresh(), pC = fresh();
   checkPoolRegions(op, {{"A", 0, aPanelBytes},
                         {"B", aPanelBytes, bPanelBytes},
-                        {"C", aPanelBytes + bPanelBytes, mp * np * accBytes}});
+                        {"C", aPanelBytes + bPanelBytes, pan.cBytes}});
   body.push_back(
       ctx.declStmt(tgPtr(dc.opScalar), pA, poolRegion(0, dc.opScalar)));
   body.push_back(ctx.declStmt(tgPtr(dc.opScalar), pB,
@@ -2173,53 +2173,68 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
   for (int64_t bi = 0; bi < Bd; ++bi) {
     for (int64_t m0 = 0; m0 < M; m0 += mp) {
       int64_t m1 = std::min<int64_t>(m0 + mp, M), mpCur = m1 - m0;
+     for (int64_t n0 = 0; n0 < N; n0 += np) {
+      int64_t n1 = std::min<int64_t>(n0 + np, N), npCur = n1 - n0;
+      int64_t pmT = mpCur / 8, pnT = npCur / 8;
+      for (int64_t k0 = 0; k0 < K; k0 += kp) {
+      int64_t k1 = std::min<int64_t>(k0 + kp, K), kpCur = k1 - k0;
       barrier();
       for (int r = 0; r < nARegs; ++r) {
-        // (row >= m0 && row < m1)
-        msl::Expr *guard = ctx.paren(ctx.binary(
+        // (row >= m0 && row < m1 && col >= k0 && col < k1)
+        msl::Expr *guard = ctx.paren(ctx.chain(
             B::LAnd,
-            ctx.binary(B::Ge, layout.layoutCoordExpr(aStageTy, r, aRowDim),
-                       ctx.i32lit(m0)),
-            ctx.binary(B::Lt, layout.layoutCoordExpr(aStageTy, r, aRowDim),
-                       ctx.i32lit(m1))));
+            {ctx.binary(B::Ge, layout.layoutCoordExpr(aStageTy, r, aRowDim),
+                        ctx.i32lit(m0)),
+             ctx.binary(B::Lt, layout.layoutCoordExpr(aStageTy, r, aRowDim),
+                        ctx.i32lit(m1)),
+             ctx.binary(B::Ge, layout.layoutCoordExpr(aStageTy, r, aColDim),
+                        ctx.i32lit(k0)),
+             ctx.binary(B::Lt, layout.layoutCoordExpr(aStageTy, r, aColDim),
+                        ctx.i32lit(k1))}));
         if (rank == 3)
           guard = ctx.paren(
               ctx.binary(B::LAnd,
                          ctx.binary(B::Eq, layout.batchCoordExpr(aStageTy, r),
                                     ctx.i32lit(bi)),
                          guard));
-        // ((row - m0) * K + col)
+        // ((row - m0) * kpCur + (col - k0))
         msl::Expr *off = ctx.paren(ctx.add(
             ctx.mul(ctx.paren(ctx.binary(
                         B::Sub, layout.layoutCoordExpr(aStageTy, r, aRowDim),
                         ctx.i32lit(m0))),
-                    ctx.i32lit(K)),
-            layout.layoutCoordExpr(aStageTy, r, aColDim)));
+                    ctx.i32lit(kpCur)),
+            ctx.paren(ctx.binary(B::Sub,
+                                 layout.layoutCoordExpr(aStageTy, r, aColDim),
+                                 ctx.i32lit(k0)))));
         body.push_back(ctx.compactIfBare(
             guard, ctx.assignStmt(ctx.subscript(ctx.var(pA), off),
                                   ctx.var(dc.aNames[r]))));
       }
-      for (int64_t n0 = 0; n0 < N; n0 += np) {
-        int64_t n1 = std::min<int64_t>(n0 + np, N), npCur = n1 - n0;
-        int64_t pmT = mpCur / 8, pnT = npCur / 8;
+      {
         barrier();
         for (int r = 0; r < nBRegs; ++r) {
-          // (col >= n0 && col < n1)
-          msl::Expr *guard = ctx.paren(ctx.binary(
+          // (col >= n0 && col < n1 && row >= k0 && row < k1)
+          msl::Expr *guard = ctx.paren(ctx.chain(
               B::LAnd,
-              ctx.binary(B::Ge, layout.layoutCoordExpr(bStageTy, r, bColDim),
-                         ctx.i32lit(n0)),
-              ctx.binary(B::Lt, layout.layoutCoordExpr(bStageTy, r, bColDim),
-                         ctx.i32lit(n1))));
+              {ctx.binary(B::Ge, layout.layoutCoordExpr(bStageTy, r, bColDim),
+                          ctx.i32lit(n0)),
+               ctx.binary(B::Lt, layout.layoutCoordExpr(bStageTy, r, bColDim),
+                          ctx.i32lit(n1)),
+               ctx.binary(B::Ge, layout.layoutCoordExpr(bStageTy, r, bRowDim),
+                          ctx.i32lit(k0)),
+               ctx.binary(B::Lt, layout.layoutCoordExpr(bStageTy, r, bRowDim),
+                          ctx.i32lit(k1))}));
           if (rank == 3)
             guard = ctx.paren(
                 ctx.binary(B::LAnd,
                            ctx.binary(B::Eq, layout.batchCoordExpr(bStageTy, r),
                                       ctx.i32lit(bi)),
                            guard));
-          // (row * npCur + (col - n0))
+          // ((row - k0) * npCur + (col - n0))
           msl::Expr *off = ctx.paren(ctx.add(
-              ctx.mul(layout.layoutCoordExpr(bStageTy, r, bRowDim),
+              ctx.mul(ctx.paren(ctx.binary(
+                          B::Sub, layout.layoutCoordExpr(bStageTy, r, bRowDim),
+                          ctx.i32lit(k0))),
                       ctx.i32lit(npCur)),
               ctx.paren(ctx.binary(B::Sub,
                                    layout.layoutCoordExpr(bStageTy, r, bColDim),
@@ -2236,12 +2251,19 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
           for (int64_t f = w; f < pnFrag; f += pWarps) {
             int64_t mi = f / pnT, ni = f % pnT;
             std::string acc = fresh();
-            inner.push_back(
-                accFragDecl(ctx.matrix(msl::MatrixType::Elem::Float), acc));
-            for (int64_t ki = 0; ki < (K / 8); ++ki) {
+            if (k0 == 0) {
+              inner.push_back(
+                  accFragDecl(ctx.matrix(msl::MatrixType::Elem::Float), acc));
+            } else {
+              inner.push_back(
+                  fragDecl(ctx.matrix(msl::MatrixType::Elem::Float), acc));
+              inner.push_back(
+                  sgLoad(acc, pC, mi * 8 * npCur + ni * 8, npCur));
+            }
+            for (int64_t ki = 0; ki < (kpCur / 8); ++ki) {
               std::string fa = fresh(), fb = fresh();
               inner.push_back(fragDecl(dc.opFrag, fa));
-              inner.push_back(sgLoad(fa, pA, mi * 8 * K + ki * 8, K));
+              inner.push_back(sgLoad(fa, pA, mi * 8 * kpCur + ki * 8, kpCur));
               inner.push_back(fragDecl(dc.opFrag, fb));
               inner.push_back(sgLoad(fb, pB, ki * 8 * npCur + ni * 8, npCur));
               inner.push_back(sgMultiplyAccumulate(acc, fa, fb));
@@ -2253,7 +2275,7 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
               std::move(inner)));
         }
         barrier();
-        for (int r = 0; r < nRes; ++r) {
+        for (int r = 0; k1 == K && r < nRes; ++r) {
           std::string base = dc.cInit[dc.cInit.size() == 1 ? 0 : r];
           // ((rowExpr - m0) * npCur + (colExpr - n0))
           msl::Expr *off = ctx.paren(ctx.add(
@@ -2288,6 +2310,8 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
                                         ctx.var(base)))));
         }
       }
+      }
+     }
     }
   }
   body.push_back(ctx.hardBarrier(false));
@@ -3620,16 +3644,21 @@ bool MSLEmitter::convertLayoutIsDeadDotStageSource(ttg::ConvertLayoutOp c) {
   return true;
 }
 
-void MSLEmitter::dotPanelDims(int64_t M, int64_t N, int64_t K,
-                              int64_t elemBytes, int64_t accBytes, int64_t &mp,
-                              int64_t &np) {
-  mp = M;
-  np = N;
-  auto fits = [&](int64_t m, int64_t n) {
-    return m * K * elemBytes + K * n * elemBytes + m * n * accBytes <=
-           kTGResidentBudgetBytes;
+MSLEmitter::DotPanel MSLEmitter::dotPanelPlan(int64_t M, int64_t N, int64_t K,
+                                              int64_t elemBytes,
+                                              int64_t accBytes) {
+  auto cost = [&](int64_t m, int64_t n, int64_t k) {
+    DotPanel p;
+    p.mp = m;
+    p.np = n;
+    p.kp = k;
+    p.aBytes = m * k * elemBytes;
+    p.bBytes = k * n * elemBytes;
+    p.cBytes = m * n * accBytes;
+    return p;
   };
-  while (!fits(mp, np)) {
+  int64_t mp = M, np = N;
+  while (cost(mp, np, K).bytes() > kTGResidentBudgetBytes) {
     if (mp >= np && mp > 8)
       mp -= 8;
     else if (np > 8)
@@ -3639,6 +3668,13 @@ void MSLEmitter::dotPanelDims(int64_t M, int64_t N, int64_t K,
     else
       break;
   }
+  // Both operand extents are at their floor and the panel still overflows, so
+  // the K extent is what does not fit. Halving it keeps the 8-multiple
+  // alignment the MMA fragments need.
+  int64_t kp = K;
+  while (kp > 8 && cost(mp, np, kp).bytes() > kTGResidentBudgetBytes)
+    kp /= 2;
+  return cost(mp, np, kp);
 }
 
 bool MSLEmitter::dotNeedsPanel(int64_t M, int64_t N, int64_t K,

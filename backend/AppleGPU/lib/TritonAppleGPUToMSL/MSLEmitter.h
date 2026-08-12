@@ -841,11 +841,22 @@ private:
   // 128x128 C is 64KB vs 32KB A+B); banding the C round-trip over row groups
   // keeps a single reused region small enough to fit alongside A/B in 32KB.
   // When full A+B+C staging exceeds the 32KB threadgroup budget, walk the
-  // output tile in (mp x np) panels (both multiples of 8) staging only
-  // A[mp x K] + B[K x np] + C[mp x np] at a time, so peak live TG stays under
-  // 32768. Picks the largest square-ish panel that fits.
-  static void dotPanelDims(int64_t M, int64_t N, int64_t K, int64_t elemBytes,
-                           int64_t accBytes, int64_t &mp, int64_t &np);
+  // output tile in (mp x np) panels (all multiples of 8) staging only
+  // A[mp x kp] + B[kp x np] + C[mp x np] at a time, so peak live TG stays under
+  // 32768. Picks the largest square-ish panel that fits; kp shrinks only once
+  // mp and np are at their floor, since a K split costs a reload of C.
+  struct DotPanel {
+    int64_t mp, np, kp;
+    int64_t aBytes, bBytes, cBytes;
+    int64_t bytes() const { return aBytes + bBytes + cBytes; }
+  };
+
+  // The single source of truth for panel geometry AND its pool footprint.
+  // scanPool's reservation, emitDotPanel's region offsets and the fits() search
+  // all derive from this one call, so they cannot disagree (cf. the pool
+  // overruns from scanPool/planDot divergence).
+  static DotPanel dotPanelPlan(int64_t M, int64_t N, int64_t K,
+                               int64_t elemBytes, int64_t accBytes);
 
   static bool dotNeedsPanel(int64_t M, int64_t N, int64_t K, int64_t elemBytes,
                             int64_t accBytes);

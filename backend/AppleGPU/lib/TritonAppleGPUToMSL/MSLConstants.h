@@ -35,6 +35,9 @@ inline constexpr int64_t tgPoolForResidency(int64_t n) {
 // so it can skip one and keep the occupancy the attribute would cost.
 inline constexpr int64_t kAlwaysAdmittedThreads = 384;
 
+// Metal binds at most 31 buffers per kernel, [[buffer(0)]] .. [[buffer(30)]].
+inline constexpr unsigned kMaxMSLBuffers = 31;
+
 // How many threadgroups stay resident when a pool of `bytes` is declared.
 inline constexpr int64_t tgResidency(int64_t bytes) {
   return bytes > 0 ? kTGCoreBudgetBytes / bytes : kTGCoreBudgetBytes;

@@ -712,6 +712,18 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
         ctx.ptr(ctx.scalar(msl::Scalar::I8), msl::AddrSpace::Constant),
         argbufId, ctx.bufferAttr(buffer++)));
   }
+
+  // Metal binds at most 31 buffers (indices 0-30). Past that the front end
+  // rejects the source with "'buffer' attribute parameter is out of bounds",
+  // one diagnostic per offending parameter and no hint that an argument count
+  // is to blame -- so say it here instead.
+  if (buffer > kMaxMSLBuffers) {
+    func.emitError() << "EmitMSL: kernel needs " << buffer
+                     << " buffer bindings but Metal allows at most "
+                     << kMaxMSLBuffers
+                     << "; the fused kernel has too many tensor arguments";
+    return failure();
+  }
   msl::Type *u3 = ctx.vector(msl::Scalar::U32, 3);
   tgposId = fresh();
   tidId = fresh();

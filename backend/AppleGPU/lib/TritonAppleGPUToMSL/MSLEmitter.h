@@ -205,15 +205,37 @@ private:
   int nextId = 0;
   int coordId = 0;
   int indent = 1;
-  // The AGX backend's SROA runs out of memory somewhere past ten thousand
-  // simdgroup fragment allocas in one function. planFragRolling totals what the
-  // whole function would declare unrolled and decides once, before any of it is
-  // emitted; a running count would roll dots in a function that never reaches
-  // the limit, purely because they come last.
+  // The AGX backend's SROA runs out of memory past ~10k simdgroup fragment
+  // allocas in one function. Every dot path re-declares operand fragments once
+  // per cache window and the windows are only decided during emission, so the
+  // count is measured off the built AST and the body rebuilt rolled if over.
+  // 5696 compiles, 10000 is the lowest observed failure.
   bool fnRollKSteps = false;
   bool rollKSteps(size_t) const { return fnRollKSteps; }
-  void planFragRolling(tt::FuncOp func);
-  static constexpr int64_t kFragDeclRollThreshold = 8192;
+  static constexpr int64_t kFragDeclRollThreshold = 6144;
+
+  // Everything the body walk mutates, so the walk can be redone from a clean
+  // slate once the fragment count is known.
+  struct EmitterState {
+    int nextId, coordId, indent, tgScratchId;
+    int64_t poolBytes, globalPoolBytes;
+    bool asyncCopyFenced, emitFailed;
+    llvm::DenseMap<Value, SmallVector<std::string>> valMap;
+    llvm::DenseMap<Value, MemDescInfo> memdescMap;
+    SmallVector<std::string> dmaHandleDecls;
+    llvm::DenseMap<Operation *, std::string> dmaHandleFor;
+    SmallVector<Operation *> pendingPrefetch;
+    DenseMap<Value, int64_t> gridBoundedOrigins;
+    DenseSet<Value> clampedOrigins;
+    FusedDotCtx fusedDot;
+    DenseMap<Operation *, std::string> directStoreHandled;
+    DenseSet<Operation *> directStoreRaggedHandled;
+    DenseSet<Operation *> preEmitted;
+    llvm::DenseMap<Block *, std::string> blockLabel;
+    std::string cfgState;
+  };
+  EmitterState saveState();
+  void restoreState(EmitterState &s);
   llvm::DenseMap<Value, SmallVector<std::string>> valMap;
 
   llvm::DenseMap<Value, MemDescInfo> memdescMap;

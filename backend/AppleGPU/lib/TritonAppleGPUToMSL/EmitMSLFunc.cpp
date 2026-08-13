@@ -1068,15 +1068,65 @@ LogicalResult MSLEmitter::emit() {
   return success();
 }
 
-void MSLEmitter::planFragRolling(tt::FuncOp func) {
-  int64_t total = 0;
-  func.walk([&](tt::DotOp op) {
-    DotPlan p = planDot(op);
-    if (p.kind == DotPlan::Kind::Unsupported || p.kind == DotPlan::Kind::Scalar)
-      return;
-    total += (p.mT + p.nT) * p.kT + p.nFrag;
-  });
-  fnRollKSteps = total > kFragDeclRollThreshold;
+namespace {
+int64_t countFragDecls(const msl::Block &b);
+
+int64_t countFragDeclsIn(msl::Stmt *s) {
+  using K = msl::Stmt::Kind;
+  switch (s->kind) {
+  case K::Decl:
+    return llvm::isa<msl::MatrixType>(llvm::cast<msl::DeclStmt>(s)->ty) ? 1 : 0;
+  case K::ForScope:
+    return countFragDecls(llvm::cast<msl::ForScope>(s)->body);
+  case K::TripCountForScope:
+    return countFragDecls(llvm::cast<msl::TripCountForScope>(s)->body);
+  case K::WhileScope:
+    return countFragDecls(llvm::cast<msl::WhileScope>(s)->body);
+  case K::PlainScope:
+    return countFragDecls(llvm::cast<msl::PlainScope>(s)->body);
+  case K::IfScope: {
+    auto *i = llvm::cast<msl::IfScope>(s);
+    return countFragDecls(i->thenB) + countFragDecls(i->elseB);
+  }
+  case K::StateMachineScope: {
+    int64_t n = 0;
+    for (auto &c : llvm::cast<msl::StateMachineScope>(s)->cases)
+      n += countFragDecls(c.body);
+    return n;
+  }
+  default:
+    return 0;
+  }
+}
+
+int64_t countFragDecls(const msl::Block &b) {
+  int64_t n = 0;
+  for (msl::Stmt *s : b)
+    n += countFragDeclsIn(s);
+  return n;
+}
+} // namespace
+
+#define MSL_EMITTER_STATE(X)                                                   \
+  X(nextId) X(coordId) X(indent) X(tgScratchId) X(poolBytes)                   \
+  X(globalPoolBytes) X(asyncCopyFenced) X(emitFailed) X(valMap) X(memdescMap)  \
+  X(dmaHandleDecls) X(dmaHandleFor) X(pendingPrefetch) X(gridBoundedOrigins)   \
+  X(clampedOrigins) X(fusedDot) X(directStoreHandled)                          \
+  X(directStoreRaggedHandled) X(preEmitted) X(blockLabel) X(cfgState)
+
+MSLEmitter::EmitterState MSLEmitter::saveState() {
+  EmitterState s;
+#define MSL_SAVE(f) s.f = f;
+  MSL_EMITTER_STATE(MSL_SAVE)
+#undef MSL_SAVE
+  return s;
+}
+
+void MSLEmitter::restoreState(EmitterState &s) {
+#define MSL_RESTORE(f) f = std::move(s.f);
+  MSL_EMITTER_STATE(MSL_RESTORE)
+#undef MSL_RESTORE
+  layout.beginFunc(&coordId);
 }
 
 LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
@@ -1247,7 +1297,6 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     memdescMap[mi.getResult()] = {parent.buf, base, parent.bufStrides};
   });
 
-  planFragRolling(func);
   func.walk([&](Operation *op) { scanPool(op); });
   int64_t kernelPool = moduleHasDevFuncs ? globalPoolBytes : poolBytes;
   if (kernelPool > 0) {
@@ -1297,10 +1346,29 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
   }
 
   Region &region = func.getBody();
-  msl::Block body = region.hasOneBlock() ? walkBlock(region.front(), indent)
-                                         : emitBlockCFG(region);
+  auto walkBody = [&] {
+    return region.hasOneBlock() ? walkBlock(region.front(), indent)
+                                : emitBlockCFG(region);
+  };
+  EmitterState preBody = saveState();
+  msl::Block body = walkBody();
   if (emitFailed)
     return failure();
+  int64_t frags = countFragDecls(body);
+  if (getenv("MSL_FRAG_PLAN_DEBUG"))
+    llvm::errs() << "[fragplan] " << func.getName() << " frags=" << frags
+                 << " thr=" << kFragDeclRollThreshold
+                 << " roll=" << (frags > kFragDeclRollThreshold) << "\n";
+  if (frags > kFragDeclRollThreshold) {
+    restoreState(preBody);
+    fnRollKSteps = true;
+    body = walkBody();
+    if (emitFailed)
+      return failure();
+    if (getenv("MSL_FRAG_PLAN_DEBUG"))
+      llvm::errs() << "[fragplan] " << func.getName()
+                   << " rolled=" << countFragDecls(body) << "\n";
+  }
   dmaHandleDecls.clear();
   // Tokens are keyed per copy site; a later kernel must mint its own.
   dmaHandleFor.clear();

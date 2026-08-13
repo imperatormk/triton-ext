@@ -2365,51 +2365,110 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
               // it does not vary along. Nothing writes pA/pB between the
               // barriers bracketing this block, so one load per address serves
               // every use.
-              DenseMap<int64_t, std::string> aCache, bCache;
-              for (int64_t f = w; f < pnFrag; f += pWarps) {
-                int64_t mi = f / pnT, ni = f % pnT;
-                auto colOff = [&](int64_t scale) -> msl::Expr * {
-                  msl::Expr *base = ctx.i32lit(ni * 8 * scale);
-                  if (!affineWarps)
-                    return base;
-                  return ctx.paren(ctx.add(
-                      base, ctx.mul(ctx.var(warpId), ctx.i32lit(8 * scale))));
-                };
-                auto accAddr = [&]() -> msl::Expr * {
-                  return ctx.paren(
-                      ctx.add(ctx.i32lit(mi * 8 * npCur), colOff(1)));
-                };
-                std::string acc = fresh();
-                if (k0 == 0) {
-                  inner.push_back(accFragDecl(
-                      ctx.matrix(msl::MatrixType::Elem::Float), acc));
-                } else {
-                  inner.push_back(
-                      fragDecl(ctx.matrix(msl::MatrixType::Elem::Float), acc));
-                  inner.push_back(sgLoadExpr(acc, pC, accAddr(), npCur));
-                }
-                for (int64_t ki = 0; ki < (kpCur / 8); ++ki) {
-                  int64_t aOff = mi * 8 * kpCur + ki * 8;
-                  std::string &fa = aCache[aOff];
-                  if (fa.empty()) {
-                    fa = fresh();
-                    inner.push_back(fragDecl(dc.opFrag, fa));
-                    inner.push_back(sgLoad(fa, pA, aOff, kpCur));
+              auto colOff = [&](int64_t ni, int64_t scale) -> msl::Expr * {
+                msl::Expr *base = ctx.i32lit(ni * 8 * scale);
+                if (!affineWarps)
+                  return base;
+                return ctx.paren(ctx.add(
+                    base, ctx.mul(ctx.var(warpId), ctx.i32lit(8 * scale))));
+              };
+              auto accAddr = [&](int64_t mi, int64_t ni) -> msl::Expr * {
+                return ctx.paren(
+                    ctx.add(ctx.i32lit(mi * 8 * npCur), colOff(ni, 1)));
+              };
+              const int64_t kSteps = kpCur / 8;
+              SmallVector<std::pair<int64_t, int64_t>> slots;
+              for (int64_t f = w; f < pnFrag; f += pWarps)
+                slots.push_back({f / pnT, f % pnT});
+              if (kSteps > 1 && rollKSteps(slots.size())) {
+                SmallVector<std::string> accs;
+                for (auto [mi, ni] : slots) {
+                  std::string acc = fresh();
+                  accs.push_back(acc);
+                  if (k0 == 0) {
+                    inner.push_back(accFragDecl(
+                        ctx.matrix(msl::MatrixType::Elem::Float), acc));
+                  } else {
+                    inner.push_back(fragDecl(
+                        ctx.matrix(msl::MatrixType::Elem::Float), acc));
+                    inner.push_back(
+                        sgLoadExpr(acc, pC, accAddr(mi, ni), npCur));
                   }
-                  int64_t bOff = ki * 8 * npCur + ni * 8;
-                  std::string &fb = bCache[bOff];
-                  if (fb.empty()) {
-                    fb = fresh();
-                    inner.push_back(fragDecl(dc.opFrag, fb));
-                    inner.push_back(sgLoadExpr(
-                        fb, pB,
-                        ctx.paren(
-                            ctx.add(ctx.i32lit(ki * 8 * npCur), colOff(1))),
+                }
+                std::string kv = fresh();
+                msl::Block loopB;
+                DenseMap<int64_t, std::string> fa, fb;
+                for (auto [mi, ni] : slots) {
+                  if (!fa.count(mi)) {
+                    std::string n = fresh();
+                    fa[mi] = n;
+                    loopB.push_back(fragDecl(dc.opFrag, n));
+                    loopB.push_back(
+                        sgLoadExpr(n, pA,
+                                   ctx.paren(ctx.add(ctx.i32lit(mi * 8 * kpCur),
+                                                     ctx.var(kv))),
+                                   kpCur));
+                  }
+                  if (!fb.count(ni)) {
+                    std::string n = fresh();
+                    fb[ni] = n;
+                    loopB.push_back(fragDecl(dc.opFrag, n));
+                    loopB.push_back(sgLoadExpr(
+                        n, pB,
+                        ctx.paren(ctx.add(
+                            ctx.paren(ctx.mul(ctx.var(kv), ctx.i32lit(npCur))),
+                            colOff(ni, 1))),
                         npCur));
                   }
-                  inner.push_back(sgMultiplyAccumulate(acc, fa, fb));
                 }
-                inner.push_back(sgStoreExpr(acc, pC, accAddr(), npCur));
+                for (auto [j, mn] : llvm::enumerate(slots))
+                  loopB.push_back(sgMultiplyAccumulate(accs[j], fa[mn.first],
+                                                       fb[mn.second]));
+                inner.push_back(ctx.forScope(
+                    ctx.declStmt(ctx.named("int"), kv, ctx.i32lit(0)),
+                    ctx.binary(B::Lt, ctx.var(kv), ctx.i32lit(kpCur)),
+                    ctx.assignStmt(ctx.var(kv), ctx.binary(B::Add, ctx.var(kv),
+                                                           ctx.i32lit(8))),
+                    std::move(loopB)));
+                for (auto [j, mn] : llvm::enumerate(slots))
+                  inner.push_back(sgStoreExpr(
+                      accs[j], pC, accAddr(mn.first, mn.second), npCur));
+              } else {
+                DenseMap<int64_t, std::string> aCache, bCache;
+                for (auto [mi, ni] : slots) {
+                  std::string acc = fresh();
+                  if (k0 == 0) {
+                    inner.push_back(accFragDecl(
+                        ctx.matrix(msl::MatrixType::Elem::Float), acc));
+                  } else {
+                    inner.push_back(fragDecl(
+                        ctx.matrix(msl::MatrixType::Elem::Float), acc));
+                    inner.push_back(
+                        sgLoadExpr(acc, pC, accAddr(mi, ni), npCur));
+                  }
+                  for (int64_t ki = 0; ki < kSteps; ++ki) {
+                    int64_t aOff = mi * 8 * kpCur + ki * 8;
+                    std::string &fa = aCache[aOff];
+                    if (fa.empty()) {
+                      fa = fresh();
+                      inner.push_back(fragDecl(dc.opFrag, fa));
+                      inner.push_back(sgLoad(fa, pA, aOff, kpCur));
+                    }
+                    int64_t bOff = ki * 8 * npCur + ni * 8;
+                    std::string &fb = bCache[bOff];
+                    if (fb.empty()) {
+                      fb = fresh();
+                      inner.push_back(fragDecl(dc.opFrag, fb));
+                      inner.push_back(sgLoadExpr(
+                          fb, pB,
+                          ctx.paren(ctx.add(ctx.i32lit(ki * 8 * npCur),
+                                            colOff(ni, 1))),
+                          npCur));
+                    }
+                    inner.push_back(sgMultiplyAccumulate(acc, fa, fb));
+                  }
+                  inner.push_back(sgStoreExpr(acc, pC, accAddr(mi, ni), npCur));
+                }
               }
               if (affineWarps) {
                 for (msl::Stmt *s : inner)

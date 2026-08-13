@@ -167,9 +167,74 @@ private:
 
 int64_t moduleNumWarps(Operation *o);
 
+// Assigning true prints the stack that set it when TRITON_MSL_TRACE_FAIL is
+// set: emission failure otherwise unwinds through several `return false` hops
+// and surfaces only as "PassManager::run failed".
+struct FailFlag {
+  bool v = false;
+  FailFlag &operator=(bool b) {
+    if (b && !v && getenv("TRITON_MSL_TRACE_FAIL")) {
+      llvm::errs() << "[msl] emitFailed set here:\n";
+      llvm::sys::PrintStackTrace(llvm::errs());
+    }
+    v = b;
+    return *this;
+  }
+  operator bool() const { return v; }
+};
+
+// Everything the body walk mutates. Grouped so the walk can be redone from a
+// clean slate by one assignment: membership is the declaration, so a new
+// mutable field cannot be left out of the save.
+struct BodyWalkState {
+  int nextId = 0;
+  int coordId = 0;
+  int indent = 1;
+  int tgScratchId = 0;
+  int64_t poolBytes = 0;
+  int64_t globalPoolBytes = 0;
+  // Set once a batch of async copies has been fenced, cleared at the wait that
+  // closes the batch, so its members share a single fence.
+  bool asyncCopyFenced = false;
+  FailFlag emitFailed;
+  llvm::DenseMap<Value, SmallVector<std::string>> valMap;
+  llvm::DenseMap<Value, MemDescInfo> memdescMap;
+  // Tokens needing a prologue declaration (issue and wait can be in different
+  // scopes).
+  SmallVector<std::string> dmaHandleDecls;
+  // One event token per async-copy site, reused across trips.
+  llvm::DenseMap<Operation *, std::string> dmaHandleFor;
+  // Rotated dot-operand loads held back by walkBlock so the fused MMA phase
+  // can emit them after its publish barrier (see deferPrefetchLoad).
+  SmallVector<Operation *> pendingPrefetch;
+  // Tile origins whose grid is sized by the extent they index into, mapped to
+  // that extent. A remainder by exactly this extent cannot wrap.
+  DenseMap<Value, int64_t> gridBoundedOrigins;
+  // Tile origins pulled back so a boundary tile lands inside the dimension;
+  // a remainder on one of these can no longer wrap.
+  DenseSet<Value> clampedOrigins;
+  // Register-resident C GEMM fusion state (FusedDotCtx / FusedDotPhase /
+  // DirectStore in MSLFusedDot.h). The scf.for handler drives an
+  // `acc = tl.dot(a, b, acc)` K-loop through the three-phase path: Decl
+  // (persistent simdgroup fragments, pre-loop), MMA (stage A/B + accumulate,
+  // per iteration, no tgC round-trip), Readback (store fragments + gather the
+  // #mma->scalar result, post-loop).
+  FusedDotCtx fusedDot;
+  // Terminal stores the fused readback already wrote directly to device (keyed
+  // by op), each with the runtime predicate under which it did so. The tt.store
+  // handler guards the store on the negation to avoid a double write.
+  DenseMap<Operation *, std::string> directStoreHandled;
+  DenseSet<Operation *> directStoreRaggedHandled;
+  // Scalar defs hoisted ahead of the walk so the fused epilogue can name them;
+  // the walk must not emit them a second time.
+  DenseSet<Operation *> preEmitted;
+  llvm::DenseMap<Block *, std::string> blockLabel;
+  std::string cfgState;
+};
+
 // Per-value symbol table: maps an SSA Value to its MSL identifier. For tensor
 // values we store one identifier per register (per-thread element).
-class MSLEmitter {
+class MSLEmitter : private BodyWalkState {
 public:
   MSLEmitter(ModuleOp mod, raw_ostream &realOut)
       : mod(mod), fwd(&realOut), os(fwd) {}
@@ -202,43 +267,12 @@ private:
   msl::Expr *makeRangeElem(int start, msl::Expr *off);
   msl::Expr *aliasElem(StringRef name);
 
-  int nextId = 0;
-  int coordId = 0;
-  int indent = 1;
-  // The AGX backend's SROA runs out of memory past ~10k simdgroup fragment
-  // allocas in one function. Every dot path re-declares operand fragments once
-  // per cache window and the windows are only decided during emission, so the
-  // count is measured off the built AST and the body rebuilt rolled if over.
-  // 5696 compiles, 10000 is the lowest observed failure.
+  // Set by the shrink policy when the function is too big to emit the
+  // k-contraction unrolled; read by the dot paths during the second walk.
   bool fnRollKSteps = false;
   bool rollKSteps(size_t) const { return fnRollKSteps; }
-  static constexpr int64_t kFragDeclRollThreshold = 6144;
 
-  // Everything the body walk mutates, so the walk can be redone from a clean
-  // slate once the fragment count is known.
-  struct EmitterState {
-    int nextId, coordId, indent, tgScratchId;
-    int64_t poolBytes, globalPoolBytes;
-    bool asyncCopyFenced, emitFailed;
-    llvm::DenseMap<Value, SmallVector<std::string>> valMap;
-    llvm::DenseMap<Value, MemDescInfo> memdescMap;
-    SmallVector<std::string> dmaHandleDecls;
-    llvm::DenseMap<Operation *, std::string> dmaHandleFor;
-    SmallVector<Operation *> pendingPrefetch;
-    DenseMap<Value, int64_t> gridBoundedOrigins;
-    DenseSet<Value> clampedOrigins;
-    FusedDotCtx fusedDot;
-    DenseMap<Operation *, std::string> directStoreHandled;
-    DenseSet<Operation *> directStoreRaggedHandled;
-    DenseSet<Operation *> preEmitted;
-    llvm::DenseMap<Block *, std::string> blockLabel;
-    std::string cfgState;
-  };
-  EmitterState saveState();
-  void restoreState(EmitterState &s);
-  llvm::DenseMap<Value, SmallVector<std::string>> valMap;
-
-  llvm::DenseMap<Value, MemDescInfo> memdescMap;
+  void restoreBodyState(const BodyWalkState &s);
 
   // Layout coordinate / flat-offset exprs come from `layout` directly.
   // poolRegion/memdescElemAddr stay here (they touch pool/memdesc state, not
@@ -246,14 +280,6 @@ private:
   msl::Expr *poolRegion(int64_t byteOffset, StringRef sc);
   static SmallVector<int64_t> memdescStrides(ttg::MemDescType mt);
   static bool barrierCoversTail(const msl::Block &body);
-  // Set once a batch of async copies has been fenced, cleared at the wait that
-  // closes the batch, so its members share a single fence.
-  bool asyncCopyFenced = false;
-  // Tokens needing a prologue declaration (issue and wait can be in different
-  // scopes).
-  SmallVector<std::string> dmaHandleDecls;
-  // One event token per async-copy site, reused across trips.
-  llvm::DenseMap<Operation *, std::string> dmaHandleFor;
   msl::Expr *memdescElemAddr(const MemDescInfo &info, RankedTensorType tileTy,
                              int reg);
 
@@ -372,12 +398,6 @@ private:
   // The extent a `pid * BLOCK` tile origin is indexed against, found by walking
   // forward to the remainder that consumes it, or 0 if it reaches none.
   int64_t tileOriginExtent(Value origin, int64_t &block);
-  // Tile origins whose grid is sized by the extent they index into, mapped to
-  // that extent. A remainder by exactly this extent cannot wrap.
-  DenseMap<Value, int64_t> gridBoundedOrigins;
-  // Tile origins pulled back so a boundary tile lands inside the dimension;
-  // a remainder on one of these can no longer wrap.
-  DenseSet<Value> clampedOrigins;
   void storeBody(tt::StoreOp op, msl::Block &body);
   bool combineN(Region &region, ArrayRef<std::string> aVals,
                 ArrayRef<std::string> bVals, msl::Block &body,
@@ -480,22 +500,6 @@ private:
   void emitTileRoundTrip(Value res, Value src, RankedTensorType srcTy,
                          RankedTensorType resTy, msl::Block &body,
                          llvm::function_ref<msl::Expr *(int)> srcOff);
-  // Assigning true prints the stack that set it when TRITON_MSL_TRACE_FAIL is
-  // set: emission failure otherwise unwinds through several `return false`
-  // hops and surfaces only as "PassManager::run failed".
-  struct FailFlag {
-    bool v = false;
-    FailFlag &operator=(bool b) {
-      if (b && !v && getenv("TRITON_MSL_TRACE_FAIL")) {
-        llvm::errs() << "[msl] emitFailed set here:\n";
-        llvm::sys::PrintStackTrace(llvm::errs());
-      }
-      v = b;
-      return *this;
-    }
-    operator bool() const { return v; }
-  };
-  FailFlag emitFailed;
 
   std::string fresh() { return "v" + std::to_string(nextId++); }
 
@@ -513,9 +517,6 @@ private:
 
   SmallVector<std::string> &names(Value v) { return valMap[v]; }
 
-  // Rotated dot-operand loads held back by walkBlock so the fused MMA phase
-  // can emit them after its publish barrier (see deferPrefetchLoad).
-  SmallVector<Operation *> pendingPrefetch;
   bool deferPrefetchLoad(Operation *op);
   void emitPendingPrefetchLoads(msl::Block &body);
 
@@ -582,22 +583,6 @@ private:
   bool needsCoherentDeref(Value ptr) const;
 
   LayoutExprBuilder layout{ctx, laneId, warpId, tgposId};
-
-  // Register-resident C GEMM fusion state (FusedDotCtx / FusedDotPhase /
-  // DirectStore in MSLFusedDot.h). The scf.for handler drives an
-  // `acc = tl.dot(a, b, acc)` K-loop through the three-phase path: Decl
-  // (persistent simdgroup fragments, pre-loop), MMA (stage A/B + accumulate,
-  // per iteration, no tgC round-trip), Readback (store fragments + gather the
-  // #mma->scalar result, post-loop).
-  FusedDotCtx fusedDot;
-  // Terminal stores the fused readback already wrote directly to device (keyed
-  // by op), each with the runtime predicate under which it did so. The tt.store
-  // handler guards the store on the negation to avoid a double write.
-  DenseMap<Operation *, std::string> directStoreHandled;
-  DenseSet<Operation *> directStoreRaggedHandled;
-  // Scalar defs hoisted ahead of the walk so the fused epilogue can name them;
-  // the walk must not emit them a second time.
-  DenseSet<Operation *> preEmitted;
 
   bool preEmitScalarChain(Value v, msl::Block &body);
 
@@ -776,8 +761,6 @@ private:
   static bool shuffleReshapeCovers(Value src, Value res,
                                    ArrayRef<int32_t> perm);
 
-  int tgScratchId = 0;
-
   // A single per-kernel threadgroup pool shared by every barrier-separated
   // transient scratch site (convert-layout, dot A/B/C staging, cross-warp
   // reduce). Each site is separated from the next by a threadgroup_barrier, so
@@ -786,8 +769,6 @@ private:
   // the pool. Sized in bytes to the max single-site footprint; regions are
   // reinterpreted to the site's element type.
   std::string poolBuf;
-  int64_t poolBytes = 0;
-  int64_t globalPoolBytes = 0;
   int64_t liveTgBytes = 0;
   llvm::DenseMap<Operation *, int64_t> dotCReserved;
   bool moduleHasDevFuncs = false;
@@ -795,9 +776,6 @@ private:
   // Threadgroup budget left for the reused pool after the always-live
   // local_alloc buffers, which coexist with the pool in kernel scope.
   int64_t poolBudget() const;
-
-  llvm::DenseMap<Block *, std::string> blockLabel;
-  std::string cfgState;
 
   static int64_t bitsOf(Type t);
   static int64_t byteWidth(Type t) { return bitsOf(t) / 8; }

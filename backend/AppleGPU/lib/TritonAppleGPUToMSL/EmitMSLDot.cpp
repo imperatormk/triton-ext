@@ -2126,6 +2126,39 @@ bool MSLEmitter::emitDotFused(
   return true;
 }
 
+// The (a >= lo0 && a < hi0 && b >= lo1 && b < hi1) predicate guarding one
+// staged register, with each half dropped when the register's reachable
+// coordinates already satisfy it. Sets `dead` when they cannot, and returns
+// null for a predicate that is wholly redundant.
+msl::Expr *MSLEmitter::panelStageGuard(RankedTensorType ty, int reg,
+                                       StringAttr dimA, int64_t lo0,
+                                       int64_t hi0, StringAttr dimB,
+                                       int64_t lo1, int64_t hi1, bool &dead) {
+  SmallVector<msl::Expr *> terms;
+  auto axis = [&](StringAttr d, int64_t lo, int64_t hi) {
+    int32_t cl = 0, ch = 0;
+    layout.coordRange(ty, reg, d, cl, ch);
+    if (ch < lo || cl >= hi) {
+      dead = true;
+      return;
+    }
+    if (cl < lo)
+      terms.push_back(
+          ctx.binary(B::Ge, layout.layoutCoordExpr(ty, reg, d), ctx.i32lit(lo)));
+    if (ch >= hi)
+      terms.push_back(
+          ctx.binary(B::Lt, layout.layoutCoordExpr(ty, reg, d), ctx.i32lit(hi)));
+  };
+  dead = false;
+  axis(dimA, lo0, hi0);
+  if (dead)
+    return nullptr;
+  axis(dimB, lo1, hi1);
+  if (dead || terms.empty())
+    return nullptr;
+  return ctx.paren(ctx.chain(B::LAnd, terms));
+}
+
 // Panel-tiled dot: A/B panels staged into the pool, MMA per (m0,n0) panel into
 // pC, then a guarded readback.
 bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
@@ -2175,22 +2208,17 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
           barrier();
           for (int r = 0; r < nARegs; ++r) {
             // (row >= m0 && row < m1 && col >= k0 && col < k1)
-            msl::Expr *guard = ctx.paren(ctx.chain(
-                B::LAnd,
-                {ctx.binary(B::Ge, layout.layoutCoordExpr(aStageTy, r, aRowDim),
-                            ctx.i32lit(m0)),
-                 ctx.binary(B::Lt, layout.layoutCoordExpr(aStageTy, r, aRowDim),
-                            ctx.i32lit(m1)),
-                 ctx.binary(B::Ge, layout.layoutCoordExpr(aStageTy, r, aColDim),
-                            ctx.i32lit(k0)),
-                 ctx.binary(B::Lt, layout.layoutCoordExpr(aStageTy, r, aColDim),
-                            ctx.i32lit(k1))}));
-            if (rank == 3)
-              guard = ctx.paren(ctx.binary(
-                  B::LAnd,
-                  ctx.binary(B::Eq, layout.batchCoordExpr(aStageTy, r),
-                             ctx.i32lit(bi)),
-                  guard));
+            bool dead = false;
+            msl::Expr *guard = panelStageGuard(aStageTy, r, aRowDim, m0, m1,
+                                               aColDim, k0, k1, dead);
+            if (dead)
+              continue;
+            if (rank == 3) {
+              msl::Expr *batchEq = ctx.binary(
+                  B::Eq, layout.batchCoordExpr(aStageTy, r), ctx.i32lit(bi));
+              guard = guard ? ctx.paren(ctx.binary(B::LAnd, batchEq, guard))
+                            : ctx.paren(batchEq);
+            }
             // ((row - m0) * kpCur + (col - k0))
             msl::Expr *off = ctx.paren(ctx.add(
                 ctx.mul(
@@ -2201,34 +2229,25 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
                 ctx.paren(ctx.binary(
                     B::Sub, layout.layoutCoordExpr(aStageTy, r, aColDim),
                     ctx.i32lit(k0)))));
-            body.push_back(ctx.compactIfBare(
-                guard, ctx.assignStmt(ctx.subscript(ctx.var(pA), off),
-                                      ctx.var(dc.aNames[r]))));
+            msl::Stmt *asn = ctx.assignStmt(
+                ctx.subscript(ctx.var(pA), off), ctx.var(dc.aNames[r]));
+            body.push_back(guard ? ctx.compactIfBare(guard, asn) : asn);
           }
           {
             barrier();
             for (int r = 0; r < nBRegs; ++r) {
               // (col >= n0 && col < n1 && row >= k0 && row < k1)
-              msl::Expr *guard = ctx.paren(ctx.chain(
-                  B::LAnd,
-                  {ctx.binary(B::Ge,
-                              layout.layoutCoordExpr(bStageTy, r, bColDim),
-                              ctx.i32lit(n0)),
-                   ctx.binary(B::Lt,
-                              layout.layoutCoordExpr(bStageTy, r, bColDim),
-                              ctx.i32lit(n1)),
-                   ctx.binary(B::Ge,
-                              layout.layoutCoordExpr(bStageTy, r, bRowDim),
-                              ctx.i32lit(k0)),
-                   ctx.binary(B::Lt,
-                              layout.layoutCoordExpr(bStageTy, r, bRowDim),
-                              ctx.i32lit(k1))}));
-              if (rank == 3)
-                guard = ctx.paren(ctx.binary(
-                    B::LAnd,
-                    ctx.binary(B::Eq, layout.batchCoordExpr(bStageTy, r),
-                               ctx.i32lit(bi)),
-                    guard));
+              bool dead = false;
+              msl::Expr *guard = panelStageGuard(bStageTy, r, bColDim, n0, n1,
+                                                 bRowDim, k0, k1, dead);
+              if (dead)
+                continue;
+              if (rank == 3) {
+                msl::Expr *batchEq = ctx.binary(
+                    B::Eq, layout.batchCoordExpr(bStageTy, r), ctx.i32lit(bi));
+                guard = guard ? ctx.paren(ctx.binary(B::LAnd, batchEq, guard))
+                              : ctx.paren(batchEq);
+              }
               // ((row - k0) * npCur + (col - n0))
               msl::Expr *off = ctx.paren(ctx.add(
                   ctx.mul(
@@ -2239,9 +2258,9 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
                   ctx.paren(ctx.binary(
                       B::Sub, layout.layoutCoordExpr(bStageTy, r, bColDim),
                       ctx.i32lit(n0)))));
-              body.push_back(ctx.compactIfBare(
-                  guard, ctx.assignStmt(ctx.subscript(ctx.var(pB), off),
-                                        ctx.var(dc.bNames[r]))));
+              msl::Stmt *asn = ctx.assignStmt(ctx.subscript(ctx.var(pB), off),
+                                              ctx.var(dc.bNames[r]));
+              body.push_back(guard ? ctx.compactIfBare(guard, asn) : asn);
             }
             barrier();
             int64_t pnFrag = pmT * pnT;

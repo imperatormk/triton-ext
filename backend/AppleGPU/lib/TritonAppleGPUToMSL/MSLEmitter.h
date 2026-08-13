@@ -236,6 +236,9 @@ private:
   msl::Expr *uniformSplatScalar(Value v);
   msl::Expr *scalarEpilogueExpr(Operation *op, msl::Expr *cur, msl::Expr *rhs);
   msl::Stmt *sgStore(StringRef acc, StringRef base, int64_t off, int64_t ld);
+  msl::Expr *panelStageGuard(RankedTensorType ty, int reg, StringAttr dimA,
+                             int64_t lo0, int64_t hi0, StringAttr dimB,
+                             int64_t lo1, int64_t hi1, bool &dead);
   msl::Stmt *sgLoadExpr(StringRef frag, StringRef base, msl::Expr *off,
                         int64_t ld);
   msl::Stmt *sgStoreExpr(StringRef acc, StringRef base, msl::Expr *off,

@@ -33,6 +33,12 @@ public:
   // spreading successive rows across threadgroup banks.
   msl::Expr *sliceFlatOffset(RankedTensorType rt, int reg, int64_t rowPad = 0);
   msl::Expr *batchCoordExpr(RankedTensorType rt, int reg);
+  // Every value `layoutCoordExpr(rt, reg, outDim)` can take across all lanes
+  // and warps. The bases are disjoint powers of two, so the register's constant
+  // and the runtime bits compose by or: the set is the constant offset by every
+  // subset of the runtime mask.
+  void coordRange(RankedTensorType rt, int reg, StringAttr outDim,
+                  int32_t &lo, int32_t &hi);
   msl::Expr *transFlatOffset(RankedTensorType srcTy, ArrayRef<int32_t> perm,
                              ArrayRef<int64_t> resShape, int reg);
 

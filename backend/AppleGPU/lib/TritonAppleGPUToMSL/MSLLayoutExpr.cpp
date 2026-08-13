@@ -93,6 +93,42 @@ msl::Expr *LayoutExprBuilder::layoutCoordExpr(RankedTensorType rt, int reg,
   return expr;
 }
 
+void LayoutExprBuilder::coordRange(RankedTensorType rt, int reg,
+                                   StringAttr outDim, int32_t &lo,
+                                   int32_t &hi) {
+  MLIRContext *mctx = rt.getContext();
+  tt::LinearLayout ll = ttg::toLinearLayout(rt);
+  auto kReg = StringAttr::get(mctx, "register");
+
+  int32_t constPart = 0;
+  for (int b = 0, n = ll.getInDimSizeLog2(kReg); b < n; ++b)
+    if (reg & (1 << b))
+      constPart ^= ll.getBasis(kReg, b, outDim);
+
+  int32_t varMask = 0;
+  bool disjoint = true;
+  for (StringRef in : {"lane", "warp", "block"}) {
+    auto dim = StringAttr::get(mctx, in);
+    if (!ll.hasInDim(dim))
+      continue;
+    for (int b = 0, n = ll.getInDimSizeLog2(dim); b < n; ++b) {
+      int32_t basis = ll.getBasis(dim, b, outDim);
+      if (basis & varMask)
+        disjoint = false;
+      varMask |= basis;
+    }
+  }
+  // Overlapping bases make the reachable set a xor lattice rather than a plain
+  // bitfield, so fall back to the whole dim.
+  if (!disjoint || (constPart & varMask)) {
+    lo = 0;
+    hi = ll.getOutDimSize(outDim) - 1;
+    return;
+  }
+  lo = constPart;
+  hi = constPart | varMask;
+}
+
 msl::Expr *LayoutExprBuilder::layoutOffsetExpr(RankedTensorType rt, int reg) {
   tt::LinearLayout ll = ttg::toLinearLayout(rt);
   auto outDim = *ll.getOutDimNames().begin();

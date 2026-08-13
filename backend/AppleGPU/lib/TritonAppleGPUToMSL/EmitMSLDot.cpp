@@ -819,14 +819,12 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   p.disjointC = !fusedEpilogueC && p.M * p.N * accBytes <= cRoom;
   p.bandRows = p.M;
   if (!p.disjointC) {
-    // C overlays the dead A/B staging in the fused epilogue, so a band that
-    // fits inside what staging already claimed is free. Sizing it to the whole
-    // budget instead would inflate the pool to the 32KB cap and drop residency
-    // to one threadgroup per core, which costs far more than the extra bands.
-    int64_t budget = fusedEpilogueC
-                         ? std::max(p.stagedAB, (int64_t)8 * p.N * accBytes)
-                         : cRoom;
-    p.bandRows = dotCBandRows(p.M, p.N, std::min(budget, cRoom), accBytes);
+    // A non-disjoint C is published at pool offset 0 once A and B are dead, so
+    // the staging it overlays is its room and a band fitting inside it is free.
+    // cRoom describes only the space past the staging, which is what a disjoint
+    // C would need; clamping to it collapses the band to the 8-row floor.
+    int64_t budget = std::max(p.stagedAB, (int64_t)8 * p.N * accBytes);
+    p.bandRows = dotCBandRows(p.M, p.N, std::max(budget, cRoom), accBytes);
   }
 
   p.needAB = p.phase == FusedDotPhase::None || p.phase == FusedDotPhase::MMA;
@@ -1085,7 +1083,18 @@ void MSLEmitter::dotReadback(msl::Block &tgt, RankedTensorType cTy,
                              ArrayRef<std::string> base, int rank, int64_t N,
                              int64_t bi, int64_t r0, int64_t r1,
                              StringAttr rowDim, StringAttr colDim) {
+  bool wholeBand = r0 == 0 && r1 >= cTy.getShape()[cTy.getRank() - 2];
   for (int r = 0, nRes = ids.size(); r < nRes; ++r) {
+    // A register reaches a fixed set of rows, so one outside this band can only
+    // produce a false guard.
+    bool regInBand = false;
+    if (!wholeBand) {
+      int32_t lo = 0, hi = 0;
+      layout.coordRange(cTy, r, rowDim, lo, hi);
+      if (hi < r0 || lo >= r1)
+        continue;
+      regInBand = lo >= r0 && hi < r1;
+    }
     std::string b = base[base.size() == 1 ? 0 : r];
     // ((rowExpr - r0) * N + colExpr)
     msl::Expr *bandOff = ctx.paren(ctx.add(
@@ -1094,13 +1103,11 @@ void MSLEmitter::dotReadback(msl::Block &tgt, RankedTensorType cTy,
                                  ctx.i32lit(r0))),
             ctx.i32lit(N)),
         layout.layoutCoordExpr(cTy, r, colDim)));
-    // (rowExpr >= r0 && rowExpr < r1). The row coord is an xor of layout bases,
-    // so it always lands inside the row dim: only a band covering the whole
-    // dim makes the guard a tautology. A partial band must keep it, or the
-    // registers outside the band get clobbered by this band's gather.
-    bool wholeBand = r0 == 0 && r1 >= cTy.getShape()[cTy.getRank() - 2];
+    // (rowExpr >= r0 && rowExpr < r1), needed only when the register straddles
+    // the band edge: one wholly inside it can never fail, and one wholly
+    // outside was skipped above.
     msl::Expr *guard = nullptr;
-    if (!wholeBand)
+    if (!wholeBand && !regInBand)
       guard = ctx.paren(
           ctx.binary(B::LAnd,
                      ctx.binary(B::Ge, layout.layoutCoordExpr(cTy, r, rowDim),

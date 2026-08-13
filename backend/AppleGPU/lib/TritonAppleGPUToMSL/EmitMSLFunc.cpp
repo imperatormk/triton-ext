@@ -649,6 +649,13 @@ LogicalResult MSLEmitter::emit() {
     func.walk([&](Operation *op) { scanPool(op); });
     globalPoolBytes = std::max(globalPoolBytes, poolBytes);
   }
+  // This pre-scan caches DotFacts before emitFunc has registered any
+  // local_alloc in memdescMap, so aInPlace/bInPlace come back empty for
+  // operands that ARE resident in an alloc; planDot would then stage a value
+  // that was never materialised into registers. The sizing above is unaffected
+  // (it keys off the map-independent aNoStage/bNoStage), so recompute the
+  // facts once the allocs exist.
+  dotFactsCache.clear();
   moduleHasDevFuncs = !devFuncs.empty();
 
   for (auto func : devFuncs)

@@ -2239,10 +2239,24 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
             barrier();
             int64_t pnFrag = pmT * pnT;
             int64_t pWarps = numWarps > pnFrag ? pnFrag : numWarps;
-            for (int64_t w = 0; w < pWarps; ++w) {
+            // Under this predicate mi is warp-invariant and ni differs by
+            // exactly w, so one warpId-relative block covers every warp.
+            bool affineWarps = (pnFrag % pWarps == 0) && (pnT % pWarps == 0);
+            for (int64_t w = 0; w < (affineWarps ? 1 : pWarps); ++w) {
               msl::Block inner;
               for (int64_t f = w; f < pnFrag; f += pWarps) {
                 int64_t mi = f / pnT, ni = f % pnT;
+                auto colOff = [&](int64_t scale) -> msl::Expr * {
+                  msl::Expr *base = ctx.i32lit(ni * 8 * scale);
+                  if (!affineWarps)
+                    return base;
+                  return ctx.paren(ctx.add(
+                      base, ctx.mul(ctx.var(warpId), ctx.i32lit(8 * scale))));
+                };
+                auto accAddr = [&]() -> msl::Expr * {
+                  return ctx.paren(
+                      ctx.add(ctx.i32lit(mi * 8 * npCur), colOff(1)));
+                };
                 std::string acc = fresh();
                 if (k0 == 0) {
                   inner.push_back(accFragDecl(
@@ -2250,8 +2264,7 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
                 } else {
                   inner.push_back(
                       fragDecl(ctx.matrix(msl::MatrixType::Elem::Float), acc));
-                  inner.push_back(
-                      sgLoad(acc, pC, mi * 8 * npCur + ni * 8, npCur));
+                  inner.push_back(sgLoadExpr(acc, pC, accAddr(), npCur));
                 }
                 for (int64_t ki = 0; ki < (kpCur / 8); ++ki) {
                   std::string fa = fresh(), fb = fresh();
@@ -2259,12 +2272,18 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
                   inner.push_back(
                       sgLoad(fa, pA, mi * 8 * kpCur + ki * 8, kpCur));
                   inner.push_back(fragDecl(dc.opFrag, fb));
-                  inner.push_back(
-                      sgLoad(fb, pB, ki * 8 * npCur + ni * 8, npCur));
+                  inner.push_back(sgLoadExpr(
+                      fb, pB,
+                      ctx.paren(ctx.add(ctx.i32lit(ki * 8 * npCur), colOff(1))),
+                      npCur));
                   inner.push_back(sgMultiplyAccumulate(acc, fa, fb));
                 }
-                inner.push_back(
-                    sgStore(acc, pC, mi * 8 * npCur + ni * 8, npCur));
+                inner.push_back(sgStoreExpr(acc, pC, accAddr(), npCur));
+              }
+              if (affineWarps) {
+                for (msl::Stmt *s : inner)
+                  body.push_back(s);
+                break;
               }
               body.push_back(ctx.ifScope(ctx.binary(B::Eq, ctx.var(warpId),
                                                     ctx.lit(std::to_string(w))),

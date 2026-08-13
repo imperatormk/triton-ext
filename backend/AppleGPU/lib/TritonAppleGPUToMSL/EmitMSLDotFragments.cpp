@@ -71,6 +71,22 @@ msl::Stmt *MSLEmitter::sgStore(StringRef acc, StringRef base, int64_t off,
                                          ctx.lit(std::to_string(ld))}));
 }
 
+msl::Stmt *MSLEmitter::sgLoadExpr(StringRef frag, StringRef base,
+                                  msl::Expr *off, int64_t ld) {
+  return ctx.exprStmt(ctx.call(
+      msl::builtin::sg::Load,
+      {ctx.var(frag), ctx.binary(msl::BinOp::Add, ctx.var(base), off),
+       ctx.lit(std::to_string(ld))}));
+}
+
+msl::Stmt *MSLEmitter::sgStoreExpr(StringRef acc, StringRef base,
+                                   msl::Expr *off, int64_t ld) {
+  return ctx.exprStmt(ctx.call(
+      msl::builtin::sg::Store,
+      {ctx.var(acc), ctx.binary(msl::BinOp::Add, ctx.var(base), off),
+       ctx.lit(std::to_string(ld))}));
+}
+
 // `simdgroup_multiply_accumulate(acc, a, b, acc);`
 msl::Stmt *MSLEmitter::sgMultiplyAccumulate(StringRef acc, StringRef a,
                                             StringRef b) {

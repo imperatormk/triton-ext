@@ -31,7 +31,6 @@ msl::Expr *MSLEmitter::fragAddr(StringRef base, int64_t off) {
 
 // `frag name;` - uninitialized operand fragment decl.
 msl::Stmt *MSLEmitter::fragDecl(msl::MatrixType *frag, StringRef name) {
-  ++fnFragDecls;
   return ctx.declStmt(frag, name);
 }
 
@@ -39,7 +38,6 @@ msl::Stmt *MSLEmitter::fragDecl(msl::MatrixType *frag, StringRef name) {
 // doubles as the ctor callee (simdgroup_float8x8(0.0f)); read the printed name
 // back off the MatrixType so the call callee matches the decl type exactly.
 msl::Stmt *MSLEmitter::accFragDecl(msl::MatrixType *frag, StringRef name) {
-  ++fnFragDecls;
   StringRef ctorName = frag->elem == msl::MatrixType::Elem::Half
                            ? msl::builtin::sg::Half8x8
                        : frag->elem == msl::MatrixType::Elem::Bfloat

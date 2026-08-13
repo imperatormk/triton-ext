@@ -205,15 +205,15 @@ private:
   int nextId = 0;
   int coordId = 0;
   int indent = 1;
-  // Simdgroup fragment allocas emitted into the function being written. The
-  // AGX backend's SROA runs out of memory somewhere past ten thousand of them
-  // in one function, so the dot emitter rolls its k-steps into a loop once the
-  // running total approaches that.
-  int64_t fnFragDecls = 0;
-  bool rollKSteps(size_t slotsPerStep) const {
-    return fnFragDecls + (int64_t)slotsPerStep > kFragDeclRollThreshold;
-  }
-  static constexpr int64_t kFragDeclRollThreshold = 4096;
+  // The AGX backend's SROA runs out of memory somewhere past ten thousand
+  // simdgroup fragment allocas in one function. planFragRolling totals what the
+  // whole function would declare unrolled and decides once, before any of it is
+  // emitted; a running count would roll dots in a function that never reaches
+  // the limit, purely because they come last.
+  bool fnRollKSteps = false;
+  bool rollKSteps(size_t) const { return fnRollKSteps; }
+  void planFragRolling(tt::FuncOp func);
+  static constexpr int64_t kFragDeclRollThreshold = 8192;
   llvm::DenseMap<Value, SmallVector<std::string>> valMap;
 
   llvm::DenseMap<Value, MemDescInfo> memdescMap;

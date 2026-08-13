@@ -672,8 +672,19 @@ LogicalResult MSLEmitter::emit() {
   return success();
 }
 
+void MSLEmitter::planFragRolling(tt::FuncOp func) {
+  int64_t total = 0;
+  func.walk([&](tt::DotOp op) {
+    DotPlan p = planDot(op);
+    if (p.kind == DotPlan::Kind::Unsupported || p.kind == DotPlan::Kind::Scalar)
+      return;
+    total += (p.mT + p.nT) * p.kT + p.nFrag;
+  });
+  fnRollKSteps = total > kFragDeclRollThreshold;
+}
+
 LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
-  fnFragDecls = 0;
+  fnRollKSteps = false;
   auto fnTy = func.getFunctionType();
   // Pin the threadgroup size the runtime always dispatches (num_warps*32) so
   // the Metal compiler budgets for exactly this size instead of an
@@ -840,6 +851,7 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
     memdescMap[mi.getResult()] = {parent.buf, base, parent.bufStrides};
   });
 
+  planFragRolling(func);
   func.walk([&](Operation *op) { scanPool(op); });
   int64_t kernelPool = moduleHasDevFuncs ? globalPoolBytes : poolBytes;
   if (kernelPool > 0) {

@@ -147,8 +147,7 @@ class MPSBackend(BaseBackend):
     def get_codegen_implementation(self, options):
 
         def min_dot_size(lhs_type, rhs_type):
-            # Apple simdgroup tile is 8×8; minimum dot operand = (1, 1, 8)
-            return (1, 1, 8)
+            return (8, 8, 8)
 
         return {"min_dot_size": min_dot_size}
 

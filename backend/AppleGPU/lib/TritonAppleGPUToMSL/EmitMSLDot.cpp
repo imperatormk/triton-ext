@@ -676,6 +676,10 @@ DotPlan MSLEmitter::planDot(tt::DotOp op) {
   }
   if (!isDotOperandElem(aElem) || !isDotOperandElem(bElem)) {
     mslReject(op, "planDot", "operand-elem-unsupported");
+    op.emitError("tt.dot operand element type is not supported on Apple GPUs: "
+                 "got ")
+        << aElem << " x " << bElem
+        << "; simdgroup matrix operands must be f32, f16 or bf16";
     return p;
   }
   if (aElem != bElem) {

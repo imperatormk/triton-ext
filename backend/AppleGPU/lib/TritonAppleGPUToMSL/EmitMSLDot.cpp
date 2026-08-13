@@ -2270,6 +2270,12 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
             bool affineWarps = (pnFrag % pWarps == 0) && (pnT % pWarps == 0);
             for (int64_t w = 0; w < (affineWarps ? 1 : pWarps); ++w) {
               msl::Block inner;
+              // A's fragment depends only on (mi, ki) and B's on (ki, ni), so
+              // walking the (f, ki) grid reloads each of them once per the axis
+              // it does not vary along. Nothing writes pA/pB between the
+              // barriers bracketing this block, so one load per address serves
+              // every use.
+              DenseMap<int64_t, std::string> aCache, bCache;
               for (int64_t f = w; f < pnFrag; f += pWarps) {
                 int64_t mi = f / pnT, ni = f % pnT;
                 auto colOff = [&](int64_t scale) -> msl::Expr * {
@@ -2293,15 +2299,24 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
                   inner.push_back(sgLoadExpr(acc, pC, accAddr(), npCur));
                 }
                 for (int64_t ki = 0; ki < (kpCur / 8); ++ki) {
-                  std::string fa = fresh(), fb = fresh();
-                  inner.push_back(fragDecl(dc.opFrag, fa));
-                  inner.push_back(
-                      sgLoad(fa, pA, mi * 8 * kpCur + ki * 8, kpCur));
-                  inner.push_back(fragDecl(dc.opFrag, fb));
-                  inner.push_back(sgLoadExpr(
-                      fb, pB,
-                      ctx.paren(ctx.add(ctx.i32lit(ki * 8 * npCur), colOff(1))),
-                      npCur));
+                  int64_t aOff = mi * 8 * kpCur + ki * 8;
+                  std::string &fa = aCache[aOff];
+                  if (fa.empty()) {
+                    fa = fresh();
+                    inner.push_back(fragDecl(dc.opFrag, fa));
+                    inner.push_back(sgLoad(fa, pA, aOff, kpCur));
+                  }
+                  int64_t bOff = ki * 8 * npCur + ni * 8;
+                  std::string &fb = bCache[bOff];
+                  if (fb.empty()) {
+                    fb = fresh();
+                    inner.push_back(fragDecl(dc.opFrag, fb));
+                    inner.push_back(sgLoadExpr(
+                        fb, pB,
+                        ctx.paren(
+                            ctx.add(ctx.i32lit(ki * 8 * npCur), colOff(1))),
+                        npCur));
+                  }
                   inner.push_back(sgMultiplyAccumulate(acc, fa, fb));
                 }
                 inner.push_back(sgStoreExpr(acc, pC, accAddr(), npCur));

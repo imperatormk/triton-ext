@@ -304,6 +304,14 @@ class MPSBackend(BaseBackend):
         return msl
 
     def make_msl_metallib(self, msl, metadata, options):
+        # TRITON_MSL_NO_COMPILE: emit MSL but never hand it to Metal. Lets a
+        # kernel whose Metal compile crashes the compiler service still be
+        # dumped and inspected (TRITON_MSL_DUMP writes it in make_msl above).
+        # The returned bytes are not a metallib, so anything that runs the
+        # kernel fails afterwards -- this is a dump-only mode.
+        if os.environ.get('TRITON_MSL_NO_COMPILE') == '1':
+            return b''
+
         # Safe math globally. Metal fast-math assumes no NaN/Inf and reassociates
         # FP, silently miscompiling any kernel that produces or consumes Inf/NaN
         # or relies on RTNE. Which kernels see Inf/NaN is a runtime property, so

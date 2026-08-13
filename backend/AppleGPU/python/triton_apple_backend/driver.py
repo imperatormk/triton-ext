@@ -123,6 +123,10 @@ class MPSUtils:
         """
         Returns (module, function, n_regs, n_spills, n_max_threads).
         """
+        if _os.environ.get('TRITON_MSL_NO_COMPILE') == '1':
+            raise RuntimeError(
+                f"TRITON_MSL_NO_COMPILE=1: '{name}' was emitted but never "
+                "compiled, so it cannot be loaded. Unset it to run kernels.")
         try:
             module = self._metal.load_metallib(bytes(metallib_bytes))
             function = module.get_function(name)

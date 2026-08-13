@@ -205,6 +205,15 @@ private:
   int nextId = 0;
   int coordId = 0;
   int indent = 1;
+  // Simdgroup fragment allocas emitted into the function being written. The
+  // AGX backend's SROA runs out of memory somewhere past ten thousand of them
+  // in one function, so the dot emitter rolls its k-steps into a loop once the
+  // running total approaches that.
+  int64_t fnFragDecls = 0;
+  bool rollKSteps(size_t slotsPerStep) const {
+    return fnFragDecls + (int64_t)slotsPerStep > kFragDeclRollThreshold;
+  }
+  static constexpr int64_t kFragDeclRollThreshold = 4096;
   llvm::DenseMap<Value, SmallVector<std::string>> valMap;
 
   llvm::DenseMap<Value, MemDescInfo> memdescMap;
@@ -608,7 +617,8 @@ private:
     int64_t bytes;
   };
   msl::Stmt *bFragLoad(const DotEmitCtx &dc, int64_t ki, msl::Expr *niExpr,
-                       int64_t niLit, StringRef fb, int64_t ldb);
+                       int64_t niLit, StringRef fb, int64_t ldb,
+                       msl::Expr *kiOff = nullptr);
   void checkPoolRegions(Operation *op, ArrayRef<PoolRegion> live);
   void checkDotPoolRegions(tt::DotOp op, const DotPlan &plan);
   bool rowBoundNeverRagged(const DirectStage &ds, int64_t M);

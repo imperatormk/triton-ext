@@ -673,6 +673,7 @@ LogicalResult MSLEmitter::emit() {
 }
 
 LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
+  fnFragDecls = 0;
   auto fnTy = func.getFunctionType();
   // Pin the threadgroup size the runtime always dispatches (num_warps*32) so
   // the Metal compiler budgets for exactly this size instead of an

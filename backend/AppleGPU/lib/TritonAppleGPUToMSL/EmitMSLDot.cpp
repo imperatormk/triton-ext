@@ -1236,6 +1236,66 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       into.push_back(sgMultiplyAccumulate(acc, fa, fb));
     }
   };
+  // A whole cache window's MMAs with the k-steps rolled into a real loop: the
+  // window's fragments are k-uniform apart from operand offsets affine in ki,
+  // so one body under a counter is the same program with kT times fewer
+  // fragment allocas. The AGX backend's SROA throws bad_alloc past roughly ten
+  // thousand of those in one function.
+  struct WinSlot {
+    int64_t mi, ni;
+    std::string acc;
+  };
+  auto rollableWindow = [&](ArrayRef<WinSlot> ws) {
+    if (kT <= 1 || plan.aFrag || ws.empty())
+      return false;
+    llvm::DenseSet<int64_t> mis, nis;
+    for (auto &s : ws) {
+      mis.insert(s.mi);
+      nis.insert(s.ni);
+    }
+    return rollKSteps(mis.size() + nis.size());
+  };
+  auto fragMMAWindowRolled = [&](ArrayRef<WinSlot> ws, msl::Block &into) {
+    std::string kv = fresh();
+    msl::Block inner;
+    DenseMap<int64_t, std::string> fa, fb;
+    for (auto &s : ws) {
+      if (!fa.count(s.mi)) {
+        std::string n = fresh();
+        fa[s.mi] = n;
+        inner.push_back(fragDecl(dc.opFrag, n));
+        if (dc.devA.empty()) {
+          inner.push_back(sgLoadExpr(
+              n, dc.tgA,
+              ctx.paren(ctx.add(ctx.i32lit(s.mi * 8 * lda), ctx.var(kv))),
+              lda));
+        } else {
+          msl::Expr *off = ctx.paren(ctx.add(
+              ctx.paren(ctx.binary(B::Mul, ctx.i32lit(s.mi * 8), dc.devALda)),
+              ctx.var(kv)));
+          inner.push_back(ctx.exprStmt(ctx.call(
+              msl::builtin::sg::Load,
+              {ctx.var(n), ctx.binary(B::Add, ctx.var(dc.devA), off),
+               dc.devALda})));
+        }
+      }
+      if (!fb.count(s.ni)) {
+        std::string n = fresh();
+        fb[s.ni] = n;
+        inner.push_back(fragDecl(dc.opFrag, n));
+        inner.push_back(
+            bFragLoad(dc, 0, nullptr, s.ni, n, ldb, ctx.var(kv)));
+      }
+    }
+    for (auto &s : ws)
+      inner.push_back(sgMultiplyAccumulate(s.acc, fa[s.mi], fb[s.ni]));
+    into.push_back(ctx.forScope(
+        ctx.declStmt(ctx.named("int"), kv, ctx.i32lit(0)),
+        ctx.binary(B::Lt, ctx.var(kv), ctx.i32lit(kT * 8)),
+        ctx.assignStmt(ctx.var(kv),
+                       ctx.binary(B::Add, ctx.var(kv), ctx.i32lit(8))),
+        std::move(inner)));
+  };
 
   auto fragMMAExpr = [&](int64_t mi, StringRef niKey, msl::Expr *niExpr,
                          StringRef acc, msl::Block &into) {
@@ -1357,14 +1417,22 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
           msl::Block inner;
           for (int64_t f0 = w; f0 < nFrag; f0 += fWindow) {
             clearFragCache();
+            SmallVector<WinSlot> ws;
             for (int64_t f = f0; f < std::min(f0 + fWindow, nFrag);
-                 f += numWarps) {
-              int64_t mi = f / nT, ni = f % nT;
-              std::string acc = fresh();
-              inner.push_back(accFragDecl(dc.accFragTy, acc));
-              fragMMA(mi, ni, acc, inner);
-              inner.push_back(sgStore(acc, dc.tgC, mi * 8 * N + ni * 8, N));
+                 f += numWarps)
+              ws.push_back({f / nT, f % nT, fresh()});
+            bool roll = rollableWindow(ws);
+            for (auto &s : ws)
+              inner.push_back(accFragDecl(dc.accFragTy, s.acc));
+            if (roll) {
+              fragMMAWindowRolled(ws, inner);
+            } else {
+              for (auto &s : ws)
+                fragMMA(s.mi, s.ni, s.acc, inner);
             }
+            for (auto &s : ws)
+              inner.push_back(
+                  sgStore(s.acc, dc.tgC, s.mi * 8 * N + s.ni * 8, N));
           }
           warpIf(w, std::move(inner));
         }
@@ -1385,8 +1453,15 @@ bool MSLEmitter::emitDotDirect(tt::DotOp op, msl::Block &body,
       msl::Block inner;
       for (int64_t f0 = w; f0 < nFrag; f0 += fWindow) {
         clearFragCache();
+        SmallVector<WinSlot> ws;
         for (int64_t f = f0; f < std::min(f0 + fWindow, nFrag); f += numWarps)
-          fragMMA(f / nT, f % nT, accName(f / nT, f % nT), inner);
+          ws.push_back({f / nT, f % nT, accName(f / nT, f % nT)});
+        if (rollableWindow(ws)) {
+          fragMMAWindowRolled(ws, inner);
+        } else {
+          for (auto &s : ws)
+            fragMMA(s.mi, s.ni, s.acc, inner);
+        }
       }
       warpIf(w, std::move(inner));
     }
@@ -1517,48 +1592,72 @@ bool MSLEmitter::emitDotFused(
       std::string niKey;
       msl::Expr *niExpr;
     };
-    auto emitSlots = [&](ArrayRef<Slot> slots, msl::Block &into) {
-      for (int64_t ki = 0; ki < kT; ++ki) {
-        DenseMap<int64_t, std::string> aFrag;
-        std::map<std::string, std::string> bFrag;
-        for (auto &pr : slots) {
-          int64_t mi = pr.mi;
-          const std::string &niKey = pr.niKey;
-          if (!aFrag.count(mi)) {
-            std::string fa = fresh();
-            aFrag[mi] = fa;
-            into.push_back(fragDecl(dc.opFrag, fa));
-            if (!dc.devA.empty()) {
-              // devA already points at this warp's band, so the fragment row is
-              // band-relative; the row stride is A's device pitch.
-              int64_t bandFrags = plan.M / (numWarps * 8);
-              int64_t rowInBand = bandFrags ? mi % bandFrags : mi;
-              msl::Expr *off = ctx.paren(
-                  ctx.add(ctx.paren(ctx.binary(
-                              B::Mul, ctx.i32lit(rowInBand * 8), dc.devALda)),
-                          ctx.i32lit(ki * 8)));
-              into.push_back(ctx.exprStmt(ctx.call(
-                  msl::builtin::sg::Load,
-                  {ctx.var(fa), ctx.binary(B::Add, ctx.var(dc.devA), off),
-                   dc.devALda})));
-            } else {
-              into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
-            }
-          }
-          if (!bFrag.count(niKey)) {
-            std::string fb = fresh();
-            bFrag[niKey] = fb;
-            into.push_back(fragDecl(dc.opFrag, fb));
-            // simdgroup_load(fb, tgB + (ki*8*ldb + niExpr * 8), ldb);
-            into.push_back(bFragLoad(dc, ki, pr.niExpr, 0, fb, ldb));
+    // The AGX backend compiler runs SROA over every simdgroup fragment alloca
+    // and throws bad_alloc past ~10k of them in one function, so above a
+    // threshold the k-steps are rolled into a real loop instead of unrolled.
+    // The body is k-uniform apart from the operand offsets, which are affine in
+    // ki, so one body with a loop counter is the same program.
+    auto emitOneKStep = [&](ArrayRef<Slot> slots, msl::Block &into,
+                            int64_t ki, msl::Expr *kiOff) {
+      DenseMap<int64_t, std::string> aFrag;
+      std::map<std::string, std::string> bFrag;
+      for (auto &pr : slots) {
+        int64_t mi = pr.mi;
+        const std::string &niKey = pr.niKey;
+        if (!aFrag.count(mi)) {
+          std::string fa = fresh();
+          aFrag[mi] = fa;
+          into.push_back(fragDecl(dc.opFrag, fa));
+          msl::Expr *kTerm = kiOff ? kiOff : (msl::Expr *)ctx.i32lit(ki * 8);
+          if (!dc.devA.empty()) {
+            // devA already points at this warp's band, so the fragment row is
+            // band-relative; the row stride is A's device pitch.
+            int64_t bandFrags = plan.M / (numWarps * 8);
+            int64_t rowInBand = bandFrags ? mi % bandFrags : mi;
+            msl::Expr *off = ctx.paren(
+                ctx.add(ctx.paren(ctx.binary(
+                            B::Mul, ctx.i32lit(rowInBand * 8), dc.devALda)),
+                        kTerm));
+            into.push_back(ctx.exprStmt(ctx.call(
+                msl::builtin::sg::Load,
+                {ctx.var(fa), ctx.binary(B::Add, ctx.var(dc.devA), off),
+                 dc.devALda})));
+          } else if (kiOff) {
+            into.push_back(sgLoadExpr(
+                fa, dc.tgA,
+                ctx.paren(ctx.add(ctx.i32lit(mi * 8 * lda), kTerm)), lda));
+          } else {
+            into.push_back(sgLoad(fa, dc.tgA, mi * 8 * lda + ki * 8, lda));
           }
         }
-        for (auto [j, mn] : llvm::enumerate(slots)) {
-          const std::string &acc = fusedDot.accNames[j];
-          into.push_back(
-              sgMultiplyAccumulate(acc, aFrag[mn.mi], bFrag[mn.niKey]));
+        if (!bFrag.count(niKey)) {
+          std::string fb = fresh();
+          bFrag[niKey] = fb;
+          into.push_back(fragDecl(dc.opFrag, fb));
+          into.push_back(bFragLoad(dc, ki, pr.niExpr, 0, fb, ldb, kiOff));
         }
       }
+      for (auto [j, mn] : llvm::enumerate(slots)) {
+        const std::string &acc = fusedDot.accNames[j];
+        into.push_back(
+            sgMultiplyAccumulate(acc, aFrag[mn.mi], bFrag[mn.niKey]));
+      }
+    };
+    auto emitSlots = [&](ArrayRef<Slot> slots, msl::Block &into) {
+      if (kT > 1 && rollKSteps(slots.size())) {
+        std::string kv = fresh();
+        msl::Block inner;
+        emitOneKStep(slots, inner, 0, ctx.var(kv));
+        into.push_back(ctx.forScope(
+            ctx.declStmt(ctx.named("int"), kv, ctx.i32lit(0)),
+            ctx.binary(B::Lt, ctx.var(kv), ctx.i32lit(kT * 8)),
+            ctx.assignStmt(ctx.var(kv),
+                           ctx.binary(B::Add, ctx.var(kv), ctx.i32lit(8))),
+            std::move(inner)));
+        return;
+      }
+      for (int64_t ki = 0; ki < kT; ++ki)
+        emitOneKStep(slots, into, ki, nullptr);
     };
     if (wt.twoD) {
       // mi is a compile-time constant only within a warp row, so the 2D form

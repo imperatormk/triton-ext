@@ -446,29 +446,46 @@ std::optional<DirectStage> MSLEmitter::dotADirect(tt::DotOp op,
 
 msl::Stmt *MSLEmitter::bFragLoad(const DotEmitCtx &dc, int64_t ki,
                                  msl::Expr *niExpr, int64_t niLit, StringRef fb,
-                                 int64_t ldb) {
+                                 int64_t ldb, msl::Expr *kiOff) {
   // Staged pre-transpose, B's tile is N x K: fragment (ki, ni) starts at row
   // ni, column ki, and the flag swaps the axes on the way into the fragment.
   if (dc.bStageTransposed) {
     int64_t ld = dc.bStageLd;
+    msl::Expr *kTerm = kiOff ? kiOff : (msl::Expr *)ctx.i32lit(ki * 8);
     if (niExpr)
       return ctx.exprStmt(ctx.call(
           msl::builtin::sg::Load,
           {ctx.var(fb),
            ctx.binary(B::Add, ctx.var(dc.tgBCur),
-                      ctx.paren(ctx.add(ctx.i32lit(ki * 8),
-                                        ctx.mul(niExpr, ctx.i32lit(8 * ld))))),
+                      ctx.paren(ctx.add(
+                          kTerm, ctx.mul(niExpr, ctx.i32lit(8 * ld))))),
+           ctx.i32lit(ld), ctx.raw("ulong2(0, 0)"), ctx.lit("true")}));
+    if (kiOff)
+      return ctx.exprStmt(ctx.call(
+          msl::builtin::sg::Load,
+          {ctx.var(fb),
+           ctx.binary(B::Add, ctx.var(dc.tgBCur),
+                      ctx.paren(ctx.add(kTerm, ctx.i32lit(niLit * 8 * ld)))),
            ctx.i32lit(ld), ctx.raw("ulong2(0, 0)"), ctx.lit("true")}));
     return sgLoad(fb, dc.tgBCur, niLit * 8 * ld + ki * 8, ld,
                   /*transpose=*/true);
   }
+  msl::Expr *kTerm = kiOff ? (msl::Expr *)ctx.paren(
+                                 ctx.mul(kiOff, ctx.i32lit(ldb)))
+                           : (msl::Expr *)ctx.i32lit(ki * 8 * ldb);
   if (niExpr)
     return ctx.exprStmt(ctx.call(
         msl::builtin::sg::Load,
         {ctx.var(fb),
          ctx.binary(B::Add, ctx.var(dc.tgBCur),
-                    ctx.paren(ctx.add(ctx.i32lit(ki * 8 * ldb),
-                                      ctx.mul(niExpr, ctx.i32lit(8))))),
+                    ctx.paren(ctx.add(kTerm, ctx.mul(niExpr, ctx.i32lit(8))))),
+         ctx.i32lit(ldb)}));
+  if (kiOff)
+    return ctx.exprStmt(ctx.call(
+        msl::builtin::sg::Load,
+        {ctx.var(fb),
+         ctx.binary(B::Add, ctx.var(dc.tgBCur),
+                    ctx.paren(ctx.add(kTerm, ctx.i32lit(niLit * 8)))),
          ctx.i32lit(ldb)}));
   return sgLoad(fb, dc.tgBCur, ki * 8 * ldb + niLit * 8, ldb);
 }

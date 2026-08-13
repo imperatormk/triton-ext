@@ -203,6 +203,7 @@ private:
   msl::Expr *aliasElem(StringRef name);
 
   int nextId = 0;
+  int coordId = 0;
   int indent = 1;
   llvm::DenseMap<Value, SmallVector<std::string>> valMap;
 
@@ -413,6 +414,13 @@ private:
                                              int64_t N);
   SmallVector<std::string> dotResultIds(msl::Block &body, tt::DotOp op,
                                         const DotPlan &plan);
+  msl::Expr *coordMinus(RankedTensorType ty, int reg, StringAttr dim,
+                        int64_t origin) {
+    msl::Expr *c = layout.layoutCoordExpr(ty, reg, dim);
+    if (origin == 0)
+      return c;
+    return ctx.paren(ctx.binary(msl::BinOp::Sub, c, ctx.i32lit(origin)));
+  }
   void dotReadback(msl::Block &tgt, RankedTensorType cTy, StringRef tgC,
                    ArrayRef<std::string> ids, ArrayRef<std::string> base,
                    int rank, int64_t N, int64_t bi, int64_t r0, int64_t r1,

@@ -2071,7 +2071,7 @@ std::optional<bool> MSLEmitter::emitMemDesc(Operation *op, msl::Block &body) {
         int64_t stride = 1;
         for (int d = rank - 1; d >= 0; --d) {
           msl::Expr *c = layout.layoutCoordExpr(rt, reg, outN[d]);
-          if (d == rank - 2)
+          if (d == rank - 2 && r0 != 0)
             c = ctx.paren(ctx.binary(B::Sub, c, ctx.lit(std::to_string(r0))));
           msl::Expr *term =
               stride == 1 ? c

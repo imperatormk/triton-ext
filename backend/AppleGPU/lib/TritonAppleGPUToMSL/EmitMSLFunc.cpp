@@ -763,6 +763,8 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
   warpId = fresh();
   for (msl::Stmt *s : laneWarpProlog())
     prologue.push_back(s);
+  coordId = 0;
+  layout.beginFunc(&coordId);
 
   scalarSpinlock = false;
   func.walk([&](tt::AtomicCASOp cas) {
@@ -893,6 +895,8 @@ LogicalResult MSLEmitter::emitFunc(tt::FuncOp func) {
   dmaHandleDecls.clear();
   // Tokens are keyed per copy site; a later kernel must mint its own.
   dmaHandleFor.clear();
+  for (msl::Stmt *s : layout.takeDecls())
+    prologue.push_back(s);
   for (msl::Stmt *s : body)
     prologue.push_back(s);
   msl::KernelFn *fn = ctx.kernelFn(maxThreads, mslKernelName(func.getName()),
@@ -962,6 +966,8 @@ LogicalResult MSLEmitter::emitDeviceFunc(tt::FuncOp func) {
   laneId = fresh();
   warpId = fresh();
   msl::Block prologue = laneWarpProlog();
+  coordId = 0;
+  layout.beginFunc(&coordId);
 
   poolBuf = devPoolPtr;
   curDevFunc = func;
@@ -971,6 +977,8 @@ LogicalResult MSLEmitter::emitDeviceFunc(tt::FuncOp func) {
   if (emitFailed)
     return failure();
   curDevFunc = nullptr;
+  for (msl::Stmt *s : layout.takeDecls())
+    prologue.push_back(s);
   for (msl::Stmt *s : body)
     prologue.push_back(s);
   msl::DeviceFn *fn =

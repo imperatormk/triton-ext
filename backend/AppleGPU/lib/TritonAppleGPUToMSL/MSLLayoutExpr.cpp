@@ -30,6 +30,50 @@ msl::Expr *LayoutExprBuilder::layoutCoordExpr(RankedTensorType rt, int reg,
                                               StringAttr outDim) {
   MLIRContext *mctx = rt.getContext();
   tt::LinearLayout ll = ttg::toLinearLayout(rt);
+  if (!hoistId)
+    return buildCoordExpr(ll, mctx, reg, outDim);
+
+  // The emitted tree is a function of nothing but the bases this out-dim reads
+  // out of each runtime in-dim, plus the register's constant fold. Keying on
+  // those exact numbers makes two entries share a name only when they would
+  // have printed the same text.
+  SmallVector<int32_t> sig;
+  auto kRegD = StringAttr::get(mctx, "register");
+  int32_t constPart = 0;
+  for (int b = 0, n = ll.getInDimSizeLog2(kRegD); b < n; ++b)
+    if (reg & (1 << b))
+      constPart ^= ll.getBasis(kRegD, b, outDim);
+  sig.push_back(constPart);
+  for (StringRef in : {"lane", "warp", "block"}) {
+    auto dim = StringAttr::get(mctx, in);
+    sig.push_back(-1);
+    if (!ll.hasInDim(dim))
+      continue;
+    for (int b = 0, n = ll.getInDimSizeLog2(dim); b < n; ++b)
+      sig.push_back(ll.getBasis(dim, b, outDim));
+  }
+  std::string key;
+  for (int32_t v : sig)
+    key += std::to_string(v) + ",";
+  auto it = hoisted.find(key);
+  if (it != hoisted.end())
+    return ctx.var(it->second);
+
+  msl::Expr *tree = buildCoordExpr(ll, mctx, reg, outDim);
+  // A bare id or literal is already as short as a name for it would be.
+  if (isa<msl::Literal>(tree) || isa<msl::VarRef>(tree))
+    return tree;
+  std::string name = "c" + std::to_string((*hoistId)++);
+  msl::Stmt *d = ctx.declStmt(ctx.scalar(msl::Scalar::I32), name, tree);
+  decls.push_back(d);
+  llvm::StringRef saved = llvm::cast<msl::DeclStmt>(d)->name;
+  hoisted[key] = saved;
+  return ctx.var(saved);
+}
+
+msl::Expr *LayoutExprBuilder::buildCoordExpr(const tt::LinearLayout &ll,
+                                             MLIRContext *mctx, int reg,
+                                             StringAttr outDim) {
   auto kReg = StringAttr::get(mctx, "register");
   auto kLane = StringAttr::get(mctx, "lane");
   auto kWarp = StringAttr::get(mctx, "warp");

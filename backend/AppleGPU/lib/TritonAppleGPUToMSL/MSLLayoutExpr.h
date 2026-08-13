@@ -13,6 +13,8 @@
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
+#include <string>
 
 namespace mlir::triton::applegpu {
 
@@ -27,6 +29,21 @@ public:
 
   SmallVector<int32_t> registerCoords(RankedTensorType rt, int reg);
   msl::Expr *layoutCoordExpr(RankedTensorType rt, int reg, StringAttr outDim);
+
+  // Coordinate trees read only lane/warp/threadgroup ids, so one decl at the
+  // top of the function dominates every use. Between beginFunc and takeDecls
+  // each distinct tree is emitted once and referenced by name thereafter.
+  void beginFunc(int *idCounter) {
+    hoistId = idCounter;
+    hoisted.clear();
+    decls.clear();
+  }
+  msl::Block takeDecls() {
+    hoistId = nullptr;
+    msl::Block out = std::move(decls);
+    decls.clear();
+    return out;
+  }
   msl::Expr *layoutOffsetExpr(RankedTensorType rt, int reg);
   msl::Expr *flatTileOffset(RankedTensorType rt, int reg);
   // `rowPad` widens the innermost (row) stride past the tensor's own width,
@@ -37,18 +54,25 @@ public:
   // and warps. The bases are disjoint powers of two, so the register's constant
   // and the runtime bits compose by or: the set is the constant offset by every
   // subset of the runtime mask.
-  void coordRange(RankedTensorType rt, int reg, StringAttr outDim,
-                  int32_t &lo, int32_t &hi);
+  void coordRange(RankedTensorType rt, int reg, StringAttr outDim, int32_t &lo,
+                  int32_t &hi);
   msl::Expr *transFlatOffset(RankedTensorType srcTy, ArrayRef<int32_t> perm,
                              ArrayRef<int64_t> resShape, int reg);
 
   static uint64_t coordKey(ArrayRef<int32_t> c);
 
 private:
+  msl::Expr *buildCoordExpr(const tt::LinearLayout &ll, MLIRContext *mctx,
+                            int reg, StringAttr outDim);
+
   msl::MSLContext &ctx;
   const std::string &laneId;
   const std::string &warpId;
   const std::string &tgposId;
+
+  int *hoistId = nullptr;
+  llvm::StringMap<llvm::StringRef> hoisted;
+  msl::Block decls;
 };
 
 } // namespace mlir::triton::applegpu

@@ -1097,12 +1097,9 @@ void MSLEmitter::dotReadback(msl::Block &tgt, RankedTensorType cTy,
     }
     std::string b = base[base.size() == 1 ? 0 : r];
     // ((rowExpr - r0) * N + colExpr)
-    msl::Expr *bandOff = ctx.paren(ctx.add(
-        ctx.mul(
-            ctx.paren(ctx.binary(B::Sub, layout.layoutCoordExpr(cTy, r, rowDim),
-                                 ctx.i32lit(r0))),
-            ctx.i32lit(N)),
-        layout.layoutCoordExpr(cTy, r, colDim)));
+    msl::Expr *bandOff = ctx.paren(
+        ctx.add(ctx.mul(coordMinus(cTy, r, rowDim, r0), ctx.i32lit(N)),
+                layout.layoutCoordExpr(cTy, r, colDim)));
     // (rowExpr >= r0 && rowExpr < r1), needed only when the register straddles
     // the band edge: one wholly inside it can never fail, and one wholly
     // outside was skipped above.
@@ -2220,17 +2217,12 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
                             : ctx.paren(batchEq);
             }
             // ((row - m0) * kpCur + (col - k0))
-            msl::Expr *off = ctx.paren(ctx.add(
-                ctx.mul(
-                    ctx.paren(ctx.binary(
-                        B::Sub, layout.layoutCoordExpr(aStageTy, r, aRowDim),
-                        ctx.i32lit(m0))),
-                    ctx.i32lit(kpCur)),
-                ctx.paren(ctx.binary(
-                    B::Sub, layout.layoutCoordExpr(aStageTy, r, aColDim),
-                    ctx.i32lit(k0)))));
-            msl::Stmt *asn = ctx.assignStmt(
-                ctx.subscript(ctx.var(pA), off), ctx.var(dc.aNames[r]));
+            msl::Expr *off =
+                ctx.paren(ctx.add(ctx.mul(coordMinus(aStageTy, r, aRowDim, m0),
+                                          ctx.i32lit(kpCur)),
+                                  coordMinus(aStageTy, r, aColDim, k0)));
+            msl::Stmt *asn = ctx.assignStmt(ctx.subscript(ctx.var(pA), off),
+                                            ctx.var(dc.aNames[r]));
             body.push_back(guard ? ctx.compactIfBare(guard, asn) : asn);
           }
           {
@@ -2249,15 +2241,10 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
                               : ctx.paren(batchEq);
               }
               // ((row - k0) * npCur + (col - n0))
-              msl::Expr *off = ctx.paren(ctx.add(
-                  ctx.mul(
-                      ctx.paren(ctx.binary(
-                          B::Sub, layout.layoutCoordExpr(bStageTy, r, bRowDim),
-                          ctx.i32lit(k0))),
-                      ctx.i32lit(npCur)),
-                  ctx.paren(ctx.binary(
-                      B::Sub, layout.layoutCoordExpr(bStageTy, r, bColDim),
-                      ctx.i32lit(n0)))));
+              msl::Expr *off = ctx.paren(
+                  ctx.add(ctx.mul(coordMinus(bStageTy, r, bRowDim, k0),
+                                  ctx.i32lit(npCur)),
+                          coordMinus(bStageTy, r, bColDim, n0)));
               msl::Stmt *asn = ctx.assignStmt(ctx.subscript(ctx.var(pB), off),
                                               ctx.var(dc.bNames[r]));
               body.push_back(guard ? ctx.compactIfBare(guard, asn) : asn);
@@ -2335,13 +2322,8 @@ bool MSLEmitter::emitDotPanel(tt::DotOp op, msl::Block &body,
               std::string base = dc.cInit[dc.cInit.size() == 1 ? 0 : r];
               // ((rowExpr - m0) * npCur + (colExpr - n0))
               msl::Expr *off = ctx.paren(ctx.add(
-                  ctx.mul(ctx.paren(ctx.binary(
-                              B::Sub, layout.layoutCoordExpr(cTy, r, dc.rowDim),
-                              ctx.i32lit(m0))),
-                          ctx.i32lit(npCur)),
-                  ctx.paren(ctx.binary(
-                      B::Sub, layout.layoutCoordExpr(cTy, r, dc.colDim),
-                      ctx.i32lit(n0)))));
+                  ctx.mul(coordMinus(cTy, r, dc.rowDim, m0), ctx.i32lit(npCur)),
+                  coordMinus(cTy, r, dc.colDim, n0)));
               // (rowExpr >= m0 && rowExpr < m1 && colExpr >= n0 && colExpr <
               // n1)
               msl::Expr *guard = ctx.paren(ctx.chain(

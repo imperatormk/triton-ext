@@ -124,15 +124,22 @@ struct AppleGPUInferLayoutInterface
 
   LogicalResult
   verifyLayoutsAreEqual(ArrayRef<int64_t> shape, Attribute expected,
-                        Attribute got,
-                        std::optional<Location> loc) const override {
+                        Attribute got, std::optional<Location> loc,
+                        bool ignoreRegBroadcast = false) const override {
     if (expected == got)
       return success();
     if (!expected || !got)
       return failure();
-    if (!ttg::areLayoutsEquivalent(shape,
-                                   cast<ttg::LayoutEncodingTrait>(expected),
-                                   cast<ttg::LayoutEncodingTrait>(got)))
+    auto expectedLL =
+        ttg::toLinearLayout(shape, cast<ttg::LayoutEncodingTrait>(expected));
+    auto gotLL =
+        ttg::toLinearLayout(shape, cast<ttg::LayoutEncodingTrait>(got));
+    if (ignoreRegBroadcast) {
+      auto kReg = StringAttr::get(expected.getContext(), "register");
+      expectedLL = expectedLL.removeZeroBasesAlongDim(kReg);
+      gotLL = gotLL.removeZeroBasesAlongDim(kReg);
+    }
+    if (expectedLL != gotLL)
       return emitOptionalError(loc, "Expected result encoding ", expected,
                                " but was ", got);
     return success();

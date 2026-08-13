@@ -22,6 +22,14 @@ from triton._C.libtriton import ir, passes
 # pass (see ExportAppleGPU.cpp), so that attribute is what actually signals
 # a successful load.
 _plugin = getattr(passes, 'plugin', None)
+if _plugin is not None and not hasattr(_plugin, 'add_simplify_gather'):
+    for _path in os.environ.get('TRITON_PLUGIN_PATHS', '').split(os.pathsep):
+        if not _path:
+            continue
+        try:
+            _plugin.extend_with(_path)
+        except Exception:
+            pass
 _plugin_loaded = bool(_plugin) and hasattr(_plugin, 'add_simplify_gather')
 
 # EmitMSL hands its output path to the C++ pass through the process-global
@@ -104,6 +112,7 @@ class MPSOptions:
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     instrumentation_mode: str = "none"
+    fpsan_homomorphic_casts: bool = False
     sanitize_overflow: bool = False
     allowed_dot_input_precisions: tuple = ("ieee", )
     default_dot_input_precision: str = "ieee"

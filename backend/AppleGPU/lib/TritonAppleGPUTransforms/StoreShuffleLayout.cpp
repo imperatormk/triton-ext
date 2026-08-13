@@ -27,6 +27,29 @@ namespace mlir::triton::applegpu {
 
 namespace {
 
+// Mirrors cvtNeedsSharedMemory for a conversion that has not been materialized
+// as an op yet, so there is no forceWarpShuffle attribute to consult.
+static bool cvtNeedsSharedMemoryForTypes(RankedTensorType srcTy,
+                                         RankedTensorType dstTy) {
+  if (cvtReordersRegisters(srcTy, dstTy))
+    return false;
+  auto layout = minimalCvtLayout(srcTy, dstTy);
+  MLIRContext *ctx = srcTy.getContext();
+  auto kRegister = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
+  if (to_vector(layout.getOutDimNames()) ==
+      SmallVector<StringAttr, 2>{kRegister, kLane}) {
+    auto srcLayout =
+        ttg::toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
+    auto dstLayout =
+        ttg::toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
+    auto factors = getWarpLayoutConvertDecomposition(srcLayout, dstLayout, 32);
+    if (factors.mixedTranspositions.size() < 2)
+      return false;
+  }
+  return true;
+}
+
 // A layout-parametric op whose semantics are independent of the distributed
 // encoding, so cloning it with a different result encoding is value-preserving.
 static bool isRelayableLayoutParametricOp(Operation *op) {
@@ -185,7 +208,7 @@ class StoreShuffleLayoutPass
 
       // Only proceed when the mma -> W convert is genuinely within-simdgroup
       // (no shared memory). Otherwise this rewrite buys nothing.
-      if (cvtNeedsSharedMemory(srcTy, wType))
+      if (cvtNeedsSharedMemoryForTypes(srcTy, wType))
         continue;
 
       // Re-lay the pointer and mask address math into W. If any op in their

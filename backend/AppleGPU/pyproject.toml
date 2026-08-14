@@ -18,7 +18,7 @@ enabled = true
 [tool.scikit-build]
 cmake.version = ">=3.20"
 cmake.build-type = "Release"
-wheel.exclude = ["**/__pycache__/**", "**/*.pyc"]
+wheel.exclude = ["**/__pycache__/**", "**/*.pyc", "lib/**"]
 
 [tool.scikit-build.wheel.packages]
 triton_apple_backend = "python/triton_apple_backend"

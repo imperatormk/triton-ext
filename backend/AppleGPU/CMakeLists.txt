@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
+if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0")
+endif()
 project(applegpu_backend LANGUAGES C CXX)
 include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/triton-ext.cmake")
 configure_triton_extension()

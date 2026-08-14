@@ -1,3 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(applegpu_backend LANGUAGES C CXX)
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/triton-ext.cmake")
+configure_triton_extension()
+
 set(APPLE_GPU_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set(APPLE_GPU_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 
@@ -42,6 +47,7 @@ file(GLOB TOMSL_SRCS lib/TritonAppleGPUToMSL/*.cpp)
 # Build as a single shared library
 add_mlir_library(TritonAppleGPUBackend
     ExportAppleGPU.cpp
+    "${TRITON_EXT_SUPPORT_DIR}/Export.cpp"
     ${DIALECT_SRCS}
     ${TRANSFORM_SRCS}
     ${TOMSL_SRCS}
@@ -54,11 +60,11 @@ add_mlir_library(TritonAppleGPUBackend
     TritonAppleGPUTransformsPassesIncGen
 
     LINK_LIBS PUBLIC
-    TritonExtensionSupport
     ${TRITON_LIB}
 )
 
-triton_ext_link_mlir_lib(TritonAppleGPUBackend MLIRMathTransforms)
+target_link_libraries(TritonAppleGPUBackend PUBLIC MLIRMathTransforms)
+target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-dead_strip)
 
 set_target_properties(TritonAppleGPUBackend PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY

@@ -56,6 +56,7 @@ add_mlir_library(TritonAppleGPUBackend
     ${TOMSL_SRCS}
 
     SHARED
+    EXCLUDE_FROM_LIBMLIR
 
     DEPENDS
     TritonAppleGPUDialectIncGen
@@ -70,8 +71,7 @@ target_link_libraries(TritonAppleGPUBackend PUBLIC MLIRMathTransforms)
 target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-dead_strip)
 
 set_target_properties(TritonAppleGPUBackend PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY
-    "${TRITON_EXT_LIBRARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     OUTPUT_NAME "applegpu_backend"
     CXX_STANDARD 17)
 

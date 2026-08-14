@@ -21,15 +21,26 @@ from triton._C.libtriton import ir, passes
 # onto it only if the AppleGPU plugin dylib registered a "simplify_gather"
 # pass (see ExportAppleGPU.cpp), so that attribute is what actually signals
 # a successful load.
+def _plugin_candidates():
+    for path in os.environ.get('TRITON_PLUGIN_PATHS', '').split(os.pathsep):
+        if path:
+            yield path
+    bundled = os.path.join(os.path.dirname(__file__), '_C')
+    if os.path.isdir(bundled):
+        for name in sorted(os.listdir(bundled)):
+            if name.startswith('libapplegpu_backend') and name.endswith('.dylib'):
+                yield os.path.join(bundled, name)
+
+
 _plugin = getattr(passes, 'plugin', None)
 if _plugin is not None and not hasattr(_plugin, 'add_simplify_gather'):
-    for _path in os.environ.get('TRITON_PLUGIN_PATHS', '').split(os.pathsep):
-        if not _path:
-            continue
+    for _path in _plugin_candidates():
         try:
             _plugin.extend_with(_path)
         except Exception:
             pass
+        if hasattr(_plugin, 'add_simplify_gather'):
+            break
 _plugin_loaded = bool(_plugin) and hasattr(_plugin, 'add_simplify_gather')
 
 # EmitMSL hands its output path to the C++ pass through the process-global

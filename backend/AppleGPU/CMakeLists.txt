@@ -98,3 +98,6 @@ if(APPLE)
         DEPENDS "${ASYNC_COPY_SHIM_AIR}")
     add_dependencies(TritonAppleGPUBackend AppleGPUAsyncCopyShim)
 endif()
+
+install(TARGETS TritonAppleGPUBackend
+        LIBRARY DESTINATION triton_apple_backend/_C)

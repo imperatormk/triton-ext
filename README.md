@@ -47,6 +47,24 @@ Extensions live in subdirectories, each built as a separate Triton wheel:
 - **[`support/`](./support/)**: Contains infrastructure code to automatically
   register extensions with Triton.
 
+- **[`backend/AppleGPU/`](./backend/AppleGPU/)**: Apple GPU backend plugin.
+  Lowers Triton kernels from TTGIR directly to Metal Shading Language (MSL)
+  text, compiles that to a `.metallib` in-process via the Metal framework, and
+  dispatches via `MTLComputeCommandEncoder`. See
+  [`backend/AppleGPU/README.md`](./backend/AppleGPU/README.md) for details.
+
+## Apple GPU quick start
+
+```bash
+# 1. Build the AppleGPU plugin (libapplegpu_backend.dylib under build/lib/).
+ninja -C build libapplegpu_backend.dylib
+
+# 2. Use it. The plugin compiles MSL to a metallib in-process, so no
+#    external tools or path overrides are needed.
+TRITON_PLUGIN_PATHS=/path/to/build/lib/libapplegpu_backend.dylib \
+    pytest python/test/unit/language/test_core.py --device mps
+```
+
 ## Prerequisites
 
 - C++ compiler with C++17 support

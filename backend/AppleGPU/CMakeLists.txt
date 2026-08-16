@@ -1,0 +1,106 @@
+cmake_minimum_required(VERSION 3.20)
+if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0")
+endif()
+project(applegpu_backend LANGUAGES C CXX)
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/triton-ext.cmake")
+configure_triton_extension()
+
+set(APPLE_GPU_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set(APPLE_GPU_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+
+# Include support code for plugin export
+include_directories(${TRITON_EXT_SUPPORT_DIR})
+include_directories(${APPLE_GPU_INCLUDE_DIR})
+# Generated inc files live under the binary dir, mirroring the source include tree
+include_directories(${APPLE_GPU_GEN_DIR})
+
+# TableGen needs to find .td files in subdirs
+list(APPEND LLVM_TABLEGEN_FLAGS
+    "-I${APPLE_GPU_INCLUDE_DIR}/Dialect/TritonAppleGPU/IR")
+
+# Ensure output subdirectories exist
+file(MAKE_DIRECTORY "${APPLE_GPU_GEN_DIR}/Dialect/TritonAppleGPU/IR")
+file(MAKE_DIRECTORY "${APPLE_GPU_GEN_DIR}/TritonAppleGPUTransforms")
+
+# TableGen for dialect — output to Dialect/TritonAppleGPU/IR/
+set(LLVM_TARGET_DEFINITIONS
+    ${APPLE_GPU_INCLUDE_DIR}/Dialect/TritonAppleGPU/IR/TritonAppleGPUDialect.td)
+mlir_tablegen(Dialect/TritonAppleGPU/IR/Dialect.h.inc -gen-dialect-decls -dialect=applegpu)
+mlir_tablegen(Dialect/TritonAppleGPU/IR/Dialect.cpp.inc -gen-dialect-defs -dialect=applegpu)
+add_public_tablegen_target(TritonAppleGPUDialectIncGen)
+
+set(LLVM_TARGET_DEFINITIONS
+    ${APPLE_GPU_INCLUDE_DIR}/Dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.td)
+mlir_tablegen(Dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.h.inc -gen-attrdef-decls -attrdefs-dialect=applegpu)
+mlir_tablegen(Dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=applegpu)
+add_public_tablegen_target(TritonAppleGPUAttrDefsIncGen)
+
+# TableGen for passes — output to TritonAppleGPUTransforms/
+set(LLVM_TARGET_DEFINITIONS
+    ${APPLE_GPU_INCLUDE_DIR}/TritonAppleGPUTransforms/Passes.td)
+mlir_tablegen(TritonAppleGPUTransforms/Passes.h.inc -gen-pass-decls -name TritonAppleGPU)
+add_public_tablegen_target(TritonAppleGPUTransformsPassesIncGen)
+
+# Collect all C++ sources
+file(GLOB DIALECT_SRCS lib/TritonAppleGPUToMSL/Dialect.cpp)
+file(GLOB TRANSFORM_SRCS lib/TritonAppleGPUTransforms/*.cpp)
+file(GLOB TOMSL_SRCS lib/TritonAppleGPUToMSL/*.cpp)
+
+# Build as a single shared library
+add_mlir_library(TritonAppleGPUBackend
+    ExportAppleGPU.cpp
+    "${TRITON_EXT_SUPPORT_DIR}/Export.cpp"
+    ${DIALECT_SRCS}
+    ${TRANSFORM_SRCS}
+    ${TOMSL_SRCS}
+
+    SHARED
+    EXCLUDE_FROM_LIBMLIR
+
+    DEPENDS
+    TritonAppleGPUDialectIncGen
+    TritonAppleGPUAttrDefsIncGen
+    TritonAppleGPUTransformsPassesIncGen
+
+    LINK_LIBS PUBLIC
+    ${TRITON_LIB}
+)
+
+target_link_libraries(TritonAppleGPUBackend PUBLIC MLIRMathTransforms)
+target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-dead_strip)
+
+set_target_properties(TritonAppleGPUBackend PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    OUTPUT_NAME "applegpu_backend"
+    CXX_STANDARD 17)
+
+# On macOS with shared LLVM, use flat namespace so the plugin can resolve
+# LLVM symbols from any loaded dylib (not just the one it was linked against).
+if(APPLE)
+    target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-flat_namespace)
+endif()
+
+# Assemble the threadgroup-DMA shim once here rather than on every kernel
+# compile. Kernels that reference it are linked against this .air object.
+if(APPLE)
+    set(ASYNC_COPY_SHIM_SRC
+        "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend/async_copy_shim.ll")
+    set(ASYNC_COPY_SHIM_AIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend/async_copy_shim.air")
+    if(NOT DEFINED TRITON_MSL_SDK)
+        set(TRITON_MSL_SDK "macosx")
+    endif()
+    add_custom_command(
+        OUTPUT "${ASYNC_COPY_SHIM_AIR}"
+        COMMAND xcrun -sdk "${TRITON_MSL_SDK}" metal-as "${ASYNC_COPY_SHIM_SRC}"
+                -o "${ASYNC_COPY_SHIM_AIR}"
+        DEPENDS "${ASYNC_COPY_SHIM_SRC}"
+        COMMENT "Assembling AppleGPU threadgroup async-copy shim")
+    add_custom_target(AppleGPUAsyncCopyShim ALL
+        DEPENDS "${ASYNC_COPY_SHIM_AIR}")
+    add_dependencies(TritonAppleGPUBackend AppleGPUAsyncCopyShim)
+endif()
+
+install(TARGETS TritonAppleGPUBackend
+        LIBRARY DESTINATION triton_apple_backend/_C)

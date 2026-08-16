@@ -1,7 +1,11 @@
-build/
+build*
 dist/
+/llvm-*
+/triton-*
+!triton-ext.toml
 llvm-*/
 triton-*/
+.venv
 .venv/
 *.tar.gz
 *.pyc
@@ -12,3 +16,4 @@ triton-*/
 *.dylib
 *.dll
 *.whl
+*.air

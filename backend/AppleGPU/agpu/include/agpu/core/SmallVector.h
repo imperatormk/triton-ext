@@ -1,6 +1,6 @@
 // SmallVector.h - a vector holding its first `N` elements inline.
-#ifndef AGPU_MSL_SMALL_VECTOR_H
-#define AGPU_MSL_SMALL_VECTOR_H
+#ifndef AGPU_CORE_SMALL_VECTOR_H
+#define AGPU_CORE_SMALL_VECTOR_H
 
 #include <algorithm>
 #include <cstddef>
@@ -10,7 +10,7 @@
 #include <new>
 #include <utility>
 
-namespace agpu::msl {
+namespace agpu::core {
 
 template <class T, unsigned N> class SmallVector {
 public:
@@ -254,6 +254,6 @@ bool operator!=(const SmallVector<T, N> &a, const SmallVector<T, N> &b) {
   return !(a == b);
 }
 
-} // namespace agpu::msl
+} // namespace agpu::core
 
-#endif // AGPU_MSL_SMALL_VECTOR_H
+#endif // AGPU_CORE_SMALL_VECTOR_H

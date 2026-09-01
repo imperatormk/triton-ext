@@ -2,7 +2,7 @@
 #ifndef AGPU_TEST_HARNESS_H
 #define AGPU_TEST_HARNESS_H
 
-#include "agpu/msl/SmallVector.h"
+#include "agpu/core/Containers.h"
 
 #include <cstdio>
 #include <string>

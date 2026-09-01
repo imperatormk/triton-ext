@@ -2,10 +2,10 @@
 //
 // Five layers and the dependencies run one way:
 //
-//   core/  pure arithmetic -- no AST, no planning
-//   plan/  decides; may use core, must not emit
+//   core/  pure arithmetic and the containers -- no AST, no planning
+//   msl/   the AST, printer and analyses; may use core, nothing above it
+//   plan/  decides; may use core and msl names, must not emit
 //   emit/  consumes a plan, produces AST
-//   msl/   the AST, printer and analyses
 //   bind/  turns an IR into the facts emit/ consumes -- the top and the
 //          only layer that may include any of the others
 #include "harness.h"
@@ -94,24 +94,28 @@ std::vector<std::string> codeLinesWith(const std::string &path,
 int main() {
   // ── core/ depends on nothing above it ──────────────────────────────────
 
-  CASE("core headers do not reach into the AST");
+  CASE("core headers include nothing from a layer above them");
   {
-    for (const char *f : {"core/TileView.h", "core/Units.h",
-                          "core/CoordGuard.h", "core/Padding.h"}) {
-      auto incs = includesOf(hdr(f));
-      CHECK(!mentions(incs, "msl/Ast.h"));
-      CHECK(!mentions(incs, "msl/Context.h"));
-      CHECK(!mentions(incs, "emit/"));
+    // Checked over every header under core/, not a list: the containers used
+    // to live in msl/, which put msl/ underneath core/ and made the order
+    // above a fiction. Reintroducing any upward include fails here.
+    for (const std::string &f : headersUnder("core")) {
+      auto incs = includesOf(f);
+      CHECK(!mentions(incs, "msl/"));
       CHECK(!mentions(incs, "plan/"));
+      CHECK(!mentions(incs, "emit/"));
+      CHECK(!mentions(incs, "bind/"));
     }
   }
 
-  CASE("core headers do not depend on planning");
+  CASE("msl/ may use core/ and nothing else in agpu");
   {
-    for (const char *f :
-         {"core/TileView.h", "core/Units.h", "core/CoordGuard.h",
-          "core/Padding.h", "core/MemDesc.h", "core/Decline.h"})
-      CHECK(!mentions(includesOf(hdr(f)), "plan/"));
+    for (const std::string &f : headersUnder("msl")) {
+      auto incs = includesOf(f);
+      CHECK(!mentions(incs, "plan/"));
+      CHECK(!mentions(incs, "emit/"));
+      CHECK(!mentions(incs, "bind/"));
+    }
   }
 
   // ── plan/ decides and does not emit ───────────────────────────────────
@@ -176,8 +180,9 @@ int main() {
       CHECK(mentions(includesOf(hdr(p.emitter)), p.plan));
   }
 
-  CASE("the AST layer depends on nothing in agpu");
+  CASE("the AST proper depends on nothing in agpu");
   {
+    // Stronger than the msl/ sweep above: these six take not even core/.
     for (const char *f : {"msl/Ast.h", "msl/Context.h", "msl/AstWalk.h",
                           "msl/Printer.h", "msl/Analysis.h", "msl/Equal.h"}) {
       auto incs = includesOf(hdr(f));

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, fields
 import hashlib
 import os
 import re
+import subprocess
 import tempfile
 
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
@@ -72,6 +73,24 @@ def _disable_fp_contraction(msl):
 def _pmaybe_enable_debug(pm):
     if os.environ.get('TRITON_MPS_DEBUG'):
         pm.enable_debug()
+
+
+def _metallib_from_source(msl):
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, 'k.metal')
+        air = os.path.join(d, 'k.air')
+        lib = os.path.join(d, 'k.metallib')
+        with open(src, 'w') as f:
+            f.write(msl)
+        for argv in ([
+                'xcrun', 'metal', '-c', '-fmetal-math-mode=safe',
+                '-fmetal-math-fp32-functions=fast', src, '-o', air
+        ], ['xcrun', 'metallib', air, '-o', lib]):
+            got = subprocess.run(argv, capture_output=True, text=True)
+            if got.returncode != 0:
+                raise RuntimeError(f"{argv[1]} failed: {got.stderr.strip()}")
+        with open(lib, 'rb') as f:
+            return f.read()
 
 
 def _inert(default):
@@ -315,12 +334,11 @@ class MPSBackend(BaseBackend):
 
         # Metal fast-math assumes no NaN/Inf and reassociates FP, so it
         # miscompiles kernels over Inf/NaN or relying on RTNE.
-        from triton_apple_backend import metal_utils
         fail_dir = os.environ.get('METAL_PSO_FAIL_DIR')
         if not fail_dir:
-            return metal_utils.compile_source(msl, 'safe')
+            return _metallib_from_source(msl)
         try:
-            return metal_utils.compile_source(msl, 'safe')
+            return _metallib_from_source(msl)
         except Exception:
             import hashlib
             os.makedirs(fail_dir, exist_ok=True)

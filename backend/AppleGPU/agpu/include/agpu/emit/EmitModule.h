@@ -11,7 +11,6 @@
 #include "agpu/emit/EmitDeviceFn.h"
 #include "agpu/emit/EmitKernel.h"
 #include "agpu/emit/Prelude.h"
-#include "agpu/plan/AssertPlan.h"
 #include "agpu/plan/PoolPlan.h"
 
 #include <vector>

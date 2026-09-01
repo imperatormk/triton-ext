@@ -34,19 +34,7 @@ inline void printPrelude(std::ostream &os, const HelperSet &h,
   }
 }
 
-// A helper may be added while a body is built, so `helpers` must be the set as
-// it stood after `emitModule` returned.
-inline void printModule(std::ostream &os, const ModuleResult &r,
-                        const HelperSet &helpers, const PrintPlan &prints,
-                        const AssertPlan &asserts) {
-  printPrelude(os, helpers);
-  // Layout for the host reading the print buffer back. As comments: this is a
-  // .metal file.
-  if (prints.prints())
-    os << "/*\n" << printLayoutText(prints) << "*/\n\n";
-  if (asserts.asserts())
-    os << "/*\n" << assertLayoutText(asserts) << "*/\n\n";
-
+inline void printModuleBody(std::ostream &os, const ModuleResult &r) {
   msl::Printer p(os);
   for (msl::Stmt *s : r.retStructs) {
     msl::Block b{s};
@@ -71,6 +59,27 @@ inline void printModule(std::ostream &os, const ModuleResult &r,
     msl::Block b{kr.fn};
     p.printBlock(b);
   }
+}
+
+// A helper may be added while a body is built, so `helpers` must be the set as
+// it stood after `emitModule` returned.
+inline void printModule(std::ostream &os, const ModuleResult &r,
+                        const HelperSet &helpers) {
+  printPrelude(os, helpers);
+  printModuleBody(os, r);
+}
+
+// As above, plus the layout the host needs to read the debug buffers back.
+inline void printModule(std::ostream &os, const ModuleResult &r,
+                        const HelperSet &helpers, const PrintPlan &prints,
+                        const AssertPlan &asserts) {
+  printPrelude(os, helpers);
+  // As comments: this is a .metal file.
+  if (prints.prints())
+    os << "/*\n" << printLayoutText(prints) << "*/\n\n";
+  if (asserts.asserts())
+    os << "/*\n" << assertLayoutText(asserts) << "*/\n\n";
+  printModuleBody(os, r);
 }
 
 inline ModuleResult emitModule(msl::Context &c, ModuleFacts &m,

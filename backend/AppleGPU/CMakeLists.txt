@@ -112,22 +112,25 @@ install(TARGETS TritonAppleGPUBackend
         LIBRARY DESTINATION triton_apple_backend/_C)
 
 if(APPLE)
-    find_package(Python COMPONENTS Interpreter Development.Module QUIET)
+    find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+    list(APPEND CMAKE_PREFIX_PATH "${Python_SITEARCH}/torch/share/cmake")
     find_package(Torch QUIET)
-    if(Python_Development.Module_FOUND AND Torch_FOUND)
-        set(METAL_UTILS_PY
-            "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend")
-        python_add_library(metal_utils MODULE "${METAL_UTILS_PY}/metal_utils.m"
-                           WITH_SOABI)
-        target_compile_options(metal_utils PRIVATE
-            -ObjC++ -std=c++17 -O3 -Wno-deprecated-declarations)
-        target_link_libraries(metal_utils PRIVATE "${TORCH_LIBRARIES}"
-            "-framework Metal" "-framework Foundation")
-        target_link_options(metal_utils PRIVATE -undefined dynamic_lookup)
-        set_target_properties(metal_utils PROPERTIES
-            LIBRARY_OUTPUT_DIRECTORY "${METAL_UTILS_PY}")
-        add_dependencies(TritonAppleGPUBackend metal_utils)
-    else()
-        message(WARNING "torch not found, skipping metal_utils")
+    if(NOT Torch_FOUND)
+        message(FATAL_ERROR
+            "metal_utils requires torch installed in ${Python_SITEARCH}, or "
+            "-DTorch_DIR for a torch elsewhere")
     endif()
+
+    set(METAL_UTILS_PY
+        "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend")
+    python_add_library(metal_utils MODULE "${METAL_UTILS_PY}/metal_utils.m"
+                       WITH_SOABI)
+    target_compile_options(metal_utils PRIVATE
+        -ObjC++ -std=c++17 -O3 -Wno-deprecated-declarations)
+    target_link_libraries(metal_utils PRIVATE "${TORCH_LIBRARIES}"
+        "-framework Metal" "-framework Foundation")
+    target_link_options(metal_utils PRIVATE -undefined dynamic_lookup)
+    set_target_properties(metal_utils PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${METAL_UTILS_PY}")
+    add_dependencies(TritonAppleGPUBackend metal_utils)
 endif()

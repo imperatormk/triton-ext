@@ -44,23 +44,19 @@ With LLVM and Triton built per the [top-level README](../../README.md):
 
 ### Build the plugin
 
-Configure with cmake, pointing at your Triton + LLVM trees, then build this
-extension's targets:
+From the repo root, `make build` builds every extension through pip. To build
+this one alone, configure it directly. Triton is found by importing it with
+`Python_EXECUTABLE`; `LLVM_INSTALL_DIR` names the LLVM that Triton pinned in its
+`cmake/llvm-info.json`, and is read from the environment:
 
 ```bash
-cmake -S . -B build -G Ninja \
-  -DTRITON_SOURCE_DIR=<triton repo>  \
-  -DTRITON_BUILD_DIR=<triton repo>/build/cmake.<...>  \
-  -DTRITON_LIB=<triton repo>/python/triton/_C/libtriton.so \
-  -DLLVM_TABLEGEN_EXE=<llvm-project>/build/bin/llvm-tblgen
-# (export LLVM_INSTALL_DIR=<pinned llvm dir> so MLIR/LLVM cmake packages resolve)
+export LLVM_INSTALL_DIR=~/.triton/llvm/llvm-<hash>-<platform>-<build>
 
+cmake -S . -B build -G Ninja -DPython_EXECUTABLE=$(which python)
 ninja -C build libapplegpu_backend.dylib
 ```
 
-This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/`. cmake
-configures every extension (`dialect pass backend language extensions`); naming
-the ninja target keeps the build to AppleGPU only.
+This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/`.
 
 The plugin target also builds `metal_utils`, the ObjC++ bridge that links the
 torch cmake found. Point `-DTorch_DIR` at a different torch and it links that
@@ -68,13 +64,12 @@ one instead.
 
 ### Run
 
-Set the environment (run from the repo root, so `$PWD` resolves the build). The
-dylib in `TRITON_PLUGIN_PATHS` and the `triton_apple_backend` on `PYTHONPATH`
-must come from the same build.
+Install the package, so Triton discovers the backend through its
+`triton.backends` entry point, then point at the plugin:
 
 ```bash
-export TRITON_PLUGIN_PATHS=$PWD/build/lib/libapplegpu_backend.dylib
-export PYTHONPATH=$PWD/backend/AppleGPU/python
+pip install -e backend/AppleGPU --no-build-isolation --no-deps
+export TRITON_PLUGIN_PATHS=$PWD/backend/AppleGPU/build/lib/libapplegpu_backend.dylib
 ```
 
 Then run:

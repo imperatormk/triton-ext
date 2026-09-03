@@ -109,7 +109,7 @@ if(APPLE)
 endif()
 
 install(TARGETS TritonAppleGPUBackend
-        LIBRARY DESTINATION triton_apple_backend/_C)
+        LIBRARY DESTINATION triton_apple_backend)
 
 if(APPLE)
     find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)

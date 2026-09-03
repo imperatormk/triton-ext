@@ -64,12 +64,13 @@ one instead.
 
 ### Run
 
-Install the package, so Triton discovers the backend through its
-`triton.backends` entry point, then point at the plugin:
+Install the package. Triton discovers the backend through its `triton.backends`
+entry point, and importing it loads the bundled plugin library, so no
+`TRITON_PLUGIN_PATHS` is needed:
 
 ```bash
+export LLVM_INSTALL_DIR=~/.triton/llvm/llvm-<hash>-<platform>-<build>
 pip install -e backend/AppleGPU --no-build-isolation --no-deps
-export TRITON_PLUGIN_PATHS=$PWD/backend/AppleGPU/build/lib/libapplegpu_backend.dylib
 ```
 
 Then run:
@@ -97,7 +98,7 @@ print("vecadd ok")
 
 ## What's included
 
-### C++ MLIR Passes (loaded via TRITON_PLUGIN_PATHS)
+### C++ MLIR Passes
 
 | Pass                       | Purpose                                                 |
 | -------------------------- | ------------------------------------------------------- |
@@ -127,10 +128,6 @@ built the other way.
 - `TRITON_MSL_TRACE_FAIL=1` - stack trace at the point emission first fails.
 - `MSL_FUNC_BUDGET_DEBUG=1` - report per-function size budget accounting.
 - `TRITON_MSL_NO_COMPILE=1` - stop after emitting MSL, skip the Metal compiler.
-
-Toolchain / plumbing:
-
-- `TRITON_PLUGIN_PATHS=<dylib>` - where Triton loads this backend from.
 
 ## Test Status
 

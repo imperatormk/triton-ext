@@ -15,33 +15,10 @@ from triton._C.libtriton import ir, passes
 from triton_apple_backend.device_assert import extract_assert_layout_text
 from triton_apple_backend.device_print import extract_print_layout_text
 from triton_apple_backend.hw_constants import SG_FRAG_DIM as _SG_FRAG_DIM
+from triton_apple_backend import PLUGIN_LIBRARY
 from triton_apple_backend.hw_constants import WARP_SIZE as _WARP_SIZE
 
-
-# `passes.plugin` exists but has no pass-adding methods until a plugin dylib
-# loads through `extend_with`; Triton's TRITON_PLUGIN_PATHS loading does not
-# populate this Python module. `add_emit_msl` is the probe.
-def _plugin_candidates():
-    for path in os.environ.get('TRITON_PLUGIN_PATHS', '').split(os.pathsep):
-        if path:
-            yield path
-    bundled = os.path.join(os.path.dirname(__file__), '_C')
-    if os.path.isdir(bundled):
-        for name in sorted(os.listdir(bundled)):
-            if name.startswith('libapplegpu_backend') and name.endswith(
-                    '.dylib'):
-                yield os.path.join(bundled, name)
-
-
-_plugin = getattr(passes, 'plugin', None)
-if _plugin is not None and not hasattr(_plugin, 'add_emit_msl'):
-    for _path in _plugin_candidates():
-        try:
-            _plugin.extend_with(_path)
-        except Exception:
-            continue
-        if hasattr(_plugin, 'add_emit_msl'):
-            break
+_plugin = passes.plugin
 
 # Set by the emit-msl pass; also spelled in agpu/plan/LaunchPlan.h.
 _GRID_RESIDENCY_ATTR = 'applegpu.grid_coresident'
@@ -184,7 +161,6 @@ class MPSBackend(BaseBackend):
         return f"mps:{options.arch}"
 
     def load_dialects(self, ctx):
-        # Plugin dialect is registered automatically via TRITON_PLUGIN_PATHS
         ir.load_dialects(ctx)
 
     # Environment gates that change emitted code and so must enter the cache
@@ -200,11 +176,10 @@ class MPSBackend(BaseBackend):
             # empty) must hash differently from unset.
             present = name in os.environ
             h.update(f"{name}={present}:{os.environ.get(name, '')}".encode())
-        for path in os.environ.get('TRITON_PLUGIN_PATHS',
-                                   '').split(os.pathsep):
-            if path and os.path.exists(path):
-                st = os.stat(path)
-                h.update(f"{path}:{st.st_size}:{st.st_mtime_ns}".encode())
+        if PLUGIN_LIBRARY is not None:
+            st = PLUGIN_LIBRARY.stat()
+            h.update(
+                f"{PLUGIN_LIBRARY}:{st.st_size}:{st.st_mtime_ns}".encode())
         h.update(__file__.encode())
         try:
             h.update(str(os.stat(__file__).st_mtime_ns).encode())

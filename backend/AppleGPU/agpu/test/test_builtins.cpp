@@ -39,19 +39,19 @@ std::vector<const char *> allNames() {
       bi::math::Abs,
       bi::math::Floor,
       bi::math::Ceil,
-      bi::math::Sqrt,
-      bi::math::Rsqrt,
-      bi::math::Exp2,
-      bi::precise::Sin,
-      bi::precise::Cos,
-      bi::precise::Tanh,
-      bi::precise::Exp,
-      bi::precise::Log,
-      bi::precise::Log2,
-      bi::precise::Log10,
-      bi::precise::Exp10,
-      bi::precise::Pow,
-      bi::precise::Atan2,
+      bi::accuracy::Sqrt.fast,
+      bi::accuracy::Rsqrt.fast,
+      bi::accuracy::Exp2.fast,
+      bi::accuracy::Sin.precise,
+      bi::accuracy::Cos.precise,
+      bi::accuracy::Tanh.precise,
+      bi::accuracy::Exp.precise,
+      bi::accuracy::Log.precise,
+      bi::accuracy::Log2.precise,
+      bi::accuracy::Log10.precise,
+      bi::accuracy::Exp10.precise,
+      bi::accuracy::Pow.precise,
+      bi::accuracy::Atan2.precise,
       bi::simd::Shuffle,
       bi::simd::ShuffleUp,
       bi::simd::ShuffleDown,
@@ -97,11 +97,14 @@ int main() {
 
   CASE("a metal:: name carries its namespace and nothing else");
   {
-    for (const char *n : {bi::math::Exp2, bi::math::Sqrt, bi::math::Abs})
+    for (const char *n : {bi::math::Round, bi::math::Trunc, bi::math::Abs})
       CHECK(has(n, "metal::") && !has(n, "precise::"));
-    for (const char *n : {bi::precise::Sin, bi::precise::Cos, bi::precise::Tanh,
-                          bi::precise::Exp, bi::precise::Log})
-      CHECK(has(n, "metal::precise::"));
+    for (const bi::AccuracyPair s :
+         {bi::accuracy::Sin, bi::accuracy::Exp, bi::accuracy::Sqrt,
+          bi::accuracy::Fmod, bi::accuracy::Rsqrt}) {
+      CHECK(has(s.fast, "metal::") && !has(s.fast, "precise::"));
+      CHECK(has(s.precise, "metal::precise::"));
+    }
   }
 
   CASE("a builtin free function is unqualified");
@@ -154,7 +157,8 @@ int main() {
     for (MathFn3 fn : {MathFn3::Fma, MathFn3::Clamp})
       CHECK(owned(mathNameOf(fn)));
 
-    CHECK(mathNameOf(MathFn::Exp) == bi::precise::Exp);
+    CHECK(mathNameOf(MathFn::Exp) == bi::accuracy::Exp.precise);
+    CHECK(mathNameOf(MathFn2::Fmod) == bi::accuracy::Fmod.precise);
     CHECK(mathNameOf(MathFn::Erf) == bi::helper::Erf);
     CHECK(mathNameOf(MathFn2::Min) == bi::math::Min);
   }
@@ -164,6 +168,9 @@ int main() {
     for (const MathFn fn :
          {MathFn::Sin, MathFn::Cos, MathFn::Tanh, MathFn::Exp, MathFn::Exp10,
           MathFn::Log, MathFn::Log2, MathFn::Log10, MathFn::Sqrt})
+      CHECK(has(mathNameOf(fn), "precise::"));
+
+    for (const MathFn2 fn : {MathFn2::Fmod, MathFn2::Pow, MathFn2::Atan2})
       CHECK(has(mathNameOf(fn), "precise::"));
 
     for (const MathFn fn : {MathFn::Exp2, MathFn::Rsqrt, MathFn::Abs,

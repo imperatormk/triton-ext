@@ -12,15 +12,10 @@ inline constexpr const char *Abs = "metal::abs";
 inline constexpr const char *Fabs = "metal::fabs";
 inline constexpr const char *Floor = "metal::floor";
 inline constexpr const char *Ceil = "metal::ceil";
-inline constexpr const char *Sqrt = "metal::sqrt";
-inline constexpr const char *Rsqrt = "metal::rsqrt";
-inline constexpr const char *Exp = "metal::exp";
-inline constexpr const char *Exp2 = "metal::exp2";
 inline constexpr const char *Isnan = "metal::isnan";
 inline constexpr const char *Isinf = "metal::isinf";
 inline constexpr const char *Min = "metal::min";
 inline constexpr const char *Max = "metal::max";
-inline constexpr const char *Fmod = "metal::fmod";
 inline constexpr const char *Fma = "metal::fma";
 inline constexpr const char *Copysign = "metal::copysign";
 inline constexpr const char *Clamp = "metal::clamp";
@@ -34,28 +29,36 @@ inline constexpr const char *RoundEven = "metal::rint";
 inline constexpr const char *Trunc = "metal::trunc";
 } // namespace math
 
-// Transcendentals. In Metal the namespace controls their accuracy.
-namespace precise {
-inline constexpr const char *Sin = "metal::precise::sin";
-inline constexpr const char *Cos = "metal::precise::cos";
-inline constexpr const char *Tanh = "metal::precise::tanh";
-inline constexpr const char *Exp = "metal::precise::exp";
-inline constexpr const char *Exp10 = "metal::precise::exp10";
-inline constexpr const char *Log = "metal::precise::log";
-inline constexpr const char *Log2 = "metal::precise::log2";
-inline constexpr const char *Log10 = "metal::precise::log10";
-inline constexpr const char *Pow = "metal::precise::pow";
-inline constexpr const char *Atan2 = "metal::precise::atan2";
-// metal::sqrt(12.25) answers 3.5000002, so an exact square does not round trip.
-inline constexpr const char *Sqrt = "metal::precise::sqrt";
+// In Metal the namespace controls accuracy.
+struct AccuracyPair {
+  const char *fast;
+  const char *precise;
+};
 
-inline constexpr const char *Sinh = "metal::precise::sinh";
-inline constexpr const char *Cosh = "metal::precise::cosh";
-inline constexpr const char *Tan = "metal::precise::tan";
-inline constexpr const char *Asin = "metal::precise::asin";
-inline constexpr const char *Acos = "metal::precise::acos";
-inline constexpr const char *Atan = "metal::precise::atan";
-} // namespace precise
+namespace accuracy {
+inline constexpr AccuracyPair Sin{"metal::sin", "metal::precise::sin"};
+inline constexpr AccuracyPair Cos{"metal::cos", "metal::precise::cos"};
+inline constexpr AccuracyPair Tanh{"metal::tanh", "metal::precise::tanh"};
+inline constexpr AccuracyPair Exp{"metal::exp", "metal::precise::exp"};
+inline constexpr AccuracyPair Exp2{"metal::exp2", "metal::precise::exp2"};
+inline constexpr AccuracyPair Exp10{"metal::exp10", "metal::precise::exp10"};
+inline constexpr AccuracyPair Log{"metal::log", "metal::precise::log"};
+inline constexpr AccuracyPair Log2{"metal::log2", "metal::precise::log2"};
+inline constexpr AccuracyPair Log10{"metal::log10", "metal::precise::log10"};
+inline constexpr AccuracyPair Pow{"metal::pow", "metal::precise::pow"};
+inline constexpr AccuracyPair Atan2{"metal::atan2", "metal::precise::atan2"};
+inline constexpr AccuracyPair Fmod{"metal::fmod", "metal::precise::fmod"};
+// metal::sqrt(12.25) answers 3.5000002, so an exact square does not round trip.
+inline constexpr AccuracyPair Sqrt{"metal::sqrt", "metal::precise::sqrt"};
+inline constexpr AccuracyPair Rsqrt{"metal::rsqrt", "metal::precise::rsqrt"};
+
+inline constexpr AccuracyPair Sinh{"metal::sinh", "metal::precise::sinh"};
+inline constexpr AccuracyPair Cosh{"metal::cosh", "metal::precise::cosh"};
+inline constexpr AccuracyPair Tan{"metal::tan", "metal::precise::tan"};
+inline constexpr AccuracyPair Asin{"metal::asin", "metal::precise::asin"};
+inline constexpr AccuracyPair Acos{"metal::acos", "metal::precise::acos"};
+inline constexpr AccuracyPair Atan{"metal::atan", "metal::precise::atan"};
+} // namespace accuracy
 
 // Cross-lane shuffles.
 namespace simd {

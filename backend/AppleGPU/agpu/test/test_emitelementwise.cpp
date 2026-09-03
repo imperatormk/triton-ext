@@ -203,7 +203,7 @@ int main() {
     CHECK_EQ(render(mathExpr(c, MathFn2::Pow, c.var("a"), c.var("b"))),
              std::string("metal::precise::pow(a, b)"));
     CHECK_EQ(render(mathExpr(c, MathFn2::Fmod, c.var("a"), c.var("b"))),
-             std::string("metal::fmod(a, b)"));
+             std::string("metal::precise::fmod(a, b)"));
     CHECK_EQ(
         render(mathExpr(c, MathFn3::Fma, c.var("a"), c.var("b"), c.var("d"))),
         std::string("metal::fma(a, b, d)"));

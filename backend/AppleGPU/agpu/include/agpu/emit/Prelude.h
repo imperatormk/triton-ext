@@ -511,7 +511,9 @@ inline std::string helperSource(Helper h) {
     fn->body.push_back(
         c.ifStmt(c.binary(msl::BinOp::Eq, a, c.litF(0.0)), {c.returnStmt(x)}));
     fn->body.push_back(
-        c.declStmt(f32, "y", c.call(msl::builtin::precise::Pow, {a, third})));
+        c.declStmt(f32, "y",
+                   c.call(spell(msl::builtin::accuracy::Pow, Accuracy::Exact),
+                          {a, third})));
     fn->body.push_back(c.assign(
         y, c.binary(msl::BinOp::Sub, y,
                     c.mul(c.binary(msl::BinOp::Sub, y,
@@ -553,10 +555,11 @@ inline std::string helperSource(Helper h) {
                             c.add(c.litF(1.0), c.mul(c.litF(0.3275911), a)))));
     fn->body.push_back(c.declStmt(
         f32, "y",
-        c.binary(msl::BinOp::Sub, c.litF(1.0),
-                 c.mul(c.mul(poly, t),
-                       c.call(msl::builtin::math::Exp,
-                              {c.mul(c.unary(msl::UnOp::Neg, a), a)})))));
+        c.binary(
+            msl::BinOp::Sub, c.litF(1.0),
+            c.mul(c.mul(poly, t),
+                  c.call(spell(msl::builtin::accuracy::Exp, Accuracy::Tolerant),
+                         {c.mul(c.unary(msl::UnOp::Neg, a), a)})))));
     fn->body.push_back(c.returnStmt(c.mul(c.var("s"), c.var("y"))));
     return renderHelper(fn);
   }

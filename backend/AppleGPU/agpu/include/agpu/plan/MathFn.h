@@ -12,9 +12,7 @@ namespace agpu {
 
 // ── the functions ─────────────────────────────────────────────────────────
 
-// Math functions Metal provides directly. Names come from msl::builtin::math
-// and msl::builtin::precise; the namespace is the accuracy decision, since
-// Metal's safe-math setting does not control transcendental accuracy.
+// Math functions Metal provides directly.
 enum class MathFn {
   Exp,
   Exp2,
@@ -75,6 +73,15 @@ enum class MathFn3 {
 
 // ── the tables ────────────────────────────────────────────────────────────
 
+enum class Accuracy {
+  Exact,
+  Tolerant,
+};
+
+inline constexpr const char *spell(msl::builtin::AccuracyPair s, Accuracy a) {
+  return a == Accuracy::Exact ? s.precise : s.fast;
+}
+
 struct MathSpelling {
   MathFn fn;
   const char *name;
@@ -83,19 +90,21 @@ struct MathSpelling {
 };
 
 inline constexpr MathSpelling kMathSpellings[] = {
-    // exp2, sqrt and rsqrt are in the default namespace; exp is not. See
-    // Builtins.h.
-    {MathFn::Exp, msl::builtin::precise::Exp, true},
-    {MathFn::Exp2, msl::builtin::math::Exp2, true},
-    {MathFn::Exp10, msl::builtin::precise::Exp10, true},
-    {MathFn::Log, msl::builtin::precise::Log, true},
-    {MathFn::Log2, msl::builtin::precise::Log2, true},
-    {MathFn::Log10, msl::builtin::precise::Log10, true},
-    {MathFn::Sqrt, msl::builtin::precise::Sqrt, true},
-    {MathFn::Rsqrt, msl::builtin::math::Rsqrt, true},
-    {MathFn::Sin, msl::builtin::precise::Sin, true},
-    {MathFn::Cos, msl::builtin::precise::Cos, true},
-    {MathFn::Tanh, msl::builtin::precise::Tanh, true},
+    {MathFn::Exp, spell(msl::builtin::accuracy::Exp, Accuracy::Exact), true},
+    {MathFn::Exp2, spell(msl::builtin::accuracy::Exp2, Accuracy::Tolerant),
+     true},
+    {MathFn::Exp10, spell(msl::builtin::accuracy::Exp10, Accuracy::Exact),
+     true},
+    {MathFn::Log, spell(msl::builtin::accuracy::Log, Accuracy::Exact), true},
+    {MathFn::Log2, spell(msl::builtin::accuracy::Log2, Accuracy::Exact), true},
+    {MathFn::Log10, spell(msl::builtin::accuracy::Log10, Accuracy::Exact),
+     true},
+    {MathFn::Sqrt, spell(msl::builtin::accuracy::Sqrt, Accuracy::Exact), true},
+    {MathFn::Rsqrt, spell(msl::builtin::accuracy::Rsqrt, Accuracy::Tolerant),
+     true},
+    {MathFn::Sin, spell(msl::builtin::accuracy::Sin, Accuracy::Exact), true},
+    {MathFn::Cos, spell(msl::builtin::accuracy::Cos, Accuracy::Exact), true},
+    {MathFn::Tanh, spell(msl::builtin::accuracy::Tanh, Accuracy::Exact), true},
     {MathFn::Abs, msl::builtin::math::Abs, false},
     {MathFn::Sign, msl::builtin::math::Sign, true},
     {MathFn::Floor, msl::builtin::math::Floor, true},
@@ -104,12 +113,12 @@ inline constexpr MathSpelling kMathSpellings[] = {
     {MathFn::Isinf, msl::builtin::math::Isinf, true, true},
     {MathFn::Erf, msl::builtin::helper::Erf, true},
     {MathFn::Cbrt, msl::builtin::helper::Cbrt, true},
-    {MathFn::Tan, msl::builtin::precise::Tan, true},
-    {MathFn::Asin, msl::builtin::precise::Asin, true},
-    {MathFn::Acos, msl::builtin::precise::Acos, true},
-    {MathFn::Atan, msl::builtin::precise::Atan, true},
-    {MathFn::Sinh, msl::builtin::precise::Sinh, true},
-    {MathFn::Cosh, msl::builtin::precise::Cosh, true},
+    {MathFn::Tan, spell(msl::builtin::accuracy::Tan, Accuracy::Exact), true},
+    {MathFn::Asin, spell(msl::builtin::accuracy::Asin, Accuracy::Exact), true},
+    {MathFn::Acos, spell(msl::builtin::accuracy::Acos, Accuracy::Exact), true},
+    {MathFn::Atan, spell(msl::builtin::accuracy::Atan, Accuracy::Exact), true},
+    {MathFn::Sinh, spell(msl::builtin::accuracy::Sinh, Accuracy::Exact), true},
+    {MathFn::Cosh, spell(msl::builtin::accuracy::Cosh, Accuracy::Exact), true},
     {MathFn::Round, msl::builtin::math::Round, true},
     {MathFn::RoundEven, msl::builtin::math::RoundEven, true},
     {MathFn::Trunc, msl::builtin::math::Trunc, true},
@@ -135,9 +144,10 @@ struct MathSpelling2 {
 inline constexpr MathSpelling2 kMathSpellings2[] = {
     {MathFn2::Min, msl::builtin::math::Min, false},
     {MathFn2::Max, msl::builtin::math::Max, false},
-    {MathFn2::Fmod, msl::builtin::math::Fmod, true},
-    {MathFn2::Pow, msl::builtin::precise::Pow, true},
-    {MathFn2::Atan2, msl::builtin::precise::Atan2, true},
+    {MathFn2::Fmod, spell(msl::builtin::accuracy::Fmod, Accuracy::Exact), true},
+    {MathFn2::Pow, spell(msl::builtin::accuracy::Pow, Accuracy::Exact), true},
+    {MathFn2::Atan2, spell(msl::builtin::accuracy::Atan2, Accuracy::Exact),
+     true},
     {MathFn2::Copysign, msl::builtin::math::Copysign, true},
     {MathFn2::Mulhi, msl::builtin::math::Mulhi, false},
 };

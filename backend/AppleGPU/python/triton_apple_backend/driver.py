@@ -86,7 +86,7 @@ class _NoCompileFunction:
         self.name = name
 
 
-class MPSUtils:
+class MetalUtils:
     """Metal GPU utils. JIT-compiles metal_utils.m for zero-copy MPS tensor
     dispatch."""
 
@@ -143,9 +143,9 @@ class MPSUtils:
         return 0
 
 
-class MPSLauncher:
+class MetalLauncher:
     """Called by Triton's JIT runtime to dispatch a compiled kernel.
-    `function` = _mps_MetalKernel returned by load_binary."""
+    `function` = the MetalKernel returned by load_binary."""
 
     def __init__(self, src, metadata):
         self.signature = dict(src.signature)
@@ -157,7 +157,7 @@ class MPSLauncher:
             i for i, (k, ty) in enumerate(self.signature.items())
             if ty == 'constexpr')
 
-        # MPS has no hardware TMA, so tensordesc_meta is always None.
+        # Apple GPUs have no hardware TMA, so tensordesc_meta is always None.
         # Descriptors decompose to (ptr, *shape, *strides, padding, tf32,
         # *shape, *strides).
         non_constexpr_sig = [
@@ -339,19 +339,19 @@ class MPSLauncher:
                                         device='mps')
             reordered_args = reordered_args + (assert_buffer, )
 
-        if _os.environ.get('TRITON_MPS_DEBUG'):
+        if _os.environ.get('TRITON_MSL_DEBUG'):
             _threads = [gridX * self.lx, gridY * self.ly, gridZ * self.lz]
             _gs = [self.lx, self.ly, self.lz]
             print(
-                f'[MPS] threads={_threads} group_size={_gs} grid=({gridX},{gridY},{gridZ})'
+                f'[MSL] threads={_threads} group_size={_gs} grid=({gridX},{gridY},{gridZ})'
             )
-            print(f'[MPS] reordered_args={reordered_args}')
+            print(f'[MSL] reordered_args={reordered_args}')
             if scalar_values:
                 print(
-                    f'[MPS] scalar_types={self.scalar_types} scalar_values={scalar_values}'
+                    f'[MSL] scalar_types={self.scalar_types} scalar_values={scalar_values}'
                 )
                 print(
-                    f'[MPS] packed_bytes={packed_bytes.hex()} total_size={self.total_size}'
+                    f'[MSL] packed_bytes={packed_bytes.hex()} total_size={self.total_size}'
                 )
         function(
             *reordered_args,
@@ -378,12 +378,12 @@ class MPSLauncher:
                            assert_buffer.cpu().numpy().view('uint32'))
 
 
-class MPSDriver(DriverBase):
+class MetalDriver(DriverBase):
 
     def __init__(self):
         super().__init__()
-        self.utils = MPSUtils()
-        self.launcher_cls = MPSLauncher
+        self.utils = MetalUtils()
+        self.launcher_cls = MetalLauncher
 
     @staticmethod
     def is_active():

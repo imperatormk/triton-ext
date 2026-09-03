@@ -1,4 +1,4 @@
-"""Apple MPS Triton backend. Compiles Triton kernels through
+"""Apple GPU Triton backend. Compiles Triton kernels through
 TTIR -> TTGIR -> MSL -> metallib, then dispatches via
 MTLComputeCommandEncoder.
 """
@@ -48,7 +48,7 @@ def _disable_fp_contraction(msl):
 
 
 def _pmaybe_enable_debug(pm):
-    if os.environ.get('TRITON_MPS_DEBUG'):
+    if os.environ.get('TRITON_MSL_DEBUG'):
         pm.enable_debug()
 
 
@@ -77,7 +77,7 @@ def _inert(default):
 
 
 @dataclass(frozen=True)
-class MPSOptions:
+class MetalOptions:
     num_warps: int = 4
     num_stages: int = 2
     num_ctas: int = 1
@@ -126,7 +126,7 @@ class MPSOptions:
         return hashlib.md5(str(keyed).encode()).hexdigest()
 
 
-class MPSBackend(BaseBackend):
+class MetalBackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
@@ -137,12 +137,12 @@ class MPSBackend(BaseBackend):
         self.target = target
         self.binary_ext = "metallib"
 
-    def parse_options(self, opts) -> MPSOptions:
+    def parse_options(self, opts) -> MetalOptions:
         args = {
             k: opts[k]
-            for k in MPSOptions.__dataclass_fields__ if k in opts
+            for k in MetalOptions.__dataclass_fields__ if k in opts
         }
-        return MPSOptions(**args)
+        return MetalOptions(**args)
 
     def pack_metadata(self, metadata):
         return metadata
@@ -268,7 +268,7 @@ class MPSBackend(BaseBackend):
         os.unlink(msl_path)
         if not options.enable_fp_fusion:
             msl = _disable_fp_contraction(msl)
-        if os.environ.get('TRITON_MPS_DEBUG'):
+        if os.environ.get('TRITON_MSL_DEBUG'):
             print("=== emitted MSL ===")
             print(msl)
         m = re.search(r'kernel void (\w+)\(', msl)

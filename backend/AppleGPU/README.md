@@ -122,7 +122,7 @@ emitted code and was missing from the key meant a warm cache served a kernel
 built the other way.
 
 - `TRITON_MSL_DUMP=<path>` - write the emitted MSL for each kernel to `<path>`.
-- `TRITON_MPS_DEBUG=1` - print the emitted MSL to stdout, plus per-kernel
+- `TRITON_MSL_DEBUG=1` - print the emitted MSL to stdout, plus per-kernel
   `.ll`/`.metallib` dumps.
 - `MSL_LOG_REJECT=1` - log every fast-path rejection with its reason and site.
 - `TRITON_MSL_TRACE_FAIL=1` - stack trace at the point emission first fails.

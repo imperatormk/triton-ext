@@ -15,6 +15,8 @@ from triton._C.libtriton import ir, passes
 from triton_apple_backend.device_assert import extract_assert_layout_text
 from triton_apple_backend.device_print import extract_print_layout_text
 from triton_apple_backend.hw_constants import SG_FRAG_DIM as _SG_FRAG_DIM
+from triton_apple_backend.hw_constants import TARGET as _TARGET
+from triton_apple_backend.hw_constants import target_arch as _target_arch
 from triton_apple_backend import PLUGIN_LIBRARY
 from triton_apple_backend.hw_constants import WARP_SIZE as _WARP_SIZE
 
@@ -82,7 +84,7 @@ class MetalOptions:
     num_stages: int = 2
     num_ctas: int = 1
     arch: str = "apple_m"
-    backend_name: str = "mps"
+    backend_name: str = _TARGET
     # SIMD width is 32 on every Apple GPU family; the emitter hardcodes it.
     warp_size: int = _inert(_WARP_SIZE)
 
@@ -130,7 +132,7 @@ class MetalBackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
-        return target.backend == "mps"
+        return target.backend == _TARGET
 
     def __init__(self, target: GPUTarget):
         super().__init__(target)
@@ -158,7 +160,7 @@ class MetalBackend(BaseBackend):
         return {}
 
     def get_target_name(self, options) -> str:
-        return f"mps:{options.arch}"
+        return _target_arch(options.arch)
 
     def load_dialects(self, ctx):
         ir.load_dialects(ctx)
@@ -185,7 +187,7 @@ class MetalBackend(BaseBackend):
             h.update(str(os.stat(__file__).st_mtime_ns).encode())
         except OSError:
             pass
-        return f"mps-v0.1-{h.hexdigest()[:16]}"
+        return f"msl-v0.1-{h.hexdigest()[:16]}"
 
     def make_ttir(self, mod, metadata, options):
         pm = ir.pass_manager(mod.context)
@@ -206,7 +208,7 @@ class MetalBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         _pmaybe_enable_debug(pm)
 
-        passes.ttir.add_convert_to_ttgpuir(pm, f"mps:{options.arch}",
+        passes.ttir.add_convert_to_ttgpuir(pm, _target_arch(options.arch),
                                            options.num_warps,
                                            options.warp_size, options.num_ctas)
 

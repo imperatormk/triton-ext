@@ -13,6 +13,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from triton_apple_backend.device_assert import check as _check_asserts
 from triton_apple_backend.device_assert import parse_assert_layout
 from triton_apple_backend.device_print import format_records, parse_print_layout
+from triton_apple_backend.hw_constants import TARGET as _TARGET
 from triton_apple_backend.hw_constants import TG_BUDGET_BYTES as _TG_BUDGET_BYTES
 from triton_apple_backend.hw_constants import WARP_SIZE as _WARP_SIZE
 from triton_apple_backend.tables import SCALAR_PACK_INFO as _SCALAR_PACK_INFO
@@ -400,7 +401,7 @@ class MetalDriver(DriverBase):
 
     def get_current_target(self):
         from triton.backends.compiler import GPUTarget
-        return GPUTarget("mps", "apple_m", _WARP_SIZE)
+        return GPUTarget(_TARGET, "apple_m", _WARP_SIZE)
 
     def get_active_torch_device(self):
         return torch.device("mps", 0)

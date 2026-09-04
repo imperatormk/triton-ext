@@ -271,7 +271,9 @@ inline void emitPanelMma(msl::Context &c, msl::Block &body, const PanelTile &t,
         c.binary(msl::BinOp::Lt, c.var(nm.kVar), c.lit(t.k.size())),
         c.assignOp(msl::BinOp::Add, c.var(nm.kVar), c.lit(kSgFragDim)),
         std::move(inner));
-    loop->unrollCount = std::min<int64_t>(msl::kUnrollCount, t.kSteps());
+    const int64_t perTrip = std::max<int64_t>(1, (int64_t)slots.size());
+    loop->unrollCount = std::min<int64_t>(
+        std::max<int64_t>(1, msl::kUnrollCount / perTrip), t.kSteps());
     body.push_back(loop);
   } else {
     for (int64_t ki = 0; ki < t.kSteps(); ++ki)

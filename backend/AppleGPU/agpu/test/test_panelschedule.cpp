@@ -227,13 +227,14 @@ int main() {
     CHECK_EQ(s.readbackCount(), 4);
   }
 
-  CASE("a non-final tile has three phases, a final one four");
+  CASE("a non-final tile has three phases, a final one five");
   {
     DotFacts f = gemm(64, 64, 128);
     Panel p = panelCost(64, 64, 64, 2, kAccBytes);
     PanelSchedule s = planPanelSchedule(f, p);
     CHECK_EQ(phasesOf(s.tiles[0]).size(), 3u);
-    CHECK_EQ(phasesOf(s.tiles[1]).size(), 4u);
+    CHECK_EQ(phasesOf(s.tiles[1]).size(), 5u);
+    CHECK(phasesOf(s.tiles[1])[3] == PanelPhase::Drain);
     CHECK(phasesOf(s.tiles[1]).back() == PanelPhase::Readback);
   }
 
@@ -245,18 +246,20 @@ int main() {
     CHECK(ph[0] == PanelPhase::StageA);
     CHECK(ph[1] == PanelPhase::StageB);
     CHECK(ph[2] == PanelPhase::Mma);
-    CHECK(ph[3] == PanelPhase::Readback);
-    CHECK_EQ(ph.size(), 4u);
+    CHECK(ph[3] == PanelPhase::Drain);
+    CHECK(ph[4] == PanelPhase::Readback);
+    CHECK_EQ(ph.size(), 5u);
   }
 
-  CASE("StageB is skipped when the pool already holds the tile's B");
+  CASE("a drain forfeits the resident B, so the next tile restages");
   {
     DotFacts f = gemm(128, 64, 64);
     Panel p = panelCost(64, 64, 64, 2, kAccBytes);
     PanelSchedule s = planPanelSchedule(f, p);
     CHECK_EQ(s.size(), 2);
+    CHECK(s.tiles[0].finalK);
     CHECK(s.tiles[0].stageB);
-    CHECK(!s.tiles[1].stageB);
+    CHECK(s.tiles[1].stageB);
     CHECK(s.tiles[0].n == s.tiles[1].n);
     CHECK(s.tiles[0].k == s.tiles[1].k);
     CHECK(s.tiles[0].m.lo != s.tiles[1].m.lo);

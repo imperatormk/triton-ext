@@ -138,8 +138,9 @@ struct PanelSchedule {
 };
 
 // `m0` is the inner loop relative to `n0` and `k0` so consecutive tiles share
-// a B panel, which is what lets `stageB` skip a restage. Reordering the nest
-// silently disables that and still emits correct output.
+// a B panel, which is what lets `stageB` skip a restage where no drain has
+// intervened. Reordering the nest silently disables that and still emits
+// correct output.
 template <class Fn>
 inline void forEachPanelTile(const DotFacts &f, const Panel &p, Fn &&fn) {
   if (p.mp <= 0 || p.np <= 0 || p.kp <= 0)
@@ -168,6 +169,12 @@ inline void forEachPanelTile(const DotFacts &f, const Panel &p, Fn &&fn) {
             resK = k0;
           }
           fn(t);
+          // C shares the pool's bytes with the operands, which is sound
+          // only because every tile stages what it reads after the
+          // previous tile's readback. A drain therefore forfeits the
+          // resident B: its bytes now hold C.
+          if (t.finalK)
+            resB = resN = resK = -1;
         }
 }
 
@@ -186,7 +193,8 @@ enum class PanelPhase {
   StageA,   // scatter A registers into the pool
   StageB,   // ... then B, after a barrier
   Mma,      // ... then the MMA grid, after a barrier
-  Readback, // ... and on the final K panel only, gather C
+  Drain,    // ... on the final K panel, store the accumulators into the pool
+  Readback, // ... and gather C, one barrier after the drain
 };
 
 // Every phase reads what the previous one wrote, so every transition is a
@@ -205,8 +213,10 @@ inline std::vector<PanelPhase> phasesOf(const PanelTile &t) {
   if (t.stageB)
     ph.push_back(PanelPhase::StageB);
   ph.push_back(PanelPhase::Mma);
-  if (t.finalK)
+  if (t.finalK) {
+    ph.push_back(PanelPhase::Drain);
     ph.push_back(PanelPhase::Readback);
+  }
   return ph;
 }
 

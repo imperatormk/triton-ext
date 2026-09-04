@@ -284,11 +284,12 @@ int main() {
     CHECK_EQ(p.np, 64);
   }
 
-  CASE("K shrinks only once both extents are at the floor");
+  CASE("M and N shrink only until the drained C fits, K absorbs the rest");
   {
     Panel p = planPanel(64, 64, 1024, 2, kAccBytes, Bytes(2048));
-    CHECK_EQ(p.mp, kSgFragDim);
-    CHECK_EQ(p.np, kSgFragDim);
+    CHECK(p.cBytes <= Bytes(2048));
+    CHECK(p.total() <= Bytes(2048));
+    CHECK(p.mp * p.np > kSgFragDim * kSgFragDim);
     CHECK(p.kp < 1024);
     CHECK_EQ(p.kp % kSgFragDim, 0);
   }
@@ -319,11 +320,10 @@ int main() {
 
   CASE("the pad is dropped when it costs whole panel tiles");
   {
-    Panel p = planPanel(64, 64, 64, 2, kAccBytes, kBudget);
+    Panel p = planPanel(64, 128, 128, 4, kAccBytes, kBudget);
     CHECK(!p.stagePad);
     CHECK_EQ(p.mp, 64);
-    CHECK_EQ(p.np, 64);
-    CHECK_EQ(p.kp, 64);
+    CHECK_EQ(p.np, 128);
 
     Panel q = planPanel(32, 32, 32, 2, kAccBytes, kBudget);
     CHECK(q.stagePad);

@@ -122,7 +122,9 @@ PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
       if (!plan.facts.aDirect)
         need.add(mnm.poolA, aElem, p.aBytes.count());
       need.add(mnm.poolB, bElem, p.bBytes.count());
-      need.add(mnm.poolC, plan.cPoolElem(), p.cBytes.count());
+      const agpu::Plan::CPoolRegion panelC = plan.cPoolRegion();
+      need.add(mnm.poolC, plan.cPoolElem(), panelC.bytes,
+               panelC.overlaysOperands);
       return need;
     }
 

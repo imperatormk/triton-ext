@@ -178,24 +178,6 @@ inline msl::Stmt *sgMma(msl::Context &c, const msl::Str &acc, const msl::Str &a,
                            {c.var(acc), c.var(a), c.var(b), c.var(acc)}));
 }
 
-// C lives in the pool across K panels: the first panel initialises, every
-// later one loads what the previous left. The leading dimension is the view's
-// row stride, which exceeds the tile's extent by the bank pad.
-inline void emitAccumInit(msl::Context &c, msl::Block &body, const PanelTile &t,
-                          const PanelNames &nm, const WarpSlot &s,
-                          const msl::Str &accName) {
-  const TileView cv = t.cView();
-  msl::Expr *off = fragOffset(c, cv, {s.mi, s.ni}, nullptr, nm.warpId);
-  if (t.k.lo == 0) {
-    body.push_back(
-        c.declStmt(kSimdgroup8x8.mslTypeNode(nm.accElem), accName,
-                   c.call(kSimdgroup8x8.zeroCtor(nm.accElem), {c.litF(0.0)})));
-    return;
-  }
-  body.push_back(c.declStmt(kSimdgroup8x8.mslTypeNode(nm.accElem), accName));
-  body.push_back(sgLoad(c, accName, nm.poolC, off, cv.strideAt(0)));
-}
-
 inline void emitAccumStore(msl::Context &c, msl::Block &body,
                            const PanelTile &t, const PanelNames &nm,
                            const WarpSlot &s, const msl::Str &accName) {
@@ -216,6 +198,32 @@ inline msl::Str tileTag(const PanelTile &t) {
          "_" + std::to_string(t.k.lo);
 }
 
+inline msl::Str panelAccName(const PanelTile &t, const PanelNames &nm,
+                             int acc) {
+  msl::Str tag;
+  if (t.batch != 0)
+    tag = "_s" + std::to_string(t.batch);
+  if (t.m.lo != 0 || t.n.lo != 0)
+    tag += "_" + std::to_string(t.m.lo) + "_" + std::to_string(t.n.lo);
+  const msl::Str join = tag.empty() ? msl::Str() : tag + "_";
+  return nm.acc + join + std::to_string(acc);
+}
+
+// Individually named, never an array: an array of fragments defeats SROA and
+// lands in stack memory.
+inline void emitPanelAccumDecls(msl::Context &c, msl::Block &body,
+                                const PanelTile &t, const PanelNames &nm,
+                                const WarpProgram &prog, const WarpGrid &grid) {
+  int accCount = 0;
+  for (int64_t w = 0; w < prog.blockCount(grid.numWarps); ++w)
+    for (const WarpSlot &s : prog.slots(w, grid.mT, grid.nT, grid.numWarps))
+      accCount = std::max(accCount, s.acc + 1);
+  for (int a = 0; a < accCount; ++a)
+    body.push_back(c.declStmt(
+        kSimdgroup8x8.mslTypeNode(nm.accElem), panelAccName(t, nm, a),
+        c.call(kSimdgroup8x8.zeroCtor(nm.accElem), {c.litF(0.0)})));
+}
+
 // K steps outermost, slots within. An A fragment serves every slot in its row,
 // a B fragment every slot in its column.
 inline void emitPanelMma(msl::Context &c, msl::Block &body, const PanelTile &t,
@@ -225,11 +233,8 @@ inline void emitPanelMma(msl::Context &c, msl::Block &body, const PanelTile &t,
   const msl::Str tag = tileTag(t);
   const msl::Str join = tag.empty() ? msl::Str() : tag + "_";
   const auto accNameOf = [&](const WarpSlot &s) {
-    return nm.acc + join + std::to_string(s.acc);
+    return panelAccName(t, nm, s.acc);
   };
-
-  for (const WarpSlot &s : slots)
-    emitAccumInit(c, body, t, nm, s, accNameOf(s));
 
   // B's K axis is its row axis, so its fragments move along columns.
   const TileView bv = t.bView();
@@ -279,9 +284,6 @@ inline void emitPanelMma(msl::Context &c, msl::Block &body, const PanelTile &t,
     for (int64_t ki = 0; ki < t.kSteps(); ++ki)
       step(body, KStep::unrolled(ki), ki);
   }
-
-  for (const WarpSlot &s : slots)
-    emitAccumStore(c, body, t, nm, s, accNameOf(s));
 }
 
 // Must count exactly what the emitDot panel walk makes emitPanelMma emit for
@@ -295,13 +297,19 @@ inline PanelMmaSize predictPanelDotSize(const DotFacts &f, const Panel &p,
   forEachPanelTile(f, p, [&](const PanelTile &t) {
     const WarpGrid grid = panelWarpGrid(t, warpsFor(f), f.numWarps);
     const WarpProgram prog = planWarpProgram(grid);
+    if (t.k.lo == 0) {
+      int accCount = 0;
+      for (int64_t w = 0; w < prog.blockCount(grid.numWarps); ++w)
+        for (const WarpSlot &s : prog.slots(w, grid.mT, grid.nT, grid.numWarps))
+          accCount = std::max(accCount, s.acc + 1);
+      out.decls += accCount;
+      out.fragDecls += accCount;
+    }
     for (int64_t w = 0; w < prog.blockCount(grid.numWarps); ++w) {
       const std::vector<WarpSlot> slots =
           prog.slots(w, grid.mT, grid.nT, grid.numWarps);
       if (slots.empty())
         continue;
-      out.decls += (int)slots.size();
-      out.fragDecls += (int)slots.size();
       const int64_t block = prog.guardWarp(w).value_or(-1);
       FragCache localA, localB;
       FragCache &a =
@@ -349,6 +357,8 @@ inline void emitPanelTile(msl::Context &c, msl::Block &body, const PanelTile &t,
                 coords.b, in.bElem);
       break;
     case PanelPhase::Mma:
+      if (t.k.lo == 0)
+        emitPanelAccumDecls(c, body, t, nm, prog, grid);
       emitWarpBlocks(
           c, body, prog, grid, nm.warpId,
           [&](msl::Block &inner, const std::vector<WarpSlot> &slots,
@@ -357,6 +367,14 @@ inline void emitPanelTile(msl::Context &c, msl::Block &body, const PanelTile &t,
             if (reuse)
               share = reuse->shareFor(t, prog.guardWarp(w).value_or(-1));
             emitPanelMma(c, inner, t, nm, in.a, slots, in.rollK, share);
+          });
+      break;
+    case PanelPhase::Drain:
+      emitWarpBlocks(
+          c, body, prog, grid, nm.warpId,
+          [&](msl::Block &inner, const std::vector<WarpSlot> &slots, int64_t) {
+            for (const WarpSlot &s : slots)
+              emitAccumStore(c, inner, t, nm, s, panelAccName(t, nm, s.acc));
           });
       break;
     case PanelPhase::Readback:

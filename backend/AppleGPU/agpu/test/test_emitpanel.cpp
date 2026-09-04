@@ -41,36 +41,39 @@ OperandSource stagedA(const PanelTile &t) {
 int main() {
   PanelNames nm;
 
-  CASE("the first K panel initialises the accumulator");
+  CASE("the accumulator is declared zeroed, once, outside the warp blocks");
   {
     msl::Context c;
     DotFacts f = gemm(16, 16, 16);
     PanelSchedule s = planPanelSchedule(f, panelCost(16, 16, 16, 2, kAccBytes));
+    const WarpGrid g = panelWarpGrid(s.tiles[0], f.numWarps);
     msl::Block body;
-    emitPanelMma(c, body, s.tiles[0], nm, stagedA(s.tiles[0]),
-                 {slotAt(0, 0, 0)}, false);
+    emitPanelAccumDecls(c, body, s.tiles[0], nm, planWarpProgram(g), g);
     const std::string out = render(body);
     CHECK(out.find("simdgroup_float8x8(0.0f)") != std::string::npos);
     CHECK(out.find("make_filled") == std::string::npos);
-    CHECK_EQ(countOf(out, "simdgroup_load(acc0"), 0);
+    CHECK_EQ(countOf(out, "simdgroup_load"), 0);
+    CHECK_EQ(countOf(out, "if ("), 0);
   }
 
-  CASE("a later K panel loads what the previous one left");
+  CASE("a later K panel accumulates into the same registers, no pool trip");
   {
     msl::Context c;
     DotFacts f = gemm(16, 16, 32);
     PanelSchedule s = planPanelSchedule(f, panelCost(16, 16, 16, 2, kAccBytes));
     CHECK_EQ(s.size(), 2);
+    CHECK_EQ(panelAccName(s.tiles[0], nm, 0), panelAccName(s.tiles[1], nm, 0));
     msl::Block body;
     emitPanelMma(c, body, s.tiles[1], nm, stagedA(s.tiles[1]),
                  {slotAt(0, 0, 0)}, false);
     const std::string out = render(body);
     CHECK(out.find(kZeroAcc + "(0.0f)") == std::string::npos);
-    CHECK(out.find("simdgroup_load(acc") != std::string::npos);
-    CHECK(out.find(", pC") != std::string::npos);
+    CHECK(out.find("simdgroup_load(acc") == std::string::npos);
+    CHECK(out.find(", pC") == std::string::npos);
+    CHECK(out.find("simdgroup_multiply_accumulate(acc0") != std::string::npos);
   }
 
-  CASE("every panel stores C back");
+  CASE("only the drain stores C back");
   {
     msl::Context c;
     DotFacts f = gemm(16, 16, 32);
@@ -79,10 +82,14 @@ int main() {
     for (const PanelTile &t : s.tiles) {
       msl::Block body;
       emitPanelMma(c, body, t, nm, stagedA(t), {slotAt(0, 0, 0)}, false);
-      const std::string out = render(body);
-      CHECK(out.find("simdgroup_store(acc") != std::string::npos);
-      CHECK(out.find(", pC") != std::string::npos);
+      CHECK_EQ(countOf(render(body), "simdgroup_store"), 0);
     }
+    msl::Block drain;
+    emitAccumStore(c, drain, s.tiles[1], nm, slotAt(0, 0, 0),
+                   panelAccName(s.tiles[1], nm, 0));
+    const std::string out = render(drain);
+    CHECK(out.find("simdgroup_store(acc") != std::string::npos);
+    CHECK(out.find(", pC") != std::string::npos);
   }
 
   CASE("unrolled K emits one MMA per step");
@@ -111,8 +118,8 @@ int main() {
     CHECK_EQ(countOf(out, "for ("), 1);
     CHECK(out.find("kv < 32") != std::string::npos);
     CHECK(out.find("kv += 8") != std::string::npos);
-    CHECK_EQ(countOf(out, kZeroAcc + "(0.0f)"), 1);
-    CHECK_EQ(countOf(out, "simdgroup_store"), 1);
+    CHECK_EQ(countOf(out, kZeroAcc + "(0.0f)"), 0);
+    CHECK_EQ(countOf(out, "simdgroup_store"), 0);
   }
 
   CASE("the K term is the only difference between the forms");
@@ -132,8 +139,8 @@ int main() {
     CHECK_EQ(countOf(u, "for ("), 0);
     CHECK_EQ(countOf(r, "for ("), 1);
     for (const std::string &s2 : {u, r}) {
-      CHECK_EQ(countOf(s2, kZeroAcc + "(0.0f)"), 1);
-      CHECK_EQ(countOf(s2, "simdgroup_store"), 1);
+      CHECK_EQ(countOf(s2, kZeroAcc + "(0.0f)"), 0);
+      CHECK_EQ(countOf(s2, "simdgroup_store"), 0);
     }
   }
 
@@ -172,6 +179,8 @@ int main() {
     msl::Block body;
     emitPanelMma(c, body, s.tiles[0], nm, stagedA(s.tiles[0]),
                  {slotAt(1, 1, 1)}, false);
+    emitAccumStore(c, body, s.tiles[0], nm, slotAt(1, 1, 1),
+                   panelAccName(s.tiles[0], nm, 1));
     const std::string out = render(body);
     CHECK(out.find("pA + 192") != std::string::npos);
     CHECK(out.find("pB + 8") != std::string::npos);
@@ -188,6 +197,8 @@ int main() {
     CHECK_EQ(tail.m.size(), 8);
     msl::Block body;
     emitPanelMma(c, body, tail, nm, stagedA(tail), {slotAt(0, 0, 0)}, false);
+    emitAccumStore(c, body, tail, nm, slotAt(0, 0, 0),
+                   panelAccName(tail, nm, 0));
     const std::string tail_out = render(body);
     CHECK(tail_out.find("simdgroup_store(acc") != std::string::npos);
     CHECK(tail_out.find(", pC, 20)") != std::string::npos);
@@ -278,7 +289,7 @@ int main() {
                   planWarpProgram(g));
     const std::string out = render(body);
 
-    CHECK_EQ(countOf(out, "threadgroup_barrier"), 4);
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 5);
     const std::size_t pa = out.find("= a0");
     const std::size_t pb = out.find("= b0");
     const std::size_t mma = out.find("simdgroup_multiply_accumulate");
@@ -478,11 +489,17 @@ int main() {
     CHECK_EQ(s.size(), 4); // 2 M panels x 1 N x 2 K
 
     msl::Block body;
-    for (const PanelTile &t : s.tiles)
+    for (const PanelTile &t : s.tiles) {
+      const WarpGrid g = panelWarpGrid(t, f.numWarps);
+      if (t.k.lo == 0)
+        emitPanelAccumDecls(c, body, t, nm, planWarpProgram(g), g);
       emitPanelMma(c, body, t, nm, stagedA(t), {slotAt(0, 0, 0)}, false);
+      if (t.finalK)
+        emitAccumStore(c, body, t, nm, slotAt(0, 0, 0), panelAccName(t, nm, 0));
+    }
     const std::string out = render(body);
-    CHECK_EQ(countOf(out, kZeroAcc + "(0.0f)"), 2);
-    CHECK_EQ(countOf(out, "simdgroup_store(acc"), 4);
+    CHECK_EQ(countOf(out, kZeroAcc + "(0.0f)"), 8);   // 2 positions x 4 slots
+    CHECK_EQ(countOf(out, "simdgroup_store(acc"), 2); // one drain per position
 
     std::set<std::string> declared;
     std::istringstream lines(out);
@@ -494,7 +511,7 @@ int main() {
       const std::size_t end = line.find_first_of(" =;", nameAt);
       CHECK(declared.insert(line.substr(nameAt, end - nameAt)).second);
     }
-    CHECK_EQ(declared.size(), (std::size_t)4); // one per tile
+    CHECK_EQ(declared.size(), (std::size_t)8);
   }
 
   CASE("a batch slice is part of the tile's name");
@@ -520,6 +537,8 @@ int main() {
     DotFacts f = gemm(16, 16, 16);
     PanelSchedule s = planPanelSchedule(f, panelCost(16, 16, 16, 2, kAccBytes));
     msl::Block body;
+    const WarpGrid g = panelWarpGrid(s.tiles[0], f.numWarps);
+    emitPanelAccumDecls(c, body, s.tiles[0], nm, planWarpProgram(g), g);
     emitPanelMma(c, body, s.tiles[0], nm, stagedA(s.tiles[0]),
                  {slotAt(0, 0, 0)}, false);
     const std::string out = render(body);
@@ -536,6 +555,8 @@ int main() {
     msl::Block body;
     const WarpSlot s0{SlotCoord::fixed(0), SlotCoord::affine(1, 0), 0};
     emitPanelMma(c, body, s.tiles[0], nm, stagedA(s.tiles[0]), {s0}, false);
+    emitAccumStore(c, body, s.tiles[0], nm, s0,
+                   panelAccName(s.tiles[0], nm, 0));
     const std::string out = render(body);
     CHECK(out.find("simdgroup_load(fb1, pB + warp * 8, 24)") !=
           std::string::npos);
@@ -634,7 +655,7 @@ int main() {
     emitPanelTile(c, body, t, nm, in, PanelCoords::forAll(cs), g,
                   planWarpProgram(g));
     const std::string out = render(body);
-    CHECK_EQ(countOf(out, "threadgroup_barrier"), 3);
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 4);
     CHECK_EQ(countOf(out, "pA["), 0);
     CHECK(out.find("simdgroup_load(fa0, dA, ldA)") != std::string::npos);
   }
@@ -665,6 +686,8 @@ int main() {
         for (const PanelTile &t : s.tiles) {
           const WarpGrid grid = panelWarpGrid(t, warpsFor(f), f.numWarps);
           const WarpProgram prog = planWarpProgram(grid);
+          if (t.k.lo == 0)
+            emitPanelAccumDecls(c, body, t, nm, prog, grid);
           emitWarpBlocks(
               c, body, prog, grid, nm.warpId,
               [&](msl::Block &inner, const std::vector<WarpSlot> &slots,

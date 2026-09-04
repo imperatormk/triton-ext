@@ -117,7 +117,9 @@ inline StageBytes planStageBytes(const DotFacts &f, bool pad = true) {
 // ── panel geometry ────────────────────────────────────────────────────────
 
 // A panel: the sub-tile of the operands that fits the pool at once. When A
-// and B together exceed the budget, the dot walks panels instead.
+// and B together exceed the budget, the dot walks panels instead. C overlays
+// the operands: registers carry it across the K panels and it reaches the pool
+// only at the drain.
 struct Panel {
   int64_t mp = 0, np = 0, kp = 0;
   Bytes aBytes, bBytes, cBytes;
@@ -125,7 +127,7 @@ struct Panel {
   // The pitch every tile of this walk stages at.
   bool stagePad = true;
 
-  Bytes total() const { return aBytes + bBytes + cBytes; }
+  Bytes total() const { return maxBytes(aBytes + bBytes, cBytes); }
 };
 
 // Bytes come from `stagedTileBytes`, the same formula PanelSchedule.h's tile
@@ -144,15 +146,45 @@ inline Panel panelCost(int64_t m, int64_t n, int64_t k, int64_t elemBytes,
   return p;
 }
 
-// Shrink M and N in fragment steps until the panel fits, then K. Larger
-// extent first, to keep the panel square; K last, since both operands share
-// it and shrinking it costs reuse on both sides.
+// Ordered so `stageB`'s consecutive-tile skip survives the M walk: fewest
+// tiles, then the largest panel, then the wider N.
 inline Panel planPanelAt(int64_t M, int64_t N, int64_t K, int64_t elemBytes,
                          int64_t accBytes, Bytes budget, bool aStaged,
                          bool pad) {
+  const auto cost = [&](int64_t m, int64_t n, int64_t k) {
+    return panelCost(m, n, k, elemBytes, accBytes, aStaged, pad);
+  };
   int64_t mp = M, np = N;
-  while (panelCost(mp, np, K, elemBytes, accBytes, aStaged, pad).total() >
-         budget) {
+  if (cost(mp, np, K).cBytes > budget) {
+    int64_t bestTiles = 0, bestArea = 0;
+    bool found = false;
+    for (int64_t m = fragAlignedExtent(M); m >= kSgFragDim; m -= kSgFragDim)
+      for (int64_t n = fragAlignedExtent(N); n >= kSgFragDim; n -= kSgFragDim) {
+        if (cost(m, n, K).cBytes > budget)
+          continue;
+        const int64_t tiles = ((M + m - 1) / m) * ((N + n - 1) / n);
+        const int64_t area = m * n;
+        if (found && (tiles > bestTiles ||
+                      (tiles == bestTiles &&
+                       (area < bestArea || (area == bestArea && n <= np)))))
+          continue;
+        found = true;
+        bestTiles = tiles;
+        bestArea = area;
+        mp = m;
+        np = n;
+      }
+    if (!found) {
+      mp = kSgFragDim;
+      np = kSgFragDim;
+    }
+  }
+  // Fragment steps: halving K=24 reaches 6, which rounds to zero fragments
+  // and computes zero.
+  int64_t kp = K - K % kSgFragDim;
+  while (kp > kSgFragDim && cost(mp, np, kp).total() > budget)
+    kp -= kSgFragDim;
+  while (cost(mp, np, kp).total() > budget) {
     if (mp >= np && mp > kSgFragDim)
       mp -= kSgFragDim;
     else if (np > kSgFragDim)
@@ -160,14 +192,7 @@ inline Panel planPanelAt(int64_t M, int64_t N, int64_t K, int64_t elemBytes,
     else
       break;
   }
-  // Fragment steps: halving K=24 reaches 6, which rounds to zero fragments
-  // and computes zero.
-  int64_t kp = K - K % kSgFragDim;
-  while (kp > kSgFragDim &&
-         panelCost(mp, np, kp, elemBytes, accBytes, aStaged, pad).total() >
-             budget)
-    kp -= kSgFragDim;
-  return panelCost(mp, np, kp, elemBytes, accBytes, aStaged, pad);
+  return cost(mp, np, kp);
 }
 
 // How many tiles the walk emits for this panel.
@@ -400,6 +425,8 @@ struct Plan {
                               padStagedC())
                   .count(),
               true};
+    if (kind == Kind::Panel)
+      return {std::max(panel().panel.cBytes.count(), kMinPoolPtrBytes), true};
     return {std::max(pool.cReserve().count(), kMinPoolPtrBytes), false};
   }
 

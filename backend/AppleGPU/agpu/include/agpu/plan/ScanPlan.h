@@ -9,6 +9,7 @@
 #include "agpu/core/Decline.h"
 #include "agpu/msl/Ast.h"
 #include "agpu/msl/Builtins.h"
+#include "agpu/plan/Combiner.h"
 #include "agpu/plan/Elementwise.h"
 #include "agpu/plan/ReductionPlan.h"
 
@@ -45,6 +46,8 @@ struct ScanFacts {
   // whose operands disagree, since the register grouping comes from the
   // scanned tensor's layout alone. Empty means one operand, or unstated.
   std::vector<int64_t> regsPerOperand;
+
+  Combiner combiner = Combiner::Generic;
 
   ElemType elemAt(int k) const {
     return k < (int)elems.size() ? elems[(std::size_t)k] : f32();
@@ -173,8 +176,29 @@ struct ScanPlan {
 
   bool usable = false;
 
+  Combiner combiner = Combiner::Generic;
+
   ElemType elemAt(int k) const {
     return k < (int)elems.size() ? elems[(std::size_t)k] : f32();
+  }
+
+  // The whole-simdgroup prefix that replaces the lane ladder. Only a forward
+  // scan over every lane bit: the intrinsic fixes both the direction and the
+  // span. Reverse and strided ladders keep the shuffle steps.
+  const char *laneIntrinsic(int64_t warpSize) const {
+    if (reverse || elems.size() > 1)
+      return nullptr;
+    if (laneMask != (unsigned)(warpSize - 1))
+      return nullptr;
+    return simdPrefixInclusiveFn(combiner, elemAt(0));
+  }
+
+  // The exclusive prefix carries the identity, so the fold it feeds needs no
+  // guard: the first lane along the axis reads the identity.
+  const char *prefixIntrinsic(int64_t warpSize) const {
+    if (!laneIntrinsic(warpSize))
+      return nullptr;
+    return simdPrefixExclusiveFn(combiner, elemAt(0));
   }
 
   // Whether a lane's own registers fold before any shuffle.
@@ -330,6 +354,7 @@ inline ScanPlan planScan(const ScanFacts &f) {
   ScanPlan p;
   p.reverse = f.reverse;
   p.elems = f.elems;
+  p.combiner = f.combiner;
   p.laneMask = maskOf(f.laneBits);
   p.warpMask = maskOf(f.warpBits);
 

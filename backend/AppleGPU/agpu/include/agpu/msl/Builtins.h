@@ -66,6 +66,22 @@ inline constexpr const char *Shuffle = "simd_shuffle";
 inline constexpr const char *ShuffleUp = "simd_shuffle_up";
 inline constexpr const char *ShuffleDown = "simd_shuffle_down";
 inline constexpr const char *ShuffleXor = "simd_shuffle_xor";
+
+// Whole-simdgroup folds. Metal has no bfloat or 64-bit overload; see
+// `simdFoldable`.
+inline constexpr const char *Sum = "simd_sum";
+inline constexpr const char *Product = "simd_product";
+inline constexpr const char *Min = "simd_min";
+inline constexpr const char *Max = "simd_max";
+inline constexpr const char *And = "simd_and";
+inline constexpr const char *Or = "simd_or";
+inline constexpr const char *Xor = "simd_xor";
+inline constexpr const char *PrefixInclusiveSum = "simd_prefix_inclusive_sum";
+inline constexpr const char *PrefixExclusiveSum = "simd_prefix_exclusive_sum";
+inline constexpr const char *PrefixInclusiveProduct =
+    "simd_prefix_inclusive_product";
+inline constexpr const char *PrefixExclusiveProduct =
+    "simd_prefix_exclusive_product";
 } // namespace simd
 
 // simdgroup_matrix intrinsics. The type names live in CanonicalFragment.

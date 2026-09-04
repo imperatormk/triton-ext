@@ -5,6 +5,7 @@
 #define AGPU_REDUCTION_PLAN_H
 
 #include "agpu/core/Units.h"
+#include "agpu/plan/Combiner.h"
 #include "agpu/plan/Elementwise.h"
 
 #include <algorithm>
@@ -104,6 +105,22 @@ struct ReductionPlan {
   // the reduced tensor's layout, so operands that disagree read the wrong
   // element. Empty means one operand.
   std::vector<int64_t> regsPerOperand;
+
+  Combiner combiner = Combiner::Generic;
+
+  // The whole-simdgroup fold that replaces the lane ladder, or null when the
+  // ladder stands. The steps must cover every lane bit: a partial fold would
+  // cross groups that the reduction keeps apart.
+  const char *laneIntrinsic(int64_t warpSize) const {
+    if (elems.size() > 1)
+      return nullptr;
+    unsigned covered = 0;
+    for (const ReduceStep &s : laneSteps)
+      covered |= (unsigned)s.xorOffset;
+    if (covered != (unsigned)(warpSize - 1))
+      return nullptr;
+    return simdReduceFn(combiner, elemAt(0));
+  }
 
   ElemType elemAt(int k) const {
     return k < (int)elems.size() ? elems[(std::size_t)k] : f32();

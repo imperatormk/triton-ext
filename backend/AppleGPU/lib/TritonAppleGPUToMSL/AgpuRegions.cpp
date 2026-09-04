@@ -8,6 +8,50 @@ namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
 
+// The one MLIR-facing row of the combiner table; Combiner.h owns the rest.
+// The structural match is Triton's: `getSingleCombiner` returns null unless
+// the region is a single op over the block arguments, in order or
+// commutatively reversed.
+static agpu::Combiner combinerOf(Operation *op) {
+  if (!op)
+    return agpu::Combiner::Generic;
+  return llvm::TypeSwitch<Operation *, agpu::Combiner>(op)
+      .Case<arith::AddFOp>([](auto) { return agpu::Combiner::AddF; })
+      .Case<arith::MulFOp>([](auto) { return agpu::Combiner::MulF; })
+      .Case<arith::AddIOp>([](auto) { return agpu::Combiner::AddI; })
+      .Case<arith::MulIOp>([](auto) { return agpu::Combiner::MulI; })
+      .Case<arith::MinNumFOp>([](auto) { return agpu::Combiner::MinF; })
+      .Case<arith::MaxNumFOp>([](auto) { return agpu::Combiner::MaxF; })
+      .Case<arith::MinSIOp>([](auto) { return agpu::Combiner::MinS; })
+      .Case<arith::MaxSIOp>([](auto) { return agpu::Combiner::MaxS; })
+      .Case<arith::MinUIOp>([](auto) { return agpu::Combiner::MinU; })
+      .Case<arith::MaxUIOp>([](auto) { return agpu::Combiner::MaxU; })
+      .Case<arith::AndIOp>([](auto) { return agpu::Combiner::AndI; })
+      .Case<arith::OrIOp>([](auto) { return agpu::Combiner::OrI; })
+      .Case<arith::XOrIOp>([](auto) { return agpu::Combiner::XorI; })
+      .Default([](auto) { return agpu::Combiner::Generic; });
+}
+
+// tt.scan has no `getSingleCombiner`, so this is that check for a scan region.
+static Operation *singleScanCombiner(triton::ScanOp scan) {
+  if (scan.getNumOperands() != 1 || scan.getNumResults() != 1)
+    return nullptr;
+  Block &blk = scan.getCombineOp().front();
+  Operation *term = blk.getTerminator();
+  if (term->getNumOperands() != 1)
+    return nullptr;
+  Operation *op = term->getOperand(0).getDefiningOp();
+  if (!op || op->getNumOperands() != 2 || op->getNumResults() != 1)
+    return nullptr;
+  const Value a = blk.getArgument(0), b = blk.getArgument(1);
+  const Value lhs = op->getOperand(0), rhs = op->getOperand(1);
+  const bool reversed =
+      lhs == b && rhs == a && op->hasTrait<OpTrait::IsCommutative>();
+  if (!(lhs == a && rhs == b) && !reversed)
+    return nullptr;
+  return op;
+}
+
 agpu::Decision AgpuEmitter::reductionPlanOf(triton::ReduceOp red,
                                             RankedTensorType srcTy,
                                             agpu::ReductionPlan &out) {
@@ -50,6 +94,7 @@ agpu::Decision AgpuEmitter::reductionPlanOf(triton::ReduceOp red,
   const int64_t warps = numWarps();
   out.warpSubset = agpu::subsetsOf(out.warpMask, (int)warps);
   out.reducedAxis = axis;
+  out.combiner = combinerOf(red.getSingleCombiner());
 
   // numWarps slots: every warp publishes, including ones this reduction does
   // not span.
@@ -299,6 +344,7 @@ agpu::Decision AgpuEmitter::scanPlanOf(triton::ScanOp scan,
   out.numWarps = numWarps();
   out.regCount = registerCount(srcTy);
   out.reverse = scan.getReverse();
+  out.combiner = combinerOf(singleScanCombiner(scan));
 
   // Carried per operand for the same reason as the reduction: an integer scan
   // through f32 is exact only to 2^24.

@@ -741,6 +741,38 @@ void printPoll(std::ostream &os) {
   os << "  out[tid.x] = (int)ready + (int)ready2;\n}\n";
 }
 
+void printCombiners(std::ostream &os) {
+  const ElemType types[] = {f32(),
+                            f16(),
+                            i32(),
+                            ElemType{ElemType::Kind::Int, 32, true},
+                            ElemType{ElemType::Kind::Int, 16},
+                            ElemType{ElemType::Kind::Int, 16, true}};
+  os << "kernel void agpu_probe_combiners(device float *out [[buffer(0)]],\n"
+        "                                 uint3 tid "
+        "[[thread_position_in_threadgroup]]) {\n"
+        "  float sink = 0;\n";
+  int n = 0;
+  for (unsigned i = 1; i < unsigned(Combiner::Count); ++i) {
+    const Combiner fn = Combiner(i);
+    for (const ElemType &e : types) {
+      const char *r = simdReduceFn(fn, e);
+      const char *pi = simdPrefixInclusiveFn(fn, e);
+      const char *px = simdPrefixExclusiveFn(fn, e);
+      if (!r && !pi && !px)
+        continue;
+      const std::string v = "cv" + std::to_string(n++);
+      std::ostringstream ty;
+      msl::Printer(ty).printType(mslTypeOf(e));
+      os << "  " << ty.str() << " " << v << " = (" << ty.str() << ")tid.x;\n";
+      for (const char *fnName : {r, pi, px})
+        if (fnName)
+          os << "  sink += (float)" << fnName << "(" << v << ");\n";
+    }
+  }
+  os << "  out[tid.x] = sink;\n}\n";
+}
+
 void printPlannedModule(std::ostream &os) {
   Emitter e;
 
@@ -810,6 +842,9 @@ int main() {
   std::cout << "\n";
 
   printMemDesc(std::cout);
+  std::cout << "\n";
+
+  printCombiners(std::cout);
   std::cout << "\n";
 
   printPlannedModule(std::cout);

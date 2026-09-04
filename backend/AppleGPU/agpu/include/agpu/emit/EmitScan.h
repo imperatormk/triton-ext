@@ -75,6 +75,10 @@ inline void emitScanStep(msl::Context &c, msl::Block &body, const ScanPlan &p,
 inline void emitScanLanes(msl::Context &c, msl::Block &body, const ScanPlan &p,
                           msl::SmallVec<msl::Str, 4> &accs, const ScanNames &nm,
                           const CombineFn &combine) {
+  if (const char *fn = p.laneIntrinsic(p.scratch.warpSize)) {
+    body.push_back(c.assign(c.var(accs[0]), c.call(fn, {c.var(accs[0])})));
+    return;
+  }
   for (std::size_t i = 0; i < p.laneSteps.size(); ++i)
     emitScanStep(c, body, p, p.laneSteps[i], accs, nm, (int)i, combine);
 }
@@ -439,7 +443,15 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
   // cross-warp carry. This fold is guarded (the first lane along the axis has
   // no predecessor) while the warp carry applies to every lane, so the order
   // matters. Shuffled by the smallest delta, one hop back.
-  if (!p.laneSteps.empty()) {
+  if (const char *fn = p.prefixIntrinsic(p.scratch.warpSize)) {
+    const msl::Str a = nm.acc + "p0";
+    body.push_back(
+        c.declStmt(mslTypeOf(p.elemAt(0)), a,
+                   c.call(fn, {c.var(acc[0][(std::size_t)(regs - 1)])})));
+    const msl::SmallVec<msl::Str, 4> prefix = {a};
+    for (int64_t r = 0; r < regs; ++r)
+      storeAt(body, r, combine(body, prefix, at(r)));
+  } else if (!p.laneSteps.empty()) {
     const int64_t low = p.laneSteps.front().delta;
     msl::SmallVec<msl::Str, 4> prefix;
     for (int k = 0; k < nOp; ++k) {

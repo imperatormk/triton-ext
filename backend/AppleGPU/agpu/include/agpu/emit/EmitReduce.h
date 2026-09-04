@@ -7,6 +7,7 @@
 #include "agpu/emit/EmitShuffle.h"
 #include "agpu/msl/Builtins.h"
 #include "agpu/msl/Context.h"
+#include "agpu/plan/Combiner.h"
 #include "agpu/plan/ReductionPlan.h"
 
 #include <functional>
@@ -77,6 +78,10 @@ inline void emitLaneSteps(msl::Context &c, msl::Block &body,
                           const ReduceNames &nm, int groupIdx,
                           const CombineFn &combine) {
   const int nOp = (int)accs.size();
+  if (const char *fn = plan.laneIntrinsic(plan.scratch.warpSize)) {
+    body.push_back(c.assign(c.var(accs[0]), c.call(fn, {c.var(accs[0])})));
+    return;
+  }
   for (std::size_t si = 0; si < plan.laneSteps.size(); ++si) {
     const ReduceStep &st = plan.laneSteps[si];
     msl::SmallVec<msl::Str, 4> peers;

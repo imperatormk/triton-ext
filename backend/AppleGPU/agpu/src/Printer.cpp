@@ -705,6 +705,10 @@ void Printer::printStmt(const Stmt *s) {
   }
   case StmtKind::For: {
     auto *f = static_cast<const For *>(s);
+    if (f->unrollCount > 0) {
+      indent();
+      os_ << "#pragma clang loop unroll_count(" << f->unrollCount << ")\n";
+    }
     indent();
     printWrapped(
         "for (",

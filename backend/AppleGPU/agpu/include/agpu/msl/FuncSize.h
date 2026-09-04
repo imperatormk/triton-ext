@@ -18,6 +18,8 @@ inline constexpr int64_t kDeclBudget = 10000;
 
 inline constexpr int64_t kRollFragFloor = 1024;
 
+inline constexpr int64_t kRollMmaFloor = 128;
+
 // A pre-emission forecast of what rolling the K steps would save. The deltas
 // cover only the statements `rollK` changes, so the unrolled size can be
 // inferred from a measured rolled body without building the unrolled one.
@@ -42,7 +44,8 @@ inline ShrinkPlan planShrink(const FuncSize &s) {
   ShrinkPlan p;
   p.fuseGuards = s.branches > 0;
   p.rollKSteps =
-      s.optimiserLoad() > kDeclBudget && s.fragDecls >= kRollFragFloor;
+      (s.optimiserLoad() > kDeclBudget && s.fragDecls >= kRollFragFloor) ||
+      s.mma > kRollMmaFloor;
   return p;
 }
 

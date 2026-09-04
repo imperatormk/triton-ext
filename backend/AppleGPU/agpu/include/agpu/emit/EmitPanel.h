@@ -266,11 +266,13 @@ inline void emitPanelMma(msl::Context &c, msl::Block &body, const PanelTile &t,
   if (rollK) {
     msl::Block inner;
     step(inner, KStep::rolled(), 0);
-    body.push_back(c.forStmt(
+    msl::For *loop = c.forStmt(
         c.declStmt(msl::Context::i32(), nm.kVar, c.lit(0)),
         c.binary(msl::BinOp::Lt, c.var(nm.kVar), c.lit(t.k.size())),
         c.assignOp(msl::BinOp::Add, c.var(nm.kVar), c.lit(kSgFragDim)),
-        std::move(inner)));
+        std::move(inner));
+    loop->unrollCount = std::min<int64_t>(msl::kUnrollCount, t.kSteps());
+    body.push_back(loop);
   } else {
     for (int64_t ki = 0; ki < t.kSteps(); ++ki)
       step(body, KStep::unrolled(ki), ki);

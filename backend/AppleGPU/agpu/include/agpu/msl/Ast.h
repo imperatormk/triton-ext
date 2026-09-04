@@ -383,11 +383,14 @@ struct If : Stmt {
   bool hasElse() const { return !elseBody.empty(); }
 };
 
+inline constexpr int64_t kUnrollCount = 8;
+
 struct For : Stmt {
   Stmt *init;
   Expr *cond;
   Stmt *step;
   Block body;
+  int64_t unrollCount = 0;
   For(Stmt *i, Expr *c, Stmt *s, Block b)
       : Stmt(StmtKind::For), init(i), cond(c), step(s), body(std::move(b)) {}
 };

@@ -116,13 +116,13 @@ public:
   explicit FragReuse(msl::Block &decls) : decls_(decls) {}
 
   FragShare shareFor(const PanelTile &t, int64_t block) {
-    return {&decls_, &a_[{block, t.batch, t.m.lo, t.k.lo}],
-            &b_[{block, t.batch, t.n.lo, t.k.lo}], &counter_};
+    return {&decls_, &a_[{block, t.batch, t.m.lo, t.k.lo, t.n.lo}],
+            &b_[{block, t.batch, t.n.lo, t.k.lo, 0}], &counter_};
   }
 
 private:
   msl::Block &decls_;
-  std::map<std::array<int64_t, 4>, FragCache> a_, b_;
+  std::map<std::array<int64_t, 5>, FragCache> a_, b_;
   int counter_ = 0;
 };
 
@@ -286,7 +286,7 @@ inline void emitPanelMma(msl::Context &c, msl::Block &body, const PanelTile &t,
 inline PanelMmaSize predictPanelDotSize(const DotFacts &f, const Panel &p,
                                         bool rollK) {
   PanelMmaSize out;
-  std::map<std::array<int64_t, 4>, FragCache> sharedA, sharedB;
+  std::map<std::array<int64_t, 5>, FragCache> sharedA, sharedB;
   const msl::Str mark = "x";
   forEachPanelTile(f, p, [&](const PanelTile &t) {
     const WarpGrid grid = panelWarpGrid(t, warpsFor(f), f.numWarps);
@@ -300,8 +300,10 @@ inline PanelMmaSize predictPanelDotSize(const DotFacts &f, const Panel &p,
       out.fragDecls += (int)slots.size();
       const int64_t block = prog.guardWarp(w).value_or(-1);
       FragCache localA, localB;
-      FragCache &a = rollK ? localA : sharedA[{block, t.batch, t.m.lo, t.k.lo}];
-      FragCache &b = rollK ? localB : sharedB[{block, t.batch, t.n.lo, t.k.lo}];
+      FragCache &a =
+          rollK ? localA : sharedA[{block, t.batch, t.m.lo, t.k.lo, t.n.lo}];
+      FragCache &b =
+          rollK ? localB : sharedB[{block, t.batch, t.n.lo, t.k.lo, 0}];
       const int64_t steps = rollK ? 1 : t.kSteps();
       if (rollK)
         out.decls += 1;

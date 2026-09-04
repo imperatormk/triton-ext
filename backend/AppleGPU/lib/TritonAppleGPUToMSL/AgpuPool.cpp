@@ -139,6 +139,8 @@ PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
     if (cRegion.bytes > 0)
       need.add(mnm.poolC, plan.cPoolElem(), cRegion.bytes,
                cRegion.overlaysOperands);
+    if (plan.edgeScratch > agpu::Bytes(0))
+      need.add(mnm.poolE, agpu::f32(), plan.edgeScratch.count());
     return need;
   }
 

@@ -26,6 +26,7 @@ struct MmaNames : ThreadNames {
   msl::Str poolA = "pA";
   msl::Str poolB = "pB";
   msl::Str poolC = "pC";
+  msl::Str poolE = "pE";
   msl::Str acc = "acc";
   msl::Str kVar = "kv";
 };

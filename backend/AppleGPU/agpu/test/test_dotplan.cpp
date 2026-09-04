@@ -214,7 +214,8 @@ int main() {
     CHECK_EQ(kindOf(p), kFused);
     CHECK(p.storesCDirect());
     CHECK(p.fused().cDirect);
-    CHECK_EQ(p.pool.reserved().count(), p.stage.ab().count());
+    CHECK_EQ(p.pool.reserved().count(),
+             p.stage.ab().count() + p.edgeScratch.count());
     CHECK_EQ(p.cPoolRegion().bytes, 0);
     CHECK(!p.cPoolRegion().overlaysOperands);
   }
@@ -357,15 +358,16 @@ int main() {
     CHECK(p.direct().bandRows < 128);
   }
 
-  CASE("a direct store with no ragged arm reserves nothing for C");
+  CASE("a direct store with no ragged arm reserves only the edge scratch");
   {
     DotFacts f = gemm(64, 64, 64);
     f.fusedAcc = true;
     f.cDirect = true;
     f.cFallback = false;
     Plan p = planDot(f, kBudget);
-    CHECK(p.pool.cNeed == p.stage.ab());
-    CHECK(p.pool.cReserve() == Bytes(0));
+    CHECK(p.edgeScratch > Bytes(0));
+    CHECK(p.pool.cNeed == p.stage.ab() + p.edgeScratch);
+    CHECK(p.pool.cReserve() == p.edgeScratch);
   }
 
   CASE("a direct store with a ragged arm still reserves");
@@ -388,7 +390,7 @@ int main() {
     f.bInPlace = true;
     Plan p = planDot(f, kBudget);
     CHECK_EQ(p.stage.ab().count(), 0);
-    CHECK_EQ(p.pool.cNeed.count(), kMinPoolPtrBytes);
+    CHECK_EQ(p.pool.cNeed.count(), p.edgeScratch.count());
     CHECK(p.pool.reserved() > Bytes(0));
   }
 

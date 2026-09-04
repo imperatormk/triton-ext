@@ -48,6 +48,12 @@ agpu::Decision AgpuEmitter::namePoolRegions(const agpu::Plan &plan,
                     "a pool region this dot stages through was never carved");
   in.direct.poolB = in.panel.poolB = bBuf;
   in.direct.poolC = in.panel.poolC = cBuf;
+  if (plan.edgeScratchFits()) {
+    const am::Str eBuf = body_.pool.use(mnm.poolE);
+    if (eBuf.empty())
+      return declined("tt.dot", "the edge scratch region was never carved");
+    in.direct.poolE = in.panel.poolE = eBuf;
+  }
   return agpu::Decision::emitted();
 }
 

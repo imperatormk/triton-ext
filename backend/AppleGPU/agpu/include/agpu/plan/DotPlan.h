@@ -269,6 +269,13 @@ struct FusedParams {
   bool stagePad = true;
 };
 
+// Zero where the operands leave no room: the drain falls back to guarded
+// scalar stores.
+inline Bytes edgeScratchFor(const DotFacts &f, Bytes staged, Bytes budget) {
+  const Bytes want(f.numWarps * kSgFragDim * kSgFragDim * kAccBytes);
+  return staged + want <= budget ? want : Bytes(0);
+}
+
 // Shared by `Plan::storesCDirect` (what the emitter writes) and `CReserve`
 // (what the pool reserves). The two must not disagree.
 inline bool cDrainSkipsPool(const FusedParams &fp, const DotFacts &f) {
@@ -310,6 +317,8 @@ struct Plan {
   StageBytes stage;
   PoolPlan pool;
   StrategyParams params;
+
+  Bytes edgeScratch;
 
   // Set when `liftsToFloatMma` fired: `facts` then carry the lifted shape,
   // 4-byte staged operands and no direct reads. Anything downstream spelling
@@ -361,24 +370,7 @@ struct Plan {
     return fp && cDrainSkipsPool(*fp, facts);
   }
 
-  // Whether the pool can lend the direct drain a per-warp 8x8 accumulator
-  // scratch, used by the drain's edge tiles. It aliases the staged operands,
-  // since every pool read is behind the drain by then.
-  //
-  // Measured from B's offset, since that is where `emitDirectDot` writes it
-  // (`poolB + warp*64`). Measuring from the base
-  // over-counts by `stage.a` and lets the drain write past the buffer.
-  bool edgeScratchFits() const {
-    return edgeScratchRoom() >=
-           facts.numWarps * kSgFragDim * kSgFragDim * kAccBytes;
-  }
-
-  // Saturating: an arm reserving less than the operands would go negative and
-  // compare as a large unsigned elsewhere.
-  int64_t edgeScratchRoom() const {
-    const int64_t room = pool.reserved().count() - stage.a.count();
-    return room > 0 ? room : 0;
-  }
+  bool edgeScratchFits() const { return edgeScratch.count() > 0; }
 
   bool cThroughPool() const { return kind != Kind::Scalar && !storesCDirect(); }
 
@@ -454,7 +446,7 @@ struct CReserve {
   // drain addresses.
   Bytes operator()(const FusedParams &fp) const {
     if (cDrainSkipsPool(fp, f))
-      return stagedAB;
+      return stagedAB + edgeScratchFor(f, stagedAB, budget);
     return maxBytes(stagedAB, cFull(fp.stagePad));
   }
 
@@ -759,6 +751,8 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
 
   // 5. Fields that need the pool fixed first. Only Direct has any.
   std::visit(PoolDependent{f, p.pool}, p.params);
+  if (p.storesCDirect())
+    p.edgeScratch = edgeScratchFor(f, p.stage.ab(), budget);
   return p;
 }
 

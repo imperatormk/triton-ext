@@ -270,7 +270,7 @@ agpu::Decision AgpuEmitter::resolveDirectCStore(const DotOperands &ops,
   in.cStore.tileRows = plan.facts.M;
   in.cStore.tileCols = plan.facts.N;
   if (plan.edgeScratchFits())
-    in.cStore.edgeScratch = in.direct.poolB;
+    in.cStore.edgeScratch = in.direct.poolE;
 
   if (ops.shape.cUniformGuard) {
     const am::Str *g = body_.sym.scalarName(idOf(ops.shape.cUniformGuard));

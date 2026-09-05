@@ -259,7 +259,8 @@ inline void emitScratchEdgeStores(msl::Context &c, msl::Block &edge,
                                          c.var(nm.laneId))),
         rowAbs, colAbs);
     msl::Block one;
-    one.push_back(c.assign(c.subscript(c.var(t.base), off), value));
+    one.push_back(
+        c.assign(c.subscript(basePtr(c, t.base, t.baseOffset), off), value));
     c.guardedInto(edge, guard, std::move(one));
   }
   edge.push_back(c.barrier(msl::Barrier::Scope::Simdgroup));
@@ -285,7 +286,8 @@ emitGuardedScalarEdgeStores(msl::Context &c, msl::Block &edge,
     msl::Expr *off = c.binary(msl::BinOp::Add, t.leadingDim.scale(c, row), col);
     msl::Expr *value = chainAt(fragElemExpr(c, acc, i), row, col);
     msl::Block one;
-    one.push_back(c.assign(c.subscript(c.var(t.base), off), value));
+    one.push_back(
+        c.assign(c.subscript(basePtr(c, t.base, t.baseOffset), off), value));
     c.guardedInto(edge, guard, std::move(one));
   }
 }
@@ -337,7 +339,9 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
           c.binary(msl::BinOp::Add, t.leadingDim.scale(c, rowE()), colE());
       into.push_back(c.exprStmt(
           c.call(msl::builtin::sg::Store,
-                 {c.var(frag), c.binary(msl::BinOp::Add, c.var(t.base), off),
+                 {c.var(frag),
+                  c.binary(msl::BinOp::Add, basePtr(c, t.base, t.baseOffset),
+                           off),
                   t.leadingDim.expr(c)})));
     };
 
@@ -356,14 +360,14 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
           rhs = od.splat;
           break;
         case DrainOperand::Kind::Row:
-          rhs = c.subscript(c.var(od.base), col);
+          rhs = c.subscript(basePtr(c, od.base, od.baseOffset), col);
           break;
         case DrainOperand::Kind::Col:
-          rhs = c.subscript(c.var(od.base), row);
+          rhs = c.subscript(basePtr(c, od.base, od.baseOffset), row);
           break;
         case DrainOperand::Kind::Tile:
           rhs = c.subscript(
-              c.var(od.base),
+              basePtr(c, od.base, od.baseOffset),
               c.binary(msl::BinOp::Add, od.leadingDim.scale(c, row), col));
           break;
         }

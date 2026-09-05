@@ -15,14 +15,19 @@ static am::Expr *windowRowStartExpr(am::Context &c, const am::Str &name,
 
 agpu::Decision AgpuEmitter::baseOffsetExpr(const DeviceTile &t,
                                            const char *which, am::Expr *&out) {
+  am::Context &mc = agpu_.context();
   out = nullptr;
+  // A scalar addptr binds to its base's name and keeps the offset aside.
+  if (const auto off = body_.offsetOf.find({idOf(t.base), 0});
+      off != body_.offsetOf.end())
+    out = mc.var(off->second.name);
   if (!t.baseOffset)
     return agpu::Decision::emitted();
   const am::Str *n = body_.sym.scalarName(idOf(t.baseOffset));
   if (!n)
     return declined("tt.dot",
                     std::string(which) + "'s window base offset has no name");
-  out = agpu_.context().var(*n);
+  out = out ? mc.binary(am::BinOp::Add, out, mc.var(*n)) : mc.var(*n);
   return agpu::Decision::emitted();
 }
 
@@ -136,11 +141,7 @@ agpu::Decision AgpuEmitter::resolveDrainSteps(const DotOperands &ops,
               baseOffsetExpr(sf.addend.window, "a folded operand", opBaseOff);
           !d.ok())
         return d;
-      if (opBaseOff) {
-        od.base = derivedDevicePointer(*base, opBaseOff, *oe,
-                                       "pOdev" + std::to_string(body_.dotSeq) +
-                                           "_" + at);
-      }
+      od.baseOffset = opBaseOff;
       switch (sf.addend.form) {
       case DrainAddend::Form::Row:
         od.kind = agpu::DrainOperand::Kind::Row;
@@ -215,16 +216,12 @@ agpu::Decision AgpuEmitter::resolveDirectCStore(const DotOperands &ops,
           elemTypeOf(ops.shape.cDevice.base.getType()))
     in.cStore.elem = *ce;
 
-  // A uniform offset gets its own pointer, like A's `pAdev`.
-  am::Expr *cBaseOff = nullptr;
-  if (const agpu::Decision d = baseOffsetExpr(ops.shape.cDevice, "C", cBaseOff);
+  // Not a derived pointer: a fused drain stores after the loop this dot sits
+  // in, outside any block declared here.
+  if (const agpu::Decision d =
+          baseOffsetExpr(ops.shape.cDevice, "C", in.cStore.baseOffset);
       !d.ok())
     return d;
-  if (cBaseOff) {
-    in.cStore.base =
-        derivedDevicePointer(*base, cBaseOff, in.cStore.elem,
-                             "pCdev" + std::to_string(body_.dotSeq));
-  }
   if (ops.shape.cDevice.rowStart) {
     const am::Str *rs = body_.sym.scalarName(idOf(ops.shape.cDevice.rowStart));
     if (!rs)

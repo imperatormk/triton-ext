@@ -13,6 +13,7 @@ namespace agpu {
 
 struct DeviceStoreTarget {
   msl::Str base;                 // the tensor's base pointer, empty when absent
+  msl::Expr *baseOffset = nullptr; // elements past `base`, null for zero
   Stride leadingDim;             // elements between consecutive rows
   msl::Expr *rowStart = nullptr; // window origin, null for zero
   msl::Expr *colStart = nullptr;
@@ -55,12 +56,19 @@ struct DrainOperand {
   Kind kind = Kind::None;
   msl::Expr *splat = nullptr; // Splat: the uniform value
   msl::Str base;              // Row/Tile: the device base pointer
+  msl::Expr *baseOffset = nullptr;
   Stride leadingDim;          // Tile: its own row stride
 
   // What `base` points at, for the memoised read. Must match the un-memoised
   // arm's type or `DrainStep::roundBefore` rounds the two differently.
   ElemType elem = f32();
 };
+
+inline msl::Expr *basePtr(msl::Context &c, const msl::Str &base,
+                          msl::Expr *baseOffset) {
+  return baseOffset ? c.binary(msl::BinOp::Add, c.var(base), baseOffset)
+                    : c.var(base);
+}
 
 // One link of a step's accumulator-rooted operand chain: the op (EpilogueOps.h
 // names the set) and its own operand, which is never another chain.

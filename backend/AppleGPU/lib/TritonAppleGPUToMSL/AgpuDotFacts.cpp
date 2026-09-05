@@ -212,9 +212,15 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
 
   f.fusedAcc = shape.accumulatorOutlivesLoop();
   f.cInitNonzero = f.fusedAcc && !zeroSplat(fusedInitOf(shape.cCarried));
-  f.cRename = false;
   f.aInPlace = f.bInPlace = false;
   f.aDirect = (bool)shape.aDevice.base;
+  if (!f.fusedAcc) {
+    const Value landing = readbackLandingOf(shape);
+    f.cRename = renameReadbackOf(landing ? cast<RankedTensorType>(landing.getType())
+                                         : shape.cTy,
+                                 f)
+                    .rename();
+  }
 
   // `cElem` is the fp32 accumulator. The tensor behind the store window may
   // be narrower and the pointee's width decides whether a direct

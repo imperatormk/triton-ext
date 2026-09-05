@@ -488,6 +488,8 @@ struct CReserve {
   // bands as the remainder holds, floored at one. `selectKind` already
   // guaranteed one band fits or the shape would have panelled.
   Bytes operator()(const DirectParams &dp) const {
+    if (f.cRename)
+      return stagedAB;
     const bool pad = dp.stagePad;
     if (stagedAB + cFull(pad) <= budget)
       return stagedAB + cFull(pad);
@@ -535,7 +537,7 @@ struct PoolDependent {
     // row division would come out one row shy.
     const Bytes full =
         stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes, dp.stagePad);
-    dp.bandRows = pool.cReserve() >= full
+    dp.bandRows = f.cRename || pool.cReserve() >= full
                       ? fragAlignedExtent(f.M)
                       : bandRowsFor(stagedTileView(f.M, fragAlignedExtent(f.N),
                                                    kAccBytes, dp.stagePad)

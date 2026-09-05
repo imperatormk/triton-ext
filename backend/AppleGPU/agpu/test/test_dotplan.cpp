@@ -771,8 +771,25 @@ int main() {
     Plan p = planDot(f, kBudget);
     CHECK(f.cCostsPoolNothing());
     CHECK(!p.cThroughPool());
-    if (p.readsBackByRename())
-      CHECK(DotPassSchedule::of(p).drain == DotPassSchedule::Drain::Rename);
+    CHECK(p.readsBackByRename());
+    CHECK(DotPassSchedule::of(p).drain == DotPassSchedule::Drain::Rename);
+    CHECK_EQ(p.pool.cReserve().count(), 0);
+    CHECK_EQ(p.cBandRows(), 64);
+  }
+
+  CASE("a rename never bands, even where the pool could not hold C whole");
+  {
+    DotFacts f = gemm(64, 64, 64);
+    f.aElemBytes = f.bElemBytes = 4;
+    Plan pooled = planDot(f, kBudget);
+    CHECK_EQ(kindOf(pooled), kPanel);
+
+    f.cRename = true;
+    Plan p = planDot(f, kBudget);
+    CHECK_EQ(kindOf(p), kDirect);
+    CHECK(p.readsBackByRename());
+    CHECK_EQ(p.cBandRows(), 64);
+    CHECK(p.pool.reserved() <= kBudget);
   }
 
   CASE("the plan reports why a dot is not fused, not only what it chose");

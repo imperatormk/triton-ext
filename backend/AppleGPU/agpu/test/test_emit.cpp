@@ -1,5 +1,6 @@
 // End-to-end: plan -> guard -> address -> AST -> MSL text.
 #include "agpu/emit/Emit.h"
+#include "agpu/emit/EmitDirect.h"
 #include "agpu/msl/Printer.h"
 #include "fixtures.h"
 #include "harness.h"
@@ -27,6 +28,31 @@ CoordSource twoDim() {
 
 int main() {
   const int ROW = 0, COL = 1;
+
+  CASE("a renamed readback adds the incoming accumulator like a pool one");
+  {
+    msl::Context c;
+    ReadbackPlan plan;
+    plan.kind = ReadbackPlan::Kind::Rename;
+    plan.regs = {{0, 0}, {0, 1}, {1, 0}};
+    msl::SmallVec<msl::Str, 8> names{"c0", "c1", "c2"};
+    DirectNames nm;
+
+    msl::Block body;
+    emitFragmentReadback(c, body, plan, names, {}, nm);
+    const std::string assigned = render(body);
+    CHECK(assigned.find("c0 = acc0.thread_elements()[0];") != std::string::npos);
+    CHECK(assigned.find("c2 = acc1.thread_elements()[0];") != std::string::npos);
+    CHECK(assigned.find("+") == std::string::npos);
+
+    msl::Block added;
+    msl::SmallVec<msl::Str, 8> bases{"in0", "in1", "in2"};
+    emitFragmentReadback(c, added, plan, names, bases, nm);
+    const std::string out = render(added);
+    CHECK(out.find("c0 = acc0.thread_elements()[0] + in0;") != std::string::npos);
+    CHECK(out.find("c1 = acc0.thread_elements()[1] + in1;") != std::string::npos);
+    CHECK(out.find("c2 = acc1.thread_elements()[0] + in2;") != std::string::npos);
+  }
 
   CASE("a register wholly inside the panel stages unguarded");
   {

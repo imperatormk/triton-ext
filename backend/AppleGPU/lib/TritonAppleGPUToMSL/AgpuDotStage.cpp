@@ -78,7 +78,9 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
   const agpu::TileView bStaged = agpu::stagedOperandView(
       pf, pf.K, agpu::fragAlignedExtent(pf.N), pf.bElemBytes, stagePad);
 
-  if (!stagesPerTile && agpu::DotPassSchedule::of(plan).barrierBeforeStage())
+  // Every pool user opens its epoch with a barrier: the previous one (a fused
+  // pass's MMAs, a drained dot's readback) leaves its reads unfenced.
+  if (!stagesPerTile)
     cur_->push_back(agpu_.context().barrier());
 
   if (pf.aDirect) {

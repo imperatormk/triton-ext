@@ -140,7 +140,6 @@ emitFusedLoop(msl::Context &c, msl::Block &body, const Plan &p,
   body.push_back(c.barrier());
   emitReadback(c, body, cv, nm.poolC, back.actions, back.names, back.bases,
                cCoords, back.elem, back.regElem);
-  body.push_back(c.barrier());
   return Decision::emitted();
 }
 

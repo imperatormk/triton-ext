@@ -380,7 +380,6 @@ inline void emitPanelTile(msl::Context &c, msl::Block &body, const PanelTile &t,
     case PanelPhase::Readback:
       emitReadback(c, body, t.cStagedView(), nm.poolC, in.cActions, in.cNames,
                    in.cBases, coords.c, in.cElem, in.cRegElem);
-      body.push_back(c.barrier());
       break;
     }
   }

@@ -316,26 +316,21 @@ int main() {
     CHECK(store < read);
     CHECK_EQ(countOf(out, "simdgroup_store"), 16);
 
-    // Three barriers, owned by the bracket: one before the stores, since this
-    // plan's C overlays the operand pool the loop was still reading, one
-    // before the readback, since registers come from slots other warps
-    // stored, and one after it so the next pool user cannot overwrite slots
-    // a slower warp is still reading.
+    // Two barriers, owned by the bracket: one before the stores, since this
+    // plan's C overlays the operand pool the loop was still reading and one
+    // before the readback, since registers come from slots other warps stored.
     CHECK(p.cPoolRegion().overlaysOperands);
-    CHECK_EQ(countOf(out, "threadgroup_barrier"), 3);
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 2);
     const std::size_t b1 = out.find("threadgroup_barrier");
     const std::size_t b2 = out.find("threadgroup_barrier", b1 + 1);
-    const std::size_t b3 = out.find("threadgroup_barrier", b2 + 1);
     CHECK(loop < b1 && b1 < store);
     CHECK(store < b2 && b2 < read);
-    CHECK(read < b3);
   }
 
   CASE("a fused plan's own emission neither declares nor drains");
   {
     // The same direct emitter, told by the pass schedule that the bracket
-    // owns both ends: no zeroed fragments, no stores. The one barrier closes
-    // the operand reads, which no drain fences here.
+    // owns both ends: no zeroed fragments, no stores, no pool touch.
     msl::Context c;
     msl::Block body;
     DotFacts f = gemm(64, 64, 64);
@@ -349,9 +344,7 @@ int main() {
     CHECK(countOf(out, "simdgroup_multiply_accumulate") > 0);
     CHECK_EQ(countOf(out, "simdgroup_float8x8(0.0f)"), 0);
     CHECK_EQ(countOf(out, "simdgroup_store"), 0);
-    CHECK_EQ(countOf(out, "threadgroup_barrier"), 1);
-    CHECK(out.rfind("simdgroup_multiply_accumulate") <
-          out.find("threadgroup_barrier"));
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 0);
   }
 
   CASE("a direct drain stores fragments to the device window, unfenced");

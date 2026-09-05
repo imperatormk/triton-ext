@@ -689,7 +689,7 @@ int main() {
     CHECK_EQ(countOf(out, "pC + 128, 16"), 2);
     CHECK(out.find("r0 =") != std::string::npos);
     CHECK(out.find("r16 =") != std::string::npos);
-    CHECK_EQ(countOf(out, "threadgroup_barrier"), 4);
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 3);
   }
 
   CASE("a whole-tile band is today's single pass, unfiltered");

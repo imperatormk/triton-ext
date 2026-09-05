@@ -559,13 +559,8 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
         });
 
     // No drain: fragments stay live for the caller. Such a pass is one band.
-    // A drain would have fenced the operand reads; without one the pass must
-    // close them itself, or the next scatter over the pool races the MMAs.
-    if (!sched.drainsC() ||
-        sched.drain == DotPassSchedule::Drain::Rename) {
-      body.push_back(c.barrier());
+    if (!sched.drainsC() || sched.drain == DotPassSchedule::Drain::Rename)
       return;
-    }
 
     // Drained but no readback requested: remaining bands still need MMAs.
     if (!readbackFor)
@@ -580,7 +575,8 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
     emitReadback(c, body, cv.originAt({band.lo, 0}), nm.poolC, back.actions,
                  back.names, back.bases, cCoords, back.elem, back.regElem);
 
-    body.push_back(c.barrier());
+    if (band.hi < rows)
+      body.push_back(c.barrier());
   }
 }
 

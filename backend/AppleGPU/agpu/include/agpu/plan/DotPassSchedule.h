@@ -22,11 +22,6 @@ struct DotPassSchedule {
 
   bool drainsC() const { return drain != Drain::None; }
 
-  // A pool drain fences the operand reads on its way out. Any other pass
-  // leaves them unfenced, so iteration N+1's B scatter would race iteration
-  // N's MMA.
-  bool barrierBeforeStage() const { return drain != Drain::Pool; }
-
   static DotPassSchedule of(const Plan &p) {
     if (p.accumulatorsOutlivePass())
       return {false, Drain::None};

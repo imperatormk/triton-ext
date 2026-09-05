@@ -127,10 +127,9 @@ emitFusedLoop(msl::Context &c, msl::Block &body, const Plan &p,
     return Decision::emitted();
   }
 
-  // A fused C may overlay the staged operands, so every warp must be past
-  // its last operand load before any warp's store arrives.
-  if (p.cPoolRegion().overlaysOperands)
-    body.push_back(c.barrier());
+  // A drain is the one pool write no staging barrier precedes, so it opens
+  // its own epoch.
+  body.push_back(c.barrier());
 
   emitWarpBlocks(c, body, prog, grid, nm.warpId,
                  [&](msl::Block &inner, const std::vector<WarpSlot> &slots,

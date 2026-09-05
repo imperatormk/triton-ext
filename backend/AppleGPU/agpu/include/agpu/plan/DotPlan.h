@@ -736,12 +736,6 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   }
 
   f.cRename = false;
-  if (!f.fusedAcc && !f.batched() && !f.intAcc && !p.intThroughFloat) {
-    CoverChoice chosen = planCover(f);
-    p.cover = chosen.cover;
-    p.readback = std::move(chosen.readback);
-    f.cRename = p.readback.rename();
-  }
   p.facts = f;
 
   // 1. What the operands cost, padding included.
@@ -781,10 +775,13 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   fit.wholeC = wholeCFits(true) || wholeCFits(false);
   p.fit = fit;
   p.kind = selectKind(f, fit);
-  if (p.kind != Plan::Kind::Direct) {
-    f.cRename = p.facts.cRename = false;
-    p.readback = {};
-    p.cover = {};
+
+  if (p.kind == Plan::Kind::Direct && !f.fusedAcc && !f.batched() &&
+      !f.intAcc && !p.intThroughFloat) {
+    CoverChoice chosen = planCover(f);
+    p.cover = chosen.cover;
+    p.readback = std::move(chosen.readback);
+    f.cRename = p.facts.cRename = p.readback.rename();
   }
 
   // 3. The strategy's own parameters.

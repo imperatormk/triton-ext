@@ -639,6 +639,8 @@ private:
 
   std::vector<agpu::LayoutBasis> layoutDimsOf(Value v);
 
+  agpu::MaskBound maskBoundOf(Value mask, Value laidOut);
+
   // A wide access casts to an unqualified vector pointer, stripping the
   // coherent qualifier, so the fact travels on the access instead.
   bool coherentBuffer(Value ptr) const;

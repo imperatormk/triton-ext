@@ -322,6 +322,113 @@ int main() {
                      std::to_string(r)) != std::string::npos);
   }
 
+  // ── a mask the layout decides ──────────────────────────────────────────
+
+  CASE("a bound the layout decides classifies every register");
+  {
+    // An `R0_BLOCK` of 1024 over a 768-wide row: the last eight registers sit
+    // past the bound for every lane, the rest never reach it.
+    MoveFacts f = loadOf(32, 32, 4, 16);
+    f.hasMask = true;
+    f.bound.known = true;
+    f.bound.dim = 0;
+    f.bound.limit = 768;
+    f.bound.dimSize = 1024;
+    f.bound.basis.reg = {1, 2, 128, 256, 512};
+    f.bound.basis.lane = {4, 8, 16, 32, 64};
+
+    MovePlan p = planMove(f);
+    CHECK(!p.guards.empty());
+    CHECK(!p.peel);
+    for (int64_t r = 0; r < 24; ++r) {
+      CHECK(!p.guards.testedAt(r));
+      CHECK(!p.guards.deadAt(r));
+    }
+    for (int64_t r = 24; r < 32; ++r)
+      CHECK(p.guards.deadAt(r));
+  }
+
+  CASE("registers the bound excludes emit no access at all");
+  {
+    msl::Context c;
+    msl::Block body;
+    MoveFacts f = loadOf(32, 32, 4, 16);
+    f.hasMask = true;
+    f.bound.known = true;
+    f.bound.dim = 0;
+    f.bound.limit = 768;
+    f.bound.dimSize = 1024;
+    f.bound.basis.reg = {1, 2, 128, 256, 512};
+    f.bound.basis.lane = {4, 8, 16, 32, 64};
+
+    MovePlan p = planMove(f);
+    CHECK_EQ(p.width(), 4);
+    emitMove(c, body, f, p, TestSite(c, 32, /*mask=*/true).site, elem);
+    const std::string out = render(body);
+    // Six whole runs survive, none of them guarded, and the dead eight leave
+    // only the initialiser that defines their names.
+    CHECK_EQ(countOf(out, "_w = *"), 6);
+    CHECK_EQ(countOf(out, "if (m"), 0);
+    CHECK(out.find("float v24 = 0") != std::string::npos);
+    CHECK(out.find("*p24") == std::string::npos);
+  }
+
+  CASE("a register the lanes carry across the bound keeps its guard");
+  {
+    // Every register spans the whole lane range here, so no register is
+    // decided either way and the access keeps the mask it had.
+    msl::Context c;
+    msl::Block body;
+    MoveFacts f = loadOf(4, 32, 4, 16);
+    f.hasMask = true;
+    f.bound.known = true;
+    f.bound.dim = 0;
+    f.bound.limit = 10;
+    f.bound.dimSize = 16;
+    f.bound.basis.reg = {1, 2};
+    f.bound.basis.lane = {4, 8};
+
+    MovePlan p = planMove(f);
+    for (int64_t r = 0; r < 4; ++r)
+      CHECK(p.guards.testedAt(r));
+    CHECK(!runIsUnguarded(p.guards, 0, 4));
+    CHECK(!runIsDead(p.guards, 0, 4));
+    emitMove(c, body, f, p, TestSite(c, 4, /*mask=*/true).site, elem);
+    const std::string out = render(body);
+    CHECK_EQ(countOf(out, "if (m"), 4);
+    CHECK(out.find("_w = *") == std::string::npos);
+  }
+
+  CASE("a second runtime term leaves the mask alone");
+  {
+    // A store that elects one writer ANDs the election into the guard, so the
+    // layout no longer decides the whole condition.
+    MoveFacts f = loadOf(32, 32, 4, 16);
+    f.isStore = true;
+    f.hasMask = true;
+    f.guardHasRuntimeTerm = true;
+    f.bound.known = true;
+    f.bound.dim = 0;
+    f.bound.limit = 768;
+    f.bound.dimSize = 1024;
+    f.bound.basis.reg = {1, 2, 128, 256, 512};
+    f.bound.basis.lane = {4, 8, 16, 32, 64};
+
+    MovePlan p = planMove(f);
+    CHECK(p.guards.empty());
+    CHECK(p.peel);
+  }
+
+  CASE("an unrecognised mask keeps the peel it had");
+  {
+    MoveFacts f = loadOf(8, 32, 4, 16);
+    f.hasMask = true;
+    CHECK(!f.bound.known);
+    MovePlan p = planMove(f);
+    CHECK(p.guards.empty());
+    CHECK(p.peel);
+  }
+
   // ── declining ──────────────────────────────────────────────────────────
 
   CASE("a scalar access declines and is no bug");

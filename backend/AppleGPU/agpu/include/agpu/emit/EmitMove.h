@@ -129,9 +129,12 @@ inline void emitMove(msl::Context &c, msl::Block &body, const MoveFacts &f,
 
   if (!p.peel) {
     for (int64_t base = 0; base < f.regCount; base += p.width()) {
-      if (f.hasMask) {
+      if (runIsDead(p.guards, base, p.width()))
+        continue;
+      if (f.hasMask && !runIsUnguarded(p.guards, base, p.width())) {
         for (int64_t i = 0; i < p.width(); ++i)
-          emitMaskedScalar(c, body, f, p, site, base + i, elem);
+          if (!p.guards.deadAt(base + i))
+            emitMaskedScalar(c, body, f, p, site, base + i, elem);
         continue;
       }
       if (f.isStore)

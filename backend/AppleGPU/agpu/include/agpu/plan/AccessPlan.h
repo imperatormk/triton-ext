@@ -2,14 +2,26 @@
 #ifndef AGPU_ACCESS_PLAN_H
 #define AGPU_ACCESS_PLAN_H
 
+#include "agpu/core/CoordGuard.h"
 #include "agpu/core/Decline.h"
 #include "agpu/plan/AccessWidth.h"
+#include "agpu/plan/LayoutBasis.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace agpu {
 
 inline constexpr int64_t kMaskFastPathMinRegs = 4;
+
+// A mask read as `coordinate < limit`, with the layout that builds it
+struct MaskBound {
+  bool known = false;
+  int dim = 0;
+  int64_t limit = 0;
+  int64_t dimSize = 0;
+  LayoutBasis basis;
+};
 
 // What the IR says about one access.
 struct MoveFacts {
@@ -26,8 +38,39 @@ struct MoveFacts {
   RegBases bases;
   RuntimeSpan runtime; // lane/warp/block bases per dimension, or'd
 
+  // A further runtime term ANDed with the mask, which elision must not drop
+  bool guardHasRuntimeTerm = false;
+
+  MaskBound bound;
+
   const char *where() const { return isStore ? "emitStore" : "emitLoad"; }
 };
+
+struct MaskGuards {
+  std::vector<CoordGuard::Kind> kinds;
+
+  bool empty() const { return kinds.empty(); }
+  bool deadAt(int64_t r) const {
+    return !kinds.empty() && kinds[(std::size_t)r] == CoordGuard::Kind::Dead;
+  }
+  bool testedAt(int64_t r) const {
+    return kinds.empty() || kinds[(std::size_t)r] == CoordGuard::Kind::Needed;
+  }
+};
+
+inline MaskGuards planMaskGuards(const MoveFacts &f) {
+  MaskGuards g;
+  if (!f.hasMask || !f.bound.known || f.guardHasRuntimeTerm)
+    return g;
+  const CoordWindow window{f.bound.dim, 0, f.bound.limit};
+  g.kinds.reserve((std::size_t)f.regCount);
+  for (int64_t r = 0; r < f.regCount; ++r)
+    g.kinds.push_back(
+        planGuard({f.bound.basis.rangeOf((int)r, f.bound.dim, f.bound.dimSize)},
+                  {window})
+            .kind());
+  return g;
+}
 
 // A run exists only if the register count divides by the width; a trailing
 // partial run declines the whole vectorisation.
@@ -51,9 +94,31 @@ inline RunPlan planRuns(const MoveFacts &f, const AccessPlan &w) {
   return r;
 }
 
+// A run straddling the bound keeps its guards
+inline bool runIsUnguarded(const MaskGuards &g, int64_t base, int64_t width) {
+  if (g.empty())
+    return false;
+  for (int64_t i = 0; i < width; ++i)
+    if (g.testedAt(base + i) || g.deadAt(base + i))
+      return false;
+  return true;
+}
+
+inline bool runIsDead(const MaskGuards &g, int64_t base, int64_t width) {
+  if (g.empty())
+    return false;
+  for (int64_t i = 0; i < width; ++i)
+    if (!g.deadAt(base + i))
+      return false;
+  return true;
+}
+
 // Individually-guarded loads issue serially. Peeling gives the all-true case
-// one unconditional batch, with the else arm keeping masked semantics.
-inline bool peelsFastPath(const MoveFacts &f) {
+// one unconditional batch, with the else arm keeping masked semantics. A mask
+// the layout already decides needs no peel.
+inline bool peelsFastPath(const MoveFacts &f, const MaskGuards &g) {
+  if (!g.empty())
+    return false;
   return f.hasMask && f.regCount >= kMaskFastPathMinRegs;
 }
 
@@ -79,6 +144,8 @@ struct MovePlan {
 
   bool coherent = false;
 
+  MaskGuards guards;
+
   // Read by `moveDecision` for the reason the access did not vectorise.
   AccessPlan access;
 
@@ -91,7 +158,8 @@ inline MovePlan planMove(const MoveFacts &f) {
   p.elem = vecElemOf(f.elemBits);
   p.access = planAccess(f.bases, f.runtime, f.ptr, p.elem);
   p.runs = planRuns(f, p.access);
-  p.peel = peelsFastPath(f);
+  p.guards = planMaskGuards(f);
+  p.peel = peelsFastPath(f, p.guards);
   p.init = initFor(f);
   p.coherent = f.coherent;
   return p;

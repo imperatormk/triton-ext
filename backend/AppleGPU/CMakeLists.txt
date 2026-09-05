@@ -126,7 +126,7 @@ if(APPLE)
     python_add_library(metal_utils MODULE "${METAL_UTILS_PY}/metal_utils.m"
                        WITH_SOABI)
     target_compile_options(metal_utils PRIVATE
-        -ObjC++ -std=c++17 -O3 -Wno-deprecated-declarations)
+        -ObjC++ -std=c++20 -O3 -Wno-deprecated-declarations)
     target_link_libraries(metal_utils PRIVATE "${TORCH_LIBRARIES}"
         "-framework Metal" "-framework Foundation")
     target_link_options(metal_utils PRIVATE -undefined dynamic_lookup)

@@ -40,6 +40,86 @@ std::vector<agpu::LayoutBasis> AgpuEmitter::layoutDimsOf(Value v) {
   return cs.dims;
 }
 
+namespace {
+
+Value throughExpand(Value v) {
+  while (auto ed = v.getDefiningOp<ExpandDimsOp>())
+    v = ed.getSrc();
+  return v;
+}
+
+bool splatIntOf(Value v, int64_t &out) {
+  auto cst = v.getDefiningOp<arith::ConstantOp>();
+  auto dense =
+      cst ? dyn_cast<DenseElementsAttr>(cst.getValue()) : DenseElementsAttr();
+  if (!dense || !dense.isSplat())
+    return false;
+  auto i = dyn_cast<IntegerAttr>(dense.getSplatValue<Attribute>());
+  if (!i)
+    return false;
+  out = i.getInt();
+  return true;
+}
+
+} // namespace
+
+// A mask is a bound only when it reads `iota < constant` on one axis of the
+// laid-out tensor: the compared index is then the coordinate itself, so the
+// layout decides the mask and no lane can disagree.
+agpu::MaskBound AgpuEmitter::maskBoundOf(Value mask, Value laidOut) {
+  agpu::MaskBound b;
+  const auto lt = laidOut ? dyn_cast<RankedTensorType>(laidOut.getType())
+                          : RankedTensorType();
+  auto cmp = mask ? mask.getDefiningOp<arith::CmpIOp>() : arith::CmpIOp();
+  if (!lt || !cmp)
+    return b;
+
+  Value idx, limit;
+  if (cmp.getPredicate() == arith::CmpIPredicate::slt) {
+    idx = cmp.getLhs();
+    limit = cmp.getRhs();
+  } else if (cmp.getPredicate() == arith::CmpIPredicate::sgt) {
+    idx = cmp.getRhs();
+    limit = cmp.getLhs();
+  } else {
+    return b;
+  }
+  if (!splatIntOf(limit, b.limit))
+    return b;
+
+  Value src = throughExpand(idx);
+  auto mr = src.getDefiningOp<MakeRangeOp>();
+  if (!mr || mr.getStart() != 0)
+    return b;
+
+  const auto mt = dyn_cast<RankedTensorType>(mask.getType());
+  if (!mt || mt.getShape() != lt.getShape())
+    return b;
+
+  // The range is the one axis the mask varies along, so it is the only one
+  // whose extent it can be; an ambiguous shape is left unrecognised.
+  int dim = -1;
+  for (int d = 0; d < lt.getRank(); ++d) {
+    if (lt.getDimSize(d) != (int64_t)mr.getEnd())
+      continue;
+    if (dim >= 0)
+      return b;
+    dim = d;
+  }
+  if (dim < 0)
+    return b;
+
+  const std::vector<agpu::LayoutBasis> dims = layoutDimsOf(laidOut);
+  if ((int)dims.size() != lt.getRank())
+    return b;
+
+  b.known = true;
+  b.dim = dim;
+  b.dimSize = lt.getDimSize(dim);
+  b.basis = dims[(std::size_t)dim];
+  return b;
+}
+
 PtrOffset AgpuEmitter::offsetSum(agpu::ValueId basePtr, int64_t reg,
                                  const am::Str &added) {
   const auto prior = body_.offsetOf.find({basePtr, reg});
@@ -88,6 +168,9 @@ agpu::Decision AgpuEmitter::emitLoad(const agpu::OpView &o,
       layoutDimsOf(mlirValueOf(o.results[0]));
   f.bases = agpu::regBasesOf(lDims);
   f.runtime = agpu::runtimeSpanOf(lDims);
+  if (f.hasMask)
+    f.bound = maskBoundOf(mlirValueOf(o.operands[maskIndex]),
+                          mlirValueOf(o.results[0]));
 
   agpu::MoveSite site;
   // When the pointer's registers are one affine family, materialise one base
@@ -185,6 +268,9 @@ agpu::Decision AgpuEmitter::emitStore(const agpu::OpView &o,
   const std::vector<agpu::LayoutBasis> sDims = layoutDimsOf(ptrV);
   f.bases = agpu::regBasesOf(sDims);
   f.runtime = agpu::runtimeSpanOf(sDims);
+  f.guardHasRuntimeTerm = elected != nullptr;
+  if (o.operands.size() > maskIndex)
+    f.bound = maskBoundOf(mlirValueOf(o.operands[maskIndex]), ptrV);
 
   agpu::MoveSite site;
   site.elem = [this, ptr](int64_t r) { return addressAt(ptr, r); };

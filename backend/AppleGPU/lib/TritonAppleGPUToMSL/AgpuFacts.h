@@ -127,6 +127,8 @@ struct DotShape {
   // the MMA reads fragments in place and never stages them into the pool.
   DeviceTile aDevice;
 
+  Value cInput, cResult;
+
   // The incoming C is an scf.for iter arg: this dot runs once per iteration.
   bool cIterArg = false;
 

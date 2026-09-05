@@ -112,14 +112,18 @@ DotOperands AgpuEmitter::dotOperandsOf(const agpu::OpView &o) {
       return ty;
     return {};
   };
-  const Value afterLoop = convertAfter(d.shape.cCarried);
-  Value landing = fused ? (afterLoop ? afterLoop : d.shape.cCarried)
-                        : convertAfter(mlirValueOf(o.results[0]));
-  if (fused && landing && !landingTy(landing))
-    landing = d.shape.cCarried;
-  if (const RankedTensorType ty = landingTy(landing)) {
+  if (fused) {
+    const Value afterLoop = convertAfter(d.shape.cCarried);
+    Value landing = afterLoop ? afterLoop : d.shape.cCarried;
+    if (landing && !landingTy(landing))
+      landing = d.shape.cCarried;
+    if (const RankedTensorType ty = landingTy(landing)) {
+      d.cOut = idOf(landing);
+      d.cOutTy = ty;
+    }
+  } else if (const Value landing = readbackLandingOf(d.shape)) {
     d.cOut = idOf(landing);
-    d.cOutTy = ty;
+    d.cOutTy = cast<RankedTensorType>(landing.getType());
   }
 
   if (addsC) {
@@ -170,6 +174,23 @@ DotShape AgpuEmitter::dotShapeOf(triton::DotOp dot) const {
   return d;
 }
 
+Value AgpuEmitter::readbackLandingOf(const DotShape &shape) {
+  if (!shape.cResult || !shape.cTy)
+    return {};
+  const Value landing = convertAfter(shape.cResult);
+  auto ty = landing ? dyn_cast<RankedTensorType>(landing.getType())
+                    : RankedTensorType();
+  if (!ty || (int)coordSourceOf(ty).dims.size() != ty.getRank() ||
+      !registerCoordAt(ty, 0))
+    return {};
+  // `cIn` is indexed by register in C's layout, so a readback that adds needs
+  // an interchangeable layout.
+  const bool addsC = !isZeroTensor(idOf(shape.cInput));
+  if (addsC && !layoutsInterchangeable(shape.cTy, ty))
+    return {};
+  return landing;
+}
+
 agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
   agpu::DotFacts f;
   // A shape whose types were unreadable leaves M, N and K at zero, so the
@@ -191,7 +212,13 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
 
   f.fusedAcc = shape.accumulatorOutlivesLoop();
   f.cInitNonzero = f.fusedAcc && !zeroSplat(fusedInitOf(shape.cCarried));
-  f.cRename = !f.fusedAcc && renameReadbackOf(shape.cTy, f).rename();
+  if (!f.fusedAcc) {
+    const Value landing = readbackLandingOf(shape);
+    f.cRename = renameReadbackOf(landing ? cast<RankedTensorType>(landing.getType())
+                                         : shape.cTy,
+                                 f)
+                    .rename();
+  }
   f.aInPlace = f.bInPlace = false;
   f.aDirect = (bool)shape.aDevice.base;
 

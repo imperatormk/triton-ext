@@ -508,6 +508,12 @@ private:
 
   agpu::DotFacts dotFactsOf(const DotShape &shape);
 
+  // The single-use convert_layout a non-fused dot's readback lands in instead
+  // of the result, when its layout resolves and, if the readback adds C, is
+  // interchangeable with C's. Null: the result itself. Facts and emission
+  // both ask this, so the rename decision and the registers it names agree.
+  Value readbackLandingOf(const DotShape &shape);
+
   // aTy is null when a type could not be read.
   DotShape dotShapeOf(triton::DotOp dot) const;
 

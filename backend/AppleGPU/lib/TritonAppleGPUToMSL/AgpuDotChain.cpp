@@ -418,6 +418,8 @@ void fillFusedCStore(DotShape &d) {
 // chain stores. The pool pre-pass and the handler reach C and result
 // differently, so only the derivation is shared here.
 void fillAccumulatorCarry(DotShape &d, Value c, Value result) {
+  d.cInput = c;
+  d.cResult = result;
   d.cIterArg = carriedAccumulator(c);
   d.cCarried = fusedAccumulator(c, result);
   fillFusedCStore(d);

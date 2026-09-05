@@ -735,7 +735,10 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
       f.aDirect = false;
   }
 
-  f.cRename = false;
+  CoverChoice chosen;
+  if (!f.fusedAcc && !f.batched() && !f.intAcc && !p.intThroughFloat)
+    chosen = planCover(f);
+  const bool mayRename = chosen.readback.rename();
   p.facts = f;
 
   // 1. What the operands cost, padding included.
@@ -748,7 +751,7 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   //    panel.
   const auto bandBytes = [&](bool pad) {
     return Bytes(
-        f.cCostsPoolNothing()
+        f.cCostsPoolNothing() || mayRename
             ? 0
             : kSgFragDim *
                   stagedTileView(f.M, fragAlignedExtent(f.N), kAccBytes, pad)
@@ -765,7 +768,7 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   // operands staged at that same pitch. Asked at both pitches.
   const auto wholeCBytes = [&](bool pad) {
     const Bytes cWhole(
-        f.cCostsPoolNothing()
+        f.cCostsPoolNothing() || mayRename
             ? 0
             : stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes, pad)
                   .count());
@@ -776,12 +779,10 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   p.fit = fit;
   p.kind = selectKind(f, fit);
 
-  if (p.kind == Plan::Kind::Direct && !f.fusedAcc && !f.batched() &&
-      !f.intAcc && !p.intThroughFloat) {
-    CoverChoice chosen = planCover(f);
+  if (p.kind == Plan::Kind::Direct && mayRename) {
     p.cover = chosen.cover;
     p.readback = std::move(chosen.readback);
-    f.cRename = p.facts.cRename = p.readback.rename();
+    f.cRename = p.facts.cRename = true;
   }
 
   // 3. The strategy's own parameters.

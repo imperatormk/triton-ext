@@ -651,6 +651,42 @@ int main() {
     CHECK_EQ(countOf(out, "?"), 2);
   }
 
+  CASE("a branch hangs off the running value its base names, not the accumulator");
+  {
+    // acc + 2, then (acc + 2) * ((acc + 2) * 3): with branchBase 1 the
+    // branch repeats the addition; with 0 it starts from the bare element.
+    const auto render_with = [&](int base) {
+      msl::Context c;
+      msl::Block body;
+      std::vector<WarpSlot> slots = {
+          {SlotCoord::fixed(0), SlotCoord::fixed(0), 0}};
+      DeviceStoreTarget t;
+      t.base = "cptr";
+      t.leadingDim = Stride::runtime("ldc");
+      DrainStep bias;
+      bias.op = "arith.addf";
+      bias.operand.kind = DrainOperand::Kind::Splat;
+      bias.operand.splat = c.litF(2.0);
+      DrainStep prod;
+      prod.op = "arith.mulf";
+      prod.operand.kind = DrainOperand::Kind::AccChain;
+      prod.branchBase = base;
+      DrainBranchLink scale;
+      scale.op = "arith.mulf";
+      scale.operand.kind = DrainOperand::Kind::Splat;
+      scale.operand.splat = c.litF(3.0);
+      prod.branch.push_back(scale);
+      emitAccumDeviceStores(c, body, slots, t, {bias, prod}, nm);
+      return render(body);
+    };
+    const std::string rerooted = render_with(1);
+    const std::string rooted = render_with(0);
+    CHECK_EQ(countOf(rerooted, "2.0f"), 4);
+    CHECK_EQ(countOf(rooted, "2.0f"), 2);
+    CHECK_EQ(countOf(rerooted, "3.0f"), 2);
+    CHECK_EQ(countOf(rooted, "3.0f"), 2);
+  }
+
   // ── the banded C readback ──────────────────────────────────────────────
 
   CASE("a banded dot slices C into row bands that reuse one region");

@@ -179,6 +179,7 @@ agpu::Decision AgpuEmitter::resolveDrainSteps(const DotOperands &ops,
     const std::string at = std::to_string(in.cSteps.size());
     if (sf.kind == DrainStepFact::Operand::AccChain) {
       step.operand.kind = agpu::DrainOperand::Kind::AccChain;
+      step.branchBase = sf.branchBase;
       for (const DrainBranchLinkFact &lf : sf.branch) {
         agpu::DrainBranchLink link;
         link.op = lf.op->getName().getStringRef().str();

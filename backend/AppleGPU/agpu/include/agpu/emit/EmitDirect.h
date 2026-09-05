@@ -391,6 +391,7 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
       msl::Expr *cur = value;
       ElemType curElem = f32();
       int stepIdx = 0;
+      std::vector<msl::Expr *> ran{value};
       for (const DrainStep &st : steps) {
         if (st.roundBefore) {
           cur = c.cast(mslTypeOf(t.elem), cur);
@@ -398,9 +399,8 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
         }
         msl::Expr *rhs = nullptr;
         if (st.operand.kind == DrainOperand::Kind::AccChain) {
-          // Folded from the element the chain started at; earlier steps have
-          // already moved `cur`.
-          msl::Expr *b = value;
+          const int at = st.branchBase < stepIdx ? st.branchBase : stepIdx;
+          msl::Expr *b = ran[(std::size_t)(at < 0 ? 0 : at)];
           int li = 0;
           for (const DrainBranchLink &lk : st.branch)
             b = epilogueExpr(
@@ -415,6 +415,7 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
         }
         cur = epilogueExpr(c, {std::string_view(st.op), rhs}, cur, curElem);
         ++stepIdx;
+        ran.push_back(cur);
       }
       if (t.narrows())
         cur = c.cast(mslTypeOf(t.elem), cur);

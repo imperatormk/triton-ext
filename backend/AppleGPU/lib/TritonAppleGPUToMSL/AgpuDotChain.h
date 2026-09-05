@@ -156,8 +156,11 @@ private:
   template <class Target>
   std::string classifyOperand(Value operand, Target &target);
 
+  // Ops from `user` to a store along single uses, or -1 if none is reached.
+  static int hopsToStore(Operation *user);
+
   bool accChain(Value operand, agpu::msl::SmallVec<BranchLinkRaw, 4> &links,
-                std::string &creason);
+                int &base, std::string &creason);
 
   bool operandPeel(Operation *def) const;
   Value lookThroughPeels(Value x) const;
@@ -173,6 +176,10 @@ private:
   FusedDrain out_;
   triton::StoreOp store_;
   agpu::msl::SmallVec<FoldedOp, 4> folded_;
+  // The one folded value allowed several consumers, and the spine step count
+  // at which it was reached.
+  Value fanOut_;
+  int fanOutStep_ = 0;
   // A truncf, or a step computed on f16 tensors, rounds the running value. A
   // rounding not yet consumed by a step is pending; the consuming step records
   // it so the drain replays it in place.

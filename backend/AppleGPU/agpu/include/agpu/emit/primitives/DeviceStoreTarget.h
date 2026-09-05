@@ -72,9 +72,11 @@ struct DrainBranchLink {
 struct DrainStep {
   msl::Str op;
   DrainOperand operand;
-  // `Kind::AccChain`: the step's right operand, folded from the accumulator
-  // element. Empty means the operand is the accumulator itself.
+  // `Kind::AccChain`: the step's right operand, folded from the running
+  // value after `branchBase` steps (0: the accumulator element). Empty means
+  // the operand is that value itself.
   std::vector<DrainBranchLink> branch;
+  int branchBase = 0;
   // Whether the kernel rounded the running value to the tensor's element
   // before this op consumed it. The drain replays that rounding.
   bool roundBefore = false;

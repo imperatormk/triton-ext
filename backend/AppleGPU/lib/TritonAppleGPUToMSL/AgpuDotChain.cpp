@@ -43,11 +43,24 @@ bool DrainProof::spine(Operation *firstUser) {
     Operation *user = nullptr;
     if (v == root_ && firstUser) {
       user = firstUser;
-    } else {
-      if (!v.hasOneUse())
-        return fail(v == root_ ? "the loop result has more than one use"
-                               : "a folded value has more than one use");
+    } else if (v.hasOneUse()) {
       user = *v.getUsers().begin();
+    } else if (v == root_ || fanOut_) {
+      return fail(v == root_ ? "the loop result has more than one use"
+                             : "a second folded value has more than one use");
+    } else {
+      int best = -1;
+      for (Operation *u : v.getUsers()) {
+        const int hops = hopsToStore(u);
+        if (hops >= 0 && (best < 0 || hops < best)) {
+          best = hops;
+          user = u;
+        }
+      }
+      if (!user)
+        return fail("a folded value has more than one use");
+      fanOut_ = v;
+      fanOutStep_ = (int)folded_.size();
     }
     if ((store_ = dyn_cast<triton::StoreOp>(user)))
       break;
@@ -200,7 +213,7 @@ std::string DrainProof::classifyOperand(Value operand, Target &target) {
 // absorbed. `links` come out root-first. False sets `creason`.
 bool DrainProof::accChain(Value operand,
                           agpu::msl::SmallVec<BranchLinkRaw, 4> &links,
-                          std::string &creason) {
+                          int &base, std::string &creason) {
   const auto cfail = [&](std::string reason) {
     creason = std::move(reason);
     return false;
@@ -208,7 +221,8 @@ bool DrainProof::accChain(Value operand,
   std::vector<Operation *> branchChainOps;
   Value x = operand;
   int length = 0;
-  while (x != root_) {
+  base = 0;
+  while (x != root_ && !(fanOut_ && x == fanOut_)) {
     if (!x.hasOneUse())
       return cfail("a folded value has more than one use");
     Operation *def = x.getDefiningOp();
@@ -250,8 +264,10 @@ bool DrainProof::accChain(Value operand,
       }
     }
     links.push_back({def, other});
+    branchChainOps.push_back(def);
     x = next;
   }
+  base = x == root_ ? 0 : fanOutStep_;
   std::reverse(links.begin(), links.end());
   out_.chainOps.insert(out_.chainOps.end(), branchChainOps.begin(),
                        branchChainOps.end());
@@ -276,7 +292,7 @@ bool DrainProof::foldSteps() {
         return fail(creason);
       agpu::msl::SmallVec<BranchLinkRaw, 4> raw;
       std::string breason;
-      if (!accChain(operand, raw, breason))
+      if (!accChain(operand, raw, step.branchBase, breason))
         return fail(std::move(breason));
       step.kind = DrainStepFact::Operand::AccChain;
       for (const BranchLinkRaw &lk : raw) {
@@ -298,7 +314,7 @@ bool DrainProof::foldSteps() {
 // Every consumer of a fanned-out root must be part of the drain, else the
 // fragments are not the value's only home.
 bool DrainProof::checkFanOut() {
-  if (root_.hasOneUse())
+  if (root_.hasOneUse() && !fanOut_)
     return true;
   llvm::SmallPtrSet<Operation *, 8> absorbed;
   for (const auto &[op, operand, roundBefore] : folded_)
@@ -306,11 +322,31 @@ bool DrainProof::checkFanOut() {
   for (const DrainStepFact &s : out_.steps)
     for (const DrainBranchLinkFact &l : s.branch)
       absorbed.insert(l.op);
+  for (Operation *op : out_.chainOps)
+    absorbed.insert(op);
   absorbed.insert(store_.getOperation());
   for (Operation *u : root_.getUsers())
     if (!absorbed.count(u))
       return fail("the loop result has a consumer outside the drain");
+  if (fanOut_)
+    for (Operation *u : fanOut_.getUsers())
+      if (!absorbed.count(u))
+        return fail("a folded value has a consumer outside the drain");
   return true;
+}
+
+int DrainProof::hopsToStore(Operation *user) {
+  int hops = 0;
+  while (!isa<triton::StoreOp>(user)) {
+    const auto name = user->getName().getStringRef();
+    if (user->getNumResults() != 1 || !user->getResult(0).hasOneUse() ||
+        !(isa<gpu::ConvertLayoutOp, arith::TruncFOp, arith::ExtFOp>(user) ||
+          agpu::isEpilogueOp({name.data(), name.size()})))
+      return -1;
+    user = *user->getResult(0).getUsers().begin();
+    ++hops;
+  }
+  return hops;
 }
 
 FusedDrain DrainProof::run(Operation *firstUser) {

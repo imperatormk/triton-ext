@@ -116,6 +116,7 @@ struct DrainStepFact {
   // AccChain: the operand is itself computed from the accumulator (e.g.
   // gelu's chain of epilogue ops). Empty: the operand IS the accumulator.
   agpu::msl::SmallVec<DrainBranchLinkFact, 4> branch;
+  int branchBase = 0;
   bool roundBefore = false;
 };
 

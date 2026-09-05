@@ -14,6 +14,7 @@
 #include "agpu/msl/Context.h"
 #include "agpu/plan/DotPassSchedule.h"
 #include "agpu/plan/DotPlan.h"
+#include "agpu/plan/ReadbackPlan.h"
 #include "agpu/plan/WarpSlots.h"
 
 #include <functional>
@@ -41,6 +42,8 @@ struct ReadbackInputs {
   // What the destination registers hold: i32 for the lifted integer dot,
   // whose pool stays f32.
   ElemType regElem = f32();
+
+  ReadbackPlan plan;
 
   bool empty() const { return actions.empty(); }
 };
@@ -154,6 +157,19 @@ inline void emitAccumStores(msl::Context &c, msl::Block &body,
                            c.binary(msl::BinOp::Add, c.var(nm.poolC), off),
                            c.lit(cv.strideAt(0))})));
   }
+}
+
+// The registers the consumer wants are the lanes the fragments already hold,
+// so each one is an assignment. No pool bytes, no barrier.
+inline void emitFragmentReadback(msl::Context &c, msl::Block &body,
+                                 const ReadbackPlan &plan,
+                                 const msl::SmallVec<msl::Str, 8> &names,
+                                 const DirectNames &nm) {
+  for (std::size_t r = 0; r < plan.regs.size() && r < names.size(); ++r)
+    body.push_back(c.assign(
+        c.var(names[r]),
+        fragElemExpr(c, nm.acc + std::to_string(plan.regs[r].acc),
+                     plan.regs[r].elem)));
 }
 
 inline msl::Expr *wholeTileInBounds(msl::Context &c,
@@ -520,6 +536,10 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
       return out;
     };
 
+    const bool renaming =
+        sched.drain == DotPassSchedule::Drain::Rename && readbackFor;
+    const ReadbackInputs renamed = renaming ? readbackFor(band) : ReadbackInputs{};
+
     emitWarpBlocks(
         c, body, prog, grid, nm.warpId,
         [&](msl::Block &inner, const std::vector<WarpSlot> &all, int64_t w) {
@@ -532,14 +552,17 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
             share = {&body, &fc.first, &fc.second, &counter};
           }
           emitDirectMma(c, inner, slots, in, nm, counter, share);
-          if (sched.drainC)
+          if (sched.drain == DotPassSchedule::Drain::Pool)
             emitAccumStores(c, inner, slots, cv, nm, band.lo / kSgFragDim);
+          else if (renaming)
+            emitFragmentReadback(c, inner, renamed.plan, renamed.names, nm);
         });
 
     // No drain: fragments stay live for the caller. Such a pass is one band.
     // A drain would have fenced the operand reads; without one the pass must
     // close them itself, or the next scatter over the pool races the MMAs.
-    if (!sched.drainC) {
+    if (!sched.drainsC() ||
+        sched.drain == DotPassSchedule::Drain::Rename) {
       body.push_back(c.barrier());
       return;
     }

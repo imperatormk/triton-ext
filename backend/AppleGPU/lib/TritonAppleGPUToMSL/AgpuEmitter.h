@@ -641,6 +641,9 @@ private:
 
   agpu::MaskBound maskBoundOf(Value mask, Value laidOut);
 
+  agpu::ReadbackPlan renameReadbackOf(RankedTensorType cTy,
+                                      const agpu::DotFacts &f);
+
   // A wide access casts to an unqualified vector pointer, stripping the
   // coherent qualifier, so the fact travels on the access instead.
   bool coherentBuffer(Value ptr) const;

@@ -36,6 +36,7 @@ struct DotFacts {
   bool cInitNonzero = false; // the fused loop's init is not zeros
   bool cDirect = false;      // C stores straight to device
   bool cFallback = false;    // ... but keeps a pool arm for ragged tiles
+  bool cRename = false;      // C's consumers read the fragment's own lanes
 
   // Fragment grid, rounded up: there is no MMA smaller than 8x8. The readback
   // guards against storing a partial fragment past the edge.
@@ -46,7 +47,7 @@ struct DotFacts {
 
   // Facts-space form of `cDrainSkipsPool`, for fit tests that run before a
   // strategy is chosen. The two must agree.
-  bool cCostsPoolNothing() const { return cDirect && !cFallback; }
+  bool cCostsPoolNothing() const { return (cDirect && !cFallback) || cRename; }
 
   bool raggedM() const { return M % kSgFragDim != 0; }
   bool raggedN() const { return N % kSgFragDim != 0; }
@@ -364,6 +365,10 @@ struct Plan {
   // stored after it, only multiplied into here.
   bool accumulatorsOutlivePass() const { return kind == Kind::Fused; }
 
+  bool readsBackByRename() const {
+    return kind == Kind::Direct && facts.cRename && !storesCDirect();
+  }
+
   // The pitch C is staged at, from whichever payload carries it.
   bool padStagedC() const {
     if (const DirectParams *d = std::get_if<DirectParams>(&params))
@@ -397,7 +402,9 @@ struct Plan {
 
   bool edgeScratchFits() const { return edgeScratch.count() > 0; }
 
-  bool cThroughPool() const { return kind != Kind::Scalar && !storesCDirect(); }
+  bool cThroughPool() const {
+    return kind != Kind::Scalar && !storesCDirect() && !facts.cRename;
+  }
 
   // C's region of the threadgroup pool: how many bytes and whether they
   // overlay the staged operands at the pool base or follow them.

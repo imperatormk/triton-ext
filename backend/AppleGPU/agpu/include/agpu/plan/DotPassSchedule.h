@@ -12,18 +12,26 @@
 namespace agpu {
 
 struct DotPassSchedule {
-  // What `drainC` withholds is emitted once by `emitFusedLoop`.
-  bool declareAccums = true;
-  bool drainC = true;
+  // A rename leaves each value in the lane that already holds it, so it moves
+  // no pool bytes.
+  enum class Drain { None, Pool, Rename };
 
-  // The drain also fences the operand pool. A pass that does not drain leaves
-  // its reads unfenced, so iteration N+1's B scatter would race iteration N's
-  // MMA.
-  bool barrierBeforeStage() const { return !drainC; }
+  // What a withheld drain omits is emitted once by `emitFusedLoop`.
+  bool declareAccums = true;
+  Drain drain = Drain::Pool;
+
+  bool drainsC() const { return drain != Drain::None; }
+
+  // A pool drain fences the operand reads on its way out. Any other pass
+  // leaves them unfenced, so iteration N+1's B scatter would race iteration
+  // N's MMA.
+  bool barrierBeforeStage() const { return drain != Drain::Pool; }
 
   static DotPassSchedule of(const Plan &p) {
     if (p.accumulatorsOutlivePass())
-      return {false, false};
+      return {false, Drain::None};
+    if (p.readsBackByRename())
+      return {true, Drain::Rename};
     return {};
   }
 };

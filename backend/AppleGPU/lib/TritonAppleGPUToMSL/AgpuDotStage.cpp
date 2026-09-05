@@ -198,6 +198,9 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
       return d;
   }
   in.readbackFor = [this, cId, cTy, cIn = ops.cIn, cView = plan.cStagedView(),
+                    rename = plan.readsBackByRename()
+                                 ? renameReadbackOf(cTy, plan.facts)
+                                 : agpu::ReadbackPlan{},
                     // A fused dot's registers stay f32; other paths land in
                     // C's own element.
                     regElem = plan.accumulatorsOutlivePass()
@@ -226,6 +229,7 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
     // otherwise the incoming accumulator's names.
     back.bases = cIn;
     back.bases.resize(back.names.size());
+    back.plan = rename;
     return back;
   };
 

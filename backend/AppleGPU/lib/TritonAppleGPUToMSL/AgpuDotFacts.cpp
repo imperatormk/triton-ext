@@ -15,6 +15,24 @@ am::Str AgpuEmitter::derivedDevicePointer(const am::Str &base, am::Expr *offset,
   return name;
 }
 
+agpu::ReadbackPlan AgpuEmitter::renameReadbackOf(RankedTensorType cTy,
+                                                 const agpu::DotFacts &f) {
+  if (!cTy || f.numWarps <= 0)
+    return {};
+  agpu::WarpGrid g;
+  g.mT = f.mT();
+  g.nT = f.nT();
+  g.numWarps = f.numWarps;
+  const agpu::WarpProgram p = agpu::planWarpProgram(g);
+  // Only the parameterised form gives every warp the same slot list, which is
+  // what one register-to-slot map across all warps means.
+  if (p.form != agpu::WarpForm::Parameterised)
+    return {};
+  return agpu::planReadback(coordSourceOf(cTy).dims,
+                            p.slots(0, g.mT, g.nT, g.numWarps),
+                            registerCount(cTy), f.numWarps);
+}
+
 DotOperands AgpuEmitter::dotOperandsOf(const agpu::OpView &o) {
   DotOperands d;
   if (o.operands.size() < 3 || o.results.size() != 1) {
@@ -173,6 +191,7 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
 
   f.fusedAcc = shape.accumulatorOutlivesLoop();
   f.cInitNonzero = f.fusedAcc && !zeroSplat(fusedInitOf(shape.cCarried));
+  f.cRename = !f.fusedAcc && renameReadbackOf(shape.cTy, f).rename();
   f.aInPlace = f.bInPlace = false;
   f.aDirect = (bool)shape.aDevice.base;
 

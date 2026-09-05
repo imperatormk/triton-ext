@@ -755,15 +755,29 @@ int main() {
     Plan direct = planDot(f, kBudget);
     DotPassSchedule single = DotPassSchedule::of(direct);
     CHECK(single.declareAccums);
-    CHECK(single.drainC);
+    CHECK(single.drain == DotPassSchedule::Drain::Pool);
     CHECK(!single.barrierBeforeStage());
 
     f.fusedAcc = true;
     Plan fused = planDot(f, kBudget);
     DotPassSchedule pass = DotPassSchedule::of(fused);
     CHECK(!pass.declareAccums);
-    CHECK(!pass.drainC);
+    CHECK(!pass.drainsC());
     CHECK(pass.barrierBeforeStage());
+  }
+
+  CASE("a renamed readback drains without touching the pool");
+  {
+    DotFacts f = gemm(64, 64, 64);
+    f.cRename = true;
+    Plan p = planDot(f, kBudget);
+    CHECK(f.cCostsPoolNothing());
+    CHECK(!p.cThroughPool());
+    if (p.readsBackByRename()) {
+      DotPassSchedule s = DotPassSchedule::of(p);
+      CHECK(s.drain == DotPassSchedule::Drain::Rename);
+      CHECK(s.barrierBeforeStage());
+    }
   }
 
   CASE("the plan reports why a dot is not fused, not only what it chose");

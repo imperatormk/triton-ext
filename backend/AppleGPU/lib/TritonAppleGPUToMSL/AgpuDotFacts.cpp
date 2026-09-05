@@ -22,15 +22,15 @@ agpu::ReadbackPlan AgpuEmitter::renameReadbackOf(RankedTensorType cTy,
   agpu::WarpGrid g;
   g.mT = f.mT();
   g.nT = f.nT();
-  g.numWarps = f.numWarps;
+  g.numWarps = agpu::warpsFor(f);
+  g.hwWarps = f.numWarps;
+  g.aDirect = f.aDirect;
   const agpu::WarpProgram p = agpu::planWarpProgram(g);
-  // Only the parameterised form gives every warp the same slot list, which is
-  // what one register-to-slot map across all warps means.
   if (p.form != agpu::WarpForm::Parameterised)
     return {};
   return agpu::planReadback(coordSourceOf(cTy).dims,
                             p.slots(0, g.mT, g.nT, g.numWarps),
-                            registerCount(cTy), f.numWarps);
+                            registerCount(cTy), g.numWarps);
 }
 
 DotOperands AgpuEmitter::dotOperandsOf(const agpu::OpView &o) {
@@ -212,13 +212,7 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
 
   f.fusedAcc = shape.accumulatorOutlivesLoop();
   f.cInitNonzero = f.fusedAcc && !zeroSplat(fusedInitOf(shape.cCarried));
-  if (!f.fusedAcc) {
-    const Value landing = readbackLandingOf(shape);
-    f.cRename = renameReadbackOf(landing ? cast<RankedTensorType>(landing.getType())
-                                         : shape.cTy,
-                                 f)
-                    .rename();
-  }
+  f.cRename = false;
   f.aInPlace = f.bInPlace = false;
   f.aDirect = (bool)shape.aDevice.base;
 

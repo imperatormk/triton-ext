@@ -162,10 +162,18 @@ struct WarpProgram {
   }
 };
 
+struct WarpCover {
+  int64_t mi = 0, ni = 0;
+  bool set() const { return mi > 0 && ni > 0; }
+  bool operator==(const WarpCover &o) const { return mi == o.mi && ni == o.ni; }
+};
+
 // The grid a warp program covers: fragment counts and warp count.
 struct WarpGrid {
   int64_t mT = 0, nT = 0, numWarps = 1;
   bool aDirect = false; // A read from device memory: warps want M bands
+
+  WarpCover cover;
 
   // The banded emitter selects each band's slots by row at compile time, so a
   // form whose row coordinate is affine in the warp id cannot be filtered.
@@ -202,21 +210,23 @@ WarpProgram::slots(int64_t w, int64_t mT, int64_t nT, int64_t numWarps) const {
   switch (form) {
   case WarpForm::Parameterised: {
     // Warp w sits at (w / gN % gM, w % gN) of the warp grid and owns
-    // fragment rows [row * miCount, +miCount) by columns [col * niCount,
-    // +niCount). An axis the warps do not divide folds to a constant.
+    // fragment rows {row + r * gM} by columns {col + c * gN}: warps
+    // interleave at fragment granularity, which is how `apple_mma` lays C
+    // out, so a register's fragment is its own warp's. An axis the warps do
+    // not divide folds to a constant.
     //
     // The moduli are identities at runtime (w < gM * gN) and exist for the
-    // compiler: a raw `warp * miCount` has no provable range, so the
-    // epilogue's bounds guards survive to the AIR as branches.
+    // compiler: a raw `warp` term has no provable range, so the epilogue's
+    // bounds guards survive to the AIR as branches.
     const int64_t gM = mT / miCount, gN = nT / niCount;
     for (int64_t r = 0; r < miCount; ++r) {
       const SlotCoord mi = gM == 1
                                ? SlotCoord::fixed(r)
-                               : fold(SlotCoord::blocked(miCount, r, gN, gM));
+                               : fold(SlotCoord::blocked(1, r * gM, gN, gM));
       for (int64_t col = 0; col < niCount; ++col) {
         const SlotCoord ni =
             gN == 1 ? SlotCoord::fixed(col)
-                    : fold(SlotCoord::blocked(niCount, col, 1, gN));
+                    : fold(SlotCoord::blocked(1, col * gN, 1, gN));
         out.push_back({mi, ni, (int)out.size()});
       }
     }
@@ -246,16 +256,11 @@ WarpProgram::slots(int64_t w, int64_t mT, int64_t nT, int64_t numWarps) const {
 //
 //   2. Operand fragments per warp, miCount + niCount, for a fixed product.
 //      Minimised at the squarest factorization.
-inline WarpProgram planWarpProgram(const WarpGrid &g) {
-  WarpProgram p;
-  p.because = "no usable exact cover, so each warp gets its own guarded block";
+inline std::vector<WarpCover> exactCovers(const WarpGrid &g) {
+  std::vector<WarpCover> out;
   if (!g.disjointC || g.numWarps <= 0 || !g.warpsDivideFrags())
-    return p;
-
+    return out;
   const int64_t fpw = g.nFrag() / g.numWarps;
-
-  bool found = false;
-  int64_t bestDev = 0, bestFrags = 0;
   for (int64_t mi = 1; mi <= fpw; ++mi) {
     if (fpw % mi)
       continue;
@@ -268,21 +273,41 @@ inline WarpProgram planWarpProgram(const WarpGrid &g) {
     // coordinate is constant (miCount == mT, one warp-grid row) qualify.
     if (g.bandedC && mi != g.mT)
       continue;
-    const int64_t dev = g.aDirect ? g.numWarps * mi : 0;
-    const int64_t frags = mi + ni;
-    // The ascending-mi scan breaks full ties toward the wider block.
-    if (found && (dev > bestDev || (dev == bestDev && frags >= bestFrags)))
-      continue;
-    found = true;
-    bestDev = dev;
-    bestFrags = frags;
-    p.miCount = mi;
-    p.niCount = ni;
+    out.push_back({mi, ni});
   }
-  if (!found)
+  return out;
+}
+
+inline int64_t coverDeviceTraffic(const WarpGrid &g, const WarpCover &c) {
+  return g.aDirect ? g.numWarps * c.mi : 0;
+}
+
+inline WarpProgram planWarpProgram(const WarpGrid &g) {
+  WarpProgram p;
+  p.because = "no usable exact cover, so each warp gets its own guarded block";
+  const std::vector<WarpCover> covers = exactCovers(g);
+  if (covers.empty())
     return p;
+
+  WarpCover best;
+  for (const WarpCover &c : covers) {
+    if (g.cover.set() && c == g.cover) {
+      best = c;
+      p.because = "the cover the plan chose";
+      break;
+    }
+    // The ascending-mi scan breaks full ties toward the wider block.
+    if (best.set() &&
+        (coverDeviceTraffic(g, c) > coverDeviceTraffic(g, best) ||
+         (coverDeviceTraffic(g, c) == coverDeviceTraffic(g, best) &&
+          c.mi + c.ni >= best.mi + best.ni)))
+      continue;
+    best = c;
+    p.because = "the cover reading device A once, then the squarest";
+  }
   p.form = WarpForm::Parameterised;
-  p.because = "the cover reading device A once, then the squarest";
+  p.miCount = best.mi;
+  p.niCount = best.ni;
   return p;
 }
 

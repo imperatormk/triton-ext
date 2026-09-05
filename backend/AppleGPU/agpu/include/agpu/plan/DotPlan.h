@@ -39,8 +39,6 @@ struct DotFacts {
   bool cFallback = false;    // ... but keeps a pool arm for ragged tiles
   bool cRename = false;      // C's consumers read the fragment's own lanes
 
-  // The layout C lands in, row then column bases, and its register count.
-  // `planDot` decides `cRename` over these once the warp cover is final.
   std::vector<LayoutBasis> cDims;
   int64_t cRegs = 0;
 
@@ -350,6 +348,7 @@ struct Plan {
   PoolPlan pool;
   StrategyParams params;
   ReadbackPlan readback;
+  WarpCover cover;
 
   Bytes edgeScratch;
 
@@ -563,8 +562,6 @@ inline int64_t fragsPerWarpFor(const DotFacts &f) {
   return (f.nFrag() + nw - 1) / nw;
 }
 
-// The one grid the direct and fused emitters cover C with. The rename is
-// decided over the same grid, so what it validates is what gets emitted.
 inline WarpGrid warpGridFor(const DotFacts &f, bool bandedC) {
   WarpGrid g;
   g.mT = f.mT();
@@ -576,18 +573,48 @@ inline WarpGrid warpGridFor(const DotFacts &f, bool bandedC) {
   return g;
 }
 
-// A rename never bands, so its grid is the unbanded one. Only the
-// parameterised form gives every warp the same slot list, which is what one
-// register-to-slot map across all warps means.
-inline ReadbackPlan planRenameReadback(const DotFacts &f) {
+struct CoverChoice {
+  WarpCover cover;
+  ReadbackPlan readback;
+};
+
+// The cover C's layout wants, taken only while its extra operand loads stay
+// within the round trip a rename removes. An idle warp forbids it: its lanes
+// hold duplicate coordinates and would store unassigned registers.
+inline CoverChoice planCover(const DotFacts &f) {
+  CoverChoice c;
   if (f.cDims.empty() || f.cRegs <= 0 || f.numWarps <= 0)
-    return {};
+    return c;
   const WarpGrid g = warpGridFor(f, false);
-  const WarpProgram p = planWarpProgram(g);
-  if (p.form != WarpForm::Parameterised)
-    return {};
-  return planReadback(f.cDims, p.slots(0, g.mT, g.nT, g.numWarps), f.cRegs,
-                      g.numWarps);
+  if (g.guardsIdleWarps())
+    return c;
+  const WarpProgram base = planWarpProgram(g);
+  if (base.form != WarpForm::Parameterised)
+    return c;
+  const int64_t baseFrags = base.miCount + base.niCount;
+  const int64_t baseDev = coverDeviceTraffic(g, {base.miCount, base.niCount});
+  const int64_t roundTrip = 2 * (g.nFrag() / g.numWarps);
+
+  int64_t bestPenalty = -1;
+  for (const WarpCover &cand : exactCovers(g)) {
+    if (coverDeviceTraffic(g, cand) != baseDev)
+      continue;
+    const int64_t penalty = (cand.mi + cand.ni - baseFrags) * f.kT();
+    if (penalty > roundTrip || (bestPenalty >= 0 && penalty >= bestPenalty))
+      continue;
+    WarpProgram wp;
+    wp.form = WarpForm::Parameterised;
+    wp.miCount = cand.mi;
+    wp.niCount = cand.ni;
+    ReadbackPlan rb = planReadback(
+        f.cDims, wp.slots(0, g.mT, g.nT, g.numWarps), f.cRegs, g.numWarps);
+    if (!rb.rename())
+      continue;
+    bestPenalty = penalty;
+    c.cover = cand;
+    c.readback = std::move(rb);
+  }
+  return c;
 }
 
 // Which lowering a dot takes. Rows are checked in priority order.
@@ -709,8 +736,10 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   }
 
   f.cRename = false;
-  if (!f.fusedAcc && !p.intThroughFloat) {
-    p.readback = planRenameReadback(f);
+  if (!f.fusedAcc && !f.batched() && !f.intAcc && !p.intThroughFloat) {
+    CoverChoice chosen = planCover(f);
+    p.cover = chosen.cover;
+    p.readback = std::move(chosen.readback);
     f.cRename = p.readback.rename();
   }
   p.facts = f;

@@ -24,13 +24,19 @@ void AgpuEmitter::logDotPlan(const DotOperands &ops, const agpu::Plan &plan) {
 }
 
 agpu::Decision AgpuEmitter::emitDotOp(const agpu::OpView &o) {
-  const DotOperands ops = dotOperandsOf(o);
+  DotOperands ops = dotOperandsOf(o);
   if (!ops.ok())
     return ops.why;
 
   const agpu::DotFacts f = dotFactsOf(ops.shape);
   const agpu::Plan plan = agpu_.planFor(f);
   logDotPlan(ops, plan);
+
+  if (plan.readsBackByRename()) {
+    ops.cOutTy = renameLandingTypeOf(ops.shape);
+    if (ops.cOutTy == ops.shape.cTy)
+      ops.cOut = o.results[0];
+  }
 
   if (plan.kind == agpu::Plan::Kind::Unsupported)
     return declined("tt.dot", "no strategy for this shape");

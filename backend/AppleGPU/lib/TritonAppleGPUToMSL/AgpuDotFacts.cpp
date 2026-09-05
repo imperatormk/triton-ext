@@ -173,6 +173,16 @@ Value AgpuEmitter::readbackLandingOf(const DotShape &shape) {
   return landing;
 }
 
+RankedTensorType AgpuEmitter::renameLandingTypeOf(const DotShape &shape) {
+  const Value landing = readbackLandingOf(shape);
+  if (!landing)
+    return shape.cTy;
+  const auto landTy = cast<RankedTensorType>(landing.getType());
+  if (layoutsInterchangeable(shape.cTy, landTy))
+    return landTy;
+  return shuffleFor(shape.cTy, landTy).usable() ? shape.cTy : landTy;
+}
+
 agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
   agpu::DotFacts f;
   // A shape whose types were unreadable leaves M, N and K at zero, so the
@@ -197,11 +207,9 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
   f.aInPlace = f.bInPlace = false;
   f.aDirect = (bool)shape.aDevice.base;
   if (!f.fusedAcc) {
-    const Value landing = readbackLandingOf(shape);
-    const RankedTensorType landTy =
-        landing ? cast<RankedTensorType>(landing.getType()) : shape.cTy;
-    f.cDims = coordSourceOf(landTy).dims;
-    f.cRegs = registerCount(landTy);
+    const RankedTensorType renameTy = renameLandingTypeOf(shape);
+    f.cDims = coordSourceOf(renameTy).dims;
+    f.cRegs = registerCount(renameTy);
   }
 
   // `cElem` is the fp32 accumulator. The tensor behind the store window may

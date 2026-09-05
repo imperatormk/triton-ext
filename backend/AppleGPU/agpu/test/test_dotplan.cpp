@@ -21,34 +21,32 @@ DotFacts gemm(int64_t M, int64_t N, int64_t K, int64_t warps = 4) {
 
 const Bytes kBudget{kTGResidentBudgetBytes};
 
-// C's layout under a warp cover of `miCount` by `niCount` blocks, the low
-// warp bits along columns as `planWarpProgram` spells them.
-void landIn(DotFacts &f, int64_t miCount, int64_t niCount) {
+// C under `apple_mma` with warpsPerCTA [gM, gN]: warps interleave at
+// fragment granularity, low warp bits along columns, repetitions above.
+void landIn(DotFacts &f, int64_t gM, int64_t gN) {
   LayoutBasis row, col;
   row.lane = {0, 1, 2, 0, 4};
   col.lane = {2, 0, 0, 4, 0};
   row.reg.push_back(0);
   col.reg.push_back(1);
-  const int64_t rowsPerWarp = f.mT() / miCount * kSgFragDim;
-  const int64_t colsPerWarp = f.nT() / niCount * kSgFragDim;
-  for (int64_t s = kSgFragDim; s < colsPerWarp; s <<= 1) {
-    row.reg.push_back(0);
-    col.reg.push_back((int32_t)s);
-  }
-  for (int64_t s = kSgFragDim; s < rowsPerWarp; s <<= 1) {
-    row.reg.push_back((int32_t)s);
-    col.reg.push_back(0);
-  }
-  for (int64_t s = colsPerWarp; s < f.nT() * kSgFragDim; s <<= 1) {
+  for (int64_t s = kSgFragDim; s < gN * kSgFragDim; s <<= 1) {
     row.warp.push_back(0);
     col.warp.push_back((int32_t)s);
   }
-  for (int64_t s = rowsPerWarp; s < f.mT() * kSgFragDim; s <<= 1) {
+  for (int64_t s = kSgFragDim; s < gM * kSgFragDim; s <<= 1) {
     row.warp.push_back((int32_t)s);
     col.warp.push_back(0);
   }
+  for (int64_t s = gN * kSgFragDim; s < f.nT() * kSgFragDim; s <<= 1) {
+    row.reg.push_back(0);
+    col.reg.push_back((int32_t)s);
+  }
+  for (int64_t s = gM * kSgFragDim; s < f.mT() * kSgFragDim; s <<= 1) {
+    row.reg.push_back((int32_t)s);
+    col.reg.push_back(0);
+  }
   f.cDims = {row, col};
-  f.cRegs = 2 * (rowsPerWarp / kSgFragDim) * (colsPerWarp / kSgFragDim);
+  f.cRegs = 2 * (f.mT() / gM) * (f.nT() / gN);
 }
 
 int kindOf(const Plan &p) { return static_cast<int>(p.kind); }
@@ -808,14 +806,33 @@ int main() {
     CHECK_EQ(p.cBandRows(), 64);
   }
 
-  CASE("a layout the emitted cover does not match stays a pool readback");
+  CASE("the cover follows the layout while the extra loads fit the round trip");
   {
     DotFacts f = gemm(64, 64, 64);
     landIn(f, 4, 1);
     Plan p = planDot(f, kBudget);
+    CHECK(p.readsBackByRename());
+    CHECK((p.cover == WarpCover{2, 8}));
+    CHECK_EQ((int64_t)p.readback.regs.size(), f.cRegs);
+
+    DotFacts deep = gemm(64, 64, 512);
+    landIn(deep, 4, 1);
+    Plan pooled = planDot(deep, kBudget);
+    CHECK(!pooled.readsBackByRename());
+    CHECK(!pooled.cover.set());
+    CHECK(pooled.cThroughPool());
+    CHECK(DotPassSchedule::of(pooled).drain == DotPassSchedule::Drain::Pool);
+  }
+
+  CASE("a layout no exact cover matches stays a pool readback");
+  {
+    DotFacts f = gemm(64, 64, 64);
+    landIn(f, 4, 1);
+    f.cDims[0].warp = {8, 0};
+    f.cDims[1].warp = {0, 8};
+    Plan p = planDot(f, kBudget);
     CHECK(!p.readsBackByRename());
     CHECK(p.cThroughPool());
-    CHECK(DotPassSchedule::of(p).drain == DotPassSchedule::Drain::Pool);
   }
 
   CASE("the rename is decided on the cover the plan emits, not the facts' one");
@@ -826,16 +843,43 @@ int main() {
     landIn(f, 4, 1);
     Plan p = planDot(f, kBudget);
     CHECK(!p.facts.aDirect);
-    CHECK(!p.readsBackByRename());
+    CHECK(p.readsBackByRename());
+    CHECK((p.cover == WarpCover{1, 4}));
 
     landIn(f, 2, 2);
     Plan renamed = planDot(f, kBudget);
     CHECK(renamed.readsBackByRename());
+    CHECK((renamed.cover == WarpCover{2, 2}));
 
     f.carriedAcc = true;
     Plan direct = planDot(f, kBudget);
     CHECK(direct.facts.aDirect);
     CHECK(!direct.readsBackByRename());
+  }
+
+  CASE("idle hardware warps refuse the rename");
+  {
+    DotFacts f = gemm(8, 16, 32);
+    landIn(f, 1, 2);
+    f.cDims[0].warp.push_back(0);
+    f.cDims[1].warp.push_back(0);
+    Plan p = planDot(f, kBudget);
+    CHECK(warpsFor(p.facts) < p.facts.numWarps);
+    CHECK(!p.readsBackByRename());
+  }
+
+  CASE("a batched or integer dot never claims a rename");
+  {
+    DotFacts batched = gemm(32, 32, 32);
+    landIn(batched, 2, 2);
+    batched.rank = 3;
+    batched.Bd = 2;
+    CHECK(!planDot(batched, kBudget).facts.cRename);
+
+    DotFacts ints = gemm(32, 32, 32);
+    landIn(ints, 2, 2);
+    ints.intAcc = true;
+    CHECK(!planDot(ints, kBudget).facts.cRename);
   }
 
   CASE("a fused dot never renames");

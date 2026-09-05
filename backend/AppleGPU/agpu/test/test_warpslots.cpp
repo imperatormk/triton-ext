@@ -75,6 +75,29 @@ int main() {
     CHECK(coversExactlyOnce(planWarpProgram(g), g));
   }
 
+  CASE("a cover the plan chose is taken when exact, else the scan decides");
+  {
+    WarpGrid g;
+    g.mT = 4;
+    g.nT = 4;
+    g.numWarps = 4;
+    const WarpProgram scanned = planWarpProgram(g);
+    CHECK_EQ(scanned.miCount, 2);
+    CHECK_EQ(scanned.niCount, 2);
+
+    g.cover = {1, 4};
+    const WarpProgram chosen = planWarpProgram(g);
+    CHECK(chosen.form == WarpForm::Parameterised);
+    CHECK_EQ(chosen.miCount, 1);
+    CHECK_EQ(chosen.niCount, 4);
+    CHECK(coversExactlyOnce(chosen, g));
+
+    g.cover = {3, 1};
+    const WarpProgram ignored = planWarpProgram(g);
+    CHECK_EQ(ignored.miCount, 2);
+    CHECK_EQ(ignored.niCount, 2);
+  }
+
   CASE("exhaustive: every legal power-of-two shape covers exactly once");
   {
     int checked = 0;

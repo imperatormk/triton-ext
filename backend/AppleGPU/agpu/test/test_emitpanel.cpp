@@ -603,9 +603,9 @@ int main() {
     const std::string out = render(body);
     CHECK(out.find("if (warp ==") == std::string::npos);
     CHECK(out.find("simdgroup_store(acc0, pC + (warp / 2 % 2 * 8 * 36 + "
-                   "warp % 2 * 2 * 8), 36)") != std::string::npos);
+                   "warp % 2 * 8), 36)") != std::string::npos);
     CHECK(out.find("simdgroup_store(acc1, pC + (warp / 2 % 2 * 8 * 36 + "
-                   "(warp % 2 * 2 + 1) * 8), 36)") != std::string::npos);
+                   "(warp % 2 + 2) * 8), 36)") != std::string::npos);
   }
 
   CASE("a device A tile reads fragments at its global corner");

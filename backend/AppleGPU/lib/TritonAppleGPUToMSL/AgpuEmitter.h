@@ -513,6 +513,7 @@ private:
   // interchangeable with C's. Null: the result itself. Facts and emission
   // both ask this, so the rename decision and the registers it names agree.
   Value readbackLandingOf(const DotShape &shape);
+  RankedTensorType renameLandingTypeOf(const DotShape &shape);
 
   // aTy is null when a type could not be read.
   DotShape dotShapeOf(triton::DotOp dot) const;

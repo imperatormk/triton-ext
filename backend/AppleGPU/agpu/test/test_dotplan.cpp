@@ -882,6 +882,19 @@ int main() {
     CHECK(!planDot(ints, kBudget).facts.cRename);
   }
 
+  CASE("a plan that is not Direct keeps C in the pool whatever the layout");
+  {
+    DotFacts f = gemm(32, 128, 64);
+    f.aElemBytes = f.bElemBytes = 4;
+    landIn(f, 1, 4);
+    Plan p = planDot(f, kBudget);
+    CHECK_EQ(kindOf(p), kPanel);
+    CHECK(!p.facts.cRename);
+    CHECK(!p.readsBackByRename());
+    CHECK(p.cThroughPool());
+    CHECK(p.cPoolRegion().bytes > 0);
+  }
+
   CASE("a fused dot never renames");
   {
     DotFacts f = gemm(64, 64, 64);

@@ -781,6 +781,11 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   fit.wholeC = wholeCFits(true) || wholeCFits(false);
   p.fit = fit;
   p.kind = selectKind(f, fit);
+  if (p.kind != Plan::Kind::Direct) {
+    f.cRename = p.facts.cRename = false;
+    p.readback = {};
+    p.cover = {};
+  }
 
   // 3. The strategy's own parameters.
   switch (p.kind) {

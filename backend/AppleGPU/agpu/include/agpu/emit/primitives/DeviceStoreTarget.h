@@ -12,10 +12,10 @@
 namespace agpu {
 
 struct DeviceStoreTarget {
-  msl::Str base;                 // the tensor's base pointer, empty when absent
+  msl::Str base; // the tensor's base pointer, empty when absent
   msl::Expr *baseOffset = nullptr; // elements past `base`, null for zero
-  Stride leadingDim;             // elements between consecutive rows
-  msl::Expr *rowStart = nullptr; // window origin, null for zero
+  Stride leadingDim;               // elements between consecutive rows
+  msl::Expr *rowStart = nullptr;   // window origin, null for zero
   msl::Expr *colStart = nullptr;
 
   // The mask, as per-axis bounds on the window's coordinates. Null: unmasked.
@@ -57,7 +57,7 @@ struct DrainOperand {
   msl::Expr *splat = nullptr; // Splat: the uniform value
   msl::Str base;              // Row/Tile: the device base pointer
   msl::Expr *baseOffset = nullptr;
-  Stride leadingDim;          // Tile: its own row stride
+  Stride leadingDim; // Tile: its own row stride
 
   // What `base` points at, for the memoised read. Must match the un-memoised
   // arm's type or `DrainStep::roundBefore` rounds the two differently.

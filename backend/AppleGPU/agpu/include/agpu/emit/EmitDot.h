@@ -51,7 +51,8 @@ struct DotInputs {
 
 // Read off the plan.
 inline WarpGrid gridOf(const Plan &p) {
-  WarpGrid g = warpGridFor(p.facts, p.cBandRows() < p.cStagedView().extentAt(0));
+  WarpGrid g =
+      warpGridFor(p.facts, p.cBandRows() < p.cStagedView().extentAt(0));
   g.cover = p.cover;
   return g;
 }

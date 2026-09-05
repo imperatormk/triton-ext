@@ -224,9 +224,9 @@ WarpProgram::slots(int64_t w, int64_t mT, int64_t nT, int64_t numWarps) const {
                                ? SlotCoord::fixed(r)
                                : fold(SlotCoord::blocked(1, r * gM, gN, gM));
       for (int64_t col = 0; col < niCount; ++col) {
-        const SlotCoord ni =
-            gN == 1 ? SlotCoord::fixed(col)
-                    : fold(SlotCoord::blocked(1, col * gN, 1, gN));
+        const SlotCoord ni = gN == 1
+                                 ? SlotCoord::fixed(col)
+                                 : fold(SlotCoord::blocked(1, col * gN, 1, gN));
         out.push_back({mi, ni, (int)out.size()});
       }
     }

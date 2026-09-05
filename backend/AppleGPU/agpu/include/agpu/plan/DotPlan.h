@@ -606,8 +606,8 @@ inline CoverChoice planCover(const DotFacts &f) {
     wp.form = WarpForm::Parameterised;
     wp.miCount = cand.mi;
     wp.niCount = cand.ni;
-    ReadbackPlan rb = planReadback(
-        f.cDims, wp.slots(0, g.mT, g.nT, g.numWarps), f.cRegs, g.numWarps);
+    ReadbackPlan rb = planReadback(f.cDims, wp.slots(0, g.mT, g.nT, g.numWarps),
+                                   f.cRegs, g.numWarps);
     if (!rb.rename())
       continue;
     bestPenalty = penalty;

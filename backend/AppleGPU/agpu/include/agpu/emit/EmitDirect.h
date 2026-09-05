@@ -337,12 +337,11 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
     const auto sgStore = [&](msl::Block &into, const msl::Str &frag) {
       msl::Expr *off =
           c.binary(msl::BinOp::Add, t.leadingDim.scale(c, rowE()), colE());
-      into.push_back(c.exprStmt(
-          c.call(msl::builtin::sg::Store,
-                 {c.var(frag),
-                  c.binary(msl::BinOp::Add, basePtr(c, t.base, t.baseOffset),
-                           off),
-                  t.leadingDim.expr(c)})));
+      into.push_back(c.exprStmt(c.call(
+          msl::builtin::sg::Store,
+          {c.var(frag),
+           c.binary(msl::BinOp::Add, basePtr(c, t.base, t.baseOffset), off),
+           t.leadingDim.expr(c)})));
     };
 
     const auto chainAt = [&](msl::Expr *value, msl::Expr *row, msl::Expr *col,
@@ -546,7 +545,8 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
 
     const bool renaming =
         sched.drain == DotPassSchedule::Drain::Rename && readbackFor;
-    const ReadbackInputs renamed = renaming ? readbackFor(band) : ReadbackInputs{};
+    const ReadbackInputs renamed =
+        renaming ? readbackFor(band) : ReadbackInputs{};
 
     emitWarpBlocks(
         c, body, prog, grid, nm.warpId,

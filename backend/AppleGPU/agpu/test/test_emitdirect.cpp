@@ -651,7 +651,8 @@ int main() {
     CHECK_EQ(countOf(out, "?"), 2);
   }
 
-  CASE("a branch hangs off the running value its base names, not the accumulator");
+  CASE("a branch hangs off the running value its base names, not the "
+       "accumulator");
   {
     // acc + 2, then (acc + 2) * ((acc + 2) * 3): with branchBase 1 the
     // branch repeats the addition; with 0 it starts from the bare element.

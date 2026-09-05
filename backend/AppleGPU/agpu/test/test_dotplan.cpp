@@ -777,7 +777,8 @@ int main() {
 
   // ── the pass schedule ──────────────────────────────────────────────────
 
-  CASE("a fused pass neither declares nor drains; a single-shot pass does both");
+  CASE(
+      "a fused pass neither declares nor drains; a single-shot pass does both");
   {
     DotFacts f = gemm(64, 64, 64);
     Plan direct = planDot(f, kBudget);

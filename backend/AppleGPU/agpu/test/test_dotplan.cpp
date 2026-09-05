@@ -21,6 +21,36 @@ DotFacts gemm(int64_t M, int64_t N, int64_t K, int64_t warps = 4) {
 
 const Bytes kBudget{kTGResidentBudgetBytes};
 
+// C's layout under a warp cover of `miCount` by `niCount` blocks, the low
+// warp bits along columns as `planWarpProgram` spells them.
+void landIn(DotFacts &f, int64_t miCount, int64_t niCount) {
+  LayoutBasis row, col;
+  row.lane = {0, 1, 2, 0, 4};
+  col.lane = {2, 0, 0, 4, 0};
+  row.reg.push_back(0);
+  col.reg.push_back(1);
+  const int64_t rowsPerWarp = f.mT() / miCount * kSgFragDim;
+  const int64_t colsPerWarp = f.nT() / niCount * kSgFragDim;
+  for (int64_t s = kSgFragDim; s < colsPerWarp; s <<= 1) {
+    row.reg.push_back(0);
+    col.reg.push_back((int32_t)s);
+  }
+  for (int64_t s = kSgFragDim; s < rowsPerWarp; s <<= 1) {
+    row.reg.push_back((int32_t)s);
+    col.reg.push_back(0);
+  }
+  for (int64_t s = colsPerWarp; s < f.nT() * kSgFragDim; s <<= 1) {
+    row.warp.push_back(0);
+    col.warp.push_back((int32_t)s);
+  }
+  for (int64_t s = rowsPerWarp; s < f.mT() * kSgFragDim; s <<= 1) {
+    row.warp.push_back((int32_t)s);
+    col.warp.push_back(0);
+  }
+  f.cDims = {row, col};
+  f.cRegs = 2 * (rowsPerWarp / kSgFragDim) * (colsPerWarp / kSgFragDim);
+}
+
 int kindOf(const Plan &p) { return static_cast<int>(p.kind); }
 const int kScalar = static_cast<int>(Plan::Kind::Scalar);
 const int kPanel = static_cast<int>(Plan::Kind::Panel);
@@ -767,14 +797,55 @@ int main() {
   CASE("a renamed readback drains without touching the pool");
   {
     DotFacts f = gemm(64, 64, 64);
-    f.cRename = true;
+    landIn(f, 2, 2);
     Plan p = planDot(f, kBudget);
-    CHECK(f.cCostsPoolNothing());
+    CHECK(p.facts.cCostsPoolNothing());
     CHECK(!p.cThroughPool());
     CHECK(p.readsBackByRename());
+    CHECK_EQ((int64_t)p.readback.regs.size(), f.cRegs);
     CHECK(DotPassSchedule::of(p).drain == DotPassSchedule::Drain::Rename);
     CHECK_EQ(p.pool.cReserve().count(), 0);
     CHECK_EQ(p.cBandRows(), 64);
+  }
+
+  CASE("a layout the emitted cover does not match stays a pool readback");
+  {
+    DotFacts f = gemm(64, 64, 64);
+    landIn(f, 4, 1);
+    Plan p = planDot(f, kBudget);
+    CHECK(!p.readsBackByRename());
+    CHECK(p.cThroughPool());
+    CHECK(DotPassSchedule::of(p).drain == DotPassSchedule::Drain::Pool);
+  }
+
+  CASE("the rename is decided on the cover the plan emits, not the facts' one");
+  {
+    DotFacts f = gemm(32, 32, 32);
+    f.aElemBytes = f.bElemBytes = 4;
+    f.aDirect = true;
+    landIn(f, 4, 1);
+    Plan p = planDot(f, kBudget);
+    CHECK(!p.facts.aDirect);
+    CHECK(!p.readsBackByRename());
+
+    landIn(f, 2, 2);
+    Plan renamed = planDot(f, kBudget);
+    CHECK(renamed.readsBackByRename());
+
+    f.carriedAcc = true;
+    Plan direct = planDot(f, kBudget);
+    CHECK(direct.facts.aDirect);
+    CHECK(!direct.readsBackByRename());
+  }
+
+  CASE("a fused dot never renames");
+  {
+    DotFacts f = gemm(64, 64, 64);
+    landIn(f, 2, 2);
+    f.fusedAcc = true;
+    Plan p = planDot(f, kBudget);
+    CHECK(!p.facts.cRename);
+    CHECK(!p.readsBackByRename());
   }
 
   CASE("a rename never bands, even where the pool could not hold C whole");
@@ -784,7 +855,7 @@ int main() {
     Plan pooled = planDot(f, kBudget);
     CHECK_EQ(kindOf(pooled), kPanel);
 
-    f.cRename = true;
+    landIn(f, 2, 2);
     Plan p = planDot(f, kBudget);
     CHECK_EQ(kindOf(p), kDirect);
     CHECK(p.readsBackByRename());

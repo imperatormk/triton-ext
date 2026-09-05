@@ -200,9 +200,8 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
       return d;
   }
   in.readbackFor = [this, cId, cTy, cIn = ops.cIn, cView = plan.cStagedView(),
-                    rename = plan.readsBackByRename()
-                                 ? renameReadbackOf(cTy, plan.facts)
-                                 : agpu::ReadbackPlan{},
+                    rename = plan.readsBackByRename() ? plan.readback
+                                                      : agpu::ReadbackPlan{},
                     // A fused dot's registers stay f32; other paths land in
                     // C's own element.
                     regElem = plan.accumulatorsOutlivePass()

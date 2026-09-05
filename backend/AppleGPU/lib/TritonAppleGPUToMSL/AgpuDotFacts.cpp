@@ -15,24 +15,6 @@ am::Str AgpuEmitter::derivedDevicePointer(const am::Str &base, am::Expr *offset,
   return name;
 }
 
-agpu::ReadbackPlan AgpuEmitter::renameReadbackOf(RankedTensorType cTy,
-                                                 const agpu::DotFacts &f) {
-  if (!cTy || f.numWarps <= 0)
-    return {};
-  agpu::WarpGrid g;
-  g.mT = f.mT();
-  g.nT = f.nT();
-  g.numWarps = agpu::warpsFor(f);
-  g.hwWarps = f.numWarps;
-  g.aDirect = f.aDirect;
-  const agpu::WarpProgram p = agpu::planWarpProgram(g);
-  if (p.form != agpu::WarpForm::Parameterised)
-    return {};
-  return agpu::planReadback(coordSourceOf(cTy).dims,
-                            p.slots(0, g.mT, g.nT, g.numWarps),
-                            registerCount(cTy), g.numWarps);
-}
-
 DotOperands AgpuEmitter::dotOperandsOf(const agpu::OpView &o) {
   DotOperands d;
   if (o.operands.size() < 3 || o.results.size() != 1) {
@@ -216,10 +198,10 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
   f.aDirect = (bool)shape.aDevice.base;
   if (!f.fusedAcc) {
     const Value landing = readbackLandingOf(shape);
-    f.cRename = renameReadbackOf(landing ? cast<RankedTensorType>(landing.getType())
-                                         : shape.cTy,
-                                 f)
-                    .rename();
+    const RankedTensorType landTy =
+        landing ? cast<RankedTensorType>(landing.getType()) : shape.cTy;
+    f.cDims = coordSourceOf(landTy).dims;
+    f.cRegs = registerCount(landTy);
   }
 
   // `cElem` is the fp32 accumulator. The tensor behind the store window may

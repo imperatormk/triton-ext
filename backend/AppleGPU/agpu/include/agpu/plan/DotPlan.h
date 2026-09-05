@@ -7,6 +7,7 @@
 #include "agpu/core/TileView.h"
 #include "agpu/core/Units.h"
 #include "agpu/plan/Elementwise.h"
+#include "agpu/plan/ReadbackPlan.h"
 #include "agpu/plan/WarpSlots.h"
 
 #include <algorithm>
@@ -37,6 +38,11 @@ struct DotFacts {
   bool cDirect = false;      // C stores straight to device
   bool cFallback = false;    // ... but keeps a pool arm for ragged tiles
   bool cRename = false;      // C's consumers read the fragment's own lanes
+
+  // The layout C lands in, row then column bases, and its register count.
+  // `planDot` decides `cRename` over these once the warp cover is final.
+  std::vector<LayoutBasis> cDims;
+  int64_t cRegs = 0;
 
   // Fragment grid, rounded up: there is no MMA smaller than 8x8. The readback
   // guards against storing a partial fragment past the edge.
@@ -343,6 +349,7 @@ struct Plan {
   StageBytes stage;
   PoolPlan pool;
   StrategyParams params;
+  ReadbackPlan readback;
 
   Bytes edgeScratch;
 
@@ -556,6 +563,33 @@ inline int64_t fragsPerWarpFor(const DotFacts &f) {
   return (f.nFrag() + nw - 1) / nw;
 }
 
+// The one grid the direct and fused emitters cover C with. The rename is
+// decided over the same grid, so what it validates is what gets emitted.
+inline WarpGrid warpGridFor(const DotFacts &f, bool bandedC) {
+  WarpGrid g;
+  g.mT = f.mT();
+  g.nT = f.nT();
+  g.numWarps = warpsFor(f);
+  g.hwWarps = f.numWarps;
+  g.aDirect = f.aDirect;
+  g.bandedC = bandedC;
+  return g;
+}
+
+// A rename never bands, so its grid is the unbanded one. Only the
+// parameterised form gives every warp the same slot list, which is what one
+// register-to-slot map across all warps means.
+inline ReadbackPlan planRenameReadback(const DotFacts &f) {
+  if (f.cDims.empty() || f.cRegs <= 0 || f.numWarps <= 0)
+    return {};
+  const WarpGrid g = warpGridFor(f, false);
+  const WarpProgram p = planWarpProgram(g);
+  if (p.form != WarpForm::Parameterised)
+    return {};
+  return planReadback(f.cDims, p.slots(0, g.mT, g.nT, g.numWarps), f.cRegs,
+                      g.numWarps);
+}
+
 // Which lowering a dot takes. Rows are checked in priority order.
 struct KindRule {
   Plan::Kind kind;
@@ -672,6 +706,12 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
         budget;
     if (wholePadded || wholePlain)
       f.aDirect = false;
+  }
+
+  f.cRename = false;
+  if (!f.fusedAcc && !p.intThroughFloat) {
+    p.readback = planRenameReadback(f);
+    f.cRename = p.readback.rename();
   }
   p.facts = f;
 

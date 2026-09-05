@@ -51,14 +51,7 @@ struct DotInputs {
 
 // Read off the plan.
 inline WarpGrid gridOf(const Plan &p) {
-  WarpGrid g;
-  g.mT = p.facts.mT();
-  g.nT = p.facts.nT();
-  g.numWarps = warpsFor(p.facts);
-  g.hwWarps = p.facts.numWarps;
-  g.aDirect = p.facts.aDirect;
-  g.bandedC = p.cBandRows() < p.cStagedView().extentAt(0);
-  return g;
+  return warpGridFor(p.facts, p.cBandRows() < p.cStagedView().extentAt(0));
 }
 
 // A loop whose body accumulates into simdgroup fragments it does not own.

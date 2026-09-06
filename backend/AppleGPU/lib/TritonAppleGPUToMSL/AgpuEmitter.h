@@ -666,15 +666,12 @@ private:
   agpu::CoordSource coordSourceOf(RankedTensorType ty);
 
   // `names` is indexed by register (one entry always); `actions` one per
-  // register that reaches the window. False when the layout cannot be read.
-  enum class StageDir { Store, Load };
-  agpu::Decision
-  planTileActions(agpu::ValueId v, RankedTensorType ty,
-                  const std::vector<agpu::CoordWindow> &windows,
-                  const agpu::TileView &dst, unsigned elemBits, StageDir dir,
-                  agpu::msl::SmallVec<agpu::StageAction, 8> &actions,
-                  agpu::msl::SmallVec<agpu::msl::Str, 8> &names,
-                  std::string_view where);
+  // register that reaches the window. Declines when the layout cannot be read.
+  agpu::Decision planTileActions(
+      agpu::ValueId v, RankedTensorType ty,
+      const std::vector<agpu::CoordWindow> &windows, const agpu::TileView &dst,
+      unsigned elemBits, agpu::msl::SmallVec<agpu::StageAction, 8> &actions,
+      agpu::msl::SmallVec<agpu::msl::Str, 8> &names, std::string_view where);
 
   agpu::PanelInputs
   panelInputsFor(const agpu::PanelTile &t, const agpu::Plan &plan,

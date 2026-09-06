@@ -87,9 +87,9 @@ agpu::Decision AgpuEmitter::emitLocalLoad(const agpu::OpView &o) {
 
   am::SmallVec<agpu::StageAction, 8> actions;
   am::SmallVec<am::Str, 8> unused;
-  if (const agpu::Decision d = planTileActions(
-          o.results[0], resTy, wholeWindowsOf(resTy), md.view, elem->bits,
-          StageDir::Load, actions, unused, "ttg.local_load");
+  if (const agpu::Decision d =
+          planTileActions(o.results[0], resTy, wholeWindowsOf(resTy), md.view,
+                          elem->bits, actions, unused, "ttg.local_load");
       !d.ok())
     return d;
   int64_t covered = 0;

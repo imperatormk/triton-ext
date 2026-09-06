@@ -99,10 +99,9 @@ agpu::Decision AgpuEmitter::resolveDrainSteps(const DotOperands &ops,
   const agpu::ElemType splatElem =
       elemTypeOf(ops.shape.cDevice.base.getType()).value_or(agpu::f32());
 
-  // Resolve one folded operand to names the drain can spell. `at`
-  // disambiguates derived pointer names.
-  const auto resolveOperand = [&](const auto &sf, agpu::DrainOperand &od,
-                                  const std::string &at) -> agpu::Decision {
+  // Resolve one folded operand to names the drain can spell.
+  const auto resolveOperand = [&](const auto &sf,
+                                  agpu::DrainOperand &od) -> agpu::Decision {
     using K = std::decay_t<decltype(sf.kind)>;
     switch (sf.kind) {
     default:
@@ -177,7 +176,6 @@ agpu::Decision AgpuEmitter::resolveDrainSteps(const DotOperands &ops,
     step.op = sf.op->getName().getStringRef().str();
     step.roundBefore = sf.roundBefore;
     requireHelperFor(sf.op);
-    const std::string at = std::to_string(in.cSteps.size());
     if (sf.kind == DrainStepFact::Operand::AccChain) {
       step.operand.kind = agpu::DrainOperand::Kind::AccChain;
       step.branchBase = sf.branchBase;
@@ -185,14 +183,11 @@ agpu::Decision AgpuEmitter::resolveDrainSteps(const DotOperands &ops,
         agpu::DrainBranchLink link;
         link.op = lf.op->getName().getStringRef().str();
         requireHelperFor(lf.op);
-        if (const agpu::Decision d =
-                resolveOperand(lf, link.operand,
-                               at + "_" + std::to_string(step.branch.size()));
-            !d.ok())
+        if (const agpu::Decision d = resolveOperand(lf, link.operand); !d.ok())
           return d;
         step.branch.push_back(std::move(link));
       }
-    } else if (const agpu::Decision d = resolveOperand(sf, step.operand, at);
+    } else if (const agpu::Decision d = resolveOperand(sf, step.operand);
                !d.ok()) {
       return d;
     }

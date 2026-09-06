@@ -23,17 +23,15 @@ struct Visitor {
 };
 
 #define EXPR_NODE(Name, Class)                                                 \
-  inline void children(Class *n, const Visitor &v) {                           \
-    (void)n;                                                                   \
-    (void)v;
+  inline void children([[maybe_unused]] Class *n,                              \
+                       [[maybe_unused]] const Visitor &v) {
 #define EXPR_CHILD(Class, field) v.expr(n->field);
 #define EXPR_CHILD_LIST(Class, field)                                          \
   for (Expr * c : n->field)                                                    \
     v.expr(c);
 #define STMT_NODE(Name, Class)                                                 \
-  inline void children(Class *n, const Visitor &v) {                           \
-    (void)n;                                                                   \
-    (void)v;
+  inline void children([[maybe_unused]] Class *n,                              \
+                       [[maybe_unused]] const Visitor &v) {
 #define STMT_CHILD_EXPR(Class, field) v.expr(n->field);
 #define STMT_CHILD_EXPR_LIST(Class, field)                                     \
   for (Expr * c : n->field)                                                    \
@@ -80,9 +78,8 @@ inline void forEachChild(Stmt *s, const detail::Visitor &v) {
 #define EXPR_NODE(Name, Class)                                                 \
   template <class F> inline void blocksOf(Class *, F &) {
 #define STMT_NODE(Name, Class)                                                 \
-  template <class F> inline void blocksOf(Class *n, F &fn) {                   \
-    (void)n;                                                                   \
-    (void)fn;
+  template <class F>                                                           \
+  inline void blocksOf([[maybe_unused]] Class *n, [[maybe_unused]] F &fn) {
 #define STMT_CHILD_BLOCK(Class, field) fn(n->field);
 #define STMT_CHILD_BLOCK_LIST(Class, field, member)                            \
   for (auto &entry : n->field)                                                 \

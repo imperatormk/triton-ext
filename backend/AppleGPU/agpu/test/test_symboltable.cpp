@@ -25,11 +25,11 @@ int main() {
     t.bindScalar(1, "v0");
     CHECK_EQ(t.size(), (std::size_t)1);
 
-    (void)t.namesOf(99);
-    (void)t.regCount(99);
-    (void)t.regAt(99, 0);
-    (void)t.scalarName(99);
-    (void)t.isDataless(99);
+    CHECK(t.namesOf(99) == nullptr);
+    CHECK_EQ(t.regCount(99), (std::size_t)0);
+    CHECK(t.regAt(99, 0) == nullptr);
+    CHECK(t.scalarName(99) == nullptr);
+    CHECK(!t.isDataless(99));
     CHECK_EQ(t.size(), (std::size_t)1);
     CHECK(!t.isBound(99));
   }

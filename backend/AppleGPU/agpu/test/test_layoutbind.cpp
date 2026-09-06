@@ -124,7 +124,7 @@ int main() {
     msl::Context c;
     CoordHoist h{ThreadNames{}};
     const LayoutBasis lb{{}, {1, 2, 4}, {}, {8, 16}};
-    (void)h.coord(c, lb, 0);
+    CHECK(h.coord(c, lb, 0) != nullptr);
     const std::string decls = renderBlock(h.decls);
     CHECK(decls.find("tgpos.x") != std::string::npos);
   }

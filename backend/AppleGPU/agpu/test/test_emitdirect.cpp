@@ -73,7 +73,7 @@ int main() {
 
   CASE("a device-direct A pulls the cover toward fewer A fragments");
   {
-    WarpGrid g{8, 2, 4, /*aDirect=*/true, false};
+    WarpGrid g{8, 2, 4, /*aDirect=*/true};
     WarpProgram p = planWarpProgram(g);
     CHECK(p.form == WarpForm::Parameterised);
     CHECK_EQ(p.miCount, 2);
@@ -82,7 +82,7 @@ int main() {
 
   CASE("staged operands take the near-square cover");
   {
-    WarpGrid g{4, 4, 4, false, false};
+    WarpGrid g{4, 4, 4};
     WarpProgram p = planWarpProgram(g);
     CHECK(p.form == WarpForm::Parameterised);
     CHECK_EQ(p.miCount, 2);
@@ -91,7 +91,7 @@ int main() {
 
   CASE("a flat grid still splits both axes when that loads less");
   {
-    WarpGrid g{2, 8, 4, false, false};
+    WarpGrid g{2, 8, 4};
     WarpProgram p = planWarpProgram(g);
     CHECK(p.form == WarpForm::Parameterised);
     CHECK_EQ(p.miCount, 2);
@@ -100,7 +100,7 @@ int main() {
 
   CASE("no exact cover falls back to one guarded block per warp");
   {
-    WarpGrid g{3, 5, 4, false, false};
+    WarpGrid g{3, 5, 4};
     WarpProgram p = planWarpProgram(g);
     CHECK(p.form == WarpForm::PerWarp);
     CHECK_EQ(p.blockCount(4), 4);
@@ -109,9 +109,7 @@ int main() {
   CASE("a program always covers the grid exactly once");
   {
     const WarpGrid grids[] = {
-        {8, 2, 4, true, false},  {4, 4, 4, false, false},
-        {2, 8, 4, false, false}, {3, 5, 4, false, false},
-        {4, 4, 2, false, false}, {6, 3, 3, false, false},
+        {8, 2, 4, true}, {4, 4, 4}, {2, 8, 4}, {3, 5, 4}, {4, 4, 2}, {6, 3, 3},
     };
     for (const WarpGrid &g : grids) {
       auto cov = coverage(planWarpProgram(g), g);
@@ -128,7 +126,7 @@ int main() {
   {
     msl::Context c;
     msl::Block body;
-    WarpGrid g{4, 4, 4, false, false};
+    WarpGrid g{4, 4, 4};
     WarpProgram p = planWarpProgram(g);
     emitDirectDot(c, body, p, g, gemmInputs(2, 32, 64),
                   TileView::rowMajor({32, 32}), nm, 0, {}, {});
@@ -140,10 +138,10 @@ int main() {
   CASE("the program says which warp a block serves, so the emitter need not "
        "ask");
   {
-    WarpGrid par{4, 4, 4, false, false};
+    WarpGrid par{4, 4, 4};
     CHECK(!planWarpProgram(par).guardWarp(0).has_value());
 
-    WarpGrid per{3, 5, 4, false, false};
+    WarpGrid per{3, 5, 4};
     WarpProgram p = planWarpProgram(per);
     CHECK(p.guardWarp(2).has_value());
     CHECK_EQ(*p.guardWarp(2), 2);
@@ -153,7 +151,7 @@ int main() {
   {
     msl::Context c;
     msl::Block body;
-    WarpGrid g{3, 5, 4, false, false};
+    WarpGrid g{3, 5, 4};
     WarpProgram p = planWarpProgram(g);
     emitDirectDot(c, body, p, g, gemmInputs(1, 8, 40),
                   TileView::rowMajor({24, 40}), nm, 0, {}, {});
@@ -164,7 +162,7 @@ int main() {
 
   CASE("both forms run the same emitter, over the slots the program hands out");
   {
-    const WarpGrid grids[] = {{4, 4, 4, false, false}, {3, 5, 4, false, false}};
+    const WarpGrid grids[] = {{4, 4, 4}, {3, 5, 4}};
     for (const WarpGrid &g : grids) {
       msl::Context c;
       msl::Block body;
@@ -280,7 +278,7 @@ int main() {
   {
     msl::Context c;
     msl::Block body;
-    WarpGrid g{2, 2, 4, false, false};
+    WarpGrid g{2, 2, 4};
     WarpProgram p = planWarpProgram(g);
     emitDirectDot(c, body, p, g, gemmInputs(1, 8, 16),
                   TileView::rowMajor({16, 16}), nm, 0, {}, {});
@@ -396,7 +394,7 @@ int main() {
     // tensor.
     msl::Context c;
     msl::Block body;
-    WarpGrid g{1, 2, 2, false, false};
+    WarpGrid g{1, 2, 2};
     g.hwWarps = 4;
     CHECK(g.guardsIdleWarps());
     const WarpProgram p = planWarpProgram(g);
@@ -414,7 +412,7 @@ int main() {
   {
     msl::Context c;
     msl::Block body;
-    WarpGrid g{2, 2, 4, false, false};
+    WarpGrid g{2, 2, 4};
     g.hwWarps = 4;
     CHECK(!g.guardsIdleWarps());
     const WarpProgram p = planWarpProgram(g);
@@ -696,7 +694,7 @@ int main() {
     // between barriers, so the second band reuses the first's region.
     msl::Context c;
     msl::Block body;
-    WarpGrid g{2, 4, 4, false, false};
+    WarpGrid g{2, 4, 4};
     g.mT = 4;
     g.nT = 2;
     g.bandedC = true;
@@ -733,7 +731,7 @@ int main() {
   {
     msl::Context c;
     msl::Block whole, zero;
-    WarpGrid g{2, 2, 4, false, false};
+    WarpGrid g{2, 2, 4};
     const WarpProgram p = planWarpProgram(g);
     emitDirectDot(c, whole, p, g, gemmInputs(1, 16, 16),
                   TileView::rowMajor({16, 16}), nm, /*bandRows=*/16, {}, {});
@@ -747,7 +745,7 @@ int main() {
   {
     // A banded C is drained by compile-time row, so under bandedC only covers
     // whose warp axis is all-N qualify.
-    WarpGrid g{8, 2, 4, /*aDirect=*/true, false};
+    WarpGrid g{8, 2, 4, /*aDirect=*/true};
     const WarpProgram open = planWarpProgram(g);
     CHECK(open.form == WarpForm::Parameterised);
     CHECK(open.miCount < g.mT);

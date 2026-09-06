@@ -709,8 +709,8 @@ inline std::string helperSource(Helper h) {
   }
 
   // Round-toward-zero. MSL's cast is always nearest-even, so this truncates
-  // the mantissa directly. Overflow saturates to 0x7bff (largest finite half),
-  // not 0x7c00 (inf), since RTZ cannot turn a finite input into inf.
+  // the mantissa directly. Overflow saturates to 0x7bff (largest finite
+  // half): RTZ cannot turn a finite input into inf (0x7c00).
   case Helper::RtzHalf: {
     msl::Context c;
     const msl::Type u32 = msl::Type::scalar(msl::Scalar::U32);
@@ -790,8 +790,8 @@ inline std::string helperSource(Helper h) {
   }
 
   // fp8 has no MSL type and travels as a byte. Rounds to nearest-even and
-  // handles subnormals. e4m3fn's top slot is NaN, so saturation is the
-  // half-way mark below 448, not 0x7f.
+  // handles subnormals. e4m3fn's top slot is NaN, so saturation lands on
+  // the half-way mark below 448, since 0x7f is unavailable as a finite max.
   case Helper::Fp8PackE4M3: {
     msl::Context c;
     msl::Expr *const nearMax = c.binary(

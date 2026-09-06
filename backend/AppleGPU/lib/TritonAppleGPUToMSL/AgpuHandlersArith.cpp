@@ -205,8 +205,8 @@ agpu::Decision AgpuEmitter::emitMath2Op(const agpu::OpView &o) {
   const bool promote = !(operand == *operandP);
   return emitPerRegister(o, ready.regs, operand, 'm', [&](int64_t r) {
     RegValue v;
-    // MSL picks the overload from argument types, so the operands carry
-    // the promotion too, not just the result declaration.
+    // MSL picks the overload from argument types, so the promotion must reach
+    // the operands as well as the result declaration.
     const am::Str an = promote ? castTo(operand, a.at(r)) : a.at(r);
     const am::Str bn = promote ? castTo(operand, b.at(r)) : b.at(r);
     if (m->fn == agpu::MathFn2::Min || m->fn == agpu::MathFn2::Max) {

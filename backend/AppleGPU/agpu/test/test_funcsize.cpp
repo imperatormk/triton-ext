@@ -70,7 +70,7 @@ int main() {
     CHECK(!fuse.needsReemit());
   }
 
-  CASE("whether the re-emit helped is a question, not an assumption");
+  CASE("whether the re-emit helped is checked directly");
   {
     CHECK(shrinkHelped(sized(20000, 5000), sized(9000, 500)));
     CHECK(!shrinkHelped(sized(20000, 5000), sized(20000, 5000)));
@@ -124,7 +124,7 @@ int main() {
     CHECK_EQ(body.size(), 2u);
   }
 
-  CASE("conditions are compared structurally, not by identity");
+  CASE("conditions are compared structurally");
   {
     Context c;
     Block body;

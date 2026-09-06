@@ -47,7 +47,7 @@ int main() {
     CHECK(!abi.hasArgBuffer);
   }
 
-  CASE("scalars pack into one argument buffer, not one binding each");
+  CASE("scalars pack together into a single argument buffer");
   {
     KernelAbi abi =
         planKernelAbi({ptr("a"), scalar("m"), scalar("n"), scalar("k")}, 4);
@@ -126,7 +126,7 @@ int main() {
     CHECK_EQ(countOf(out, "coherent"), 1);
   }
 
-  CASE("a binding is a number the host can compare, not rendered text");
+  CASE("a binding is a plain number the host can compare");
   {
     msl::Context c;
     KernelFacts f;
@@ -149,7 +149,7 @@ int main() {
     CHECK_EQ(checked, 3); // two pointers and the argument buffer
   }
 
-  CASE("the launch qualifier carries its value, not a rendered string");
+  CASE("the launch qualifier carries its raw value");
   {
     msl::Context c;
     KernelFacts f;

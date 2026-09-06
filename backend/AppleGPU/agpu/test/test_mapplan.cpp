@@ -36,7 +36,7 @@ int main() {
           }
   }
 
-  CASE("the two orders are genuinely different, not the same map twice");
+  CASE("the two orders produce genuinely different maps");
   {
     // With pack 2 and 3 groups the two orders agree at (1,1) only.
     MapPlan p{{2, 1, 6, 2, false}};

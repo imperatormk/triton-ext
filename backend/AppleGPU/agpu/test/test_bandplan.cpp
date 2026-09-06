@@ -11,7 +11,7 @@ int main() {
     CHECK_EQ(c.available().count(), 24576);
   }
 
-  CASE("an over-committed pool has zero capacity, not negative");
+  CASE("an over-committed pool's capacity floors at zero");
   {
     Capacity c(Bytes(1024), Bytes(4096));
     CHECK_EQ(c.available().count(), 0);
@@ -110,7 +110,7 @@ int main() {
     }
   }
 
-  CASE("bands are split evenly, not filled to the cap with a short tail");
+  CASE("bands are split evenly across the capacity");
   {
     BandPlan p = planBand(1000, 4, Capacity(Bytes(2048), Bytes(0)));
     CHECK_EQ(p.bandCount(), 2);

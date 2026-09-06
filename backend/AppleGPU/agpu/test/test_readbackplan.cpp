@@ -89,7 +89,7 @@ int main() {
     CHECK(!planReadback(dims, cover(1, 8), 16, 4).rename());
   }
 
-  CASE("no slots and no registers decline rather than assert");
+  CASE("no slots and no registers decline gracefully");
   {
     CHECK(!planReadback(mmaDims(0, 3), {}, 16, 4).rename());
     CHECK(!planReadback(mmaDims(0, 3), cover(1, 8), 0, 4).rename());

@@ -127,7 +127,7 @@ int main() {
     CHECK(e.pool.plan().scratch == Bytes(0));
   }
 
-  CASE("a decline is recorded, not returned and forgotten");
+  CASE("a decline is recorded for later reporting");
   {
     Emitter e;
     msl::Block body;
@@ -336,7 +336,7 @@ int main() {
     CHECK(os.str().find("model.py:12") != std::string::npos);
   }
 
-  CASE("a source list shorter than the plan is a bug, not a decline");
+  CASE("a source list shorter than the plan asserts as a caller bug");
   {
     Emitter e;
     Rebind r;

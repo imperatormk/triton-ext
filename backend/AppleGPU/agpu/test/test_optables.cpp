@@ -115,7 +115,7 @@ int main() {
     CHECK_EQ(std::string(mathNameOf(s)), std::string("metal::precise::sqrt"));
   }
 
-  CASE("tt.precise_sqrt is sqrt, not a second spelling of it");
+  CASE("tt.precise_sqrt maps to metal::precise::sqrt");
   {
     CHECK(mathFnOf("tt.precise_sqrt") == mathFnOf("math.sqrt"));
   }

@@ -99,7 +99,7 @@ inline RegRun longestRegRun(const RegBases &bases,
 }
 
 // Condition (b): contiguity is a hard limit; alignment is relaxed through
-// MSL's packed vectors, aligned to the element, not the vector.
+// MSL's packed vectors, which align only to the element.
 struct WidthLimit {
   int64_t width = 1;
   bool packed = false; // needs a packed_* vector type to be legal

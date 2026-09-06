@@ -63,7 +63,7 @@ int main() {
     CHECK_EQ(SlotCoord::affine(2, 1).at(3), 7);
   }
 
-  CASE("coordinates are compared as integers, not as spelled strings");
+  CASE("coordinates are compared as integers");
   {
     CHECK(SlotCoord::affine(2, 1) == SlotCoord::affine(2, 1));
     CHECK(!(SlotCoord::affine(2, 1) == SlotCoord::affine(1, 2)));
@@ -122,7 +122,7 @@ int main() {
 
   // ── one emitter for every arm ──────────────────────────────────────────
 
-  CASE("the parameterised form emits one block, not one per warp");
+  CASE("the parameterised form emits a single shared block");
   {
     msl::Context c;
     msl::Block body;
@@ -180,7 +180,7 @@ int main() {
 
   // ── the fragment cache ─────────────────────────────────────────────────
 
-  CASE("an A fragment is loaded once per row, not once per pair");
+  CASE("an A fragment is loaded exactly once per row");
   {
     msl::Context c;
     msl::Block body;
@@ -225,7 +225,7 @@ int main() {
 
   // ── rolled K ───────────────────────────────────────────────────────────
 
-  CASE("rolling K emits one loop body, not kT copies");
+  CASE("rolling K emits a single shared loop body");
   {
     msl::Context c;
     std::vector<WarpSlot> slots = {
@@ -607,7 +607,7 @@ int main() {
     CHECK_EQ(countOf(out, "simdgroup_store(acc0,"), 0);
   }
 
-  CASE("a relu splat over a narrowing target is typed, not an f32 literal");
+  CASE("a relu splat over a narrowing target keeps the target's type");
   {
     msl::Context c;
     msl::Block body;
@@ -649,8 +649,7 @@ int main() {
     CHECK_EQ(countOf(out, "?"), 2);
   }
 
-  CASE("a branch hangs off the running value its base names, not the "
-       "accumulator");
+  CASE("a branch hangs off the running value its base names");
   {
     // acc + 2, then (acc + 2) * ((acc + 2) * 3): with branchBase 1 the
     // branch repeats the addition; with 0 it starts from the bare element.

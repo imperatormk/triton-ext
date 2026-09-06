@@ -326,7 +326,7 @@ agpu::Decision AgpuEmitter::emitAddPtrOp(const agpu::OpView &o) {
       // A base whose offsets differ per register is not uniform even if
       // its name repeats. Only addptr needs this: offsetOf is populated for
       // pointer values alone, and the elementwise fold's operands are always
-      // arith results, never pointers.
+      // arith results.
       if (i == 0)
         for (int64_t r = 0; r < ready.regs; ++r)
           if (body_.offsetOf.count({o.operands[0], r}))

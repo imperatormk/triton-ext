@@ -171,7 +171,7 @@ int precedence(BinOp op) {
   return 0;
 }
 
-// `pointerTo`, not `inAddrSpace`: Metal rejects `device atomic_int` as an
+// Built with `pointerTo` because Metal rejects `device atomic_int` as an
 // automatic variable.
 Type atomicPtr(Scalar s, AddrSpace as) {
   return Type::named(std::string("atomic_") + spell(s)).pointerTo(as);

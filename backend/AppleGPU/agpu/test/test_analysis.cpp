@@ -239,7 +239,7 @@ int main() {
     CHECK_EQ(render(b), std::string("if (p) o = 1;\n"));
   }
 
-  CASE("a chain of dead decls is found in one call, not one layer per call");
+  CASE("a chain of dead decls is found in a single call");
   {
     Context c;
     Block blk{c.declStmt(Context::i32(), "b", c.lit(1)),

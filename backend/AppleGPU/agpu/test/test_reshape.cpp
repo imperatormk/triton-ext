@@ -31,7 +31,7 @@ int main() {
     CHECK_EQ(out[3], std::string("b1"));
   }
 
-  CASE("join follows the layout's numbering, not 2r and 2r+1");
+  CASE("join follows the layout's own register numbering");
   {
     InterleaveFacts f;
     f.src = {{0}, {1}, {2}};
@@ -115,7 +115,7 @@ int main() {
     CHECK(p.from[3].high);
   }
 
-  CASE("the nibble follows the layout's numbering, not the register index");
+  CASE("the nibble follows the layout's own numbering");
   {
     InterleaveFacts f;
     f.src = {{0}, {1}};

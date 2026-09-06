@@ -158,7 +158,7 @@ int main() {
     CHECK_EQ(res[0], std::string("sa0_0"));
   }
 
-  CASE("more registers than one window is several scans, not a decline");
+  CASE("more registers than one window still plans several usable scans");
   {
     // The layout puts the tail windows at different axis positions, so each
     // window is its own scan.
@@ -211,7 +211,7 @@ int main() {
     CHECK_EQ(distinct, 4);
   }
 
-  CASE("the cross-lane result reaches every register, not just the last");
+  CASE("the cross-lane result reaches every register");
   {
     msl::Context c;
     msl::Block body;
@@ -372,7 +372,7 @@ int main() {
     CHECK(afterCarry.find("sa0_1 = ") != std::string::npos);
   }
 
-  CASE("the warp total is published once, not once per register");
+  CASE("the warp total is published exactly once");
   {
     // Publishing per register would put a barrier inside the carry loop and
     // a barrier under divergent control flow is undefined in Metal.
@@ -458,7 +458,7 @@ int main() {
     CHECK(body.empty());
   }
 
-  CASE("every operand's registers come back, not just operand 0's");
+  CASE("every operand's registers come back");
   {
     // A scan carrying a value and an index computes both and hands back both.
     msl::Context c;
@@ -488,7 +488,7 @@ int main() {
 
   // ── the element type ───────────────────────────────────────────────────
 
-  CASE("an integer scan accumulates through an integer, not a float");
+  CASE("an integer scan keeps an integer accumulator");
   {
     msl::Context c;
     msl::Block body;
@@ -539,7 +539,7 @@ int main() {
     CHECK(out.find(">= ") == std::string::npos);
   }
 
-  CASE("a reverse warp scan publishes from lane 0, not lane 31");
+  CASE("a reverse warp scan publishes its total from lane 0");
   {
     // The ladder finishes at the opposite end, so the warp's total is there.
     msl::Context c;

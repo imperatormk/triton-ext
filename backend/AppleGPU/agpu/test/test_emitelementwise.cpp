@@ -61,7 +61,7 @@ int main() {
         std::string("bool d = (uint)a >= (uint)b;\n"));
   }
 
-  CASE("float division is its own operation, not the signed one");
+  CASE("float division is its own distinct operation");
   {
     msl::Context c;
     CHECK_EQ(render(emitEw(c, EwOp::DivF, f32(), "d", c.var("a"), c.var("b"))),
@@ -120,7 +120,7 @@ int main() {
              std::string("metal::isnan(a) || metal::isnan(b) || a < b"));
   }
 
-  CASE("ord and uno are NaN tests, not relations");
+  CASE("ord and uno test for NaN");
   {
     msl::Context c;
     CHECK(planFCmp(FCmp::Uno).kind == FCmpPlan::Kind::NanTest);
@@ -130,7 +130,7 @@ int main() {
              std::string("!(metal::isnan(a) || metal::isnan(b))"));
   }
 
-  CASE("the constant predicates emit a constant, not a comparison");
+  CASE("the constant predicates emit a bare constant");
   {
     msl::Context c;
     CHECK(planFCmp(FCmp::True).kind == FCmpPlan::Kind::Constant);
@@ -186,7 +186,7 @@ int main() {
              std::string("metal::min(a, b)"));
   }
 
-  CASE("a predicate returns bool, not the float it consumed");
+  CASE("a predicate always returns bool");
   {
     msl::Context c;
     CHECK(mathResultType(MathFn::Isnan, f32()) == i1());
@@ -221,7 +221,7 @@ int main() {
     CHECK(checkMath3(MathFn3::Fma, i32()).isDecline());
   }
 
-  CASE("select is a ternary, not a branch");
+  CASE("select renders as a ternary expression");
   {
     // Both arms are already in registers; a branch would only add divergence.
     msl::Context c;

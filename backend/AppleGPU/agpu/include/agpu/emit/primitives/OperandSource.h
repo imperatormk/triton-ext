@@ -54,7 +54,7 @@ struct OperandSource {
 
   int64_t sliceStride = 0;
 
-  // One element's offset, for a consumer that reads scalars, not fragments.
+  // One element's offset, for a consumer that reads scalars over fragments.
   // `batch` (null for an unbatched dot) selects a slice by `sliceStride`.
   msl::Expr *elemOffsetOf(msl::Context &c, msl::Expr *row, msl::Expr *col,
                           msl::Expr *batch = nullptr) const {

@@ -207,7 +207,7 @@ int main() {
 
   // ── reverse ────────────────────────────────────────────────────────────
 
-  CASE("reverse is carried, not re-derived");
+  CASE("reverse is carried straight through");
   {
     ScanFacts f = facts({{0, 1}});
     f.reverse = true;
@@ -215,7 +215,7 @@ int main() {
     CHECK(!planScan(facts({{0, 1}})).reverse);
   }
 
-  CASE("reverse changes all four direction answers, not just register order");
+  CASE("reverse changes all four direction answers");
   {
     ScanFacts f = facts({{0, 1}});
     f.reverse = true;
@@ -540,7 +540,7 @@ int main() {
                      want[(std::size_t)posOf(b, w, l, r)]);
   }
 
-  CASE("carryWarps yields the warps the axis traverses, not all of them");
+  CASE("carryWarps yields only the warps the axis traverses");
   {
     ScanFacts f = facts({{0, 1}}, {{0, 2}}, 8);
     const ScanPlan p = planScan(f);

@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(AGPU_WARNINGS -Wall -Wextra -Wpedantic)
+set(AGPU_WARNINGS -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
 
 add_library(agpu_core INTERFACE)
 target_include_directories(agpu_core INTERFACE include)

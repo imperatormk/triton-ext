@@ -89,7 +89,7 @@ int main() {
     }
   }
 
-  CASE("reading the environment is explicit, not latched on first use");
+  CASE("each fromEnvironment call reads the environment fresh");
   {
     // A GateSet is a value: two built the same way agree and setting one
     // does not reach the other -- unlike a function-local static getenv cache.

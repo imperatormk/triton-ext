@@ -126,7 +126,7 @@ int main() {
     CHECK_EQ(out[5], msl::Str("b2"));
   }
 
-  CASE("an unnamed register is reported, not passed to the printer");
+  CASE("an unnamed register is reported by the emitter itself");
   {
     Rebind partial;
     partial.from = {0, -1};

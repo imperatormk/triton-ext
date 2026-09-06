@@ -13,7 +13,7 @@ PoolRequest req(const char *what, int64_t bytes) {
 } // namespace
 
 int main() {
-  CASE("a function needs the largest single request, not their sum");
+  CASE("a function needs only the largest single request");
   {
     FunctionPool p = planFunctionPool(
         {req("dot", 16384), req("reduce", 4096), req("scan", 8192)});
@@ -34,7 +34,7 @@ int main() {
     CHECK_EQ(std::string(p.driver), std::string("dot"));
   }
 
-  CASE("live buffers add to the pool, not share with it");
+  CASE("live buffers each add to the pool");
   {
     FunctionPool p = planFunctionPool({req("dot", 16384)}, Bytes(8192));
     CHECK(p.scratch == Bytes(16384));
@@ -57,7 +57,7 @@ int main() {
     CHECK(poolDecision(p, Bytes(32768)).ok());
   }
 
-  CASE("an over-budget function is refused here, not by Metal");
+  CASE("an over-budget function is refused ahead of Metal");
   {
     // Over budget links cleanly, then crashes MTLCompilerService at PSO
     // creation.
@@ -89,7 +89,7 @@ int main() {
     CHECK_EQ(tgResidency(tight.total().count()), 2);
   }
 
-  CASE("the limit is the hardware one, not an occupancy target");
+  CASE("the limit reflects the hardware itself");
   {
     FunctionPool p = planFunctionPool({req("dot", kTGResidentBudgetBytes)});
     CHECK(poolDecision(p).ok());

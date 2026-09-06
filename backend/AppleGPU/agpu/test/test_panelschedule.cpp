@@ -113,14 +113,14 @@ int main() {
     CHECK_EQ(a2[0].hi, 64);
   }
 
-  CASE("a ragged final panel is clipped, not skipped");
+  CASE("a ragged final panel is still emitted, just clipped");
   {
     DotFacts f = gemm(100, 64, 64);
     Panel p = panelCost(64, 64, 64, 2, kAccBytes);
     PanelSchedule s = planPanelSchedule(f, p);
     CHECK_EQ(s.size(), 2);
     CHECK(s.tiles[0].m == (Range{0, 64}));
-    CHECK(s.tiles[1].m == (Range{64, 100})); // 36 rows, not 64
+    CHECK(s.tiles[1].m == (Range{64, 100})); // a short tail of 36 rows
     CHECK_EQ(s.tiles[1].m.size(), 36);
   }
 

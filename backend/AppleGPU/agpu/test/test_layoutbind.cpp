@@ -60,7 +60,7 @@ int main() {
       }
   }
 
-  CASE("the second ask returns a name, not a rebuilt tree");
+  CASE("the second ask returns the same cached name");
   {
     msl::Context c;
     CoordHoist h{ThreadNames{}};

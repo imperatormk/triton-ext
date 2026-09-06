@@ -96,9 +96,10 @@ int main() {
 
   CASE("core headers include nothing from a layer above them");
   {
-    // Checked over every header under core/, not a list: the containers used
-    // to live in msl/, which put msl/ underneath core/ and made the order
-    // above a fiction. Reintroducing any upward include fails here.
+    // Checked by walking every header actually under core/.
+    // The containers used to live in msl/, which put msl/ underneath core/
+    // and made the order above a fiction. Reintroducing any upward include
+    // fails here.
     for (const std::string &f : headersUnder("core")) {
       auto incs = includesOf(f);
       CHECK(!mentions(incs, "msl/"));

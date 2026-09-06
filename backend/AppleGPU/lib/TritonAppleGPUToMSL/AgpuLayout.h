@@ -148,8 +148,8 @@ inline bool layoutsInterchangeable(RankedTensorType a, RankedTensorType b) {
 }
 
 // The source element feeding a result register, across a shape change that
-// moves no data (expand_dims, broadcast, convert_layout). On coordinates,
-// not register indices: an index means different things under two layouts.
+// moves no data (expand_dims, broadcast, convert_layout). Works in
+// coordinates, since an index means different things under two layouts.
 inline std::optional<int64_t>
 elemThroughRebind(RankedTensorType srcTy, RankedTensorType resTy, int resReg) {
   const ArrayRef<int64_t> srcShape = srcTy.getShape();

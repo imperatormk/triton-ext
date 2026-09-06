@@ -217,7 +217,7 @@ int main() {
                          {{ROW, 0, 32}, {COL, 0, 32}}, {8, 0});
     msl::Block body;
     emitStage(c, body, pa, "pA", {*act}, {"v0", "v1"}, cs, f16());
-    // The pad lives in the stride, which scales the row term: 36, not 32.
+    // The pad lives in the stride, so the row term scales by the padded 36.
     const std::string out = render(body);
     CHECK(out.find("* 36") != std::string::npos);
     CHECK(out.find("* 32") == std::string::npos);

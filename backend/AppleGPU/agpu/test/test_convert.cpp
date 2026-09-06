@@ -87,7 +87,7 @@ int main() {
     CHECK(narrowsFloat(f32(), f16()));
   }
 
-  CASE("bfloat is its own type, not half with a flag set");
+  CASE("bfloat is its own distinct type");
   {
     // bf16 and half are both 16-bit floats with different mantissas.
     CHECK(!(bf16() == f16()));
@@ -139,7 +139,7 @@ int main() {
     CHECK(render(b).find("__agpu_f32_to_e5m2") != std::string::npos);
   }
 
-  CASE("the bias variants are their own encodings, not e4m3 with a flag");
+  CASE("the bias variants are their own distinct encodings");
   {
     // e4b8 has e4m3's mantissa split and a bias of 8; e5b16 has e5m2's and a
     // bias of 16.

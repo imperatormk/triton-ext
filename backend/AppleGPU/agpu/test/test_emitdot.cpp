@@ -52,7 +52,7 @@ int main() {
     CHECK(countOf(out, "simdgroup_float8x8(0.0f)") > 0);
   }
 
-  CASE("a shape that panels emits panel tiles, not a direct grid");
+  CASE("a shape that panels emits its own panel tiles");
   {
     // Same call, different strategy: the budget is too small for the operands.
     msl::Context c;
@@ -107,8 +107,7 @@ int main() {
     CHECK(body.empty());
   }
 
-  CASE("an integer accumulator past the lift bound emits a per-thread K "
-       "loop, never an MMA");
+  CASE("an integer accumulator past the lift bound emits a per-thread K loop");
   {
     // There is no integer MMA on Apple GPUs; `simdgroup_matrix<int>` is a
     // static_assert. Within the exactness bound an i8 dot lifts to the float
@@ -204,7 +203,7 @@ int main() {
     CHECK_EQ(countOf(out, "simdgroup"), 0);
   }
 
-  CASE("a panel plan with no tile builder is a caller bug, not a decline");
+  CASE("a panel plan with no tile builder asserts as a caller bug");
   {
     msl::Context c;
     msl::Block body;
@@ -222,7 +221,7 @@ int main() {
 
   // ── the grid comes from the plan ───────────────────────────────────────
 
-  CASE("the warp grid is read off the facts, not recomputed");
+  CASE("the warp grid is read directly off the facts");
   {
     const Plan p = planDot(gemm(64, 128, 64), kBudget);
     const WarpGrid g = gridOf(p);
@@ -244,7 +243,7 @@ int main() {
     CHECK(countOf(render(body), "simdgroup_multiply_accumulate") > 0);
   }
 
-  CASE("rolling is an input, not a plan field");
+  CASE("rolling is supplied by the caller as an input");
   {
     // emitKernel decides it from the size budget and passes it down.
     msl::Context c;
@@ -395,7 +394,7 @@ int main() {
     CHECK(out.find(zero) < out.find("THE_LOOP"));
   }
 
-  CASE("a direct drain without its window is a caller bug, not a decline");
+  CASE("a direct drain without its window asserts as a caller bug");
   {
     msl::Context c;
     msl::Block body;

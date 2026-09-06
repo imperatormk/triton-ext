@@ -272,8 +272,8 @@ struct ScalarParams {
   // the multiply. An integer dot accumulates at 32 bits.
   ElemType acc = i32();
 
-  // Dropped when only the plain pitch fits: the K loop reads elements, not
-  // simdgroup columns.
+  // Dropped when only the plain pitch fits, since the K loop then reads
+  // plain elements directly.
   bool stagePad = true;
 };
 
@@ -911,8 +911,8 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   return p;
 }
 
-// The whole table's verdict, for MSL_DOT_PLAN_DEBUG. Takes facts and fit, not
-// the chosen kind: the kind cannot say which of two Panel rows fired.
+// The whole table's verdict, for MSL_DOT_PLAN_DEBUG. Takes facts and fit,
+// since the chosen kind alone cannot say which of two Panel rows fired.
 inline std::string dotPlanReport(const DotFacts &f, const DotFit &fit) {
   std::string out;
   // Element widths belong in the shape: two dots of one shape can differ only

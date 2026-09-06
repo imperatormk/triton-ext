@@ -127,7 +127,7 @@ int main() {
     CHECK(r.from[3] < 0);
   }
 
-  CASE("an empty rebinding declines, never succeeding vacuously");
+  CASE("an empty rebinding declines outright");
   {
     CHECK(rebindDecision(Rebind{}).isDecline());
   }

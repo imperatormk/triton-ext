@@ -25,7 +25,7 @@ msl::SmallVec<msl::Str, 8> regs(std::initializer_list<const char *> names) {
 } // namespace
 
 int main() {
-  CASE("zeroing strides by the thread count, not one bin per thread");
+  CASE("zeroing splits the strides evenly across the thread count");
   {
     msl::Context c;
     msl::Block body;
@@ -128,7 +128,7 @@ int main() {
         std::string::npos);
   }
 
-  CASE("num_programs reads the count builtin, not the id");
+  CASE("num_programs reads the count builtin");
   {
     msl::Context c;
     CHECK(render(emitGridQuery(c, GridQuery::NumPrograms, 0, "n"))
@@ -163,7 +163,7 @@ int main() {
     CHECK(render(body).find("int g0 = buf[i0];") != std::string::npos);
   }
 
-  CASE("gather reads a compound offset, not just an index register");
+  CASE("gather reads a compound offset");
   {
     msl::Context c;
     msl::Block body;

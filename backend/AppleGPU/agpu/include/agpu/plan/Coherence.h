@@ -19,7 +19,7 @@ struct BufferAccess {
   AccessKind kind = AccessKind::Load;
   int loopDepth = 0; // 0 = outside any loop
 
-  // A per-lane address into a tile, not one shared scalar location.
+  // A per-lane address into a tile.
   bool isTensor = false;
 };
 

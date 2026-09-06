@@ -103,7 +103,7 @@ int main() {
   CASE("occurrences and distinct sites are counted separately");
   {
     // Autotuning recompiles one kernel under N configurations, so N identical
-    // declines are one site, not N.
+    // declines collapse to a single site.
     DeclineLog log;
     const Decision d = Decision::declined("emitScan", "gapped ladder");
     for (int cfg = 0; cfg < 4; ++cfg)
@@ -247,7 +247,7 @@ int main() {
     CHECK(out.find("configs=1") != std::string::npos);
   }
 
-  CASE("the summary names the sites, not only how many");
+  CASE("the summary names the sites beyond just counting them");
   {
     DeclineLog log;
     log.record(Decision::declined("tt.print", "not implemented"),

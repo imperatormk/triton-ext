@@ -46,21 +46,16 @@ inline msl::Type resultTypeOf(const AtomicPlan &p) {
   return msl::Type::named(spellWord(p.word));
 }
 
-// A fence: this sits inside a thread-election `if` and a
-// threadgroup_barrier in divergent control flow is undefined in Metal.
+// Legal in divergent control flow, unlike a barrier.
 inline msl::Stmt *deviceFence(msl::Context &c) {
   return c.exprStmt(c.call(msl::builtin::atomic::ThreadFence,
                            {c.var(msl::builtin::memflags::Device),
                             c.var(msl::builtin::order::SeqCst)}));
 }
 
-// Release fence before the operation, acquire fence after.
 inline void emitAtomicBody(msl::Context &c, msl::Block &body,
                            const AtomicPlan &p, const msl::Str &ptr,
                            const msl::Str &value, const AtomicNames &nm) {
-  if (p.fences.before)
-    body.push_back(deviceFence(c));
-
   switch (p.strategy) {
   case AtomicStrategy::Native:
     body.push_back(
@@ -88,9 +83,6 @@ inline void emitAtomicBody(msl::Context &c, msl::Block &body,
   case AtomicStrategy::Unsupported:
     break;
   }
-
-  if (p.fences.after)
-    body.push_back(deviceFence(c));
 }
 
 // The excluded threads still hold their initialiser, so a reader of the
@@ -122,10 +114,16 @@ inline void emitAtomic(msl::Context &c, msl::Block &body, const AtomicPlan &p,
                        const AtomicNames &nm, msl::Expr *cond = nullptr) {
   if (!p.usable())
     return;
+  // A device seq_cst fence before a uniform-address atomic crashes the AGX3
+  // compiler. Outside the election: a barrier there would be divergent.
+  if (p.fences.before)
+    body.push_back(c.barrier(msl::Barrier::Scope::Device));
   msl::Block inner;
   emitAtomicBody(c, inner, p, ptr, value, nm);
   c.guardedInto(body, c.allOf(cond, electionExpr(c, p.election, nm)),
                 std::move(inner));
+  if (p.fences.after)
+    body.push_back(c.barrier(msl::Barrier::Scope::Device));
   emitElectedBroadcast(c, body, p, nm);
 }
 

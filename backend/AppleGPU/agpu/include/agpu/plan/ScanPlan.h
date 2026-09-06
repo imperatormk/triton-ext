@@ -109,8 +109,8 @@ struct ScanStep {
 };
 
 // Deltas scaled by the axis stride in lanes, the lowest set bit of the mask,
-// not always 1: a column scan of an 8x8 tile puts the axis on lane bits 3 and
-// 4, so the ladder is 8, 16, not 1, 2.
+// which need not be 1: a column scan of an 8x8 tile puts the axis on lane
+// bits 3 and 4, giving a ladder of 8, 16 where a row scan would give 1, 2.
 inline std::vector<ScanStep> laneLadder(unsigned laneMask) {
   std::vector<ScanStep> steps;
   if (laneMask == 0)
@@ -268,9 +268,8 @@ struct ScanPlan {
     return laneMask != 0 && laneMask != (unsigned)(warpSize - 1);
   }
 
-  // The lane holding the warp's total once the ladder has run. `laneMask`,
-  // not `warpSize - 1`: only an axis filling the warp puts the total at lane
-  // 31.
+  // The lane holding the warp's total once the ladder has run: `laneMask`,
+  // since only an axis filling the warp puts the total at lane 31.
   int64_t totalLane(int64_t warpSize) const {
     if (reverse)
       return 0;

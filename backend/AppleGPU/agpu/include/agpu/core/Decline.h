@@ -54,7 +54,7 @@ private:
 };
 
 // `site` is where in the source; `config` is the compilation (warp count,
-// tile shape, ...). One kernel autotuned under N configs is one site, not N.
+// tile shape, ...). One kernel autotuned under N configs stays a single site.
 struct DeclineSite {
   msl::Str site;
   msl::Str config;

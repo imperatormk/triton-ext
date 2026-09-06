@@ -54,50 +54,60 @@ int main() {
     CHECK_EQ(countOf(render(body), "fence"), 0);
   }
 
-  CASE("a release fence precedes the operation");
+  CASE("a release barrier precedes the operation");
   {
     msl::Context c;
     msl::Block body;
     emitAtomic(c, body, planAtomic(intAdd(), MemOrder::Release), "p", "v", nm);
     const std::string out = render(body);
-    CHECK_EQ(countOf(out, "atomic_thread_fence"), 1);
-    CHECK(out.find("atomic_thread_fence") < out.find("atomic_fetch_add"));
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 1);
+    CHECK(out.find("threadgroup_barrier") < out.find("atomic_fetch_add"));
   }
 
-  CASE("an acquire fence follows the operation");
+  CASE("an acquire barrier follows the operation");
   {
     msl::Context c;
     msl::Block body;
     emitAtomic(c, body, planAtomic(intAdd(), MemOrder::Acquire), "p", "v", nm);
     const std::string out = render(body);
-    CHECK_EQ(countOf(out, "atomic_thread_fence"), 1);
-    CHECK(out.find("atomic_fetch_add") < out.find("atomic_thread_fence"));
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 1);
+    CHECK(out.find("atomic_fetch_add") < out.find("threadgroup_barrier"));
   }
 
-  CASE("the emitted code has acquire-release fences on both sides");
+  CASE("the emitted code has acquire-release barriers on both sides");
   {
     msl::Context c;
     msl::Block body;
     emitAtomic(c, body, planAtomic(intAdd(), MemOrder::AcquireRelease), "p",
                "v", nm);
     const std::string out = render(body);
-    CHECK_EQ(countOf(out, "atomic_thread_fence"), 2);
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 2);
     const std::size_t op = out.find("atomic_fetch_add");
-    CHECK(out.find("atomic_thread_fence") < op);
-    CHECK(out.find("atomic_thread_fence", op) != std::string::npos);
+    CHECK(out.find("threadgroup_barrier") < op);
+    CHECK(out.find("threadgroup_barrier", op) != std::string::npos);
   }
 
-  CASE("the fence is a thread fence, device-scoped");
+  CASE("the barrier carries device scope and no thread fence is emitted");
   {
-    // Not a barrier: this sits inside the election `if` and a
-    // threadgroup_barrier in divergent control flow is undefined behaviour.
     msl::Context c;
     msl::Block body;
     emitAtomic(c, body, planAtomic(intAdd(), MemOrder::Acquire), "p", "v", nm);
     const std::string out = render(body);
-    CHECK(out.find("atomic_thread_fence") != std::string::npos);
     CHECK(out.find("mem_device") != std::string::npos);
-    CHECK(out.find("threadgroup_barrier") == std::string::npos);
+    CHECK(out.find("atomic_thread_fence") == std::string::npos);
+  }
+
+  CASE("both barriers sit outside the election guard");
+  {
+    msl::Context c;
+    msl::Block body;
+    AtomicFacts f = intAdd();
+    f.laneFree = 0b11;
+    emitAtomic(c, body, planAtomic(f, MemOrder::AcquireRelease), "p", "v", nm);
+    const std::string out = render(body);
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 2);
+    CHECK(out.find("threadgroup_barrier") < out.find("if ("));
+    CHECK(out.find("atomic_fetch_add") < out.rfind("threadgroup_barrier"));
   }
 
   CASE("no free bits means no guard");

@@ -248,7 +248,7 @@ int main() {
     CHECK(checkMath(MathFn::Tan, i32()).isDecline());
   }
 
-  CASE("round and roundeven are different functions, not two names for one");
+  CASE("round and roundeven are genuinely different functions");
   {
     // round takes a half away from zero, roundeven takes it to even:
     // round(+2.5) is 3 and rint(+2.5) is 2.

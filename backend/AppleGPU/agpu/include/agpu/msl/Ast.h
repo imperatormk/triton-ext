@@ -58,7 +58,7 @@ public:
     return Type(Form::Vector, s, n, {}, AddrSpace::None);
   }
 
-  // `packed_floatN`: aligned to the element, not the vector.
+  // `packed_floatN`, which aligns only to the element.
   static Type packedVector(Scalar s, int n) {
     Type t(Form::Vector, s, n, {}, AddrSpace::None);
     t.packed_ = true;

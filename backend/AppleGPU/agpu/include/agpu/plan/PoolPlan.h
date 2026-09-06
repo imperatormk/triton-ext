@@ -91,9 +91,9 @@ inline FunctionPool planModulePool(const std::vector<FunctionPool> &functions) {
 // What the operations walked so far have asked for, accumulated.
 class PoolRequests {
 public:
-  // Scratch regions are reused, so requests are maxed, not summed, and
-  // `label` names the requester for diagnostics only. It is not a key: two
-  // requests under one label do not collide.
+  // Scratch regions are reused, so requests are maxed together. `label`
+  // names the requester for diagnostics only; it plays no role as a key, so
+  // two requests under one label coexist without colliding.
   void scratch(const char *label, Bytes bytes) {
     requests_.push_back({label, bytes});
   }

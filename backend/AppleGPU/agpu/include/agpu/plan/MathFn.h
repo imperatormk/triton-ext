@@ -50,7 +50,7 @@ enum class MathFn {
   Count,
 };
 
-// `Min`/`Max` live here, not among the comparisons, because they return a
+// `Min`/`Max` live in this value-returning group because of that return
 // value. Their NaN behaviour is a separate decision; see
 // `minMaxPropagatesNan`.
 enum class MathFn2 {

@@ -92,8 +92,8 @@ inline bool zeroSplat(Value v) {
 }
 
 // The `tt.store` a fused accumulator drains into, and the single-use chain of
-// converts and epilogue-table ops it folds on the way. The fold is bounded by
-// the operands, not the arithmetic: each folded op's second operand must be
+// converts and epilogue-table ops it folds on the way. The operands bound the
+// fold and the arithmetic does not: each folded op's second operand must be
 // readable at the drain's own coordinates and a mask must be the window's own
 // bounds. A fanned-out loop result is allowed only where every consumer folds
 // back in (gelu reads its accumulator twice, via `DrainStepFact::branch`).

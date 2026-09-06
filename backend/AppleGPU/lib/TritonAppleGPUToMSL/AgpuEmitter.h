@@ -290,8 +290,8 @@ private:
   LogicalResult bindArgs(triton::FuncOp func,
                          std::vector<agpu::KernelArg> &args);
 
-  // .at() aborts in this exceptions-disabled build; go through these, never
-  // the maps directly.
+  // .at() aborts in this exceptions-disabled build, so always go through
+  // these accessors.
   const agpu::ElemType *elemOf(agpu::ValueId v) const {
     const auto it = elemFor_.find(v);
     return it == elemFor_.end() ? nullptr : &it->second;

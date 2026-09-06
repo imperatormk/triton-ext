@@ -40,7 +40,7 @@ int main() {
     CHECK(planPoll(pollOf(32)).load == PollLoad::AtomicWord);
   }
 
-  CASE("a 64-bit flag is a volatile deref, not an atomic load");
+  CASE("a 64-bit flag reads through a volatile deref");
   {
     PollPlan p = planPoll(pollOf(64));
     CHECK(p.usable);
@@ -85,7 +85,7 @@ int main() {
     CHECK(out.find("if (tid.x == 0)") < out.find("while ("));
   }
 
-  CASE("the load is re-issued every iteration, not hoisted");
+  CASE("the load is re-issued on every iteration");
   {
     msl::Context c;
     msl::Block body;

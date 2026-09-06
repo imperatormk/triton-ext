@@ -210,7 +210,7 @@ int main() {
     CHECK_EQ(countOf(out, "threadgroup_barrier"), 2 * 2 + 1);
   }
 
-  CASE("expressions compare by structure, not by spelling");
+  CASE("expressions compare by structure");
   {
     msl::Context c;
     CHECK(msl::exprsEqual(c.var("x"), c.var("x")));
@@ -236,7 +236,7 @@ int main() {
     CHECK(msl::exprsEqual(folded, c.lit(8)));
   }
 
-  CASE("a call compares its callee, not only its arguments");
+  CASE("a call compares its callee along with its arguments");
   {
     msl::Context c;
     msl::Expr *f = c.call("foo", {c.var("x")});
@@ -293,7 +293,7 @@ int main() {
     CHECK(body.size() > 0u);
   }
 
-  CASE("the identity test is asked before banding, not inside it");
+  CASE("the identity test is asked ahead of banding");
   {
     msl::Context c;
     for (Capacity cap : {Capacity(Bytes(32768), Bytes(0)), // fits

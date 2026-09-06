@@ -131,8 +131,8 @@ AgpuEmitter::lowerCombine(Region &region, am::Block &body,
   // time; the per-walk suffix avoids Metal redefinition errors.
   const ScopeMark scope(*this, "c" + std::to_string(body_.combineSeq++));
 
-  // Block arguments are source-major (a0,a1,...,b0,b1,...) per Triton's
-  // verifier, not pairwise.
+  // Block arguments arrive source-major (a0,a1,...,b0,b1,...): that is the
+  // order Triton's verifier requires.
   if (blk.getNumArguments() != lhs.size() + rhs.size()) {
     body_.notePending("the combine region's arity does not match the operands");
     return out;

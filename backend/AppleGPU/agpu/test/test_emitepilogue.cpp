@@ -58,7 +58,7 @@ int main() {
         std::string("a / b"));
   }
 
-  CASE("a binary with no right operand is a caller error, not a decline");
+  CASE("a binary with no right operand asserts as a caller error");
   {
     msl::Context c;
     CHECK(isEpilogueBinary("arith.addf"));
@@ -70,15 +70,15 @@ int main() {
   CASE("a unary renders its math function");
   {
     msl::Context c;
-    // `fabs`, not `abs`: `abs` is also overloaded for integers, so a float
-    // argument is ambiguous.
+    // `abs` is also overloaded for integers, which makes a float argument
+    // ambiguous, so the emitter spells it `fabs`.
     CHECK_EQ(render(epilogueExpr(c, {"math.absf"}, c.var("a"))),
              std::string("metal::fabs(a)"));
     CHECK_EQ(render(epilogueExpr(c, {"math.exp"}, c.var("a"))),
              std::string("metal::precise::exp(a)"));
   }
 
-  CASE("fusable is a policy, not a capability");
+  CASE("fusable is decided by policy");
   {
     // Folding a transcendental into a K loop evaluates it once per step rather
     // than once per output. That is what fusableOnly filters for.

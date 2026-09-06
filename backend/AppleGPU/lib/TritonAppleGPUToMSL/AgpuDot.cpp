@@ -65,9 +65,9 @@ agpu::Decision AgpuEmitter::emitDotOp(const agpu::OpView &o) {
   }
 
   // A fused dot's accumulators are the enclosing loop's to declare and
-  // drain; left here for `emitForOp` to find. `result` is the loop
-  // result, not `cOut`: they differ when the readback absorbed the
-  // post-loop convert and the loop must stop carrying the loop result.
+  // drain; left here for `emitForOp` to find. `result` holds the loop result
+  // while `cOut` may differ, once the readback has absorbed the post-loop
+  // convert and the loop must stop carrying the loop result.
   if (plan.accumulatorsOutlivePass()) {
     body_.fusedDots.push_back(FusedDot{plan, in.direct, in.coords.c,
                                        in.readbackFor, in.cStore, in.cSteps,

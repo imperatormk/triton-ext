@@ -10,7 +10,7 @@ using namespace agpu;
 using agpu_test::render;
 
 int main() {
-  CASE("a poisoned pointer is nullptr, not a cast zero");
+  CASE("a poisoned pointer renders as nullptr");
   {
     msl::Context c;
     const msl::Type ptr =
@@ -18,7 +18,7 @@ int main() {
     CHECK_EQ(render(poisonPointer(c, ptr)), std::string("nullptr"));
   }
 
-  CASE("a poisoned float is a float zero, not an integer one");
+  CASE("a poisoned float keeps a float-typed zero");
   {
     msl::Context c;
     const std::string h = render(poisonDecl(c, "p", f16()));

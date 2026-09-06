@@ -95,7 +95,7 @@ int main() {
     CHECK(p.scalar().acc == i32());
   }
 
-  CASE("the scalar reservation reads its payload, not the strategy rule");
+  CASE("the scalar reservation reads straight off its payload");
   {
     DotFacts f = gemm(64, 64, 64);
     f.intAcc = true;
@@ -106,7 +106,7 @@ int main() {
     CHECK(p.facts.intAcc);
   }
 
-  CASE("a shape ragged in M or N is emitted, not declined");
+  CASE("a shape ragged in M or N still gets emitted");
   {
     CHECK_EQ(kindOf(planDot(gemm(60, 64, 64), kBudget)), kDirect);
     CHECK_EQ(kindOf(planDot(gemm(64, 63, 64), kBudget)), kDirect);
@@ -204,7 +204,7 @@ int main() {
     CHECK(fusedPadWorthCarrying(Bytes(4336), Bytes(4000), kBudget));
   }
 
-  CASE("a fused C that fits only unpadded drops the pad, not the fusion");
+  CASE("a fused C that fits only unpadded drops the pad but keeps the fusion");
   {
     DotFacts f = gemm(64, 128, 64);
     f.fusedAcc = true;
@@ -322,7 +322,7 @@ int main() {
     CHECK_EQ(p.kp % kSgFragDim, 0);
   }
 
-  CASE("a shrunk K stays fragment-aligned for every K, not just powers of two");
+  CASE("a shrunk K stays fragment-aligned for any K");
   {
     for (int64_t K : {24, 40, 48, 96, 128, 256, 1024})
       for (int64_t budget : {256, 384, 512, 1024, 2048}) {
@@ -564,7 +564,7 @@ int main() {
     CHECK_EQ(looped.stage.a.count(), 0);
   }
 
-  CASE("a shape only the plain pitch admits goes direct-unpadded, not panel");
+  CASE("a shape only the plain pitch admits goes direct-unpadded");
   {
     DotFacts f = gemm(64, 56, 64);
     f.aElemBytes = f.bElemBytes = 4;
@@ -837,7 +837,7 @@ int main() {
     CHECK(p.cThroughPool());
   }
 
-  CASE("the rename is decided on the cover the plan emits, not the facts' one");
+  CASE("the rename is decided on the plan's own emitted cover");
   {
     DotFacts f = gemm(32, 32, 32);
     f.aElemBytes = f.bElemBytes = 4;
@@ -1002,7 +1002,7 @@ int main() {
     CHECK(p.pool.reserved() <= kBudget);
   }
 
-  CASE("the plan reports why a dot is not fused, not only what it chose");
+  CASE("the plan explains why a dot went unfused, beyond just its choice");
   {
     DotFacts big = gemm(128, 128, 128);
     big.fusedAcc = true;

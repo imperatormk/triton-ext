@@ -225,7 +225,7 @@ int main() {
     CHECK(out.find("threadgroup_barrier") < out.find("break;"));
   }
 
-  CASE("an address space is a name, not a name plus a space");
+  CASE("an address space renders as a single name");
   {
     CHECK_EQ(std::string(spell(AddrSpace::Device)), std::string("device"));
     CHECK_EQ(std::string(spell(AddrSpace::Constant)), std::string("constant"));
@@ -354,7 +354,7 @@ int main() {
     CHECK_EQ(countOf(render(b), "threadgroup_barrier"), 1);
   }
 
-  CASE("a hard barrier keeps its own scope, not the widest");
+  CASE("a hard barrier keeps its own scope when fused with a softer one");
   {
     using S = Barrier::Scope;
     Context c;
@@ -487,7 +487,7 @@ int main() {
                          "x = 1;\n"));
   }
 
-  CASE("a struct declaration is a node, not raw text");
+  CASE("a struct declaration renders as a proper AST node");
   {
     Context c;
     auto *sd = c.structDecl();

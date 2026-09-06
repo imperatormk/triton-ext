@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-# Loaded by path, not by package import: `import triton_apple_backend.driver`
-# runs Triton's backend discovery, which needs a built plugin. The ABI tables
-# are plain data and need none of that.
+# Loaded by path to avoid `import triton_apple_backend.driver`, which runs
+# Triton's backend discovery and needs a built plugin. The ABI tables are
+# plain data and need none of that.
 _PKG = Path(__file__).resolve().parents[1] / "python" / "triton_apple_backend"
 
 

@@ -282,7 +282,7 @@ int main() {
     CHECK_EQ(dn.pool, kn.pool);
   }
 
-  CASE("names two emitters must agree on are inherited, not respelled");
+  CASE("names two emitters must agree on are inherited verbatim");
   {
     // EmitDirect calls into EmitPanel, so poolC, acc and kVar must agree at
     // runtime. A differing default reads an undeclared variable.

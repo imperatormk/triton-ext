@@ -60,7 +60,7 @@ int main() {
 
   // ── spelling ───────────────────────────────────────────────────────────
 
-  CASE("a vector constructor is spelled by the type, not by a fallback");
+  CASE("a vector constructor is spelled according to its type");
   {
     CHECK_EQ(vecCtorName(f32(), 4), std::string("float4"));
     CHECK_EQ(vecCtorName(f16(), 2), std::string("half2"));
@@ -170,7 +170,7 @@ int main() {
 
   // ── stores ─────────────────────────────────────────────────────────────
 
-  CASE("a store writes through the pointer, not into the value");
+  CASE("a store writes through the pointer");
   {
     msl::Context c;
     msl::Block body;
@@ -217,7 +217,7 @@ int main() {
     CHECK(planMove(f).init == MaskedInit::None);
   }
 
-  CASE("an `other` value seeds the registers, not zero");
+  CASE("an `other` value seeds the registers");
   {
     msl::Context c;
     msl::Block body;
@@ -266,7 +266,7 @@ int main() {
       CHECK(out.find("if (m" + std::to_string(r) + ")") != std::string::npos);
   }
 
-  CASE("the peel guard spans every register, not each run");
+  CASE("the peel guard spans every register in one shot");
   {
     // Splitting it per run would re-serialise the runs against each other.
     msl::Context c;
@@ -282,7 +282,7 @@ int main() {
     CHECK(out.find("m0 && m1") != std::string::npos);
   }
 
-  CASE("a broadcast mask contributes one term, not one per register");
+  CASE("a broadcast mask contributes a single shared term");
   {
     msl::Context c;
     msl::Block body;

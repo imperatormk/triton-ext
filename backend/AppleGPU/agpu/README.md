@@ -96,7 +96,8 @@ installed, set `TOOLCHAINS` to the Metal toolchain's bundle id.
 1. **Sizing and emission share the object.** Whoever reserves space calls
    `cosizeElems()` on the same view the emitter addresses through.
 1. **Decline, don't fail.** A shape this emitter cannot express returns a
-   `Decision` with a reason, never `/*bad loop header*/` in the output.
+   `Decision` carrying a reason, so the output stays free of stray markers like
+   `/*bad loop header*/`.
 1. **Refuse only what the toolchain cannot diagnose.** An over-limit threadgroup
    declaration crashes MTLCompilerService, so the pool gate catches it. Register
    pressure, alignment and buffer counts are Metal's job.
@@ -111,4 +112,4 @@ installed, set `TOOLCHAINS` to the Metal toolchain's bundle id.
    that decides ends in `Plan` or `Schedule`; the rest are the types and tables
    those decisions are written in (`ElemType`, `MathFn`, `WarpSlots`). `emit/*`
    build AST and are named for the op family; `emit/primitives/` holds the small
-   types an emitter holds, not functions that emit.
+   types an emitter holds, kept apart from the functions that emit.

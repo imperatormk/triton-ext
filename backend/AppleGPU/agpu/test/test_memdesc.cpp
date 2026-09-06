@@ -56,7 +56,7 @@ int main() {
     CHECK_EQ(s.offsetOf({1, 0}), 3 * 16 + 4);
   }
 
-  CASE("a subslice keeps the parent's strides, not its own extents");
+  CASE("a subslice inherits the parent's strides");
   {
     // A 4x8 window into a 16-wide tile still steps 16 per row.
     MemDesc s = allocMemDesc("buf", {8, 16}).subslice({0, 0}, {4, 8});

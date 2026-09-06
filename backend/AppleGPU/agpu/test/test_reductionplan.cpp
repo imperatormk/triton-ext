@@ -65,7 +65,7 @@ int main() {
     CHECK_EQ(groups[1].sourceRegs, std::vector<int>({2, 3}));
   }
 
-  CASE("replicated registers fold once, not twice");
+  CASE("replicated registers fold exactly once");
   {
     std::vector<CoordKey> src = {
         CoordKey({0, 0}),

@@ -297,7 +297,7 @@ int main() {
     CHECK(pb < mma);
   }
 
-  CASE("barrier order is the caller's, not a helper's");
+  CASE("the caller decides barrier order");
   {
     msl::Context c;
     DotFacts f = gemm(16, 16, 16);
@@ -437,7 +437,7 @@ int main() {
     CHECK_EQ(countOf(render(body), "if ("), 0);
   }
 
-  CASE("a register wholly past the edge is dropped, not guarded");
+  CASE("a register wholly past the edge is dropped outright");
   {
     DotFacts f = gemm(60, 64, 64);
     PanelSchedule s = planPanelSchedule(f, panelCost(64, 64, 64, 2, kAccBytes));
@@ -525,7 +525,7 @@ int main() {
     CHECK_EQ(tileTag(s.tiles[1]), msl::Str{"_s1"});
   }
 
-  CASE("fragment type names come from the fragment, not from the emitter");
+  CASE("the fragment supplies its own type names");
   {
     CHECK_EQ(kSimdgroup8x8.mslType("float"), std::string("simdgroup_float8x8"));
     CHECK_EQ(kSimdgroup8x8.mslType("bfloat"),

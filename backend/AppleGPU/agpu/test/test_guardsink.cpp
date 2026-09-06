@@ -203,7 +203,7 @@ int main() {
     CHECK(out.find("a") < out.find("bb"));
   }
 
-  CASE("a masked store of n registers ends up under one guard, not n");
+  CASE("a masked store of n registers ends up under a single guard");
   {
     Context c;
     Block b;

@@ -105,7 +105,7 @@ int main() {
     }());
   }
 
-  CASE("the packed atomic narrows through a helper, never a cast");
+  CASE("the packed atomic narrows through a dedicated helper");
   {
     HelperSet h;
     h.require(planAtomic(atomicOf(RmwOp::Add, ElemClass::Float, 16),
@@ -131,7 +131,7 @@ int main() {
     CHECK(!h.any());
   }
 
-  CASE("erf uses the tighter fit, not the reference's");
+  CASE("erf uses its own tighter fit");
   {
     HelperSet h;
     h.add(Helper::Erf);
@@ -153,7 +153,7 @@ int main() {
     CHECK(!other.any());
   }
 
-  CASE("fp8 packs round to nearest-even, not toward zero");
+  CASE("fp8 packs round to nearest-even");
   {
     HelperSet h;
     h.add(Helper::Fp8PackE4M3);
@@ -202,7 +202,7 @@ int main() {
     CHECK(prelude(rtz).find("sgn | 0x7bffu") != std::string::npos);
   }
 
-  CASE("bfloat's nearest-even is a rounded truncation, not a bare one");
+  CASE("bfloat's nearest-even rounds before truncating");
   {
     HelperSet ne, z;
     ne.add(Helper::RtneIntBfloat);
@@ -282,7 +282,7 @@ int main() {
       }
   }
 
-  CASE("erf's table entry names the helper, not a metal:: function");
+  CASE("erf's table entry names the prelude helper");
   {
     CHECK_EQ(std::string(mathNameOf(MathFn::Erf)),
              std::string(msl::builtin::helper::Erf));

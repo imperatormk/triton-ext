@@ -214,8 +214,8 @@ inline msl::Str panelAccName(const PanelTile &t, const PanelNames &nm,
   return nm.acc + join + std::to_string(acc);
 }
 
-// Individually named, never an array: an array of fragments defeats SROA and
-// lands in stack memory.
+// Individually named because an array of fragments defeats SROA and lands in
+// stack memory.
 inline void emitPanelAccumDecls(msl::Context &c, msl::Block &body,
                                 const PanelTile &t, const PanelNames &nm,
                                 const WarpProgram &prog, const WarpGrid &grid) {

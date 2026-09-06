@@ -122,8 +122,8 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
   in.b.leadingDim = agpu::Stride(bStaged.strideAt(bStaged.rank() - 2));
   if (pf.batched())
     in.b.sliceStride = bStaged.strideAt(0);
-  // B is indexed by N, its column axis: fragment `ni` sits `ni*8` elements
-  // across, not `ni*8` rows down.
+  // B is indexed by N, its column axis, so fragment `ni` sits `ni*8`
+  // elements across the row.
   in.b.fragAxis = agpu::OperandSource::FragAxis::Cols;
   return agpu::Decision::emitted();
 }
@@ -144,8 +144,9 @@ agpu::Decision AgpuEmitter::stageDotOperands(const DotOperands &ops,
       !d.ok())
     return d;
 
-  // Fragment element follows the operands, not `MmaNames`'s half default: a
-  // simdgroup_half8x8 loading from a `threadgroup float *` is a type error.
+  // Fragment element follows the operands and overrides `MmaNames`'s half
+  // default: a simdgroup_half8x8 loading from a `threadgroup float *` is a
+  // type error.
   // `accElem` stays float; the accumulator is always fp32.
   const am::Type aMsl = agpu::mslTypeOf(stagedAElem);
   in.panel.opElem = am::spell(aMsl.scalarKind());
@@ -260,8 +261,8 @@ agpu::Decision AgpuEmitter::planTileActions(
     for (int d = 0; d < ty.getRank(); ++d)
       ranges.push_back(cs.rangeOf((int)r, d, ty.getShape()[d]));
 
-    // Use `registerCoordAt`, not `ranges[d].lo`: the latter is the reachable
-    // set's start and is the same for every register along a lane-varying dim.
+    // Use `registerCoordAt` here. `ranges[d].lo` is the reachable set's start
+    // and is the same for every register along a lane-varying dim.
     const std::optional<agpu::TileView::Coord> at = registerCoordAt(ty, (int)r);
     if (!at)
       return declined(where, "the layout has no coordinates");

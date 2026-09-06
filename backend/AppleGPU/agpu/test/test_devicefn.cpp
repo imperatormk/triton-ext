@@ -49,7 +49,7 @@ int main() {
     CHECK_EQ(render(emitDeviceReturn(c, abi, {})), std::string("return;\n"));
   }
 
-  CASE("one scalar result comes back directly, not wrapped");
+  CASE("one scalar result comes back directly");
   {
     DeviceFnFacts f = fnOf("sum", {scalar(f32())}, {scalar(f32())});
     DeviceFnAbi abi = planDeviceFn(f);
@@ -178,7 +178,7 @@ int main() {
 
   // ── the prototype ──────────────────────────────────────────────────────
 
-  CASE("a prototype is the signature and a semicolon, not an empty body");
+  CASE("a prototype is just the signature and a semicolon");
   {
     DeviceFnFacts f =
         fnOf("g", {scalar(f32()), pointer(i32())}, {scalar(f32())});
@@ -277,7 +277,7 @@ int main() {
     CHECK(decl.find("float f1;") != std::string::npos);
   }
 
-  CASE("a void call is a statement, not a discarded declaration");
+  CASE("a void call emits as a bare statement");
   {
     DeviceFnFacts f = fnOf("g", {}, {});
     DeviceFnAbi abi = planDeviceFn(f);

@@ -148,7 +148,7 @@ int main() {
     CHECK_EQ(tile.strideAt(1), 1);
   }
 
-  CASE("transposed B is a stride swap, not a boolean");
+  CASE("transposed B is represented as a stride swap");
   {
     const int64_t K = 32, N = 64;
     TileView bRow = TileView::rowMajor({K, N});

@@ -106,7 +106,7 @@ int main() {
     CHECK(render(body).find("threadgroup") == std::string::npos);
   }
 
-  CASE("an integer reduction accumulates through an integer, not a float");
+  CASE("an integer reduction keeps an integer accumulator");
   {
     msl::Context c;
     msl::Block body;
@@ -300,7 +300,7 @@ int main() {
     CHECK(out.find("threadgroup_barrier", rd) != std::string::npos);
   }
 
-  CASE("every warp combines its own subset, not warp 0's");
+  CASE("every warp combines its own subset");
   {
     // warpSubset holds XOR offsets: for each warp, the slots it reads are the
     // warps that differ from it only in the mask.
@@ -324,7 +324,7 @@ int main() {
     }
   }
 
-  CASE("scratch is sized for every warp, not just the subset");
+  CASE("scratch is sized for the whole warp count");
   {
     // The publish writes at warp*32 from all warps, so a reservation sized
     // to the subset is written past by the warps outside it.

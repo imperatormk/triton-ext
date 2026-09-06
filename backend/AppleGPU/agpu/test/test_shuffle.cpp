@@ -62,7 +62,7 @@ int main() {
       CHECK_EQ(basis[b], 1 << b);
   }
 
-  CASE("a permutation that moves lane 0 is affine, not rejected");
+  CASE("a permutation that moves lane 0 can still be affine");
   {
     std::vector<int32_t> basis;
     int32_t offset = 0;
@@ -70,7 +70,7 @@ int main() {
     CHECK_EQ(offset, 3);
   }
 
-  CASE("linearity is verified exhaustively, not inferred from the basis");
+  CASE("linearity is verified exhaustively over every lane");
   {
     // A permutation can agree with an affine map on every basis vector and
     // disagree elsewhere.

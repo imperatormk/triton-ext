@@ -35,8 +35,8 @@ atomics) and uses nothing Metal 4 only, so the MSL runs on M3+ without change.
 It does not yet use Metal 4's cooperative_tensor MMA or packed fp8/MX storage,
 so GEMM and conv run at Metal 3 fragment speed there.
 
-Per-device limits such as max threads per threadgroup are read back from the
-compiled pipeline, not assumed.
+Per-device limits such as max threads per threadgroup are always read back from
+the compiled pipeline.
 
 ## Setup
 
@@ -146,9 +146,9 @@ as vestigial, the second has a real lowering.
 
 ## Known Limitations
 
-- `float64` - Metal has no double, so an f64 kernel computes in f32 instead of
-  being rejected. The narrowing is silent apart from a decline note; see
-  `narrowsSilently` in `agpu/include/agpu/plan/ElemType.h`.
+- `float64` - Metal has no double, so an f64 kernel silently computes in f32.
+  The narrowing carries a decline note; see `narrowsSilently` in
+  `agpu/include/agpu/plan/ElemType.h`.
 - `float8` (e4m3, e5m2) - kernels compile and run when fp8 crosses the boundary
   as uint8 storage plus `triton.reinterpret`, which is what Triton's own fp8
   tests do. A native `torch.float8_*` device tensor is not possible: torch MPS

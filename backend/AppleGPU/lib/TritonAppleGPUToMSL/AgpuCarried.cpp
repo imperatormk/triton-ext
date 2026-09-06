@@ -13,8 +13,8 @@ int64_t AgpuEmitter::registersHeldByType(Type t) const {
 agpu::CarriedValue AgpuEmitter::carriedFresh(Value v) {
   agpu::CarriedValue cv;
   cv.regs = freshNames(v, registersHeldByType(v.getType()));
-  // Held type, not `elemTypeOf`'s pointee: a carried pointer needs the
-  // address's own type.
+  // Uses the held type: a carried pointer needs the address's own type,
+  // which `elemTypeOf`'s pointee does not give.
   if (const std::optional<agpu::ElemType> e = heldTypeOf(v.getType()))
     cv.elem = *e;
   bindCarried(v, cv);

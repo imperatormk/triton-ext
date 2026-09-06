@@ -32,7 +32,7 @@ Carried one(std::initializer_list<const char *> regs, ElemType e = i32()) {
 } // namespace
 
 int main() {
-  CASE("results are declared before the construct, not inside it");
+  CASE("results are declared ahead of the construct");
   {
     // A variable declared inside a region is out of scope after it.
     msl::Context c;

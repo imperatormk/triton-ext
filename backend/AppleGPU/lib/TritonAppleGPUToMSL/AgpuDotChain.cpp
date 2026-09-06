@@ -114,15 +114,15 @@ bool DrainProof::spine(Operation *firstUser) {
       }
     }
     folded_.push_back({user, other, pendingRound_});
-    // An f16-computed step rounds its own result; f32 leaves it unrounded
-    // until the next truncf.
+    // Every element the drain can spell now computes at f32, so no step
+    // rounds its own result.
     auto sty = dyn_cast<RankedTensorType>(user->getResult(0).getType());
     if (!sty ||
         !(sty.getElementType().isF32() || sty.getElementType().isF16() ||
           sty.getElementType().isBF16()))
       return fail("an epilogue op computes in an element the drain cannot "
                   "spell");
-    pendingRound_ = !sty.getElementType().isF32();
+    pendingRound_ = false;
     out_.chainOps.push_back(user);
     v = user->getResult(0);
   }

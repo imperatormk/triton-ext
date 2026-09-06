@@ -177,12 +177,15 @@ void AgpuEmitter::setTileInputs(const DotOperands &ops, const agpu::Plan &plan,
   // `in.a` is the device source when A is read in place. The staged case
   // rebuilds a per-tile pool source inside the callback: a panel tile's pitch
   // is the tile's.
+  // Resolved once here: narrowing a widened register mints a
+  // temporary, which belongs in this block rather than the panel loop's.
   in.tileInputs = [this, plan, aId, aTy, bId, bTy, cId, cTy, deviceA = in.a,
                    poolA = in.panel.poolA, cIn = ops.cIn, stagedAElem,
-                   stagedBElem,
+                   stagedBElem, aNames = stagedNamesOf(aId, registerCount(aTy)),
+                   bNames = stagedNamesOf(bId, registerCount(bTy)),
                    cElem = ops.shape.cElem](const agpu::PanelTile &t) {
     return panelInputsFor(t, plan, aId, aTy, bId, bTy, cId, cTy, deviceA, poolA,
-                          cIn, stagedAElem, stagedBElem, cElem);
+                          cIn, stagedAElem, stagedBElem, cElem, aNames, bNames);
   };
 }
 
@@ -193,7 +196,8 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
   const RankedTensorType cTy = ops.cOutTy;
   {
     am::SmallVec<agpu::StageAction, 8> probe;
-    am::SmallVec<am::Str, 8> bound;
+    const am::SmallVec<am::Str, 8> bound =
+        stagedNamesOf(cId, registerCount(cTy));
     if (const agpu::Decision d =
             planTileActions(cId, cTy, wholeWindowsOf(cTy), plan.cStagedView(),
                             (int)agpu::kAccBits, probe, bound, "tt.dot");
@@ -201,6 +205,7 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
       return d;
   }
   in.readbackFor = [this, cId, cTy, cIn = ops.cIn, cView = plan.cStagedView(),
+                    cNames = stagedNamesOf(cId, registerCount(cTy)),
                     rename = plan.readsBackByRename() ? plan.readback
                                                       : agpu::ReadbackPlan{},
                     // A fused dot's registers stay f32; other paths land in
@@ -215,10 +220,9 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
     agpu::CoordWindow &mw = window[cTy.getRank() - 2];
     mw.lo = rows.lo;
     mw.hi = std::min(rows.hi, mw.hi);
-    am::SmallVec<am::Str, 8> bound;
     if (const agpu::Decision d =
             planTileActions(cId, cTy, window, cView, (int)agpu::kAccBits,
-                            back.actions, bound, "tt.dot");
+                            back.actions, cNames, "tt.dot");
         !d.ok()) {
       body_.notePending("a C band's layout stopped resolving mid-emission");
       return back;
@@ -238,11 +242,21 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
   return agpu::Decision::emitted();
 }
 
+am::SmallVec<am::Str, 8> AgpuEmitter::stagedNamesOf(agpu::ValueId v,
+                                                    int64_t regs) {
+  am::SmallVec<am::Str, 8> names;
+  for (int64_t r = 0; r < regs; ++r) {
+    const am::Str *n = body_.sym.regAt(v, (std::size_t)r);
+    names.push_back(n ? inIrType(v, r) : am::Str{});
+  }
+  return names;
+}
+
 agpu::Decision AgpuEmitter::planTileActions(
     agpu::ValueId v, RankedTensorType ty,
     const std::vector<agpu::CoordWindow> &windows, const agpu::TileView &dst,
     unsigned elemBits, am::SmallVec<agpu::StageAction, 8> &actions,
-    am::SmallVec<am::Str, 8> &names, std::string_view where) {
+    const am::SmallVec<am::Str, 8> &names, std::string_view where) {
   const agpu::CoordSource cs = coordSourceOf(ty);
   // `rangeOf` indexes `cs.dims`; fewer output dims than rank reads past the
   // end.
@@ -250,11 +264,8 @@ agpu::Decision AgpuEmitter::planTileActions(
     return declined(where, "the layout has no coordinates");
 
   const int64_t regs = registerCount(ty);
-
-  for (int64_t r = 0; r < regs; ++r) {
-    const am::Str *n = body_.sym.regAt(v, (std::size_t)r);
-    names.push_back(n ? *n : am::Str{});
-  }
+  if ((int64_t)names.size() != regs)
+    return declined(where, "a staged register has no name");
 
   for (int64_t r = 0; r < regs; ++r) {
     std::vector<agpu::CoordRange> ranges;
@@ -286,7 +297,8 @@ agpu::PanelInputs AgpuEmitter::panelInputsFor(
     agpu::ValueId cId, RankedTensorType cTy, const agpu::OperandSource &deviceA,
     const am::Str &poolAName, const am::SmallVec<am::Str, 8> &cIn,
     const agpu::ElemType &aElem, const agpu::ElemType &bElem,
-    const agpu::ElemType &cElem) {
+    const agpu::ElemType &cElem, const am::SmallVec<am::Str, 8> &aNames,
+    const am::SmallVec<am::Str, 8> &bNames) {
   if (agpu_.gates.on(agpu::Gate::TraceOps)) {
     std::ostringstream os;
     os << "  panelInputsFor m=" << t.m.lo << ".." << t.m.hi << " n=" << t.n.lo
@@ -308,19 +320,22 @@ agpu::PanelInputs AgpuEmitter::panelInputsFor(
   } else {
     in.a.buffer = poolAName;
     in.a.leadingDim = agpu::Stride(t.aView().strideAt(0));
+    in.aNames = aNames;
     ok = planTileActions(aId, aTy, t.aWindows(), t.aStagedView(), aElem.bits,
-                         in.aActions, in.aNames, "tt.dot")
+                         in.aActions, aNames, "tt.dot")
              .ok();
   }
+  in.bNames = bNames;
   ok = planTileActions(bId, bTy, t.bWindows(), t.bStagedView(), bElem.bits,
-                       in.bActions, in.bNames, "tt.dot")
+                       in.bActions, bNames, "tt.dot")
            .ok() &&
        ok;
 
   // C is the dot's result and has no bound names yet; staging would fill
   // `cNames` with empty strings, so they are minted below instead.
   ok = planTileActions(cId, cTy, t.cWindows(), t.cStagedView(),
-                       (int)agpu::kAccBits, in.cActions, in.cNames, "tt.dot")
+                       (int)agpu::kAccBits, in.cActions,
+                       stagedNamesOf(cId, registerCount(cTy)), "tt.dot")
            .ok() &&
        ok;
   in.cNames.clear();
@@ -344,13 +359,13 @@ AgpuEmitter::stageWholeTensor(agpu::ValueId v, RankedTensorType ty,
                               const am::Str &buffer, const agpu::TileView &dst,
                               const agpu::ElemType &elem,
                               std::string_view where, std::string_view what) {
+  const int64_t regs = registerCount(ty);
   am::SmallVec<agpu::StageAction, 8> actions;
-  am::SmallVec<am::Str, 8> names;
+  const am::SmallVec<am::Str, 8> names = stagedNamesOf(v, regs);
   if (const agpu::Decision d = planTileActions(
           v, ty, wholeWindowsOf(ty), dst, elem.bits, actions, names, where);
       !d.ok())
     return d;
-  const int64_t regs = registerCount(ty);
   int64_t covered = 0;
   for (const agpu::StageAction &a : actions)
     covered += a.width;

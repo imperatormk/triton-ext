@@ -18,6 +18,19 @@ am::Str AgpuEmitter::castTo(const agpu::ElemType &to, const am::Str &src) {
   return name;
 }
 
+am::Str AgpuEmitter::inIrType(agpu::ValueId v, int64_t r) {
+  const am::Str *name = body_.sym.regAt(v, r);
+  if (!name)
+    return am::Str();
+  const auto it = declaredFor_.find(v);
+  if (it == declaredFor_.end())
+    return *name;
+  const agpu::ElemType *ir = elemOf(v);
+  if (!ir || it->second == *ir)
+    return *name;
+  return castTo(*ir, *name);
+}
+
 agpu::Decision AgpuEmitter::emitReinterpretCast(const agpu::OpView &o,
                                                 const Ready &ready,
                                                 const Operand &a,
@@ -80,7 +93,8 @@ agpu::Decision AgpuEmitter::emitReinterpretCast(const agpu::OpView &o,
     return declined(o.name, "reinterpret between different widths");
   return emitPerRegister(o, ready.regs, to, 'b', [&](int64_t r) {
     RegValue v;
-    v.value = mc.bitcast(toTy, mc.var(a.at(r)));
+    const am::Str src = inIrType(o.operands[0], r);
+    v.value = mc.bitcast(toTy, mc.var(src.empty() ? a.at(r) : src));
     return v;
   });
 }
@@ -147,7 +161,7 @@ agpu::Decision AgpuEmitter::emitCastOp(const agpu::OpView &o) {
   if (cn->reinterpret)
     return emitReinterpretCast(o, ready, a, from, to);
 
-  return emitConvertCast(o, ready, a, from, to, *fromP);
+  return emitConvertCast(o, ready, a, from, to, declaredOf(o.operands[0]));
 }
 
 agpu::Decision AgpuEmitter::emitMath3Op(const agpu::OpView &o) {
@@ -278,7 +292,10 @@ agpu::Decision AgpuEmitter::emitSelectOp(const agpu::OpView &o) {
 
   return emitPerRegister(o, ready.regs, elem, 's', [&](int64_t r) {
     RegValue v;
-    v.value = mc.ternary(mc.var(c.at(r)), mc.var(t.at(r)), mc.var(f.at(r)));
+    const am::Str tn = inIrType(o.operands[1], r);
+    const am::Str fn = inIrType(o.operands[2], r);
+    v.value = mc.ternary(mc.var(c.at(r)), mc.var(tn.empty() ? t.at(r) : tn),
+                         mc.var(fn.empty() ? f.at(r) : fn));
     return v;
   });
 }
@@ -339,7 +356,8 @@ agpu::Decision AgpuEmitter::emitElementwiseOp(const agpu::OpView &o) {
 
   const agpu::ElemType operand =
       elemOf(o.operands[0]) ? *elemOf(o.operands[0]) : ready.elem;
-  const agpu::EwTypes t = agpu::typesFor(ew, operand);
+  agpu::EwTypes t = agpu::typesFor(ew, operand);
+  t.result = agpu::evalWidthFor(t.result);
 
   // Where the value is affine in a coordinate, emit register 0 and the
   // rest as literal deltas from it.

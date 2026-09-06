@@ -173,13 +173,17 @@ AgpuEmitter::lowerCombine(Region &region, am::Block &body,
         "the combine region does not return one value per operand");
     return out;
   }
+  // A narrowing temporary reads a value declared in the body, so it has to be
+  // emitted there rather than in the block this returns into.
+  const CurBlock in(*this, body);
   for (Value v : term->getOperands()) {
     const am::Str *n = body_.sym.regAt(idOf(v), 0);
     if (!n) {
       body_.notePending("a combine result has no name");
       return out;
     }
-    out.push_back(*n);
+    const am::Str narrowed = inIrType(idOf(v), 0);
+    out.push_back(narrowed.empty() ? *n : narrowed);
   }
   return out;
 }
@@ -208,13 +212,17 @@ agpu::Decision AgpuEmitter::gatherRegionNames(ValueRange srcs,
     const Operand op(body_.sym, idOf(s), into.sourceRegisterCount);
     if (!op.ok())
       return declined(where, "an operand register has no name");
+    const auto nameAt = [&](int64_t r) {
+      const am::Str n = inIrType(idOf(s), r);
+      return n.empty() ? op.at(r) : n;
+    };
     am::SmallVec<am::Str, 8> names;
     if (order.empty())
       for (int64_t r = 0; r < into.sourceRegisterCount; ++r)
-        names.push_back(op.at(r));
+        names.push_back(nameAt(r));
     else
       for (int r : order)
-        names.push_back(op.at(r));
+        names.push_back(nameAt((int64_t)r));
     into.names.push_back(std::move(names));
   }
   return agpu::Decision::emitted();

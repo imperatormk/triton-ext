@@ -278,8 +278,10 @@ agpu::Decision AgpuEmitter::emitStore(const agpu::OpView &o,
     site.guard = [this, &o, maskIndex, elected](int64_t r) {
       return agpu_.context().allOf(elected, maskAt(o, maskIndex, r));
     };
-  for (int64_t r = 0; r < regs; ++r)
-    site.values.push_back(val.at(r));
+  for (int64_t r = 0; r < regs; ++r) {
+    const am::Str narrowed = inIrType(o.operands[1], r);
+    site.values.push_back(narrowed.empty() ? val.at(r) : narrowed);
+  }
 
   const agpu::MovePlan p = agpu::planMove(f);
   agpu::emitMove(agpu_.context(), *cur_, f, p, site, ve ? *ve : agpu::f32());

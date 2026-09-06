@@ -23,8 +23,9 @@ inline msl::Expr *ewExpr(msl::Context &c, EwOp op, ElemType elem, msl::Expr *a,
     return nullptr;
 
   const EwTypes t = typesFor(op, elem);
-  if (!(t.operand == elem)) {
-    const msl::Type to = mslTypeOf(t.operand);
+  const ElemType want = evalWidthFor(t.operand);
+  if (!(want == elem)) {
+    const msl::Type to = mslTypeOf(want);
     a = c.cast(to, a);
     b = c.cast(to, b);
   }
@@ -34,7 +35,8 @@ inline msl::Expr *ewExpr(msl::Context &c, EwOp op, ElemType elem, msl::Expr *a,
 inline msl::Stmt *emitEw(msl::Context &c, EwOp op, ElemType elem,
                          const msl::Str &dst, msl::Expr *a, msl::Expr *b) {
   const EwTypes t = typesFor(op, elem);
-  return c.declStmt(mslTypeOf(t.result), dst, ewExpr(c, op, elem, a, b));
+  return c.declStmt(mslTypeOf(evalWidthFor(t.result)), dst,
+                    ewExpr(c, op, elem, a, b));
 }
 
 // ── NaN ───────────────────────────────────────────────────────────────────

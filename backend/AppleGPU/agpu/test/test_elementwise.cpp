@@ -299,5 +299,39 @@ int main() {
     CHECK(checkMath(MathFn::Abs, intOf(32)).ok());
   }
 
+  // ── evaluation width ──────────────────────────────────────────────────
+
+  CASE("the 16-bit floats evaluate at f32");
+  {
+    CHECK(widensToF32(bf16()));
+    CHECK(widensToF32(f16()));
+    CHECK(evalWidthFor(bf16()) == f32());
+    CHECK(evalWidthFor(f16()) == f32());
+  }
+
+  CASE("fp8 does not widen: spelled as a byte, an f32 vector would truncate");
+  {
+    for (ElemType e : {e4m3(), e5m2(), e4b8(), e5b16()}) {
+      CHECK(!widensToF32(e));
+      CHECK(evalWidthFor(e) == e);
+    }
+  }
+
+  CASE("nothing wider or non-float widens");
+  {
+    CHECK(!widensToF32(f32()));
+    CHECK(!widensToF32(intOf(16)));
+    CHECK(!widensToF32(i1()));
+    CHECK(evalWidthFor(f32()) == f32());
+    CHECK(evalWidthFor(intOf(16)) == intOf(16));
+  }
+
+  CASE("a widened comparison still yields bool");
+  {
+    const EwTypes t = typesFor(EwOp::CmpLtS, bf16());
+    CHECK(evalWidthFor(t.operand) == f32());
+    CHECK(evalWidthFor(t.result) == i1());
+  }
+
   return ::agpu_test::report("Elementwise");
 }

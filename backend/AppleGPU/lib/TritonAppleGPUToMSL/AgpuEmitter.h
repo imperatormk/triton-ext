@@ -296,6 +296,13 @@ private:
     const auto it = elemFor_.find(v);
     return it == elemFor_.end() ? nullptr : &it->second;
   }
+  agpu::ElemType declaredOf(agpu::ValueId v) const {
+    const auto it = declaredFor_.find(v);
+    if (it != declaredFor_.end())
+      return it->second;
+    const agpu::ElemType *e = elemOf(v);
+    return e ? *e : agpu::i32();
+  }
   Value mlirValueOf(agpu::ValueId v) const {
     const auto it = valueFor_.find(v);
     return it == valueFor_.end() ? Value{} : it->second;
@@ -440,6 +447,10 @@ private:
       names.push_back(n);
     }
     body_.sym.bindRegs(o.results[0], std::move(names));
+    // Null for tt.poison, which reaches here with no `elemFor_` entry.
+    const agpu::ElemType *ir = elemOf(o.results[0]);
+    if (ir && agpu::widensToF32(*ir) && elem == agpu::f32())
+      declaredFor_[o.results[0]] = elem;
     return agpu::Decision::emitted();
   }
 
@@ -495,6 +506,9 @@ private:
   };
 
   agpu::msl::Str castTo(const agpu::ElemType &to, const agpu::msl::Str &src);
+
+  // Empty if `v` has no name.
+  agpu::msl::Str inIrType(agpu::ValueId v, int64_t r);
 
   // Declares `name` as a device pointer to `elem` at base + offset, and
   // returns it. A uniform offset is folded into the pointer once, so it does
@@ -667,11 +681,20 @@ private:
 
   // `names` is indexed by register (one entry always); `actions` one per
   // register that reaches the window. Declines when the layout cannot be read.
-  agpu::Decision planTileActions(
-      agpu::ValueId v, RankedTensorType ty,
-      const std::vector<agpu::CoordWindow> &windows, const agpu::TileView &dst,
-      unsigned elemBits, agpu::msl::SmallVec<agpu::StageAction, 8> &actions,
-      agpu::msl::SmallVec<agpu::msl::Str, 8> &names, std::string_view where);
+  // `names` is the caller's already-resolved register names, one per register
+  // of `ty`, empty where the value has none.
+  agpu::Decision
+  planTileActions(agpu::ValueId v, RankedTensorType ty,
+                  const std::vector<agpu::CoordWindow> &windows,
+                  const agpu::TileView &dst, unsigned elemBits,
+                  agpu::msl::SmallVec<agpu::StageAction, 8> &actions,
+                  const agpu::msl::SmallVec<agpu::msl::Str, 8> &names,
+                  std::string_view where);
+
+  // The registers of `v` in their IR element type, narrowed where a wider
+  // evaluation width left them declared as f32.
+  agpu::msl::SmallVec<agpu::msl::Str, 8> stagedNamesOf(agpu::ValueId v,
+                                                       int64_t regs);
 
   agpu::PanelInputs
   panelInputsFor(const agpu::PanelTile &t, const agpu::Plan &plan,
@@ -681,7 +704,9 @@ private:
                  const agpu::msl::Str &poolAName,
                  const agpu::msl::SmallVec<agpu::msl::Str, 8> &cIn,
                  const agpu::ElemType &aElem, const agpu::ElemType &bElem,
-                 const agpu::ElemType &cElem);
+                 const agpu::ElemType &cElem,
+                 const agpu::msl::SmallVec<agpu::msl::Str, 8> &aNames,
+                 const agpu::msl::SmallVec<agpu::msl::Str, 8> &bNames);
 
   agpu::Decision stageWholeTensor(agpu::ValueId v, RankedTensorType ty,
                                   const agpu::msl::Str &buffer,
@@ -736,6 +761,10 @@ private:
   llvm::DenseMap<std::pair<Type, int>, bool> affineDeltasOf_;
 
   std::map<agpu::ValueId, agpu::ElemType> elemFor_;
+
+  // The type a value's registers are declared in, when wider than the IR type.
+  // Absent means the two agree.
+  std::map<agpu::ValueId, agpu::ElemType> declaredFor_;
 
   std::map<agpu::ValueId, Value> valueFor_;
 

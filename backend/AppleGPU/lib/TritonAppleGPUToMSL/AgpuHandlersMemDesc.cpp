@@ -86,7 +86,9 @@ agpu::Decision AgpuEmitter::emitLocalLoad(const agpu::OpView &o) {
     return declined("ttg.local_load", "result type was never recorded");
 
   am::SmallVec<agpu::StageAction, 8> actions;
-  am::SmallVec<am::Str, 8> unused;
+  // The result has no names yet; `local_load` mints its own below.
+  const am::SmallVec<am::Str, 8> unused =
+      stagedNamesOf(o.results[0], registerCount(resTy));
   if (const agpu::Decision d =
           planTileActions(o.results[0], resTy, wholeWindowsOf(resTy), md.view,
                           elem->bits, actions, unused, "ttg.local_load");

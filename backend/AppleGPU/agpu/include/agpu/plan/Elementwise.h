@@ -66,6 +66,20 @@ inline bool needsUnsigned(EwOp op) {
   }
 }
 
+// fp8 is excluded: it has no MSL type and travels as a byte, so widening it
+// would spell `uchar4(float, ...)` and truncate toward zero.
+inline bool widensToF32(const ElemType &e) {
+  return e.kind == ElemType::Kind::Float && e.bits == 16 &&
+         (e.floatKind == FloatKind::Ieee || e.floatKind == FloatKind::Brain);
+}
+
+// MSL leaves the evaluation width of `bfloat a = b * c` unspecified: AGX2
+// rounds once at f32, AGX3 at bf16. Both operands carry the ambiguity, so
+// widening the result alone changes nothing.
+inline ElemType evalWidthFor(ElemType elem) {
+  return widensToF32(elem) ? f32() : elem;
+}
+
 inline bool isComparison(EwOp op) {
   switch (op) {
   case EwOp::CmpEq:

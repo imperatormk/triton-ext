@@ -39,7 +39,8 @@ agpu::Decision AgpuEmitter::carriedFrom(Value v, const agpu::CarriedValue &like,
   // becomes a value.
   const bool isPtr = like.elem.isPointer();
   for (std::size_t r = 0; r < like.regs.size(); ++r) {
-    const am::Str name = from.at((int64_t)r);
+    const am::Str narrowed = inIrType(idOf(v), (int64_t)r);
+    const am::Str name = narrowed.empty() ? from.at((int64_t)r) : narrowed;
     const auto off = isPtr ? body_.offsetOf.find({idOf(v), (int64_t)r})
                            : body_.offsetOf.end();
     if (off == body_.offsetOf.end()) {

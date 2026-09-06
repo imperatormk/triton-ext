@@ -230,5 +230,32 @@ int main() {
         std::string("float d = p ? t : f;\n"));
   }
 
+  CASE("a bf16 operation casts both operands and declares f32");
+  {
+    // `bfloat d = a * b` leaves the evaluation width unspecified, and AGX2 and
+    // AGX3 read it differently. Widening the declaration alone changes
+    // nothing: the operands are what carry the ambiguity.
+    msl::Context c;
+    CHECK_EQ(render(emitEw(c, EwOp::Mul, bf16(), "d", c.var("a"), c.var("b"))),
+             std::string("float d = (float)a * (float)b;\n"));
+    CHECK_EQ(render(emitEw(c, EwOp::Add, f16(), "d", c.var("a"), c.var("b"))),
+             std::string("float d = (float)a + (float)b;\n"));
+  }
+
+  CASE("a bf16 comparison widens its operands but still declares bool");
+  {
+    msl::Context c;
+    CHECK_EQ(
+        render(emitEw(c, EwOp::CmpLtS, bf16(), "d", c.var("a"), c.var("b"))),
+        std::string("bool d = (float)a < (float)b;\n"));
+  }
+
+  CASE("an fp8 operation is left alone: it is spelled as a byte");
+  {
+    msl::Context c;
+    CHECK_EQ(render(emitEw(c, EwOp::Mul, e4m3(), "d", c.var("a"), c.var("b"))),
+             std::string("uchar d = a * b;\n"));
+  }
+
   return ::agpu_test::report("EmitElementwise");
 }

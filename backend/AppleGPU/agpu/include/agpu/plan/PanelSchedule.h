@@ -51,6 +51,9 @@ struct PanelTile {
   // it, no pool region.
   bool aDirect = false;
 
+  WarpCover cover;
+  bool renameC = false;
+
   // Pool views for this tile, in fragment-aligned extents: the MMA reads and
   // writes whole 8x8 fragments however ragged the shape is. `m` and `n`
   // still carry the true extent and the readback guard is built from them.
@@ -162,6 +165,11 @@ inline void forEachPanelTile(const DotFacts &f, const Panel &p, Fn &&fn) {
           t.bElemBytes = f.bElemBytes;
           t.stagePad = p.stagePad;
           t.aDirect = f.aDirect;
+          if (p.renameWarps.set()) {
+            t.renameC = true;
+            t.cover = {t.mFrags() / p.renameWarps.mi,
+                       t.nFrags() / p.renameWarps.ni};
+          }
           t.stageB = !(bi == resB && n0 == resN && k0 == resK);
           if (t.stageB) {
             resB = bi;
@@ -195,13 +203,13 @@ enum class PanelPhase {
   Mma,      // ... then the MMA grid, after a barrier
   Drain,    // ... on the final K panel, store the accumulators into the pool
   Readback, // ... and gather C, one barrier after the drain
+  Rename,
 };
 
 // Every phase reads what the previous one wrote, so every transition is a
-// barrier.
+// barrier, except a rename, which reads only its own warp's fragments.
 inline bool needsBarrierBefore(PanelPhase ph) {
-  (void)ph;
-  return true;
+  return ph != PanelPhase::Rename;
 }
 
 // The phases a tile runs, in order. A device-resident A has no StageA phase
@@ -213,7 +221,9 @@ inline std::vector<PanelPhase> phasesOf(const PanelTile &t) {
   if (t.stageB)
     ph.push_back(PanelPhase::StageB);
   ph.push_back(PanelPhase::Mma);
-  if (t.finalK) {
+  if (t.finalK && t.renameC) {
+    ph.push_back(PanelPhase::Rename);
+  } else if (t.finalK) {
     ph.push_back(PanelPhase::Drain);
     ph.push_back(PanelPhase::Readback);
   }
@@ -230,7 +240,26 @@ inline WarpGrid panelWarpGrid(const PanelTile &t, int64_t numWarps,
   g.nT = t.nFrags();
   g.numWarps = numWarps;
   g.hwWarps = hwWarps;
+  g.cover = t.cover;
   return g;
+}
+
+inline ReadbackPlan panelTileReadback(const DotFacts &f, const PanelTile &t) {
+  if (!t.cover.set())
+    return {};
+  WarpProgram wp;
+  wp.form = WarpForm::Parameterised;
+  wp.miCount = t.cover.mi;
+  wp.niCount = t.cover.ni;
+  const int64_t warps = warpsFor(f);
+  ReadbackWindow w;
+  w.rowLo = t.m.lo;
+  w.rowHi = t.m.lo + t.mFrags() * kSgFragDim;
+  w.colLo = t.n.lo;
+  w.colHi = t.n.lo + t.nFrags() * kSgFragDim;
+  w.batch = t.batched ? t.batch : -1;
+  return planReadback(f.cDims, wp.slots(0, t.mFrags(), t.nFrags(), warps),
+                      f.cRegs, warps, w);
 }
 
 // ── invariants worth asserting ────────────────────────────────────────────

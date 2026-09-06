@@ -39,7 +39,7 @@ int main() {
     DirectNames nm;
 
     msl::Block body;
-    emitFragmentReadback(c, body, plan, names, {}, nm);
+    emitFragmentReadback(c, body, plan, names, {}, f32(), directAccName(nm));
     const std::string assigned = render(body);
     CHECK(assigned.find("c0 = acc0.thread_elements()[0];") !=
           std::string::npos);
@@ -49,7 +49,8 @@ int main() {
 
     msl::Block added;
     msl::SmallVec<msl::Str, 8> bases{"in0", "in1", "in2"};
-    emitFragmentReadback(c, added, plan, names, bases, nm);
+    emitFragmentReadback(c, added, plan, names, bases, f32(),
+                         directAccName(nm));
     const std::string out = render(added);
     CHECK(out.find("c0 = acc0.thread_elements()[0] + in0;") !=
           std::string::npos);

@@ -159,22 +159,6 @@ inline void emitAccumStores(msl::Context &c, msl::Block &body,
   }
 }
 
-// The registers the consumer wants are the lanes the fragments already hold,
-// so each one is an assignment. No pool bytes, no barrier.
-inline void emitFragmentReadback(msl::Context &c, msl::Block &body,
-                                 const ReadbackPlan &plan,
-                                 const msl::SmallVec<msl::Str, 8> &names,
-                                 const msl::SmallVec<msl::Str, 8> &bases,
-                                 const DirectNames &nm) {
-  for (std::size_t r = 0; r < plan.regs.size() && r < names.size(); ++r) {
-    msl::Expr *value = fragElemExpr(
-        c, nm.acc + std::to_string(plan.regs[r].acc), plan.regs[r].elem);
-    if (r < bases.size() && !bases[r].empty())
-      value = c.binary(msl::BinOp::Add, value, c.var(bases[r]));
-    body.push_back(c.assign(c.var(names[r]), value));
-  }
-}
-
 inline msl::Expr *wholeTileInBounds(msl::Context &c,
                                     const DeviceStoreTarget &t) {
   if (!t.bounded() || t.tileRows <= 0 || t.tileCols <= 0)
@@ -564,7 +548,8 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
             emitAccumStores(c, inner, slots, cv, nm, band.lo / kSgFragDim);
           else if (renaming)
             emitFragmentReadback(c, inner, renamed.plan, renamed.names,
-                                 renamed.bases, nm);
+                                 renamed.bases, renamed.regElem,
+                                 directAccName(nm));
         });
 
     // No drain: fragments stay live for the caller. Such a pass is one band.

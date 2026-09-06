@@ -123,6 +123,16 @@ emitFusedLoop(msl::Context &c, msl::Block &body, const Plan &p,
     return Decision::emitted();
   }
 
+  if (p.readsBackByRename()) {
+    emitWarpBlocks(
+        c, body, prog, grid, nm.warpId,
+        [&](msl::Block &inner, const std::vector<WarpSlot> &, int64_t) {
+          emitFragmentReadback(c, inner, back.plan, back.names, back.bases,
+                               back.regElem, directAccName(nm));
+        });
+    return Decision::emitted();
+  }
+
   // A drain is the one pool write no staging barrier precedes, so it opens
   // its own epoch.
   body.push_back(c.barrier());

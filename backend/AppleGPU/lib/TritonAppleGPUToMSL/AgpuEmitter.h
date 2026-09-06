@@ -541,7 +541,8 @@ private:
                          const agpu::ElemType &stagedBElem,
                          agpu::DotInputs &in);
 
-  void setTileInputs(const DotOperands &ops, const agpu::ElemType &stagedAElem,
+  void setTileInputs(const DotOperands &ops, const agpu::Plan &plan,
+                     const agpu::ElemType &stagedAElem,
                      const agpu::ElemType &stagedBElem, agpu::DotInputs &in);
 
   agpu::Decision setReadbackFor(const DotOperands &ops, const agpu::Plan &plan,
@@ -676,9 +677,9 @@ private:
                   std::string_view where);
 
   agpu::PanelInputs
-  panelInputsFor(const agpu::PanelTile &t, agpu::ValueId aId,
-                 RankedTensorType aTy, agpu::ValueId bId, RankedTensorType bTy,
-                 agpu::ValueId cId, RankedTensorType cTy,
+  panelInputsFor(const agpu::PanelTile &t, const agpu::Plan &plan,
+                 agpu::ValueId aId, RankedTensorType aTy, agpu::ValueId bId,
+                 RankedTensorType bTy, agpu::ValueId cId, RankedTensorType cTy,
                  const agpu::OperandSource &deviceA,
                  const agpu::msl::Str &poolAName,
                  const agpu::msl::SmallVec<agpu::msl::Str, 8> &cIn,

@@ -816,9 +816,10 @@ int main() {
     CHECK((p.cover == WarpCover{2, 8}));
     CHECK_EQ((int64_t)p.readback.regs.size(), f.cRegs);
 
-    DotFacts deep = gemm(64, 64, 512);
-    landIn(deep, 4, 1);
-    Plan pooled = planDot(deep, kBudget);
+    DotFacts wide = gemm(64, 64, 64, 8);
+    landIn(wide, 8, 1);
+    Plan pooled = planDot(wide, kBudget);
+    CHECK_EQ(kindOf(pooled), kDirect);
     CHECK(!pooled.readsBackByRename());
     CHECK(!pooled.cover.set());
     CHECK(pooled.cThroughPool());
@@ -869,41 +870,121 @@ int main() {
     CHECK(!p.readsBackByRename());
   }
 
-  CASE("a batched or integer dot never claims a rename");
+  CASE("an integer dot the lift refuses never claims a rename");
   {
-    DotFacts batched = gemm(32, 32, 32);
-    landIn(batched, 2, 2);
-    batched.rank = 3;
-    batched.Bd = 2;
-    CHECK(!planDot(batched, kBudget).facts.cRename);
-
     DotFacts ints = gemm(32, 32, 32);
     landIn(ints, 2, 2);
     ints.intAcc = true;
-    CHECK(!planDot(ints, kBudget).facts.cRename);
+    Plan p = planDot(ints, kBudget);
+    CHECK_EQ(kindOf(p), kScalar);
+    CHECK(!p.facts.cRename);
+    CHECK(!p.readsBackByRename());
   }
 
-  CASE("a plan that is not Direct keeps C in the pool whatever the layout");
+  CASE("a batched dot renames through its panel walk, one slice per tile");
+  {
+    DotFacts f = gemm(32, 32, 32);
+    landIn(f, 2, 2);
+    f.cDims.insert(f.cDims.begin(), LayoutBasis{});
+    f.rank = 3;
+    f.Bd = 2;
+    Plan p = planDot(f, kBudget);
+    CHECK_EQ(kindOf(p), kPanel);
+    CHECK(p.readsBackByRename());
+    int slices = 0;
+    forEachPanelTile(p.facts, p.panel().panel, [&](const PanelTile &t) {
+      if (t.finalK && t.renameC)
+        ++slices;
+    });
+    CHECK_EQ(slices, 2);
+  }
+
+  CASE("a panel carves a C region exactly when it drains through the pool");
   {
     DotFacts f = gemm(32, 128, 64);
     f.aElemBytes = f.bElemBytes = 4;
     landIn(f, 1, 4);
-    Plan p = planDot(f, kBudget);
-    CHECK_EQ(kindOf(p), kPanel);
-    CHECK(!p.facts.cRename);
-    CHECK(!p.readsBackByRename());
-    CHECK(p.cThroughPool());
-    CHECK(p.cPoolRegion().bytes > 0);
+    Plan renamed = planDot(f, kBudget);
+    CHECK_EQ(kindOf(renamed), kPanel);
+    CHECK(renamed.readsBackByRename());
+    CHECK(!renamed.cThroughPool());
+    CHECK_EQ(renamed.cPoolRegion().bytes, 0);
+
+    f.cDims[0].warp = {0, 0};
+    f.cDims[1].warp = {8, 0};
+    Plan pooled = planDot(f, kBudget);
+    CHECK_EQ(kindOf(pooled), kPanel);
+    CHECK(!pooled.readsBackByRename());
+    CHECK(pooled.cThroughPool());
+    CHECK(pooled.cPoolRegion().bytes > 0);
   }
 
-  CASE("a fused dot never renames");
+  CASE("a fused dot renames its drain after the loop");
   {
     DotFacts f = gemm(64, 64, 64);
     landIn(f, 2, 2);
     f.fusedAcc = true;
     Plan p = planDot(f, kBudget);
-    CHECK(!p.facts.cRename);
+    CHECK_EQ(kindOf(p), kFused);
+    CHECK(p.readsBackByRename());
+    CHECK(!p.cThroughPool());
+    CHECK_EQ(p.cPoolRegion().bytes, 0);
+    CHECK(DotPassSchedule::of(p).drain == DotPassSchedule::Drain::None);
+  }
+
+  CASE("a fused loop takes only the cover that costs no extra loads");
+  {
+    DotFacts f = gemm(32, 32, 32);
+    f.aElemBytes = f.bElemBytes = 4;
+    f.fusedAcc = true;
+    landIn(f, 4, 1);
+    CHECK(!planDot(f, kBudget).readsBackByRename());
+    landIn(f, 2, 2);
+    CHECK(planDot(f, kBudget).readsBackByRename());
+  }
+
+  CASE("a lifted integer dot renames like a float one");
+  {
+    DotFacts f = gemm(32, 32, 32);
+    f.aElemBytes = f.bElemBytes = 1;
+    f.intAcc = true;
+    landIn(f, 2, 2);
+    Plan p = planDot(f, kBudget);
+    CHECK(p.intThroughFloat);
+    CHECK(p.readsBackByRename());
+  }
+
+  CASE("a panel renames when every tile sits on the layout's warp grid");
+  {
+    DotFacts f = gemm(128, 128, 768);
+    landIn(f, 2, 2);
+    Plan p = planDot(f, kBudget);
+    CHECK_EQ(kindOf(p), kPanel);
+    CHECK((p.panel().panel.renameWarps == WarpCover{2, 2}));
+    CHECK(p.readsBackByRename());
+    CHECK(!p.cThroughPool());
+    CHECK_EQ(p.cPoolRegion().bytes, 0);
+    int renamed = 0, pooled = 0;
+    forEachPanelTile(p.facts, p.panel().panel, [&](const PanelTile &t) {
+      if (!t.finalK)
+        return;
+      CHECK((t.cover == WarpCover{t.mFrags() / 2, t.nFrags() / 2}));
+      (t.renameC ? renamed : pooled) += 1;
+    });
+    CHECK_EQ(renamed, 2);
+    CHECK_EQ(pooled, 0);
+  }
+
+  CASE("a panel whose pitch splits the layout's warp grid stays on the pool");
+  {
+    DotFacts f = gemm(128, 256, 768, 8);
+    landIn(f, 2, 4);
+    Plan p = planDot(f, kBudget);
+    CHECK_EQ(kindOf(p), kPanel);
+    CHECK_EQ(p.panel().panel.np % 32, 24);
+    CHECK(!p.panel().panel.renameWarps.set());
     CHECK(!p.readsBackByRename());
+    CHECK(p.cThroughPool());
   }
 
   CASE("a rename never bands, even where the pool could not hold C whole");

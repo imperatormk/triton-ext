@@ -132,6 +132,8 @@ struct Panel {
   // The pitch every tile of this walk stages at.
   bool stagePad = true;
 
+  WarpCover renameWarps;
+
   Bytes total() const { return maxBytes(aBytes + bBytes, cBytes); }
 };
 
@@ -372,7 +374,8 @@ struct Plan {
   bool accumulatorsOutlivePass() const { return kind == Kind::Fused; }
 
   bool readsBackByRename() const {
-    return kind == Kind::Direct && facts.cRename && !storesCDirect();
+    return kind != Kind::Scalar && kind != Kind::Unsupported && facts.cRename &&
+           !storesCDirect();
   }
 
   // The pitch C is staged at, from whichever payload carries it.
@@ -487,6 +490,8 @@ struct CReserve {
   Bytes operator()(const FusedParams &fp) const {
     if (cDrainSkipsPool(fp, f))
       return stagedAB + edgeScratchFor(f, stagedAB, budget);
+    if (f.cRename)
+      return stagedAB;
     return maxBytes(stagedAB, cFull(fp.stagePad));
   }
 
@@ -576,7 +581,42 @@ inline WarpGrid warpGridFor(const DotFacts &f, bool bandedC) {
 struct CoverChoice {
   WarpCover cover;
   ReadbackPlan readback;
+  int64_t penalty = 0;
 };
+
+inline WarpCover panelRenameWarps(const DotFacts &f, const Panel &pn) {
+  if (f.cDims.size() < 2 || f.cRegs <= 0 || f.intAcc)
+    return {};
+  const LayoutBasis &rowB = f.cDims[f.cDims.size() - 2];
+  const LayoutBasis &colB = f.cDims.back();
+  if (rowB.warp.size() != colB.warp.size())
+    return {};
+  int64_t wm = 1, wn = 1;
+  for (std::size_t b = 0; b < rowB.warp.size(); ++b) {
+    const bool onRow = rowB.warp[b] != 0, onCol = colB.warp[b] != 0;
+    if (onRow == onCol)
+      return {};
+    (onRow ? wm : wn) *= 2;
+  }
+  if (wm * wn != f.numWarps || warpsFor(f) != f.numWarps)
+    return {};
+  const int64_t rowSpan = kSgFragDim * wm, colSpan = kSgFragDim * wn;
+  if (f.M % rowSpan || f.N % colSpan || pn.mp % rowSpan || pn.np % colSpan)
+    return {};
+  const int64_t mT = std::min(pn.mp, f.M) / kSgFragDim;
+  const int64_t nT = std::min(pn.np, f.N) / kSgFragDim;
+  WarpProgram wp;
+  wp.form = WarpForm::Parameterised;
+  wp.miCount = mT / wm;
+  wp.niCount = nT / wn;
+  ReadbackWindow w;
+  w.rowHi = mT * kSgFragDim;
+  w.colHi = nT * kSgFragDim;
+  w.batch = f.batched() ? 0 : -1;
+  const ReadbackPlan rb = planReadback(f.cDims, wp.slots(0, mT, nT, f.numWarps),
+                                       f.cRegs, f.numWarps, w);
+  return rb.rename() ? WarpCover{wm, wn} : WarpCover{};
+}
 
 // The cover C's layout wants, taken only while its extra operand loads stay
 // within the round trip a rename removes. An idle warp forbids it: its lanes
@@ -611,6 +651,7 @@ inline CoverChoice planCover(const DotFacts &f) {
     if (!rb.rename())
       continue;
     bestPenalty = penalty;
+    c.penalty = penalty;
     c.cover = cand;
     c.readback = std::move(rb);
   }
@@ -736,8 +777,10 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   }
 
   CoverChoice chosen;
-  if (!f.fusedAcc && !f.batched() && !f.intAcc && !p.intThroughFloat)
+  if (!f.batched() && !f.intAcc)
     chosen = planCover(f);
+  if (f.fusedAcc && chosen.penalty != 0)
+    chosen = {};
   const bool mayRename = chosen.readback.rename();
   p.facts = f;
 
@@ -779,7 +822,8 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   p.fit = fit;
   p.kind = selectKind(f, fit);
 
-  if (p.kind == Plan::Kind::Direct && mayRename) {
+  if ((p.kind == Plan::Kind::Direct || p.kind == Plan::Kind::Fused) &&
+      mayRename) {
     p.cover = chosen.cover;
     p.readback = std::move(chosen.readback);
     f.cRename = p.facts.cRename = true;
@@ -811,6 +855,9 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
     pp.panelsM = (f.M + pp.panel.mp - 1) / pp.panel.mp;
     pp.panelsN = (f.N + pp.panel.np - 1) / pp.panel.np;
     pp.panelsK = (f.K + pp.panel.kp - 1) / pp.panel.kp;
+    pp.panel.renameWarps = panelRenameWarps(f, pp.panel);
+    if (pp.panel.renameWarps.set())
+      f.cRename = p.facts.cRename = true;
     p.params = pp;
     break;
   }

@@ -4,13 +4,17 @@
 
 #include "agpu/core/Names.h"
 #include "agpu/emit/Emit.h"
+#include "agpu/emit/primitives/FragLane.h"
 #include "agpu/emit/primitives/OperandSource.h"
 #include "agpu/emit/primitives/SlotExpr.h"
 #include "agpu/msl/Builtins.h"
 #include "agpu/msl/Context.h"
 #include "agpu/plan/CanonicalFragment.h"
 #include "agpu/plan/PanelSchedule.h"
+#include "agpu/plan/ReadbackPlan.h"
 #include "agpu/plan/WarpSlots.h"
+
+#include <functional>
 
 #include <array>
 #include <map>
@@ -51,6 +55,7 @@ struct PanelInputs {
   // An empty entry means no incoming value.
   msl::SmallVec<StageAction, 8> cActions;
   msl::SmallVec<msl::Str, 8> cNames, cBases;
+  ReadbackPlan cRename;
 
   // Where the MMA reads A's fragments: the staged pool tile, or the device
   // tensor with this tile's corner as origin.
@@ -338,6 +343,29 @@ inline PanelMmaSize predictPanelDotSize(const DotFacts &f, const Panel &p,
   return out;
 }
 
+inline void
+emitFragmentReadback(msl::Context &c, msl::Block &body,
+                     const ReadbackPlan &plan,
+                     const msl::SmallVec<msl::Str, 8> &names,
+                     const msl::SmallVec<msl::Str, 8> &bases, ElemType regElem,
+                     const std::function<msl::Str(int64_t)> &accName) {
+  for (std::size_t r = 0; r < plan.regs.size() && r < names.size(); ++r) {
+    if (plan.regs[r].acc < 0)
+      continue;
+    msl::Expr *value =
+        fragElemExpr(c, accName(plan.regs[r].acc), plan.regs[r].elem);
+    if (regElem.kind == ElemType::Kind::Int)
+      value = c.cast(mslTypeOf(regElem), value);
+    if (r < bases.size() && !bases[r].empty())
+      value = c.binary(msl::BinOp::Add, value, c.var(bases[r]));
+    body.push_back(c.assign(c.var(names[r]), value));
+  }
+}
+
+inline std::function<msl::Str(int64_t)> directAccName(const MmaNames &nm) {
+  return [acc = nm.acc](int64_t a) { return acc + std::to_string(a); };
+}
+
 inline void emitPanelTile(msl::Context &c, msl::Block &body, const PanelTile &t,
                           const PanelNames &nm, const PanelInputs &in,
                           const PanelCoords &coords, const WarpGrid &grid,
@@ -380,6 +408,15 @@ inline void emitPanelTile(msl::Context &c, msl::Block &body, const PanelTile &t,
     case PanelPhase::Readback:
       emitReadback(c, body, t.cStagedView(), nm.poolC, in.cActions, in.cNames,
                    in.cBases, coords.c, in.cElem, in.cRegElem);
+      break;
+    case PanelPhase::Rename:
+      emitWarpBlocks(
+          c, body, prog, grid, nm.warpId,
+          [&](msl::Block &inner, const std::vector<WarpSlot> &, int64_t) {
+            emitFragmentReadback(
+                c, inner, in.cRename, in.cNames, in.cBases, in.cRegElem,
+                [&](int64_t a) { return panelAccName(t, nm, (int)a); });
+          });
       break;
     }
   }

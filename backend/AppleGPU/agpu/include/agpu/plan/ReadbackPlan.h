@@ -33,6 +33,11 @@ struct ReadbackPlan {
   bool rename() const { return kind == Kind::Rename; }
 };
 
+struct ReadbackWindow {
+  int64_t rowLo = 0, rowHi = 0, colLo = 0, colHi = 0, batch = -1;
+  bool set() const { return rowHi > rowLo; }
+};
+
 namespace detail {
 
 inline bool basisRowIs(const BasisRow &row, const int32_t *want, int n) {
@@ -65,12 +70,32 @@ inline bool allZero(const BasisRow &row) {
 // which is the write set equalling the read set, checked per lane.
 inline ReadbackPlan planReadback(const std::vector<LayoutBasis> &dims,
                                  const std::vector<WarpSlot> &slots,
-                                 int64_t regCount, int64_t numWarps) {
+                                 int64_t regCount, int64_t numWarps,
+                                 const ReadbackWindow &window = {}) {
   ReadbackPlan p;
   if (dims.size() < 2 || slots.empty() || regCount <= 0)
     return p;
   const LayoutBasis &rowB = dims[dims.size() - 2];
   const LayoutBasis &colB = dims[dims.size() - 1];
+  const LayoutBasis *batchB = dims.size() > 2 ? &dims[0] : nullptr;
+  if (batchB &&
+      (!window.set() || window.batch < 0 || !detail::allZero(batchB->lane) ||
+       !detail::allZero(batchB->warp) || !detail::allZero(batchB->block)))
+    return p;
+
+  auto orOf = [](const BasisRow &row) {
+    int32_t m = 0;
+    for (int32_t b : row)
+      m |= b;
+    return m;
+  };
+  if (window.set()) {
+    const int64_t rowLen = window.rowHi - window.rowLo;
+    const int64_t colLen = window.colHi - window.colLo;
+    if (colLen <= 0 || ((window.rowLo | rowLen) & orOf(rowB.warp)) ||
+        ((window.colLo | colLen) & orOf(colB.warp)))
+      return p;
+  }
 
   if (!detail::basisRowIs(rowB.lane, kFragLaneRowBasis, 5) ||
       !detail::basisRowIs(colB.lane, kFragLaneColBasis, 5))
@@ -98,12 +123,22 @@ inline ReadbackPlan planReadback(const std::vector<LayoutBasis> &dims,
     const int32_t cc = colB.registerConstant((int)r);
     if (rc % kSgFragDim != 0 || (cc & ~kFragElemBit) % kSgFragDim != 0)
       return ReadbackPlan{};
+    if (window.set() &&
+        (rc < window.rowLo || rc >= window.rowHi ||
+         (cc & ~kFragElemBit) < window.colLo ||
+         (cc & ~kFragElemBit) >= window.colHi ||
+         (batchB && batchB->registerConstant((int)r) != window.batch))) {
+      out[(std::size_t)r] = {-1, 0};
+      continue;
+    }
 
     int64_t chosen = -1;
     for (int64_t w = 0; w < numWarps; ++w) {
-      const int64_t mi = (rc ^ warpConst(rowB.warp, w)) / kSgFragDim;
+      const int64_t mi =
+          ((rc ^ warpConst(rowB.warp, w)) - window.rowLo) / kSgFragDim;
       const int64_t ni =
-          ((cc & ~kFragElemBit) ^ warpConst(colB.warp, w)) / kSgFragDim;
+          (((cc & ~kFragElemBit) ^ warpConst(colB.warp, w)) - window.colLo) /
+          kSgFragDim;
       int64_t found = -1;
       for (std::size_t s = 0; s < slots.size(); ++s)
         if (slots[s].mi.at(w) == mi && slots[s].ni.at(w) == ni) {

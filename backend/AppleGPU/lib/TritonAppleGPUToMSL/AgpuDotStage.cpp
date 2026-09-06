@@ -156,7 +156,7 @@ agpu::Decision AgpuEmitter::stageDotOperands(const DotOperands &ops,
       agpu::PanelCoords{coordSourceOf(ops.aStageTy),
                         coordSourceOf(ops.bStageTy), coordSourceOf(ops.cOutTy)};
 
-  setTileInputs(ops, stagedAElem, stagedBElem, in);
+  setTileInputs(ops, plan, stagedAElem, stagedBElem, in);
 
   // A drain that stores straight to device has no readback, so C's register
   // layout is never asked for.
@@ -165,7 +165,7 @@ agpu::Decision AgpuEmitter::stageDotOperands(const DotOperands &ops,
   return setReadbackFor(ops, plan, in);
 }
 
-void AgpuEmitter::setTileInputs(const DotOperands &ops,
+void AgpuEmitter::setTileInputs(const DotOperands &ops, const agpu::Plan &plan,
                                 const agpu::ElemType &stagedAElem,
                                 const agpu::ElemType &stagedBElem,
                                 agpu::DotInputs &in) {
@@ -176,12 +176,12 @@ void AgpuEmitter::setTileInputs(const DotOperands &ops,
   // `in.a` is the device source when A is read in place. The staged case
   // rebuilds a per-tile pool source inside the callback: a panel tile's pitch
   // is the tile's.
-  in.tileInputs = [this, aId, aTy, bId, bTy, cId, cTy, deviceA = in.a,
+  in.tileInputs = [this, plan, aId, aTy, bId, bTy, cId, cTy, deviceA = in.a,
                    poolA = in.panel.poolA, cIn = ops.cIn, stagedAElem,
                    stagedBElem,
                    cElem = ops.shape.cElem](const agpu::PanelTile &t) {
-    return panelInputsFor(t, aId, aTy, bId, bTy, cId, cTy, deviceA, poolA, cIn,
-                          stagedAElem, stagedBElem, cElem);
+    return panelInputsFor(t, plan, aId, aTy, bId, bTy, cId, cTy, deviceA, poolA,
+                          cIn, stagedAElem, stagedBElem, cElem);
   };
 }
 
@@ -281,9 +281,9 @@ agpu::Decision AgpuEmitter::planTileActions(
 }
 
 agpu::PanelInputs AgpuEmitter::panelInputsFor(
-    const agpu::PanelTile &t, agpu::ValueId aId, RankedTensorType aTy,
-    agpu::ValueId bId, RankedTensorType bTy, agpu::ValueId cId,
-    RankedTensorType cTy, const agpu::OperandSource &deviceA,
+    const agpu::PanelTile &t, const agpu::Plan &plan, agpu::ValueId aId,
+    RankedTensorType aTy, agpu::ValueId bId, RankedTensorType bTy,
+    agpu::ValueId cId, RankedTensorType cTy, const agpu::OperandSource &deviceA,
     const am::Str &poolAName, const am::SmallVec<am::Str, 8> &cIn,
     const agpu::ElemType &aElem, const agpu::ElemType &bElem,
     const agpu::ElemType &cElem) {
@@ -330,6 +330,8 @@ agpu::PanelInputs AgpuEmitter::panelInputsFor(
 
   in.cBases = cIn;
   in.cBases.resize(in.cNames.size());
+  if (plan.readsBackByRename())
+    in.cRename = agpu::panelTileReadback(plan.facts, t);
 
   if (!ok) {
     body_.notePending(

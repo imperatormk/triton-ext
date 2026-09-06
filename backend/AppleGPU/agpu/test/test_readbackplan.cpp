@@ -96,5 +96,47 @@ int main() {
     CHECK(!planReadback({}, cover(1, 8), 16, 4).rename());
   }
 
+  CASE("a window names only its registers, at tile-local fragments");
+  {
+    ReadbackWindow w;
+    w.rowHi = 32;
+    w.colLo = 32;
+    w.colHi = 64;
+    const ReadbackPlan p = planReadback(mmaDims(0, 3), cover(1, 4), 16, 4, w);
+    CHECK(p.rename());
+    CHECK_EQ((int64_t)p.regs.size(), 16);
+    for (int64_t r = 0; r < 8; ++r)
+      CHECK_EQ(p.regs[(std::size_t)r].acc, -1);
+    for (int64_t r = 8; r < 16; ++r) {
+      CHECK_EQ(p.regs[(std::size_t)r].acc, (r - 8) / 2);
+      CHECK_EQ(p.regs[(std::size_t)r].elem, r % 2);
+    }
+  }
+
+  CASE("a window that cuts through a warp basis stays on the pool");
+  {
+    ReadbackWindow w;
+    w.rowLo = 8;
+    w.rowHi = 24;
+    w.colHi = 64;
+    CHECK(!planReadback(mmaDims(0, 3), cover(1, 8), 16, 4, w).rename());
+  }
+
+  CASE("a batch axis needs a window that names its slice");
+  {
+    std::vector<LayoutBasis> dims = mmaDims(0, 3);
+    dims.insert(dims.begin(), LayoutBasis{});
+    CHECK(!planReadback(dims, cover(1, 8), 16, 4).rename());
+    ReadbackWindow w;
+    w.rowHi = 32;
+    w.colHi = 64;
+    w.batch = 0;
+    CHECK(planReadback(dims, cover(1, 8), 16, 4, w).rename());
+    w.batch = 1;
+    const ReadbackPlan other = planReadback(dims, cover(1, 8), 16, 4, w);
+    CHECK(other.rename());
+    CHECK_EQ(other.regs[0].acc, -1);
+  }
+
   return ::agpu_test::report("ReadbackPlan");
 }

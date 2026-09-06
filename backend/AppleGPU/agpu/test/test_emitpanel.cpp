@@ -704,5 +704,50 @@ int main() {
       }
   }
 
+  CASE("a renaming tile names its fragments and drains nothing");
+  {
+    msl::Context c;
+    DotFacts f = gemm(16, 32, 16);
+    f.numWarps = 4;
+    LayoutBasis row, col;
+    row.lane = {0, 1, 2, 0, 4};
+    col.lane = {2, 0, 0, 4, 0};
+    row.reg = {0, 0};
+    col.reg = {1, 16};
+    row.warp = {0, 8};
+    col.warp = {8, 0};
+    f.cDims = {row, col};
+    f.cRegs = 4;
+    PanelSchedule s = planPanelSchedule(f, panelCost(16, 32, 16, 2, kAccBytes));
+    PanelTile t = s.tiles[0];
+    t.cover = {1, 2};
+    t.renameC = true;
+    const WarpGrid g = panelWarpGrid(t, 4);
+    const WarpProgram prog = planWarpProgram(g);
+    CHECK_EQ(prog.miCount, 1);
+    CHECK_EQ(prog.niCount, 2);
+    PanelInputs in;
+    in.a = stagedA(t);
+    in.cNames = {"c0", "c1", "c2", "c3"};
+    in.cRename = panelTileReadback(f, t);
+    CHECK(in.cRename.rename());
+    msl::Block body;
+    emitPanelTile(c, body, t, nm, in, PanelCoords::forAll({}), g, prog);
+    const std::string out = render(body);
+    CHECK(out.find("c0 = acc0.thread_elements()[0];") != std::string::npos);
+    CHECK(out.find("c1 = acc0.thread_elements()[1];") != std::string::npos);
+    CHECK(out.find("c2 = acc1.thread_elements()[0];") != std::string::npos);
+    CHECK(out.find("simdgroup_store") == std::string::npos);
+    CHECK(out.find(nm.poolC + "[") == std::string::npos);
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 1);
+
+    t.renameC = false;
+    msl::Block pooled;
+    emitPanelTile(c, pooled, t, nm, in, PanelCoords::forAll({}), g, prog);
+    const std::string via = render(pooled);
+    CHECK_EQ(countOf(via, "simdgroup_store"), 2);
+    CHECK_EQ(countOf(via, "threadgroup_barrier"), 3);
+  }
+
   return ::agpu_test::report("EmitPanel");
 }

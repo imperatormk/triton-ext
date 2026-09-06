@@ -130,7 +130,11 @@ static bool packArguments(PyObject *args, std::vector<ArgInfo> *out) {
       }
       info.kind = ArgInfo::TENSOR;
       info.buf = getMTLBufferStorage(t);
-      info.offset = t.storage_offset() * t.element_size();
+      const uintptr_t base = (uintptr_t)[info.buf contents];
+      const uintptr_t data = (uintptr_t)t.data_ptr();
+      info.offset = data >= base && data - base < [info.buf length]
+                        ? (NSUInteger)(data - base)
+                        : t.storage_offset() * t.element_size();
     } else if (PyBytes_Check(arg)) {
       // Packed scalar blob, bound inline via setBytes. The args tuple keeps
       // the object alive across the dispatch_sync below.

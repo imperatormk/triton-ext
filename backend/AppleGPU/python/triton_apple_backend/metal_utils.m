@@ -7,6 +7,11 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+// Undeclared in the SDK headers, so the call site would otherwise infer `id`.
+@protocol MTLLibraryDataContents
+- (dispatch_data_t)libraryDataContents;
+@end
+
 // getMTLBufferStorage mirrors PyTorch's ATen/native/mps/OperationUtils.h.
 #include <ATen/Tensor.h>
 #include <ATen/mps/MPSStream.h>
@@ -252,8 +257,8 @@ static PyTypeObject MetalKernelType = {
     .tp_basicsize = sizeof(MetalKernelObject),
     .tp_dealloc = (destructor)MetalKernel_dealloc,
     .tp_call = (ternaryfunc)MetalKernel_call,
-    .tp_getset = MetalKernel_getset,
     .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_getset = MetalKernel_getset,
 };
 
 // ── MetalLibrary - metallib container ────────────────────────────────────
@@ -331,9 +336,9 @@ static PyTypeObject MetalLibraryType = {
         "metal_utils.MetalLibrary",
     .tp_basicsize = sizeof(MetalLibraryObject),
     .tp_dealloc = (destructor)MetalLibrary_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = MetalLibrary_methods,
     .tp_getset = MetalLibrary_getset,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
 };
 
 // ── Module functions ─────────────────────────────────────────────────────
@@ -400,7 +405,8 @@ static PyObject *py_compile_source(PyObject *self, PyObject *args) {
       return NULL;
     }
 
-    dispatch_data_t contents = [lib libraryDataContents];
+    dispatch_data_t contents =
+        [(id<MTLLibraryDataContents>)lib libraryDataContents];
     if (!contents) {
       PyErr_SetString(PyExc_RuntimeError, "MTLLibrary has no data contents");
       return NULL;

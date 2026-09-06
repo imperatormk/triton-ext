@@ -31,7 +31,7 @@ macOS 14+ with Xcode. Everything else (LLVM, Triton, cmake, ninja) is the
 repo-wide setup in the [top-level README](../../README.md).
 
 The emitter targets Metal 3. Per-device limits such as max threads per
-threadgroup are read back from the compiled pipeline, not assumed.
+threadgroup are always read back from the compiled pipeline.
 
 ## Build
 
@@ -95,8 +95,8 @@ rejects it. Numerical correctness is proved by running a kernel, as above.
 
 ## Known limitations
 
-- `float64` - Metal has no double, so an f64 kernel computes in f32 rather than
-  being rejected. See `narrowsSilently` in `agpu/include/agpu/plan/ElemType.h`.
+- `float64` - Metal has no double, so an f64 kernel silently computes in f32.
+  See `narrowsSilently` in `agpu/include/agpu/plan/ElemType.h`.
 - large `num_warps` - capped per kernel by the pipeline state's
   `maxTotalThreadsPerThreadgroup`, which the backend queries and reports so
   Triton drops over-large configs. Register pressure lowers it, so the ceiling

@@ -66,7 +66,8 @@ installed, set `TOOLCHAINS` to the Metal toolchain's bundle id.
 1. **Query, don't check.** A caller asks the plan what to do. It does not test a
    flag and decide again.
 1. **Decline, don't fail.** A shape this emitter cannot express returns a
-   `Decision` with a reason, never `/*bad loop header*/` in the output.
+   `Decision` carrying a reason, so the output stays free of stray markers like
+   `/*bad loop header*/`.
 1. **Refuse only what the toolchain cannot diagnose.** Register pressure,
    alignment and buffer counts are Metal's job.
 1. **Headers define, `src/` holds the recursive walks.** Everything is

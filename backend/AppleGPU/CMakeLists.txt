@@ -56,6 +56,9 @@ add_mlir_library(TritonAppleGPUBackend
 target_link_libraries(TritonAppleGPUBackend PUBLIC MLIRMathTransforms)
 target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-dead_strip)
 
+target_compile_options(TritonAppleGPUBackend PRIVATE
+    -Wall -Wextra -Wno-missing-field-initializers)
+
 set_target_properties(TritonAppleGPUBackend PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     OUTPUT_NAME "applegpu_backend"

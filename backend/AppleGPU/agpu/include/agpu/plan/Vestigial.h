@@ -19,7 +19,7 @@ inline constexpr std::string_view kVestigial[] = {
     "scf.yield",
     "scf.condition",
     "ttg.local_dealloc",
-    // MLIR spells it `llvm.intr.assume`, not `llvm.assume`.
+    // MLIR spells this one `llvm.intr.assume`.
     "llvm.intr.assume",
 };
 

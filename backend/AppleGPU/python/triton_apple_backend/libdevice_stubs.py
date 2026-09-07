@@ -225,7 +225,8 @@ def _rint(x):
     f = tl.math.floor(x)
     d = x - f
     up = tl.where(d == 0.5, (f - 2.0 * tl.math.floor(f * 0.5)) == 1.0, d > 0.5)
-    return tl.where(up, f + 1.0, f)
+    r = tl.where(up, f + 1.0, f)
+    return tl.where((r == 0.0) & (x < 0.0), -0.0, r)
 
 
 @triton.jit

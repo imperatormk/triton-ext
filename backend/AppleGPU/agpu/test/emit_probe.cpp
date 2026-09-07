@@ -277,6 +277,49 @@ void printElementwise(std::ostream &os) {
   os << ";\n}\n";
 }
 
+// The narrow floats evaluate at f32 and narrow once at the consumer, so a
+// chain of them declares f32 temporaries that a bf16 store has to accept.
+void printNarrowFloatChain(std::ostream &os) {
+  msl::Context c;
+  msl::Block body;
+
+  for (ElemType e : {bf16(), f16()}) {
+    const std::string tag = e.floatKind == FloatKind::Brain ? "b" : "h";
+    body.push_back(emitEw(c, EwOp::Mul, e, tag + "m0", c.var(tag + "a"),
+                          c.var(tag + "b")));
+    body.push_back(emitEw(c, EwOp::Mul, e, tag + "m1", c.var(tag + "c"),
+                          c.var(tag + "d")));
+    // Feeds one f32 temporary into the next: the chain must stay wide.
+    body.push_back(emitEw(c, EwOp::Sub, e, tag + "s", c.var(tag + "m0"),
+                          c.var(tag + "m1")));
+    body.push_back(emitEw(c, EwOp::CmpLtS, e, tag + "p", c.var(tag + "a"),
+                          c.var(tag + "b")));
+    // The single narrowing, where the value reaches its declared type.
+    body.push_back(c.declStmt(mslTypeOf(e), tag + "n",
+                              c.cast(mslTypeOf(e), c.var(tag + "s"))));
+  }
+
+  os << "kernel void agpu_probe_narrow_float(device bfloat *bout"
+        " [[buffer(0)]],\n"
+        "                                    device half *hout [[buffer(1)]],\n"
+        "                                    uint t"
+        " [[thread_position_in_grid]]) {\n"
+        "  bfloat ba = bout[t];\n"
+        "  bfloat bb = bout[t + 1];\n"
+        "  bfloat bc = bout[t + 2];\n"
+        "  bfloat bd = bout[t + 3];\n"
+        "  half ha = hout[t];\n"
+        "  half hb = hout[t + 1];\n"
+        "  half hc = hout[t + 2];\n"
+        "  half hd = hout[t + 3];\n";
+
+  msl::Printer p(os);
+  p.printBlock(body);
+
+  os << "  bout[t] = bp ? bn : (bfloat)0;\n"
+        "  hout[t] = hp ? hn : (half)0;\n}\n";
+}
+
 void printPlannedDot(std::ostream &os) {
   msl::Context c;
 
@@ -818,6 +861,9 @@ int main() {
   std::cout << "\n";
 
   printElementwise(std::cout);
+  std::cout << "\n";
+
+  printNarrowFloatChain(std::cout);
   std::cout << "\n";
 
   printRegion(std::cout);

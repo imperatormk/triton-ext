@@ -241,7 +241,7 @@ am::SmallVec<am::Str, 8> AgpuEmitter::stagedNamesOf(agpu::ValueId v,
   am::SmallVec<am::Str, 8> names;
   for (int64_t r = 0; r < regs; ++r) {
     const am::Str *n = body_.sym.regAt(v, (std::size_t)r);
-    names.push_back(n ? inIrType(v, r) : am::Str{});
+    names.push_back(n ? inIrType(v, *n) : am::Str{});
   }
   return names;
 }

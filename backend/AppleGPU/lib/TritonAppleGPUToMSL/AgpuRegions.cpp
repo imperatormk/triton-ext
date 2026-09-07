@@ -182,8 +182,7 @@ AgpuEmitter::lowerCombine(Region &region, am::Block &body,
       body_.notePending("a combine result has no name");
       return out;
     }
-    const am::Str narrowed = inIrType(idOf(v), 0);
-    out.push_back(narrowed.empty() ? *n : narrowed);
+    out.push_back(inIrType(idOf(v), *n));
   }
   return out;
 }
@@ -212,10 +211,7 @@ agpu::Decision AgpuEmitter::gatherRegionNames(ValueRange srcs,
     const Operand op(body_.sym, idOf(s), into.sourceRegisterCount);
     if (!op.ok())
       return declined(where, "an operand register has no name");
-    const auto nameAt = [&](int64_t r) {
-      const am::Str n = inIrType(idOf(s), r);
-      return n.empty() ? op.at(r) : n;
-    };
+    const auto nameAt = [&](int64_t r) { return inIrType(idOf(s), op.at(r)); };
     am::SmallVec<am::Str, 8> names;
     if (order.empty())
       for (int64_t r = 0; r < into.sourceRegisterCount; ++r)

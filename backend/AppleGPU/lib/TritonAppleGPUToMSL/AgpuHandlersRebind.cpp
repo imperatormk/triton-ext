@@ -194,10 +194,8 @@ agpu::Decision AgpuEmitter::emitRedistribute(const agpu::OpView &o,
     return ready.why;
 
   agpu::ValueNames srcNames;
-  for (int64_t r = 0; r < ready.regs; ++r) {
-    const am::Str narrowed = inIrType(o.operands[0], r);
-    srcNames.push_back(narrowed.empty() ? ready.ops[0].at(r) : narrowed);
-  }
+  for (int64_t r = 0; r < ready.regs; ++r)
+    srcNames.push_back(inIrType(o.operands[0], ready.ops[0].at(r)));
 
   agpu::ValueNames moved;
   const agpu::Decision d = moveRegs(o, srcTy, resTy, order, srcNames, *elemP,

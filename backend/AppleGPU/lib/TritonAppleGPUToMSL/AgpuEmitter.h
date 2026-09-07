@@ -507,8 +507,9 @@ private:
 
   agpu::msl::Str castTo(const agpu::ElemType &to, const agpu::msl::Str &src);
 
-  // Empty if `v` has no name.
-  agpu::msl::Str inIrType(agpu::ValueId v, int64_t r);
+  // `declared` read back in the IR element type, through a narrowing temporary
+  // where the register was declared wider.
+  agpu::msl::Str inIrType(agpu::ValueId v, const agpu::msl::Str &declared);
 
   // Declares `name` as a device pointer to `elem` at base + offset, and
   // returns it. A uniform offset is folded into the pointer once, so it does

@@ -18,17 +18,14 @@ am::Str AgpuEmitter::castTo(const agpu::ElemType &to, const am::Str &src) {
   return name;
 }
 
-am::Str AgpuEmitter::inIrType(agpu::ValueId v, int64_t r) {
-  const am::Str *name = body_.sym.regAt(v, r);
-  if (!name)
-    return am::Str();
+am::Str AgpuEmitter::inIrType(agpu::ValueId v, const am::Str &declared) {
   const auto it = declaredFor_.find(v);
   if (it == declaredFor_.end())
-    return *name;
+    return declared;
   const agpu::ElemType *ir = elemOf(v);
   if (!ir || it->second == *ir)
-    return *name;
-  return castTo(*ir, *name);
+    return declared;
+  return castTo(*ir, declared);
 }
 
 agpu::Decision AgpuEmitter::emitReinterpretCast(const agpu::OpView &o,
@@ -93,8 +90,7 @@ agpu::Decision AgpuEmitter::emitReinterpretCast(const agpu::OpView &o,
     return declined(o.name, "reinterpret between different widths");
   return emitPerRegister(o, ready.regs, to, 'b', [&](int64_t r) {
     RegValue v;
-    const am::Str src = inIrType(o.operands[0], r);
-    v.value = mc.bitcast(toTy, mc.var(src.empty() ? a.at(r) : src));
+    v.value = mc.bitcast(toTy, mc.var(inIrType(o.operands[0], a.at(r))));
     return v;
   });
 }
@@ -292,10 +288,9 @@ agpu::Decision AgpuEmitter::emitSelectOp(const agpu::OpView &o) {
 
   return emitPerRegister(o, ready.regs, elem, 's', [&](int64_t r) {
     RegValue v;
-    const am::Str tn = inIrType(o.operands[1], r);
-    const am::Str fn = inIrType(o.operands[2], r);
-    v.value = mc.ternary(mc.var(c.at(r)), mc.var(tn.empty() ? t.at(r) : tn),
-                         mc.var(fn.empty() ? f.at(r) : fn));
+    v.value =
+        mc.ternary(mc.var(c.at(r)), mc.var(inIrType(o.operands[1], t.at(r))),
+                   mc.var(inIrType(o.operands[2], f.at(r))));
     return v;
   });
 }

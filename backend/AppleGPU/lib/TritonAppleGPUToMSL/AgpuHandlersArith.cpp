@@ -32,6 +32,39 @@ am::Str AgpuEmitter::inIrType(agpu::ValueId v, const am::Str &declared) {
   return castTo(it->second, *ir, declared);
 }
 
+std::optional<AgpuEmitter::NarrowedBits>
+AgpuEmitter::narrowedBitsSource(const agpu::OpView &o,
+                                const agpu::ElemType &from,
+                                const agpu::ElemType &to) {
+  if (from.kind != agpu::ElemType::Kind::Float || from.bits != 16 ||
+      to.kind != agpu::ElemType::Kind::Float || to.bits != 16 || from == to)
+    return std::nullopt;
+
+  const Value fromV = mlirValueOf(o.operands[0]);
+  if (!fromV)
+    return std::nullopt;
+  auto trunc = fromV.getDefiningOp<arith::TruncFOp>();
+  if (!trunc)
+    return std::nullopt;
+
+  const agpu::ValueId srcId = idOf(trunc.getIn());
+  const agpu::ElemType *srcElem = elemOf(srcId);
+  if (!srcElem || !(*srcElem == agpu::f32()) ||
+      !(declaredOf(srcId) == agpu::f32()))
+    return std::nullopt;
+
+  const agpu::ConvertPlan p =
+      agpu::planConvert(*srcElem, from, agpu::Rounding::Default);
+  const std::optional<agpu::Helper> h = agpu::narrowIntHelperFor(p);
+  if (!h)
+    return std::nullopt;
+
+  Operand src(body_.sym, srcId, registersHeldBy(o.results[0]));
+  if (!src.ok())
+    return std::nullopt;
+  return NarrowedBits{src, *h};
+}
+
 agpu::Decision AgpuEmitter::emitReinterpretCast(const agpu::OpView &o,
                                                 const Ready &ready,
                                                 const Operand &a,
@@ -92,6 +125,20 @@ agpu::Decision AgpuEmitter::emitReinterpretCast(const agpu::OpView &o,
 
   if (from.bits != to.bits)
     return declined(o.name, "reinterpret between different widths");
+
+  // AGX3 widens a float-to-float as_type at its source type, converting the
+  // bits it was asked to reinterpret. Where the source is a narrowing with an
+  // integer-returning helper, call that one and bitcast its ushort.
+  if (const std::optional<NarrowedBits> nb = narrowedBitsSource(o, from, to)) {
+    agpu_.helpers.add(nb->helper);
+    const am::Str fn = agpu::helperName(nb->helper);
+    return emitPerRegister(o, ready.regs, to, 'b', [&](int64_t r) {
+      RegValue v;
+      v.value = mc.bitcast(toTy, mc.call(fn, {mc.var(nb->src.at(r))}));
+      return v;
+    });
+  }
+
   return emitPerRegister(o, ready.regs, to, 'b', [&](int64_t r) {
     RegValue v;
     v.value = mc.bitcast(toTy, mc.var(inIrType(o.operands[0], a.at(r))));

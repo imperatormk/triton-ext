@@ -512,6 +512,16 @@ private:
   // where the register was declared wider.
   agpu::msl::Str inIrType(agpu::ValueId v, const agpu::msl::Str &declared);
 
+  // The f32 registers a reinterpret's 16-bit float source was narrowed from,
+  // with the helper that redoes that narrowing into a ushort.
+  struct NarrowedBits {
+    Operand src;
+    agpu::Helper helper;
+  };
+  std::optional<NarrowedBits> narrowedBitsSource(const agpu::OpView &o,
+                                                 const agpu::ElemType &from,
+                                                 const agpu::ElemType &to);
+
   // Declares `name` as a device pointer to `elem` at base + offset, and
   // returns it. A uniform offset is folded into the pointer once, so it does
   // not reappear at every access.

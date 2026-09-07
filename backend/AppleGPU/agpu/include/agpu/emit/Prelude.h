@@ -13,6 +13,7 @@
 #include "agpu/plan/TypeConvert.h"
 
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -76,6 +77,16 @@ inline bool convertHelper(const ConvertPlan &p, Helper &out) {
   }
 }
 
+// The helper that narrows to a 16-bit float and returns its bits, for the
+// plans that have one.
+inline std::optional<Helper> narrowIntHelperFor(const ConvertPlan &p) {
+  if (p.kind != ConvertKind::NarrowRtne || p.to.kind != ElemType::Kind::Float ||
+      p.to.bits != 16)
+    return std::nullopt;
+  return p.to.floatKind == FloatKind::Brain ? Helper::RtneIntBfloat
+                                            : Helper::RtneIntHalf;
+}
+
 // Which prelude helper a math function lowers to. False for everything Metal
 // spells itself.
 inline bool mathHelper(MathFn fn, Helper &out) {
@@ -123,10 +134,8 @@ public:
     if (!convertHelper(p, h))
       return;
     add(h);
-    if (h == Helper::RtneBfloat)
-      add(Helper::RtneIntBfloat);
-    if (h == Helper::RtneHalf)
-      add(Helper::RtneIntHalf);
+    if (const std::optional<Helper> ih = narrowIntHelperFor(p))
+      add(*ih);
   }
 
 private:

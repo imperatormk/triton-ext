@@ -194,18 +194,12 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
                                            agpu::DotInputs &in) {
   const agpu::ValueId cId = ops.cOut;
   const RankedTensorType cTy = ops.cOutTy;
-  {
-    am::SmallVec<agpu::StageAction, 8> probe;
-    const am::SmallVec<am::Str, 8> bound =
-        stagedNamesOf(cId, registerCount(cTy));
-    if (const agpu::Decision d =
-            planTileActions(cId, cTy, wholeWindowsOf(cTy), plan.cStagedView(),
-                            (int)agpu::kAccBits, probe, bound, "tt.dot");
-        !d.ok())
-      return d;
-  }
+  // Asked here so the band planning inside `readbackFor`, which cannot return
+  // a Decision, has a clean decline for the part that does not depend on the
+  // band's window.
+  if (const agpu::Decision d = tileCoordsResolvable(cTy, "tt.dot"); !d.ok())
+    return d;
   in.readbackFor = [this, cId, cTy, cIn = ops.cIn, cView = plan.cStagedView(),
-                    cNames = stagedNamesOf(cId, registerCount(cTy)),
                     rename = plan.readsBackByRename() ? plan.readback
                                                       : agpu::ReadbackPlan{},
                     // A fused dot's registers stay f32; other paths land in
@@ -222,7 +216,7 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
     mw.hi = std::min(rows.hi, mw.hi);
     if (const agpu::Decision d =
             planTileActions(cId, cTy, window, cView, (int)agpu::kAccBits,
-                            back.actions, cNames, "tt.dot");
+                            back.actions, "tt.dot");
         !d.ok()) {
       body_.notePending("a C band's layout stopped resolving mid-emission");
       return back;
@@ -252,20 +246,29 @@ am::SmallVec<am::Str, 8> AgpuEmitter::stagedNamesOf(agpu::ValueId v,
   return names;
 }
 
-agpu::Decision AgpuEmitter::planTileActions(
-    agpu::ValueId v, RankedTensorType ty,
-    const std::vector<agpu::CoordWindow> &windows, const agpu::TileView &dst,
-    unsigned elemBits, am::SmallVec<agpu::StageAction, 8> &actions,
-    const am::SmallVec<am::Str, 8> &names, std::string_view where) {
-  const agpu::CoordSource cs = coordSourceOf(ty);
+agpu::Decision AgpuEmitter::tileCoordsResolvable(RankedTensorType ty,
+                                                 std::string_view where) {
   // `rangeOf` indexes `cs.dims`; fewer output dims than rank reads past the
   // end.
-  if ((int)cs.dims.size() != ty.getRank())
+  if ((int)coordSourceOf(ty).dims.size() != ty.getRank())
     return declined(where, "the layout has no coordinates");
+  for (int64_t r = 0; r < registerCount(ty); ++r)
+    if (!registerCoordAt(ty, (int)r))
+      return declined(where, "the layout has no coordinates");
+  return agpu::Decision::emitted();
+}
 
+agpu::Decision
+AgpuEmitter::planTileActions(agpu::ValueId v, RankedTensorType ty,
+                             const std::vector<agpu::CoordWindow> &windows,
+                             const agpu::TileView &dst, unsigned elemBits,
+                             am::SmallVec<agpu::StageAction, 8> &actions,
+                             std::string_view where) {
+  if (const agpu::Decision d = tileCoordsResolvable(ty, where); !d.ok())
+    return d;
+
+  const agpu::CoordSource cs = coordSourceOf(ty);
   const int64_t regs = registerCount(ty);
-  if ((int64_t)names.size() != regs)
-    return declined(where, "a staged register has no name");
 
   for (int64_t r = 0; r < regs; ++r) {
     std::vector<agpu::CoordRange> ranges;
@@ -273,7 +276,8 @@ agpu::Decision AgpuEmitter::planTileActions(
       ranges.push_back(cs.rangeOf((int)r, d, ty.getShape()[d]));
 
     // Use `registerCoordAt` here. `ranges[d].lo` is the reachable set's start
-    // and is the same for every register along a lane-varying dim.
+    // and is the same for every register along a lane-varying dim. Present for
+    // every register, or `tileCoordsResolvable` would have declined above.
     const std::optional<agpu::TileView::Coord> at = registerCoordAt(ty, (int)r);
     if (!at)
       return declined(where, "the layout has no coordinates");
@@ -310,9 +314,17 @@ agpu::PanelInputs AgpuEmitter::panelInputsFor(
   in.bElem = bElem;
   in.cRegElem = cElem;
 
+  // Every operand plans even after one declines, so each `Actions` vector is
+  // filled; the first decline is kept for its reason.
+  agpu::Decision bad = agpu::Decision::emitted();
+  const auto plan1 = [&](const agpu::Decision &d, const char *operand) {
+    if (!d.ok() && bad.ok())
+      bad = agpu::Decision::declined("tt.dot",
+                                     std::string(operand) + ": " + d.why());
+  };
+
   // A device-resident A plans no staging: the MMA reads it through `deviceA`
   // with this tile's corner as origin, since fragment indices are tile-local.
-  bool ok = true;
   if (t.aDirect) {
     in.a = deviceA;
     in.a.rowOrigin = t.m.lo;
@@ -321,24 +333,19 @@ agpu::PanelInputs AgpuEmitter::panelInputsFor(
     in.a.buffer = poolAName;
     in.a.leadingDim = agpu::Stride(t.aView().strideAt(0));
     in.aNames = aNames;
-    ok = planTileActions(aId, aTy, t.aWindows(), t.aStagedView(), aElem.bits,
-                         in.aActions, aNames, "tt.dot")
-             .ok();
+    plan1(planTileActions(aId, aTy, t.aWindows(), t.aStagedView(), aElem.bits,
+                          in.aActions, "tt.dot"),
+          "A");
   }
   in.bNames = bNames;
-  ok = planTileActions(bId, bTy, t.bWindows(), t.bStagedView(), bElem.bits,
-                       in.bActions, bNames, "tt.dot")
-           .ok() &&
-       ok;
+  plan1(planTileActions(bId, bTy, t.bWindows(), t.bStagedView(), bElem.bits,
+                        in.bActions, "tt.dot"),
+        "B");
 
-  // C is the dot's result and has no bound names yet; staging would fill
-  // `cNames` with empty strings, so they are minted below instead.
-  ok = planTileActions(cId, cTy, t.cWindows(), t.cStagedView(),
-                       (int)agpu::kAccBits, in.cActions,
-                       stagedNamesOf(cId, registerCount(cTy)), "tt.dot")
-           .ok() &&
-       ok;
-  in.cNames.clear();
+  // C is the dot's result and has no bound names yet, so they are minted below.
+  plan1(planTileActions(cId, cTy, t.cWindows(), t.cStagedView(),
+                        (int)agpu::kAccBits, in.cActions, "tt.dot"),
+        "C");
   for (int64_t r = 0; r < registerCount(cTy); ++r)
     in.cNames.push_back(accName(cId, r));
 
@@ -347,10 +354,8 @@ agpu::PanelInputs AgpuEmitter::panelInputsFor(
   if (plan.readsBackByRename())
     in.cRename = agpu::panelTileReadback(plan.facts, t);
 
-  if (!ok) {
-    body_.notePending(
-        "an operand's layout does not resolve to tile coordinates");
-  }
+  if (!bad.ok())
+    body_.notePending(bad.why());
   return in;
 }
 
@@ -362,8 +367,8 @@ AgpuEmitter::stageWholeTensor(agpu::ValueId v, RankedTensorType ty,
   const int64_t regs = registerCount(ty);
   am::SmallVec<agpu::StageAction, 8> actions;
   const am::SmallVec<am::Str, 8> names = stagedNamesOf(v, regs);
-  if (const agpu::Decision d = planTileActions(
-          v, ty, wholeWindowsOf(ty), dst, elem.bits, actions, names, where);
+  if (const agpu::Decision d = planTileActions(v, ty, wholeWindowsOf(ty), dst,
+                                               elem.bits, actions, where);
       !d.ok())
     return d;
   int64_t covered = 0;

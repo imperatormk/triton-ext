@@ -679,16 +679,18 @@ private:
 
   agpu::CoordSource coordSourceOf(RankedTensorType ty);
 
-  // `names` is indexed by register (one entry always); `actions` one per
-  // register that reaches the window. Declines when the layout cannot be read.
-  // `names` is the caller's already-resolved register names, one per register
-  // of `ty`, empty where the value has none.
+  // Whether every register of `ty` has a coordinate. The part of
+  // `planTileActions` that no window can change.
+  agpu::Decision tileCoordsResolvable(RankedTensorType ty,
+                                      std::string_view where);
+
+  // `actions` gets one entry per register that reaches the window. Declines
+  // when the layout cannot be read.
   agpu::Decision
   planTileActions(agpu::ValueId v, RankedTensorType ty,
                   const std::vector<agpu::CoordWindow> &windows,
                   const agpu::TileView &dst, unsigned elemBits,
                   agpu::msl::SmallVec<agpu::StageAction, 8> &actions,
-                  const agpu::msl::SmallVec<agpu::msl::Str, 8> &names,
                   std::string_view where);
 
   // The registers of `v` in their IR element type, narrowed where a wider

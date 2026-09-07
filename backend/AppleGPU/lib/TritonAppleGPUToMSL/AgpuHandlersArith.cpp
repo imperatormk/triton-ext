@@ -10,11 +10,15 @@ namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
 
-am::Str AgpuEmitter::castTo(const agpu::ElemType &to, const am::Str &src) {
+am::Str AgpuEmitter::castTo(const agpu::ElemType &from,
+                            const agpu::ElemType &to, const am::Str &src) {
   am::Context &mc = agpu_.context();
+  const agpu::ConvertPlan p =
+      agpu::planConvert(from, to, agpu::Rounding::Default);
+  agpu_.helpers.require(p);
   const am::Str name = "p" + src + "_" + std::to_string(body_.tempSeq++);
   cur_->push_back(mc.declStmt(agpu::mslTypeOf(to), name,
-                              mc.cast(agpu::mslTypeOf(to), mc.var(src))));
+                              agpu::convertExpr(mc, p, mc.var(src), to)));
   return name;
 }
 
@@ -25,7 +29,7 @@ am::Str AgpuEmitter::inIrType(agpu::ValueId v, const am::Str &declared) {
   const agpu::ElemType *ir = elemOf(v);
   if (!ir || it->second == *ir)
     return declared;
-  return castTo(*ir, declared);
+  return castTo(it->second, *ir, declared);
 }
 
 agpu::Decision AgpuEmitter::emitReinterpretCast(const agpu::OpView &o,
@@ -217,8 +221,8 @@ agpu::Decision AgpuEmitter::emitMath2Op(const agpu::OpView &o) {
     RegValue v;
     // MSL picks the overload from argument types, so the promotion must reach
     // the operands as well as the result declaration.
-    const am::Str an = promote ? castTo(operand, a.at(r)) : a.at(r);
-    const am::Str bn = promote ? castTo(operand, b.at(r)) : b.at(r);
+    const am::Str an = promote ? castTo(*operandP, operand, a.at(r)) : a.at(r);
+    const am::Str bn = promote ? castTo(*operandP, operand, b.at(r)) : b.at(r);
     if (m->fn == agpu::MathFn2::Min || m->fn == agpu::MathFn2::Max) {
       v.value = agpu::minMaxExpr(mc, m->fn, operand, an, bn, m->propagateNan);
       return v;

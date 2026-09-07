@@ -171,6 +171,15 @@ int precedence(BinOp op) {
   return 0;
 }
 
+bool needsShiftParens(BinOp parent, const Expr *child) {
+  if (parent != BinOp::Shl && parent != BinOp::Shr)
+    return false;
+  if (!child || child->kind != ExprKind::Binary)
+    return false;
+  const BinOp op = static_cast<const Binary *>(child)->op;
+  return op == BinOp::Add || op == BinOp::Sub;
+}
+
 // Built with `pointerTo` because Metal rejects `device atomic_int` as an
 // automatic variable.
 Type atomicPtr(Scalar s, AddrSpace as) {
@@ -324,10 +333,11 @@ void Printer::printExprAt(const Expr *e, int outerPrec) {
     const bool paren = p < outerPrec;
     if (paren)
       os_ << "(";
-    printExprAt(b->lhs, p);
+    const int additive = precedence(BinOp::Add) + 1;
+    printExprAt(b->lhs, needsShiftParens(b->op, b->lhs) ? additive : p);
     os_ << " " << spell(b->op) << " ";
     // +1 or `a - (b - c)` prints as `a - b - c`.
-    printExprAt(b->rhs, p + 1);
+    printExprAt(b->rhs, needsShiftParens(b->op, b->rhs) ? additive : p + 1);
     if (paren)
       os_ << ")";
     return;

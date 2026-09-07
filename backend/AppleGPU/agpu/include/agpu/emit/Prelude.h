@@ -120,8 +120,13 @@ public:
 
   void require(const ConvertPlan &p) {
     Helper h;
-    if (convertHelper(p, h))
-      add(h);
+    if (!convertHelper(p, h))
+      return;
+    add(h);
+    if (h == Helper::RtneBfloat)
+      add(Helper::RtneIntBfloat);
+    if (h == Helper::RtneHalf)
+      add(Helper::RtneIntHalf);
   }
 
 private:
@@ -672,7 +677,6 @@ inline std::string helperSource(Helper h) {
     fn->params.push_back({msl::Type::scalar(msl::Scalar::F32), "v", {}});
 
     msl::Expr *const u = c.var("u");
-    msl::Expr *const mant = c.var("mant");
     const auto shr = [&](msl::Expr *e, int64_t by) {
       return c.binary(msl::BinOp::Shr, e, c.lit(by));
     };
@@ -681,19 +685,20 @@ inline std::string helperSource(Helper h) {
     };
 
     fn->body.push_back(c.declStmt(u32, "u", c.bitcast(u32, c.var("v"))));
-    fn->body.push_back(c.ifStmt(
-        c.binary(msl::BinOp::Eq, andHex(shr(u, 23), 0xff), c.litHex(0xff)),
-        {c.declStmt(u32, "mant", andHex(u, 0x7fffff)),
-         c.returnStmt(c.cast(
-             u16, c.binary(msl::BinOp::Or, andHex(shr(u, 16), 0xff80),
-                           c.ternary(mant, c.litHex(0x40),
-                                     c.lit(0, msl::Type::scalar(
-                                                  msl::Scalar::U32))))))}));
     fn->body.push_back(c.declStmt(
         u32, "lsb", c.binary(msl::BinOp::And, shr(u, 16), c.lit(1, u32))));
     fn->body.push_back(c.declStmt(
-        u32, "rounded", c.add(c.add(u, c.litHex(0x7fff)), c.var("lsb"))));
-    fn->body.push_back(c.returnStmt(c.cast(u16, shr(c.var("rounded"), 16))));
+        u32, "sum", c.add(c.add(u, c.litHex(0x7fff)), c.var("lsb"))));
+    fn->body.push_back(c.declStmt(u32, "rounded", shr(c.var("sum"), 16)));
+    fn->body.push_back(
+        c.declStmt(u32, "special",
+                   c.binary(msl::BinOp::Or, andHex(shr(u, 16), 0xff80),
+                            c.ternary(andHex(u, 0x7fffff), c.litHex(0x40),
+                                      c.lit(0, u32)))));
+    fn->body.push_back(c.returnStmt(
+        c.cast(u16, c.ternary(c.binary(msl::BinOp::Eq, andHex(shr(u, 23), 0xff),
+                                       c.litHex(0xff)),
+                              c.var("special"), c.var("rounded")))));
     return renderHelper(fn);
   }
 

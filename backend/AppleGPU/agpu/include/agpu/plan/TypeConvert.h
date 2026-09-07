@@ -107,15 +107,15 @@ inline ConvertPlan planConvert(ElemType from, ElemType to, Rounding r) {
     return p;
   }
 
-  // MSL offers no way to ask for RTZ. RTNE needs a helper too: Metal compiles
-  // with fast-math on, so the plain cast diverges on NaN/Inf/subnormals.
-  // `Default` keeps the cast.
+  // MSL offers no way to ask for RTZ, so that always needs the helper. RTNE
+  // asks for it explicitly.
   if (narrowsFloat(from, to)) {
     if (r == Rounding::RTZ) {
       p.kind = ConvertKind::NarrowRtz;
       return p;
     }
-    if (r == Rounding::RTNE) {
+    // Default too for bfloat: AGX3 miscompiles `(bfloat)x` as `(half)x`.
+    if (r == Rounding::RTNE || to.floatKind == FloatKind::Brain) {
       p.kind = ConvertKind::NarrowRtne;
       return p;
     }

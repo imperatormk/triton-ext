@@ -209,7 +209,9 @@ int main() {
     z.add(Helper::RtzBfloat);
     const std::string neSrc = prelude(ne);
     CHECK(neSrc.find("u + 0x7fffu + lsb") != std::string::npos);
-    CHECK(neSrc.find("(mant ? 0x40u : 0u)") != std::string::npos);
+    // The NaN arm quiets the payload, through a select.
+    CHECK(neSrc.find("0x40u : 0u") != std::string::npos);
+    CHECK(neSrc.find("if (") == std::string::npos);
     CHECK(prelude(z).find("0x7fffu") == std::string::npos);
   }
 

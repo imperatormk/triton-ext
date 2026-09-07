@@ -177,8 +177,8 @@ void AgpuEmitter::setTileInputs(const DotOperands &ops, const agpu::Plan &plan,
   // `in.a` is the device source when A is read in place. The staged case
   // rebuilds a per-tile pool source inside the callback: a panel tile's pitch
   // is the tile's.
-  // Resolved once here: narrowing a widened register mints a
-  // temporary, which belongs in this block rather than the panel loop's.
+  // Resolved once here: narrowing a widened register mints a temporary, which
+  // belongs in this block.
   in.tileInputs = [this, plan, aId, aTy, bId, bTy, cId, cTy, deviceA = in.a,
                    poolA = in.panel.poolA, cIn = ops.cIn, stagedAElem,
                    stagedBElem, aNames = stagedNamesOf(aId, registerCount(aTy)),

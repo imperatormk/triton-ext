@@ -207,12 +207,10 @@ void printElementwise(std::ostream &os) {
   body.push_back(emitMath(c, MathFn::Isnan, f32(), "nn", c.var("fa")));
   body.push_back(emitMath(c, MathFn::Exp10, f32(), "e10", c.var("fa")));
 
-  {
-    int i = 0;
-    for (const MathSpelling &s : kMathSpellings)
-      body.push_back(
-          emitMath(c, s.fn, f32(), "mfn" + std::to_string(i++), c.var("fa")));
-  }
+  int mathFns = 0;
+  for (const MathSpelling &s : kMathSpellings)
+    body.push_back(emitMath(c, s.fn, f32(), "mfn" + std::to_string(mathFns++),
+                            c.var("fa")));
   body.push_back(
       c.declStmt(msl::Type::scalar(msl::Scalar::F32), "fm",
                  mathExpr(c, MathFn2::Fmod, c.var("fa"), c.var("fb"))));
@@ -270,8 +268,10 @@ void printElementwise(std::ostream &os) {
 
   os << "  out[t] = mn + mx + e10 + fm + fu + cl + df + sel + hv + big + neg"
         " + non\n"
-        "         + (float)nn + (float)bits + (float)sv;\n"
-        "  iout[t] = mh + du + su + tbl[t & 3] + (int)ge";
+        "         + (float)nn + (float)bits + (float)sv";
+  for (int j = 0; j < mathFns; ++j)
+    os << " + mfn" << j;
+  os << ";\n  iout[t] = mh + du + su + tbl[t & 3] + (int)ge";
   for (int j = 0; j < (int)(sizeof(all) / sizeof(all[0])); ++j)
     os << " + (int)p" << j;
   os << ";\n}\n";

@@ -173,8 +173,8 @@ AgpuEmitter::lowerCombine(Region &region, am::Block &body,
         "the combine region does not return one value per operand");
     return out;
   }
-  // A narrowing temporary reads a value declared in the body, so it has to be
-  // emitted there rather than in the block this returns into.
+  // A narrowing temporary reads a value declared in the body, so it belongs
+  // in the body.
   const CurBlock in(*this, body);
   for (Value v : term->getOperands()) {
     const am::Str *n = body_.sym.regAt(idOf(v), 0);

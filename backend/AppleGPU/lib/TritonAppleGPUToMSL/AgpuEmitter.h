@@ -505,7 +505,8 @@ private:
     agpu::msl::Block *saved_ = nullptr;
   };
 
-  agpu::msl::Str castTo(const agpu::ElemType &to, const agpu::msl::Str &src);
+  agpu::msl::Str castTo(const agpu::ElemType &from, const agpu::ElemType &to,
+                        const agpu::msl::Str &src);
 
   // `declared` read back in the IR element type, through a narrowing temporary
   // where the register was declared wider.

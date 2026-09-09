@@ -75,7 +75,9 @@ inline void emitHistogramCount(msl::Context &c, msl::Block &body,
   msl::Block inner;
   for (std::size_t r = 0; r < srcRegs.size(); ++r) {
     const msl::Str &v = srcRegs[r];
-    msl::Expr *guard = c.binary(msl::BinOp::Lt, c.var(v), c.lit(p.bins));
+    msl::Expr *guard =
+        c.binary(msl::BinOp::LAnd, c.binary(msl::BinOp::Ge, c.var(v), c.lit(0)),
+                 c.binary(msl::BinOp::Lt, c.var(v), c.lit(p.bins)));
     if (!masks.empty()) {
       const msl::Str &m = masks[masks.size() == 1 ? 0 : r];
       guard = c.binary(msl::BinOp::LAnd, c.var(m), guard);

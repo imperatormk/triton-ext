@@ -201,6 +201,28 @@ struct ScanPlan {
     return simdPrefixExclusiveFn(combiner, elemAt(0));
   }
 
+  // A ladder whose sourceless lanes read the identity drops its rung guard.
+  // Restricted to an axis on the low lane bits, the segmentation `modulo`
+  // expresses.
+  Identity fillIdentity() const {
+    if (laneMask == 0 || (laneMask & (laneMask + 1)) != 0)
+      return Identity::None;
+    if (elems.size() > 1 || !combinerSpelling(combiner, elemAt(0)))
+      return Identity::None;
+    return identityOf(combiner);
+  }
+  bool fills() const { return fillIdentity() != Identity::None; }
+
+  const char *fillShuffleName() const {
+    return reverse ? msl::builtin::simd::ShuffleAndFillDown
+                   : msl::builtin::simd::ShuffleAndFillUp;
+  }
+
+  // Zero when the axis fills the warp and the builtin's default applies.
+  int64_t fillModulo(int64_t warpSize) const {
+    return guardNeedsMask(warpSize) ? (int64_t)laneMask + 1 : 0;
+  }
+
   // Whether a lane's own registers fold before any shuffle.
   bool needsLocalPass() const { return windowRegs > 1; }
 

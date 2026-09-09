@@ -96,6 +96,32 @@ inline const CombinerSpelling *combinerSpelling(Combiner fn, ElemType e) {
   return nullptr;
 }
 
+// The value a combine leaves its other argument unchanged by. Sum and product
+// answer None: `0 + -0.0` is `+0.0`, and they take the prefix intrinsic.
+enum class Identity { None, Zero, AllOnes, PosInf, NegInf, Lowest, Highest };
+
+inline Identity identityOf(Combiner fn) {
+  switch (fn) {
+  case Combiner::MinF:
+    return Identity::PosInf;
+  case Combiner::MaxF:
+    return Identity::NegInf;
+  case Combiner::MinS:
+  case Combiner::MinU:
+    return Identity::Highest;
+  case Combiner::MaxS:
+    return Identity::Lowest;
+  case Combiner::MaxU:
+  case Combiner::OrI:
+  case Combiner::XorI:
+    return Identity::Zero;
+  case Combiner::AndI:
+    return Identity::AllOnes;
+  default:
+    return Identity::None;
+  }
+}
+
 inline const char *simdReduceFn(Combiner fn, ElemType e) {
   const CombinerSpelling *s = combinerSpelling(fn, e);
   return s ? s->reduce : nullptr;

@@ -609,6 +609,8 @@ private:
 
   agpu::msl::Expr *maskAt(const agpu::OpView &o, std::size_t maskIndex,
                           int64_t reg);
+  // An i1 conjunction arrives as its conjuncts, for the peel to dedup per term.
+  agpu::msl::Expr *maskTermAt(agpu::ValueId v, int64_t reg);
 
   agpu::AddressSpread spreadOf(Value ptr);
   agpu::AddressSpread spreadOf(RankedTensorType ty);

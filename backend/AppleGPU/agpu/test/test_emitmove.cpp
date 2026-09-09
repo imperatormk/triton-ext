@@ -282,6 +282,44 @@ int main() {
     CHECK(out.find("m0 && m1") != std::string::npos);
   }
 
+  CASE("a conjunction guard contributes each axis term once");
+  {
+    msl::Context c;
+    msl::Block body;
+    MoveFacts f = loadOf(8, 32, 4, 4);
+    f.hasMask = true;
+    MovePlan p = planMove(f);
+    CHECK(p.peel);
+    TestSite ts(c, 8, /*mask=*/true);
+    ts.site.guard = [&c](int64_t r) -> msl::Expr * {
+      return c.allOf(c.var("a" + std::to_string(r / 4)),
+                     c.var("b" + std::to_string(r % 4)));
+    };
+    emitMove(c, body, f, p, ts.site, elem);
+    const std::string out = render(body);
+    CHECK(out.find("if (a0 && b0 && b1 && b2 && b3 && a1) {") !=
+          std::string::npos);
+    CHECK(out.find("if (a1 && b2)") != std::string::npos);
+  }
+
+  CASE("a partial cross product still dedups per conjunct");
+  {
+    // Conjunction is idempotent, so nothing hinges on the pairs being
+    // complete: (a0 && b0) && (a1 && b1) is a0 && b0 && a1 && b1 either way.
+    msl::Context c;
+    msl::Block body;
+    MoveFacts f = loadOf(4, 32, 4, 4);
+    f.hasMask = true;
+    TestSite ts(c, 4, /*mask=*/true);
+    ts.site.guard = [&c](int64_t r) -> msl::Expr * {
+      return c.allOf(c.var("a" + std::to_string(r % 2)),
+                     c.var("b" + std::to_string(r % 2)));
+    };
+    emitMove(c, body, f, planMove(f), ts.site, elem);
+    const std::string out = render(body);
+    CHECK(out.find("if (a0 && b0 && a1 && b1) {") != std::string::npos);
+  }
+
   CASE("a broadcast mask contributes a single shared term");
   {
     msl::Context c;

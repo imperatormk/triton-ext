@@ -2,6 +2,8 @@
 // bookkeeping and the layout queries the handlers ask.
 #include "AgpuEmitter.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+
 namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
@@ -186,7 +188,18 @@ am::Expr *AgpuEmitter::maskAt(const agpu::OpView &o, std::size_t maskIndex,
                               int64_t reg) {
   if (o.operands.size() <= maskIndex)
     return nullptr;
-  const am::Str *m = body_.sym.regAt(o.operands[maskIndex], (std::size_t)reg);
+  return maskTermAt(o.operands[maskIndex], reg);
+}
+
+am::Expr *AgpuEmitter::maskTermAt(agpu::ValueId v, int64_t reg) {
+  if (const Value mv = mlirValueOf(v))
+    if (auto andi = mv.getDefiningOp<arith::AndIOp>()) {
+      am::Expr *l = maskTermAt(idOf(andi.getLhs()), reg);
+      am::Expr *r = maskTermAt(idOf(andi.getRhs()), reg);
+      if (l && r)
+        return agpu_.context().allOf(l, r);
+    }
+  const am::Str *m = body_.sym.regAt(v, (std::size_t)reg);
   return m ? agpu_.context().var(*m) : nullptr;
 }
 

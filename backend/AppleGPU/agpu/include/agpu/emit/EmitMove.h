@@ -145,21 +145,31 @@ inline void emitMove(msl::Context &c, msl::Block &body, const MoveFacts &f,
     return;
   }
 
-  // The peel condition is every distinct guard of the access. Splitting it
-  // per run would re-serialise the runs.
+  // The peel condition is every distinct conjunct of every guard. Splitting
+  // it per run would re-serialise the runs.
   msl::Expr *allTrue = nullptr;
   msl::SmallVec<msl::Expr *, 8> seen;
+  msl::SmallVec<msl::Expr *, 8> pending;
   for (int64_t r = 0; r < f.regCount; ++r) {
-    msl::Expr *t = site.guard ? site.guard(r) : nullptr;
-    if (!t)
-      continue;
-    bool dup = false;
-    for (msl::Expr *s : seen)
-      dup = dup || msl::exprsEqual(s, t);
-    if (dup)
-      continue;
-    seen.push_back(t);
-    allTrue = allTrue ? c.binary(msl::BinOp::LAnd, allTrue, t) : t;
+    if (msl::Expr *g = site.guard ? site.guard(r) : nullptr)
+      pending.push_back(g);
+    while (!pending.empty()) {
+      msl::Expr *t = pending.back();
+      pending.pop_back();
+      if (t->kind == msl::ExprKind::Binary &&
+          static_cast<msl::Binary *>(t)->op == msl::BinOp::LAnd) {
+        pending.push_back(static_cast<msl::Binary *>(t)->rhs);
+        pending.push_back(static_cast<msl::Binary *>(t)->lhs);
+        continue;
+      }
+      bool dup = false;
+      for (msl::Expr *s : seen)
+        dup = dup || msl::exprsEqual(s, t);
+      if (dup)
+        continue;
+      seen.push_back(t);
+      allTrue = allTrue ? c.binary(msl::BinOp::LAnd, allTrue, t) : t;
+    }
   }
 
   msl::Block hot, cold;

@@ -74,7 +74,8 @@ inline msl::Stmt *bandAccess(msl::Context &c, const BandReg &r,
 
   msl::Expr *cond = guardCond(c, g, [&](int) { return c.var(flatName); });
 
-  blk.push_back(c.guarded(cond, move(slotAt(c.var(flatName)))));
+  if (msl::Stmt *s = c.guarded(cond, move(slotAt(c.var(flatName)))))
+    blk.push_back(s);
   return c.scope(std::move(blk));
 }
 

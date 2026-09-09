@@ -45,12 +45,10 @@ public:
 
   Decision dot(msl::Block &body, const DotFacts &f, const DotInputs &in) {
     const Plan p = planFor(f);
-    // cNeed exists only once the plan is chosen, and the reservation must
-    // precede print()'s pool.plan().
-    if (p.kind != Plan::Kind::Unsupported)
-      pool.scratch("dot", p.pool.cNeed);
     const Decision d = emitDot(ctx_, body, p, in);
     declines.record(d, site);
+    if (d.ok())
+      pool.scratch("dot", p.pool.cNeed);
     return d;
   }
 

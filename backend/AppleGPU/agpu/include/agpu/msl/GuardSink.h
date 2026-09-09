@@ -94,6 +94,10 @@ inline SinkStop sinkTarget(const Block &b, std::size_t from, std::size_t &to,
     if (storeTarget(s, otherBuf, other, coordsOf)) {
       if (otherBuf == buf && !provablyDisjoint(where, other))
         return SinkStop::MayAlias;
+      if (cond.names.count(otherBuf))
+        return SinkStop::ClobbersCond;
+      if (store.names.count(otherBuf))
+        return SinkStop::FeedsStore;
       continue;
     }
 

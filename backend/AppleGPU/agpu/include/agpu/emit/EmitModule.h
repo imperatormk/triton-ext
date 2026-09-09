@@ -69,13 +69,8 @@ inline ModuleResult emitModule(msl::Context &c, ModuleFacts &m,
 
   std::vector<DeviceFnAbi> abis;
   abis.reserve(m.deviceFns.size());
-  for (DeviceFnUnit &u : m.deviceFns) {
-    DeviceFnAbi abi = planDeviceFn(u.facts);
-    r.decision = deviceFnDecision(abi);
-    if (!r.decision.ok())
-      return r;
-    abis.push_back(std::move(abi));
-  }
+  for (DeviceFnUnit &u : m.deviceFns)
+    abis.push_back(planDeviceFn(u.facts));
 
   // Bodies first: building one may add to the helper set, which must be
   // printed before anything that calls a helper.

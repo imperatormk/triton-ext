@@ -43,18 +43,6 @@ using OpHandler = std::function<Decision(const OpView &)>;
 struct OpFamily {
   std::vector<std::string_view> names;
   OpHandler body;
-
-  operator OpHandler() const {
-    OpHandler b = body;
-    if (names.empty())
-      return b;
-    return [names = names, body = std::move(b)](const OpView &op) -> Decision {
-      for (std::string_view n : names)
-        if (n == op.name)
-          return body(op);
-      return Decision::notMine();
-    };
-  }
 };
 
 // The families, in the order they are tried.

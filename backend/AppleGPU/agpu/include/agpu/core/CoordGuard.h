@@ -26,7 +26,6 @@ struct CoordRange {
   int64_t lo = 0;
   int64_t hi = 0;
 
-  bool within(const CoordWindow &w) const { return lo >= w.lo && hi < w.hi; }
   bool disjoint(const CoordWindow &w) const { return hi < w.lo || lo >= w.hi; }
 };
 

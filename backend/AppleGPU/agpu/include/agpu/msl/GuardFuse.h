@@ -28,10 +28,6 @@ struct FuseCost {
   }
 };
 
-inline bool clobbers(Stmt *s, const PtrSet<Str> &names) {
-  return writesTo(s, names);
-}
-
 // `opaque` is set when the expression contains a call: `f(x) > 0` reads more
 // than `x`.
 struct ReadNames {
@@ -77,7 +73,7 @@ inline std::size_t fusableRun(const Block &b, std::size_t i) {
       break;
     bool clobbered = false;
     for (Stmt *s : cur->thenBody)
-      clobbered = clobbered || clobbers(s, condNames);
+      clobbered = clobbered || writesTo(s, condNames);
     if (clobbered)
       break;
     ++j;

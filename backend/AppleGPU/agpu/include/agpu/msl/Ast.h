@@ -22,9 +22,6 @@ enum class StmtKind {
 #include "Nodes.def"
 };
 
-const char *name(ExprKind k);
-const char *name(StmtKind k);
-
 // ── types ─────────────────────────────────────────────────────────────────
 
 enum class Scalar {
@@ -196,10 +193,6 @@ struct Literal : Expr {
   // Spelling only: a bit mask reads as hex and compares equal to its decimal.
   bool hex = false;
   Type type = Type::scalar(Scalar::I32);
-
-  static Literal *makeInt(int64_t v, Type t);
-  static Literal *makeFloat(double v, Type t);
-  static Literal *makeBool(bool v);
 
   Literal() : Expr(ExprKind::Literal) {}
 

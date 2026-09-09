@@ -103,12 +103,8 @@ public:
   // the tensor's and the origin absorbs the subtraction. The origin goes
   // negative, so `cosizeElems()` on the result is not meaningful.
   TileView originAt(const Coord &at) const {
-    assert(at.size() == extent_.size());
-    int64_t off = 0;
-    for (std::size_t d = 0; d < at.size(); ++d)
-      off += at[d] * stride_[d];
     TileView v = *this;
-    v.origin_ = origin_ - off;
+    v.origin_ = 2 * origin_ - offsetOf(at);
     return v;
   }
   TileView originAt(std::initializer_list<int64_t> at) const {
@@ -135,13 +131,13 @@ public:
   int64_t cosizeElems() const {
     if (extent_.empty())
       return 0;
-    int64_t last = origin_;
+    Coord last(extent_.size());
     for (std::size_t d = 0; d < extent_.size(); ++d) {
       if (extent_[d] <= 0)
         return 0;
-      last += (extent_[d] - 1) * stride_[d];
+      last[d] = extent_[d] - 1;
     }
-    return last + 1;
+    return offsetOf(last) + 1;
   }
 
   int64_t sizeElems() const {

@@ -205,11 +205,6 @@ LogicalResult AgpuEmitter::addDeviceFn(triton::FuncOp func) {
     agpu_.pool.scratch("device fn", agpu::Bytes(poolBytes));
 
   const agpu::DeviceFnAbi abi = agpu::planDeviceFn(f);
-  if (!abi.usable) {
-    func.emitError("AgpuEmitter: this device function's shape is not lowered");
-    return failure();
-  }
-
   if (failed(appendDeviceReturn(func, abi, body)))
     return failure();
 

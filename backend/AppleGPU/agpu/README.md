@@ -88,9 +88,9 @@ installed, set `TOOLCHAINS` to the Metal toolchain's bundle id.
 
 ## Design rules
 
-1. **One owner per fact.** `TileView::offsetOf` is the only place a coordinate
-   is multiplied by a stride; `kWarpSize` is declared once; a helper's name and
-   its body key on one enum.
+1. **One owner per fact.** `TileView::offsetOf` is the one place a coordinate is
+   multiplied by a stride, and `originAt` and `cosizeElems` go through it;
+   `kWarpSize` is declared once; a helper's name and its body key on one enum.
 1. **Query, don't check.** A caller asks the plan what to do. It does not test a
    flag and decide again.
 1. **Sizing and emission share the object.** Whoever reserves space calls
@@ -104,12 +104,14 @@ installed, set `TOOLCHAINS` to the Metal toolchain's bundle id.
 1. **Verify numerically where structure is not enough.** A scan's emitted text
    can have the right shape and combine the wrong elements, so the suite
    simulates the ladder against the definition of a prefix sum.
-1. **Headers define, `src/` holds the recursive walks.** Everything is
-   header-only except a definition that recurses over the tree, which every
-   translation unit would otherwise re-instantiate. That is why `eraseStmts` and
-   the printer are the only two things in `src/`.
+1. **Headers define, `src/` holds the printer.** Everything is header-only
+   except the printer, whose walk over the tree every translation unit would
+   otherwise re-instantiate. That is why `Printer.cpp` is the one thing in
+   `src/`.
 1. **A layer's files divide into deciders and vocabulary.** In `plan/`, a file
-   that decides ends in `Plan` or `Schedule`; the rest are the types and tables
-   those decisions are written in (`ElemType`, `MathFn`, `WarpSlots`). `emit/*`
-   build AST and are named for the op family; `emit/primitives/` holds the small
-   types an emitter holds, kept apart from the functions that emit.
+   that chooses among strategies ends in `Plan` or `Schedule` (`DotPlan`,
+   `ScanPlan`, `PanelSchedule`); a vocabulary file holds the types and tables a
+   decision is written in (`ElemType`, `MathFn`) and may carry the small `plan*`
+   that its own table settles (`WarpSlots`, `AccessWidth`, `TypeConvert`).
+   `emit/*` build AST and are named for the op family; `emit/primitives/` holds
+   the small types an emitter holds, kept apart from the functions that emit.

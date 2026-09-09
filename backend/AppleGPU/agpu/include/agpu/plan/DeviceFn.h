@@ -100,7 +100,6 @@ struct DeviceFnAbi {
   // The implicit parameters, in the order they are appended and passed.
   std::vector<ImplicitArg> implicit;
 
-  bool usable = true;
   bool needsPool() const {
     for (ImplicitArg a : implicit)
       if (a == ImplicitArg::Pool)
@@ -153,12 +152,6 @@ inline DeviceFnAbi planDeviceFn(const DeviceFnFacts &f) {
     abi.implicit.push_back(ImplicitArg::Asserts);
 
   return abi;
-}
-
-inline Decision deviceFnDecision(const DeviceFnAbi &abi) {
-  if (abi.usable)
-    return Decision::emitted();
-  return Decision::declined("deviceFn", "signature cannot be expressed");
 }
 
 // Module-wide pool sizing lives in plan/PoolPlan.h.

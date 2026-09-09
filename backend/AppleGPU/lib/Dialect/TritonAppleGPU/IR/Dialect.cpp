@@ -11,10 +11,10 @@
 #include "llvm/ADT/TypeSwitch.h"
 
 // Pull in tablegen-generated definitions
-#include "dialect/TritonAppleGPU/IR/Dialect.cpp.inc"
+#include "Dialect/TritonAppleGPU/IR/Dialect.cpp.inc"
 
 #define GET_ATTRDEF_CLASSES
-#include "dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.cpp.inc"
+#include "Dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.cpp.inc"
 
 namespace ttg = mlir::triton::gpu;
 using namespace mlir;
@@ -167,7 +167,7 @@ namespace mlir::triton::applegpu {
 void TritonAppleGPUDialect::initialize() {
   addAttributes<
 #define GET_ATTRDEF_LIST
-#include "dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.cpp.inc"
+#include "Dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.cpp.inc"
       >();
   addInterfaces<AppleGPUInferLayoutInterface>();
 }

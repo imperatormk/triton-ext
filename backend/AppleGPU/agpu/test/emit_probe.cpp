@@ -811,6 +811,15 @@ void printCombiners(std::ostream &os) {
       for (const char *fnName : {r, pi, px})
         if (fnName)
           os << "  sink += (float)" << fnName << "(" << v << ");\n";
+      if (identityOf(fn) != Identity::None) {
+        msl::Context c;
+        std::ostringstream id;
+        msl::Printer(id).printExpr(identityExpr(c, identityOf(fn), e));
+        os << "  sink += (float)" << msl::builtin::simd::ShuffleAndFillUp << "("
+           << v << ", " << id.str() << ", 1u, 4);\n"
+           << "  sink += (float)" << msl::builtin::simd::ShuffleAndFillDown
+           << "(" << v << ", " << id.str() << ", 1u);\n";
+      }
     }
   }
   os << "  out[tid.x] = sink;\n}\n";

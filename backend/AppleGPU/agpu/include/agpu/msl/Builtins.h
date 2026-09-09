@@ -66,6 +66,8 @@ inline constexpr const char *Shuffle = "simd_shuffle";
 inline constexpr const char *ShuffleUp = "simd_shuffle_up";
 inline constexpr const char *ShuffleDown = "simd_shuffle_down";
 inline constexpr const char *ShuffleXor = "simd_shuffle_xor";
+inline constexpr const char *ShuffleAndFillUp = "simd_shuffle_and_fill_up";
+inline constexpr const char *ShuffleAndFillDown = "simd_shuffle_and_fill_down";
 
 // Whole-simdgroup folds. Metal has no bfloat or 64-bit overload; see
 // `simdFoldable`.

@@ -13,28 +13,41 @@ namespace agpu {
 
 // `simd_shuffle` and friends take only 32-bit scalars and vectors of them; a
 // `long`, `bool` or `half` is a compile error at the call, so the value
-// travels bitcast to an accepted type and back.
+// travels bitcast to an accepted type and back. A `fill` value, for the
+// `_and_fill_` variants, travels the same way; `modulo` follows `arg`.
 inline msl::Expr *shuffleOf(msl::Context &c, const char *builtin, ElemType elem,
-                            const msl::Str &v, msl::Expr *arg) {
+                            const msl::Str &v, msl::Expr *arg,
+                            msl::Expr *fill = nullptr,
+                            msl::Expr *modulo = nullptr) {
   const msl::Scalar s = mslTypeOf(elem).scalarKind();
-  const auto call = [&](msl::Expr *x) { return c.call(builtin, {x, arg}); };
+  const auto call = [&](auto wrap) {
+    msl::SmallVec<msl::Expr *, 4> args{wrap(c.var(v))};
+    if (fill)
+      args.push_back(wrap(fill));
+    args.push_back(arg);
+    if (modulo)
+      args.push_back(modulo);
+    return c.call(builtin, std::move(args));
+  };
 
   switch (shuffleFormOf(s)) {
   case ShuffleForm::SplitU32Pair:
-    return c.bitcast(
-        msl::Type::scalar(s),
-        call(c.bitcast(msl::Type::vector(msl::Scalar::U32, 2), c.var(v))));
+    return c.bitcast(msl::Type::scalar(s), call([&](msl::Expr *x) {
+                       return c.bitcast(msl::Type::vector(msl::Scalar::U32, 2),
+                                        x);
+                     }));
   case ShuffleForm::BoolAsU8:
-    return c.cast(msl::Type::scalar(s),
-                  call(c.cast(msl::Type::scalar(msl::Scalar::U8), c.var(v))));
+    return c.cast(msl::Type::scalar(s), call([&](msl::Expr *x) {
+                    return c.cast(msl::Type::scalar(msl::Scalar::U8), x);
+                  }));
   case ShuffleForm::NarrowAsBits:
-    return c.bitcast(
-        msl::Type::scalar(s),
-        call(c.bitcast(msl::Type::scalar(shuffleBitsOf(s)), c.var(v))));
+    return c.bitcast(msl::Type::scalar(s), call([&](msl::Expr *x) {
+                       return c.bitcast(msl::Type::scalar(shuffleBitsOf(s)), x);
+                     }));
   case ShuffleForm::Direct:
     break;
   }
-  return call(c.var(v));
+  return call([](msl::Expr *x) { return x; });
 }
 
 struct ShuffleNames : ThreadNames {

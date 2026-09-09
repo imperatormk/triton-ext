@@ -9,7 +9,10 @@
 #include "agpu/core/Names.h"
 #include "agpu/emit/EmitReduce.h"
 #include "agpu/msl/Builtins.h"
+#include "agpu/msl/Printer.h"
 #include "agpu/plan/ScanPlan.h"
+
+#include <sstream>
 
 namespace agpu {
 
@@ -19,13 +22,45 @@ struct ScanNames : ScratchNames {
   msl::Str carry = "scarry";
 };
 
+inline msl::Expr *identityExpr(msl::Context &c, Identity id, ElemType elem) {
+  const msl::Type t = mslTypeOf(elem);
+  std::ostringstream ty;
+  msl::Printer(ty).printType(t);
+  const auto limit = [&](const char *fn) {
+    return c.call("metal::numeric_limits<" + ty.str() + ">::" + fn, {});
+  };
+  switch (id) {
+  case Identity::Zero:
+    return c.cast(t, c.lit(0));
+  case Identity::AllOnes:
+    return c.cast(t, c.lit(-1));
+  case Identity::PosInf:
+    return limit("infinity");
+  case Identity::NegInf:
+    return c.unary(msl::UnOp::Neg, limit("infinity"));
+  case Identity::Lowest:
+    return limit("lowest");
+  case Identity::Highest:
+    return limit("max");
+  case Identity::None:
+    break;
+  }
+  return nullptr;
+}
+
 // One rung's shuffle: `simd_shuffle_up(v, delta)` or its downward twin, side
 // chosen by the plan. Not shuffle_xor; an XOR butterfly mixes partials from
-// both sides and gives a reduction.
+// both sides and gives a reduction. With an identity to hand, the sourceless
+// lanes read it instead and the rung needs no guard.
 inline msl::Expr *scanShuffle(msl::Context &c, const ScanPlan &p,
                               const msl::Str &v, int64_t delta, ElemType elem) {
-  return shuffleOf(c, p.shuffleName(), elem, v,
-                   c.lit(delta, msl::Context::u32()));
+  msl::Expr *deltaLit = c.lit(delta, msl::Context::u32());
+  if (!p.fills())
+    return shuffleOf(c, p.shuffleName(), elem, v, deltaLit);
+  const int64_t modulo = p.fillModulo(p.scratch.warpSize);
+  return shuffleOf(c, p.fillShuffleName(), elem, v, deltaLit,
+                   identityExpr(c, p.fillIdentity(), elem),
+                   modulo ? c.lit(modulo) : nullptr);
 }
 
 // A lane's position along the scanned axis; what the guards test. Masked only
@@ -64,7 +99,7 @@ inline void emitScanStep(msl::Context &c, msl::Block &body, const ScanPlan &p,
     inner.push_back(c.assign(c.var(accs[k]), c.var(out[k])));
 
   msl::Expr *cond =
-      step.guarded
+      step.guarded && !p.fills()
           ? c.binary(p.guardOp(), axisLane(c, p, nm),
                      c.lit(p.guardBound(step.delta, p.scratch.warpSize)))
           : nullptr;
@@ -464,10 +499,11 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
     msl::Block inner;
     for (int64_t r = 0; r < regs; ++r)
       storeAt(inner, r, combine(inner, prefix, at(r)));
-    c.guardedInto(body,
-                  c.binary(p.guardOp(), axisLane(c, p, nm),
-                           c.lit(p.guardBound(low, p.scratch.warpSize))),
-                  std::move(inner));
+    msl::Expr *cond =
+        p.fills() ? nullptr
+                  : c.binary(p.guardOp(), axisLane(c, p, nm),
+                             c.lit(p.guardBound(low, p.scratch.warpSize)));
+    c.guardedInto(body, cond, std::move(inner));
   }
 
   // The warps before this one: one carry, folded into every register.

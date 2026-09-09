@@ -514,6 +514,97 @@ int main() {
     CHECK(render(body).find("float sa") != std::string::npos);
   }
 
+  // ── the identity fill ──────────────────────────────────────────────────
+
+  CASE("a max scan fills the sourceless lanes and drops the rung guards");
+  {
+    msl::Context c;
+    msl::Block body;
+    ScanFacts f = facts(wholeWarp());
+    f.combiner = Combiner::MaxF;
+    ScanPlan p = planScan(f);
+    CHECK(p.fills());
+    emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
+    const std::string out = render(body);
+    CHECK(out.find("simd_shuffle_and_fill_up(sax0, "
+                   "-metal::numeric_limits<float>::infinity(), 1u)") !=
+          std::string::npos);
+    CHECK_EQ(countOf(out, "simd_shuffle_and_fill_up"), 5 + 1);
+    CHECK_EQ(countOf(out, "simd_shuffle_up("), 0);
+    CHECK_EQ(countOf(out, "if ("), 0);
+  }
+
+  CASE("a partial-warp axis passes its segment as the modulo");
+  {
+    msl::Context c;
+    msl::Block body;
+    ScanFacts f = facts({{0, 1}, {1, 2}});
+    f.combiner = Combiner::MinF;
+    ScanPlan p = planScan(f);
+    emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
+    const std::string out = render(body);
+    CHECK(out.find("simd_shuffle_and_fill_up(sax0, "
+                   "metal::numeric_limits<float>::infinity(), 1u, 4)") !=
+          std::string::npos);
+    CHECK(out.find("lane & 3") == std::string::npos);
+    CHECK_EQ(countOf(out, "if ("), 0);
+  }
+
+  CASE("a reverse fill shuffles down");
+  {
+    msl::Context c;
+    msl::Block body;
+    ScanFacts f = facts({{0, 1}, {1, 2}});
+    f.combiner = Combiner::MaxF;
+    f.reverse = true;
+    ScanPlan p = planScan(f);
+    emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
+    const std::string out = render(body);
+    CHECK_EQ(countOf(out, "simd_shuffle_and_fill_down("), 2 + 1);
+    CHECK(out.find("<= ") == std::string::npos);
+  }
+
+  CASE("a column axis, a sum and a generic combine keep the guarded ladder");
+  {
+    // A stride-8 axis interleaves its segments, which `modulo` cannot
+    // express; sum has no exact identity under signed zero; generic has none.
+    ScanFacts col = facts({{3, 1}, {4, 2}});
+    col.combiner = Combiner::MaxF;
+    CHECK(!planScan(col).fills());
+    ScanFacts sum = facts(wholeWarp());
+    sum.combiner = Combiner::AddF;
+    sum.reverse = true;
+    CHECK(!planScan(sum).fills());
+    ScanFacts gen = facts(wholeWarp());
+    CHECK(!planScan(gen).fills());
+
+    msl::Context c;
+    msl::Block body;
+    emitScan(c, body, planScan(col), 1, sources(1, 1), nm, adder(c));
+    const std::string out = render(body);
+    CHECK_EQ(countOf(out, "simd_shuffle_and_fill"), 0);
+    CHECK(out.find("(lane & 24) >= 8") != std::string::npos);
+  }
+
+  CASE("integer combiners fill with their own limits");
+  {
+    for (const auto &[fn, want] :
+         {std::pair{Combiner::MaxS, "metal::numeric_limits<int>::lowest()"},
+          std::pair{Combiner::MinS, "metal::numeric_limits<int>::max()"},
+          std::pair{Combiner::AndI, "(int)-1"},
+          std::pair{Combiner::OrI, "(int)0"}}) {
+      msl::Context c;
+      msl::Block body;
+      ScanFacts f = facts({{0, 1}});
+      f.combiner = fn;
+      f.elems = {i32()};
+      emitScan(c, body, planScan(f), 1, sources(1, 1), nm, adder(c));
+      const std::string out = render(body);
+      CHECK(out.find(std::string("simd_shuffle_and_fill_up(sax0, ") + want +
+                     ", 1u, 2)") != std::string::npos);
+    }
+  }
+
   // ── reverse ────────────────────────────────────────────────────────────
 
   CASE("a reverse scan shuffles down and inverts its guard");

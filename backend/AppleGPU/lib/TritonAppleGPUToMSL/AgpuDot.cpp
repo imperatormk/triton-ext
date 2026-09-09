@@ -46,14 +46,7 @@ agpu::Decision AgpuEmitter::emitDotOp(const agpu::OpView &o) {
   if (const agpu::Decision d = stageDotOperands(ops, plan, in); !d.ok())
     return d;
 
-  body_.armPending();
   const agpu::Decision d = agpu_.dot(*cur_, f, in);
-
-  // Checked before `d`: an unplanned tile makes `d.ok()` say nothing
-  // about correctness.
-  if (!body_.pendingOk)
-    return declined("tt.dot", body_.pendingWhy);
-
   if (!d.ok()) {
     if (d.isBug())
       return declined("tt.dot", "emitDot refused plan kind " +

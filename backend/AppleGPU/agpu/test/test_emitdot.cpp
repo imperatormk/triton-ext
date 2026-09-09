@@ -62,8 +62,7 @@ int main() {
 
     DotInputs in = inputsFor();
     in.tileInputs = [](const PanelTile &) {
-      PanelInputs pi;
-      return pi;
+      return Result<PanelInputs>::of(PanelInputs{});
     };
     Decision d = emitDot(c, body, p, in);
     CHECK(d.ok());
@@ -82,8 +81,7 @@ int main() {
     const Plan pp = planDot(gemm(256, 256, 64), Bytes(8192));
     DotInputs in = inputsFor();
     in.tileInputs = [](const PanelTile &) {
-      PanelInputs pi;
-      return pi;
+      return Result<PanelInputs>::of(PanelInputs{});
     };
     emitDot(c, panel, pp, in);
 
@@ -132,7 +130,7 @@ int main() {
       back.names.push_back("out1");
       back.bases.push_back("");
       back.bases.push_back("cin1"); // a carried accumulator to add onto
-      return back;
+      return Result<ReadbackInputs>::of(back);
     };
     LayoutBasis row, col;
     row.lane = {1, 2, 4, 8, 16};
@@ -182,7 +180,7 @@ int main() {
           StageAction{0, 1, false, {0, 0, 0}, CoordGuard::unguarded()});
       back.names.push_back("out0");
       back.bases.push_back("");
-      return back;
+      return Result<ReadbackInputs>::of(back);
     };
     // The batch coordinate varies with the lane; a constant one folds away.
     LayoutBasis batch, row, col;
@@ -279,7 +277,7 @@ int main() {
       back.names.push_back("out1");
       back.bases.push_back("");
       back.bases.push_back("");
-      return back;
+      return Result<ReadbackInputs>::of(back);
     };
     CoordSource cs;
     LayoutBasis row, col;
@@ -427,7 +425,7 @@ int main() {
           StageAction{0, 1, false, {0, 0}, CoordGuard::unguarded()});
       back.names.push_back("out0");
       back.bases.push_back("");
-      return back;
+      return Result<ReadbackInputs>::of(back);
     };
     CoordSource cs;
     cs.dims = {LayoutBasis{}, LayoutBasis{}};
@@ -495,7 +493,7 @@ int main() {
           StageAction{0, 1, false, {0, 0}, CoordGuard::unguarded()});
       back.names.push_back("out0");
       back.bases.push_back("");
-      return back;
+      return Result<ReadbackInputs>::of(back);
     };
     CoordSource cs;
     cs.dims = {LayoutBasis{}, LayoutBasis{}};
@@ -504,6 +502,42 @@ int main() {
                       [&]() { return Decision::declined("test", "no loop"); });
     CHECK(!d.ok());
     CHECK_EQ(countOf(render(body), "simdgroup_store"), 0);
+  }
+
+  CASE("a tile the caller cannot stage declines the dot with its reason");
+  {
+    msl::Context c;
+    msl::Block body;
+    const Plan p = planDot(gemm(256, 256, 64), Bytes(8192));
+    CHECK(p.kind == Plan::Kind::Panel);
+    DotInputs in = inputsFor();
+    int tiles = 0;
+    in.tileInputs = [&tiles](const PanelTile &) {
+      if (++tiles == 2)
+        return Result<PanelInputs>::no(
+            Decision::declined("caller", "A: no run"));
+      return Result<PanelInputs>::of(PanelInputs{});
+    };
+    const Decision d = emitDot(c, body, p, in);
+    CHECK(!d.ok());
+    CHECK_EQ(d.why(), std::string("A: no run"));
+    CHECK_EQ(tiles, 2);
+  }
+
+  CASE("a readback the caller cannot resolve declines the direct dot");
+  {
+    msl::Context c;
+    msl::Block body;
+    const Plan p = planDot(gemm(64, 64, 64), kBudget);
+    CHECK(p.kind == Plan::Kind::Direct);
+    DotInputs in = inputsFor();
+    in.readbackFor = [](const Range &) {
+      return Result<ReadbackInputs>::no(
+          Decision::declined("caller", "C: no layout"));
+    };
+    const Decision d = emitDot(c, body, p, in);
+    CHECK(!d.ok());
+    CHECK_EQ(d.why(), std::string("C: no layout"));
   }
 
   return ::agpu_test::report("EmitDot");

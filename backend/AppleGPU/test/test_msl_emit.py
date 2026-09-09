@@ -15,19 +15,33 @@ import pytest
 HERE = Path(__file__).parent
 DRIVER = HERE / "msl_driver.py"
 MSL = HERE / "msl"
+EXIT_NO_PLUGIN = 3
+
+
+def _plugin_loaded() -> bool:
+    proc = subprocess.run(
+        [sys.executable, str(DRIVER), "--check"],
+        capture_output=True,
+        text=True)
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == EXIT_NO_PLUGIN:
+        return False
+    raise RuntimeError(f"msl_driver --check failed:\n{proc.stderr}")
+
+
+pytestmark = pytest.mark.skipif(
+    not _plugin_loaded(),
+    reason="AppleGPU plugin not loaded (set TRITON_PLUGIN_PATHS)")
 
 
 def emit(fixture: str) -> str:
     src = MSL / fixture
-    if not src.exists():
-        pytest.skip(f"missing fixture {src}")
     proc = subprocess.run(
         [sys.executable, str(DRIVER), str(src)],
         capture_output=True,
         text=True)
     if proc.returncode != 0:
-        if "plugin not loaded" in proc.stderr:
-            pytest.skip("AppleGPU plugin not loaded (set TRITON_PLUGIN_PATHS)")
         pytest.fail(f"msl_driver failed:\n{proc.stderr}")
     return proc.stdout
 

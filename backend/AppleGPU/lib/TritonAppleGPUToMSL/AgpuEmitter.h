@@ -118,21 +118,6 @@ struct BodyState {
 
   // Metal admits a threadgroup declaration only in a kernel.
   bool declaresThreadgroup = false;
-  // A callback handed to an agpu::emitX function cannot return a Decision
-  // through that signature, so a failure inside one is parked here and the
-  // caller reads it after. Armed before each use, because a failure left over
-  // from one op would otherwise decline the next.
-  bool pendingOk = true;
-  std::string pendingWhy;
-
-  void armPending() {
-    pendingOk = true;
-    pendingWhy.clear();
-  }
-  void notePending(std::string why) {
-    pendingOk = false;
-    pendingWhy = std::move(why);
-  }
 };
 
 class AgpuEmitter {
@@ -219,10 +204,10 @@ private:
 
   agpu::Decision emitMapOp(triton::MapElementwiseOp map);
 
-  agpu::msl::SmallVec<agpu::msl::Str, 4>
-  lowerCombine(Region &region, agpu::msl::Block &body,
-               const agpu::msl::SmallVec<agpu::msl::Str, 4> &lhs,
-               const agpu::msl::SmallVec<agpu::msl::Str, 4> &rhs);
+  agpu::Result<agpu::CombineNames> lowerCombine(Region &region,
+                                                agpu::msl::Block &body,
+                                                const agpu::CombineNames &lhs,
+                                                const agpu::CombineNames &rhs);
 
   int64_t registersHeldByType(Type t) const;
 
@@ -738,10 +723,10 @@ private:
     agpu::msl::SmallVec<agpu::msl::Str, 8> aNames, bNames;
   };
 
-  agpu::PanelInputs panelInputsFor(const agpu::PanelTile &t,
-                                   const DotOperands &ops,
-                                   const agpu::Plan &plan,
-                                   const PanelStaging &staged);
+  agpu::Result<agpu::PanelInputs> panelInputsFor(const agpu::PanelTile &t,
+                                                 const DotOperands &ops,
+                                                 const agpu::Plan &plan,
+                                                 const PanelStaging &staged);
 
   agpu::Decision stageWholeTensor(agpu::ValueId v, RankedTensorType ty,
                                   const agpu::msl::Str &buffer,

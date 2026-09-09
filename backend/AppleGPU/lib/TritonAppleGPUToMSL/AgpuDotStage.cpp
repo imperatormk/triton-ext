@@ -197,6 +197,7 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
                     regElem = plan.accumulatorsOutlivePass()
                                   ? agpu::f32()
                                   : ops.shape.cElem](const agpu::Range &rows) {
+    using R = agpu::Result<agpu::ReadbackInputs>;
     agpu::ReadbackInputs back;
     back.regElem = regElem;
     // A band clips the M axis and leaves the others whole.
@@ -207,10 +208,9 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
     if (const agpu::Decision d =
             planTileActions(cId, cTy, window, cView, (int)agpu::kAccBits,
                             back.actions, "tt.dot");
-        !d.ok()) {
-      body_.notePending("a C band's layout stopped resolving mid-emission");
-      return back;
-    }
+        !d.ok())
+      return R::no(declined(
+          "tt.dot", "a C band's layout stopped resolving mid-emission"));
     // C is the dot's result and has no bound names yet; mint them by the
     // same `accName` convention the handler binds with.
     for (int64_t r = 0; r < registerCount(cTy); ++r)
@@ -220,7 +220,7 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
     back.bases = cIn;
     back.bases.resize(back.names.size());
     back.plan = rename;
-    return back;
+    return R::of(std::move(back));
   };
 
   return agpu::Decision::emitted();
@@ -285,10 +285,11 @@ AgpuEmitter::planTileActions(agpu::ValueId v, RankedTensorType ty,
   return agpu::Decision::emitted();
 }
 
-agpu::PanelInputs AgpuEmitter::panelInputsFor(const agpu::PanelTile &t,
-                                              const DotOperands &ops,
-                                              const agpu::Plan &plan,
-                                              const PanelStaging &staged) {
+agpu::Result<agpu::PanelInputs>
+AgpuEmitter::panelInputsFor(const agpu::PanelTile &t, const DotOperands &ops,
+                            const agpu::Plan &plan,
+                            const PanelStaging &staged) {
+  using R = agpu::Result<agpu::PanelInputs>;
   if (agpu_.gates.on(agpu::Gate::TraceOps)) {
     std::ostringstream os;
     os << "  panelInputsFor m=" << t.m.lo << ".." << t.m.hi << " n=" << t.n.lo
@@ -342,8 +343,8 @@ agpu::PanelInputs AgpuEmitter::panelInputsFor(const agpu::PanelTile &t,
     in.cRename = agpu::panelTileReadback(plan.facts, t);
 
   if (!bad.ok())
-    body_.notePending(bad.why());
-  return in;
+    return R::no(declined("tt.dot", bad.why()));
+  return R::of(std::move(in));
 }
 
 agpu::Decision

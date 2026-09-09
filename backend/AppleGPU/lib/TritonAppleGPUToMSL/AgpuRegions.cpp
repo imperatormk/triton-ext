@@ -102,11 +102,11 @@ AgpuEmitter::reductionPlanOf(triton::ReduceOp red, RankedTensorType srcTy) {
   return R::of(agpu::planReduction(facts));
 }
 
-am::SmallVec<am::Str, 4>
+agpu::Result<agpu::CombineNames>
 AgpuEmitter::lowerCombine(Region &region, am::Block &body,
-                          const am::SmallVec<am::Str, 4> &lhs,
-                          const am::SmallVec<am::Str, 4> &rhs) {
-  am::SmallVec<am::Str, 4> out;
+                          const agpu::CombineNames &lhs,
+                          const agpu::CombineNames &rhs) {
+  using R = agpu::Result<agpu::CombineNames>;
   Block &blk = region.front();
 
   // A combine region is walked once per fold step with the same value ids each
@@ -115,10 +115,9 @@ AgpuEmitter::lowerCombine(Region &region, am::Block &body,
 
   // Block arguments arrive source-major (a0,a1,...,b0,b1,...): that is the
   // order Triton's verifier requires.
-  if (blk.getNumArguments() != lhs.size() + rhs.size()) {
-    body_.notePending("the combine region's arity does not match the operands");
-    return out;
-  }
+  if (blk.getNumArguments() != lhs.size() + rhs.size())
+    return R::no(declined(
+        "combine", "the combine region's arity does not match the operands"));
   const std::size_t nOp = lhs.size();
   for (std::size_t k = 0; k < nOp; ++k) {
     const BlockArgument a = blk.getArgument(k);
@@ -134,39 +133,34 @@ AgpuEmitter::lowerCombine(Region &region, am::Block &body,
 
   // cur_ is swapped for the walk and restored after: a handler is a
   // std::function registered once and cannot take the block as an argument.
-  const bool ok = [&] {
+  const agpu::Decision walked = [&] {
     CurBlock in(*this, body);
-    return walkBlock(blk, body).ok();
+    return walkBlock(blk, body);
   }();
-  if (!ok) {
-    body_.pendingOk = false;
-    if (body_.pendingWhy.empty())
-      body_.pendingWhy = "an op in the combine region";
-    return out;
-  }
+  if (!walked.ok())
+    return R::no(walked.isRecorded()
+                     ? walked
+                     : declined("combine", "an op in the combine region"));
 
   // walkBlock skips terminators, so handle the combine region's here. Either
   // tt.reduce.return or tt.scan.return: one function serves both.
   Operation *term = blk.getTerminator();
   const bool isCombineReturn =
       isa<triton::ReduceReturnOp, triton::ScanReturnOp>(term);
-  if (!isCombineReturn || term->getNumOperands() != lhs.size()) {
-    body_.notePending(
-        "the combine region does not return one value per operand");
-    return out;
-  }
+  if (!isCombineReturn || term->getNumOperands() != lhs.size())
+    return R::no(declined(
+        "combine", "the combine region does not return one value per operand"));
   // A narrowing temporary reads a value declared in the body, so it belongs
   // in the body.
   const CurBlock in(*this, body);
+  agpu::CombineNames out;
   for (Value v : term->getOperands()) {
     const am::Str *n = body_.sym.regAt(idOf(v), 0);
-    if (!n) {
-      body_.notePending("a combine result has no name");
-      return out;
-    }
+    if (!n)
+      return R::no(declined("combine", "a combine result has no name"));
     out.push_back(inIrType(idOf(v), *n));
   }
-  return out;
+  return R::of(std::move(out));
 }
 
 RegionSources AgpuEmitter::regionSourcesOf(ValueRange srcs, ResultRange results,
@@ -250,16 +244,15 @@ agpu::Decision AgpuEmitter::emitReduceOp(triton::ReduceOp red) {
         !s.ok())
       return s;
 
-  body_.armPending();
-  const std::vector<am::SmallVec<am::Str, 4>> accs =
+  const agpu::Result<agpu::ReduceResults> reduced =
       agpu::emitReduce(agpu_.context(), *cur_, plan, numWarps(), srcNames, nm,
-                       [&](am::Block &body, const am::SmallVec<am::Str, 4> &a,
-                           const am::SmallVec<am::Str, 4> &b) {
+                       [&](am::Block &body, const agpu::CombineNames &a,
+                           const agpu::CombineNames &b) {
                          return lowerCombine(red.getCombineOp(), body, a, b);
                        });
-
-  if (!body_.pendingOk)
-    return declined("tt.reduce", body_.pendingWhy);
+  if (!reduced.ok())
+    return reduced.why;
+  const agpu::ReduceResults &accs = reduced.value;
   if ((int)accs.size() != plan.groupCount())
     return declined("tt.reduce", "the emitter refused the plan it was given");
 
@@ -436,16 +429,15 @@ agpu::Decision AgpuEmitter::emitScanOp(triton::ScanOp scan) {
         !s.ok())
       return s;
 
-  body_.armPending();
-  const am::SmallVec<am::SmallVec<am::Str, 8>, 4> accs =
+  const agpu::Result<agpu::ScanResults> scanned =
       agpu::emitScan(agpu_.context(), *cur_, plan, numWarps(), srcNames, nm,
-                     [&](am::Block &body, const am::SmallVec<am::Str, 4> &a,
-                         const am::SmallVec<am::Str, 4> &b) {
+                     [&](am::Block &body, const agpu::CombineNames &a,
+                         const agpu::CombineNames &b) {
                        return lowerCombine(scan.getCombineOp(), body, a, b);
                      });
-
-  if (!body_.pendingOk)
-    return declined("tt.scan", body_.pendingWhy);
+  if (!scanned.ok())
+    return scanned.why;
+  const agpu::ScanResults &accs = scanned.value;
   if (accs.size() != scan.getResults().size())
     return declined("tt.scan", "the emitter refused the plan it was given");
 

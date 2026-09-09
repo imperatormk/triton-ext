@@ -200,7 +200,7 @@ struct FusedDot {
   agpu::Plan plan;
   agpu::DirectNames names;
   agpu::CoordSource cCoords;
-  std::function<agpu::ReadbackInputs(const agpu::Range &)> readbackFor;
+  agpu::ReadbackFn readbackFor;
   // The device window the drain stores into, when the plan chose the direct
   // drain; empty otherwise.
   agpu::DeviceStoreTarget cStore;

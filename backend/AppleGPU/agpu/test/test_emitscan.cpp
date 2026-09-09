@@ -25,7 +25,7 @@ CombineFn adder(msl::Context &c) {
                      c.binary(msl::BinOp::Add, c.var(a[k]), c.var(b[k]))));
       out.push_back(n);
     }
-    return out;
+    return Result<CombineNames>::of(out);
   };
 }
 
@@ -141,7 +141,7 @@ int main() {
     msl::Context c;
     msl::Block body;
     ScanPlan p = planScan(facts({}, {}, 1, 4));
-    auto res = emitScan(c, body, p, 1, sources(1, 4), nm, adder(c))[0];
+    auto res = emitScan(c, body, p, 1, sources(1, 4), nm, adder(c)).value[0];
     CHECK_EQ(res.size(), 4u);
     // Three combines for four registers.
     CHECK_EQ(countOf(render(body), "float sum"), 3);
@@ -152,7 +152,7 @@ int main() {
     msl::Context c;
     msl::Block body;
     ScanPlan p = planScan(facts({}, {}, 1, 3));
-    auto res = emitScan(c, body, p, 1, sources(1, 3), nm, adder(c))[0];
+    auto res = emitScan(c, body, p, 1, sources(1, 3), nm, adder(c)).value[0];
     // No cross-lane phase, so register 0's accumulator keeps its seed.
     CHECK(render(body).find("float sa0_0 = v0_0;") != std::string::npos);
     CHECK_EQ(res[0], std::string("sa0_0"));
@@ -198,7 +198,7 @@ int main() {
     msl::Context c;
     msl::Block body;
     ScanPlan p = planScan(facts({}, {}, 1, 4));
-    auto res = emitScan(c, body, p, 1, sources(1, 4), nm, adder(c))[0];
+    auto res = emitScan(c, body, p, 1, sources(1, 4), nm, adder(c)).value[0];
     CHECK_EQ(res.size(), 4u);
 
     int distinct = 0;
@@ -217,7 +217,7 @@ int main() {
     msl::Block body;
     ScanPlan p = planScan(facts({{0, 1}}, {}, 1, 2));
     CHECK(p.usable);
-    auto res = emitScan(c, body, p, 1, sources(1, 2), nm, adder(c))[0];
+    auto res = emitScan(c, body, p, 1, sources(1, 2), nm, adder(c)).value[0];
     const std::string out = render(body);
 
     // A separate accumulator, seeded from the last register.
@@ -264,7 +264,7 @@ int main() {
       into.push_back(
           c.declStmt(mslTypeOf(f32()), n,
                      c.binary(msl::BinOp::Sub, c.var(lhs[0]), c.var(rhs[0]))));
-      return msl::SmallVec<msl::Str, 4>{n};
+      return Result<CombineNames>::of({n});
     };
     emitScan(c, body, p, 1, sources(1, 1), nm, sub);
     const std::string out = render(body);
@@ -281,7 +281,7 @@ int main() {
     msl::Context c;
     msl::Block body;
     ScanPlan p = planScan(offAxisRegs({{3, 1}, {4, 2}}, {{0, 4}}, 4, 2));
-    auto res = emitScan(c, body, p, 4, sources(1, 2), nm, adder(c));
+    auto res = emitScan(c, body, p, 4, sources(1, 2), nm, adder(c)).value;
     const std::string out = render(body);
 
     CHECK_EQ(res[0].size(), 2u);
@@ -454,7 +454,7 @@ int main() {
     ragged.push_back({"a0", "a1"});
     ragged.push_back({"b0"});
     auto out = emitScan(c, body, p, 1, ragged, nm, adder(c));
-    CHECK(out.empty());
+    CHECK(!out.ok());
     CHECK(body.empty());
   }
 
@@ -469,7 +469,7 @@ int main() {
     ScanPlan p = planScan(f);
     CHECK(p.usable);
 
-    auto res = emitScan(c, body, p, 1, sources(2, 3), nm, adder(c));
+    auto res = emitScan(c, body, p, 1, sources(2, 3), nm, adder(c)).value;
     CHECK_EQ(res.size(), 2u);
     CHECK_EQ(res[0].size(), 3u);
     CHECK_EQ(res[1].size(), 3u);
@@ -729,7 +729,7 @@ int main() {
     CHECK(!p.usable);
     auto res = emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
     CHECK_EQ(body.size(), 0u);
-    CHECK_EQ(res.size(), 0u);
+    CHECK(!res.ok());
   }
 
   return ::agpu_test::report("EmitScan");

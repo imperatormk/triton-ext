@@ -5,6 +5,7 @@ this cannot use ``testing.mlir_runner.run_passes`` -- that helper prints the
 transformed module, which for this pass is unchanged.
 
 Usage: msl_driver.py <input.mlir>
+       msl_driver.py --check
 """
 
 from __future__ import annotations
@@ -18,14 +19,22 @@ from triton._C.libtriton import ir, passes
 
 _SPLIT_RE = re.compile(r"^//\s*-----\s*$", re.MULTILINE)
 _SPLIT_OUT = "\n// -----\n"
+EXIT_NO_PLUGIN = 3
+
+
+def _plugin():
+    plugin = getattr(passes, "plugin", None)
+    if plugin is None or not hasattr(plugin, "add_emit_msl"):
+        print(
+            "AppleGPU plugin not loaded: set TRITON_PLUGIN_PATHS to the "
+            "libapplegpu_backend dylib built from this tree.",
+            file=sys.stderr)
+        raise SystemExit(EXIT_NO_PLUGIN)
+    return plugin
 
 
 def _emit(mlir: str) -> str:
-    plugin = getattr(passes, "plugin", None)
-    if plugin is None or not hasattr(plugin, "add_emit_msl"):
-        raise SystemExit(
-            "AppleGPU plugin not loaded: set TRITON_PLUGIN_PATHS to the "
-            "libapplegpu_backend dylib built from this tree.")
+    plugin = _plugin()
     with tempfile.NamedTemporaryFile("w", suffix=".mlir", delete=False) as f:
         f.write(mlir)
         src = f.name
@@ -46,7 +55,10 @@ def _emit(mlir: str) -> str:
 
 def main(argv: list[str]) -> None:
     if len(argv) < 2:
-        raise SystemExit(f"usage: {Path(argv[0]).name} <input.mlir>")
+        raise SystemExit(f"usage: {Path(argv[0]).name} <input.mlir> | --check")
+    if argv[1] == "--check":
+        _plugin()
+        return
     text = Path(argv[1]).read_text()
     chunks = [c for c in _SPLIT_RE.split(text) if c.strip()]
     sys.stdout.write(_SPLIT_OUT.join(_emit(c) for c in chunks))

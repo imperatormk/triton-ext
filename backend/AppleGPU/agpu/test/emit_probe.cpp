@@ -408,7 +408,7 @@ void printIntegerReduce(std::ostream &os) {
                      c.binary(msl::BinOp::Add, c.var(a[k]), c.var(p[k]))));
       out.push_back(n);
     }
-    return out;
+    return Result<CombineNames>::of(out);
   };
 
   ReductionPlan rp;
@@ -439,7 +439,7 @@ void printIntegerReduce(std::ostream &os) {
   ssrc.push_back({"s0"});
   msl::Block sbody;
   const msl::SmallVec<msl::Str, 8> sres =
-      emitScan(c, sbody, sp, 1, ssrc, snm, adder)[0];
+      emitScan(c, sbody, sp, 1, ssrc, snm, adder).value[0];
 
   os << "kernel void agpu_probe_intreduce(device int *out [[buffer(0)]],\n"
         "                                 uint3 tid "

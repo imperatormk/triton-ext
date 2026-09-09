@@ -28,7 +28,7 @@ CombineFn adder(msl::Context &c) {
                      c.binary(msl::BinOp::Add, c.var(a[k]), c.var(b[k]))));
       out.push_back(n);
     }
-    return out;
+    return Result<CombineNames>::of(out);
   };
 }
 
@@ -151,7 +151,7 @@ int main() {
     p.regsPerOperand = {2, 1};
     CHECK(!p.operandsShareLayout());
     auto out = emitReduce(c, body, p, kNumWarps, sources(2, 2), nm, adder(c));
-    CHECK(out.empty());
+    CHECK(!out.ok());
     CHECK(body.empty());
   }
 
@@ -164,7 +164,7 @@ int main() {
     ragged.push_back({"a0", "a1"});
     ragged.push_back({"b0"});
     auto out = emitReduce(c, body, p, kNumWarps, ragged, nm, adder(c));
-    CHECK(out.empty());
+    CHECK(!out.ok());
     CHECK(body.empty());
   }
 
@@ -176,7 +176,7 @@ int main() {
     p.regsPerOperand = {2, 2};
     CHECK(p.operandsShareLayout());
     auto out = emitReduce(c, body, p, kNumWarps, sources(2, 2), nm, adder(c));
-    CHECK(!out.empty());
+    CHECK(out.ok());
     CHECK(!body.empty());
   }
 
@@ -345,7 +345,7 @@ int main() {
     p.scratch = ScratchLayout{2 * 8 * 32, 32, 8 * 32};
 
     msl::Block body;
-    auto res = emitReduce(c, body, p, 8, sources(1, 4), nm, adder(c));
+    auto res = emitReduce(c, body, p, 8, sources(1, 4), nm, adder(c)).value;
     CHECK_EQ(res.size(), 2u);
     const std::string out = render(body);
 
@@ -392,7 +392,8 @@ int main() {
     CHECK_EQ(p.groups.size(), 2u);
 
     msl::Block body;
-    auto res = emitReduce(c, body, p, kNumWarps, sources(1, 4), nm, adder(c));
+    auto res =
+        emitReduce(c, body, p, kNumWarps, sources(1, 4), nm, adder(c)).value;
     CHECK_EQ(res.size(), 2u);
     const std::string out = render(body);
     CHECK(out.find("float acc0_0 = v0_0;") != std::string::npos);
@@ -408,7 +409,8 @@ int main() {
                                     CoordKey({1, 0}), CoordKey({1, 1})};
     p.groups = groupSurvivors(coords, 1);
     msl::Block body;
-    auto res = emitReduce(c, body, p, kNumWarps, sources(1, 4), nm, adder(c));
+    auto res =
+        emitReduce(c, body, p, kNumWarps, sources(1, 4), nm, adder(c)).value;
     CHECK_EQ(p.groupFor(CoordKey({0})), 0);
     CHECK_EQ(p.groupFor(CoordKey({1})), 1);
     CHECK_EQ(res[0][0], std::string("acc0_0"));
@@ -426,6 +428,34 @@ int main() {
     CHECK_EQ(countOf(out, "simd_shuffle_xor"), 5);
     CHECK_EQ(countOf(out, "threadgroup_barrier"), 3);
     CHECK_EQ(countOf(out, "float sum"), 3 + 5 + 1);
+  }
+
+  CASE("a combine's own reason comes back from whichever phase it fails in");
+  {
+    // Nine combines in the script above: 0..2 local, 3..7 lane, 8 warp. The
+    // callback's decision is the result and emission stops at it.
+    for (const int failAt : {0, 3, 8}) {
+      msl::Context c;
+      msl::Block body;
+      auto calls = std::make_shared<int>(0);
+      const CombineFn failing = [&c, calls, failAt](msl::Block &b,
+                                                    const CombineNames &a,
+                                                    const CombineNames &p) {
+        if ((*calls)++ == failAt)
+          return Result<CombineNames>::no(
+              Decision::declined("combine", "boom"));
+        const msl::Str n = "s" + std::to_string(*calls);
+        b.push_back(
+            c.declStmt(msl::Context::f32(), n,
+                       c.binary(msl::BinOp::Add, c.var(a[0]), c.var(p[0]))));
+        return Result<CombineNames>::of({n});
+      };
+      const auto out = emitReduce(c, body, onePlan(4, 0b11111, 0b001, 8),
+                                  kNumWarps, sources(1, 4), nm, failing);
+      CHECK(!out.ok());
+      CHECK_EQ(out.why.why(), std::string("boom"));
+      CHECK_EQ(*calls, failAt + 1);
+    }
   }
 
   return ::agpu_test::report("EmitReduce");

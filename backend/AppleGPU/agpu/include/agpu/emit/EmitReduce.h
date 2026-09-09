@@ -3,6 +3,7 @@
 #ifndef AGPU_EMIT_REDUCE_H
 #define AGPU_EMIT_REDUCE_H
 
+#include "agpu/core/Decline.h"
 #include "agpu/core/Names.h"
 #include "agpu/emit/EmitShuffle.h"
 #include "agpu/msl/Builtins.h"
@@ -15,10 +16,10 @@
 namespace agpu {
 
 // Lowers the user's combine region. Takes the block to append to and the two
-// operand name lists; returns the result names.
-using CombineFn = std::function<msl::SmallVec<msl::Str, 4>(
-    msl::Block &, const msl::SmallVec<msl::Str, 4> &,
-    const msl::SmallVec<msl::Str, 4> &)>;
+// operand name lists; returns the result names, or why it could not.
+using CombineNames = msl::SmallVec<msl::Str, 4>;
+using CombineFn = std::function<Result<CombineNames>(
+    msl::Block &, const CombineNames &, const CombineNames &)>;
 
 struct ReduceNames : ScratchNames {
   msl::Str acc = "acc";
@@ -51,13 +52,14 @@ inline msl::Expr *shuffleXor(msl::Context &c, const msl::Str &v, int64_t mask,
 }
 
 // Fold the registers one thread owns, in order. No lane crossing.
-inline msl::SmallVec<msl::Str, 4>
+inline Result<CombineNames>
 emitLocalFold(msl::Context &c, msl::Block &body, const ReductionPlan &plan,
               const ReductionGroup &g,
               const msl::SmallVec<msl::SmallVec<msl::Str, 8>, 4> &srcNames,
               const ReduceNames &nm, int groupIdx, const CombineFn &combine) {
+  using R = Result<CombineNames>;
   const int nOp = (int)srcNames.size();
-  msl::SmallVec<msl::Str, 4> accs;
+  CombineNames accs;
   for (int k = 0; k < nOp; ++k) {
     const msl::Str a =
         nm.acc + std::to_string(groupIdx) + "_" + std::to_string(k);
@@ -66,30 +68,31 @@ emitLocalFold(msl::Context &c, msl::Block &body, const ReductionPlan &plan,
     accs.push_back(a);
   }
   for (std::size_t i = 1; i < g.sourceRegs.size(); ++i) {
-    msl::SmallVec<msl::Str, 4> rhs;
+    CombineNames rhs;
     for (int k = 0; k < nOp; ++k)
       rhs.push_back(srcNames[k][g.sourceRegs[i]]);
-    msl::SmallVec<msl::Str, 4> out = combine(body, accs, rhs);
+    const Result<CombineNames> out = combine(body, accs, rhs);
+    if (!out.ok())
+      return R::no(out.why);
     for (int k = 0; k < nOp; ++k)
-      body.push_back(c.assign(c.var(accs[k]), c.var(out[k])));
+      body.push_back(c.assign(c.var(accs[k]), c.var(out.value[k])));
   }
-  return accs;
+  return R::of(accs);
 }
 
 // The lane phase: one XOR shuffle per planned step, high bit first.
-inline void emitLaneSteps(msl::Context &c, msl::Block &body,
-                          const ReductionPlan &plan,
-                          msl::SmallVec<msl::Str, 4> &accs,
-                          const ReduceNames &nm, int groupIdx,
-                          const CombineFn &combine) {
+inline Decision emitLaneSteps(msl::Context &c, msl::Block &body,
+                              const ReductionPlan &plan, CombineNames &accs,
+                              const ReduceNames &nm, int groupIdx,
+                              const CombineFn &combine) {
   const int nOp = (int)accs.size();
   if (const char *fn = plan.laneIntrinsic(plan.scratch.warpSize)) {
     body.push_back(c.assign(c.var(accs[0]), c.call(fn, {c.var(accs[0])})));
-    return;
+    return Decision::emitted();
   }
   for (std::size_t si = 0; si < plan.laneSteps.size(); ++si) {
     const ReduceStep &st = plan.laneSteps[si];
-    msl::SmallVec<msl::Str, 4> peers;
+    CombineNames peers;
     for (int k = 0; k < nOp; ++k) {
       const msl::Str p = nm.peer + std::to_string(groupIdx) + "_" +
                          std::to_string(si) + "_" + std::to_string(k);
@@ -98,22 +101,25 @@ inline void emitLaneSteps(msl::Context &c, msl::Block &body,
                      shuffleXor(c, accs[k], st.xorOffset, plan.elemAt(k))));
       peers.push_back(p);
     }
-    msl::SmallVec<msl::Str, 4> out = combine(body, accs, peers);
+    const Result<CombineNames> out = combine(body, accs, peers);
+    if (!out.ok())
+      return out.why;
     for (int k = 0; k < nOp; ++k)
-      body.push_back(c.assign(c.var(accs[k]), c.var(out[k])));
+      body.push_back(c.assign(c.var(accs[k]), c.var(out.value[k])));
   }
+  return Decision::emitted();
 }
 
 // The cross-warp phase for every survivor group at once: each group publishes
 // to its own slot range, one barrier, then each warp combines its own subset,
 // anchored on its id. Groups of one reduction are independent, so they share
 // the opening and closing barriers.
-inline void emitWarpSteps(msl::Context &c, msl::Block &body,
-                          const ReductionPlan &plan, int64_t numWarps,
-                          std::vector<msl::SmallVec<msl::Str, 4>> &groupAccs,
-                          const ReduceNames &nm, const CombineFn &combine) {
+inline Decision emitWarpSteps(msl::Context &c, msl::Block &body,
+                              const ReductionPlan &plan, int64_t numWarps,
+                              std::vector<CombineNames> &groupAccs,
+                              const ReduceNames &nm, const CombineFn &combine) {
   if (!plan.crossWarp() || groupAccs.empty())
-    return;
+    return Decision::emitted();
   const int nOp = (int)groupAccs[0].size();
   const ScratchLayout &slots = plan.scratch;
 
@@ -139,7 +145,7 @@ inline void emitWarpSteps(msl::Context &c, msl::Block &body,
                  nm.laneId, (int)gi);
 
     // Re-seed from the anchor slot; for a non-anchor warp that is not `accs`.
-    msl::SmallVec<msl::Str, 4> wacc;
+    CombineNames wacc;
     for (int k = 0; k < nOp; ++k) {
       const msl::Str w =
           nm.acc + "w" + std::to_string(gi) + "_" + std::to_string(k);
@@ -150,7 +156,7 @@ inline void emitWarpSteps(msl::Context &c, msl::Block &body,
     }
 
     for (std::size_t wi = 1; wi < plan.warpSubset.size(); ++wi) {
-      msl::SmallVec<msl::Str, 4> peers;
+      CombineNames peers;
       for (int k = 0; k < nOp; ++k) {
         const msl::Str p = nm.peer + "w" + std::to_string(gi) + "_" +
                            std::to_string(wi) + "_" + std::to_string(k);
@@ -162,9 +168,11 @@ inline void emitWarpSteps(msl::Context &c, msl::Block &body,
                        c.subscript(c.var(nm.scratch[(std::size_t)k]), idx)));
         peers.push_back(p);
       }
-      msl::SmallVec<msl::Str, 4> out = combine(body, wacc, peers);
+      const Result<CombineNames> out = combine(body, wacc, peers);
+      if (!out.ok())
+        return out.why;
       for (int k = 0; k < nOp; ++k)
-        body.push_back(c.assign(c.var(wacc[k]), c.var(out[k])));
+        body.push_back(c.assign(c.var(wacc[k]), c.var(out.value[k])));
     }
     groupAccs[gi] = wacc;
   }
@@ -172,36 +180,51 @@ inline void emitWarpSteps(msl::Context &c, msl::Block &body,
   // Closes the scratch epoch: the pool overlays this scratch with other
   // regions, so a later write there must not overtake these reads.
   body.push_back(c.barrier());
+  return Decision::emitted();
 }
+
+using ReduceResults = std::vector<CombineNames>;
 
 // A whole reduction: for each survivor group, fold locally, then across lanes;
 // then all groups across warps. Returns the accumulator names per group, in
 // plan order.
-inline std::vector<msl::SmallVec<msl::Str, 4>>
+inline Result<ReduceResults>
 emitReduce(msl::Context &c, msl::Block &body, const ReductionPlan &plan,
            int64_t numWarps,
            const msl::SmallVec<msl::SmallVec<msl::Str, 8>, 4> &srcNames,
            const ReduceNames &nm, const CombineFn &combine) {
-  std::vector<msl::SmallVec<msl::Str, 4>> results;
-
+  using R = Result<ReduceResults>;
+  const auto refused = [] {
+    return R::no(Decision::declined(
+        "emitReduce", "the emitter refused the plan it was given"));
+  };
   if (srcNames.empty() || !plan.operandsShareLayout())
-    return results;
+    return refused();
   for (std::size_t k = 1; k < srcNames.size(); ++k)
     if (srcNames[k].size() != srcNames[0].size())
-      return results;
+      return refused();
 
   if (plan.crossWarp() && (int)nm.scratch.size() < (int)srcNames.size())
-    return results;
+    return refused();
 
+  ReduceResults results;
   for (int gi = 0; gi < plan.groupCount(); ++gi) {
     const ReductionGroup &g = plan.groups[gi];
-    msl::SmallVec<msl::Str, 4> accs =
+    Result<CombineNames> accs =
         emitLocalFold(c, body, plan, g, srcNames, nm, gi, combine);
-    emitLaneSteps(c, body, plan, accs, nm, gi, combine);
-    results.push_back(accs);
+    if (!accs.ok())
+      return R::no(accs.why);
+    if (const Decision d =
+            emitLaneSteps(c, body, plan, accs.value, nm, gi, combine);
+        !d.ok())
+      return R::no(d);
+    results.push_back(accs.value);
   }
-  emitWarpSteps(c, body, plan, numWarps, results, nm, combine);
-  return results;
+  if (const Decision d =
+          emitWarpSteps(c, body, plan, numWarps, results, nm, combine);
+      !d.ok())
+    return R::no(d);
+  return R::of(std::move(results));
 }
 
 } // namespace agpu

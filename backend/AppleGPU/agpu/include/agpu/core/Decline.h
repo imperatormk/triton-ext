@@ -25,6 +25,9 @@ public:
   static Decision emitted() { return Decision(Outcome::Emitted, {}, {}); }
   static Decision notMine() { return Decision(Outcome::NotMine, {}, {}); }
   static Decision failed() { return Decision(Outcome::Failed, {}, {}); }
+  static Decision failed(msl::Str where, msl::Str why) {
+    return Decision(Outcome::Failed, std::move(where), std::move(why));
+  }
 
   static Decision declined(msl::Str where, msl::Str why) {
     return Decision(Outcome::Declined, std::move(where), std::move(why));
@@ -40,10 +43,19 @@ public:
   const msl::Str &why() const { return why_; }
 
   msl::Str message() const {
-    if (kind_ != Outcome::Declined)
+    if (where_.empty() && why_.empty())
       return {};
     return where_ + ": " + why_;
   }
+
+  // A decision travels up through the enclosing regions' handlers; the log
+  // takes it once, at the op that made it.
+  Decision recorded() const {
+    Decision d = *this;
+    d.recorded_ = true;
+    return d;
+  }
+  bool isRecorded() const { return recorded_; }
 
 private:
   Decision(Outcome k, msl::Str where, msl::Str why)
@@ -51,6 +63,18 @@ private:
 
   Outcome kind_;
   msl::Str where_, why_;
+  bool recorded_ = false;
+};
+
+// A value a step produces, or the decision that stopped it.
+template <class T> struct Result {
+  T value{};
+  Decision why = Decision::emitted();
+
+  bool ok() const { return why.ok(); }
+
+  static Result of(T v) { return Result{std::move(v), Decision::emitted()}; }
+  static Result no(Decision d) { return Result{T{}, std::move(d)}; }
 };
 
 // `site` is where in the source; `config` is the compilation (warp count,

@@ -91,8 +91,7 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
   fused.swap(body_.fusedDots);
   body_.fusedDots.swap(enclosing);
   if (!bodyDone.ok())
-    return bodyDone.isBug() ? declined("scf.for", "an op in the loop body")
-                            : bodyDone;
+    return bodyDone;
 
   // A fused dot's result lives in accumulator fragments.
   agpu::Carried carried, inits, yielded;
@@ -150,14 +149,14 @@ agpu::Decision AgpuEmitter::emitIfOp(scf::IfOp ifOp) {
   if (const agpu::Decision d =
           walkArm(ifOp.getThenRegion(), thenArm, thenYield);
       !d.ok())
-    return d.isBug() ? declined("scf.if", "an op in the then arm") : d;
+    return d;
 
   const bool hasElse = !ifOp.getElseRegion().empty();
   if (hasElse)
     if (const agpu::Decision d =
             walkArm(ifOp.getElseRegion(), elseArm, elseYield);
         !d.ok())
-      return d.isBug() ? declined("scf.if", "an op in the else arm") : d;
+      return d;
 
   // `emitIf` declares the result and leaves it alone on the missing path, so
   // it would be read uninitialised.
@@ -192,7 +191,7 @@ agpu::Decision AgpuEmitter::emitWhileOp(scf::WhileOp wh) {
 
   am::Block beforeArm;
   if (const agpu::Decision d = walkRegion(wh.getBefore(), beforeArm); !d.ok())
-    return d.isBug() ? declined("scf.while", "an op in the condition") : d;
+    return d;
 
   auto condOp =
       dyn_cast<scf::ConditionOp>(wh.getBefore().front().getTerminator());
@@ -224,7 +223,7 @@ agpu::Decision AgpuEmitter::emitWhileOp(scf::WhileOp wh) {
                                    carried, yielded, "scf.while");
           });
       !d.ok())
-    return d.isBug() ? declined("scf.while", "an op in the loop body") : d;
+    return d;
 
   return agpu::emitWhile(agpu_.context(), *cur_, carried, inits,
                          std::move(beforeArm), *cond, results, forwarded,

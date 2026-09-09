@@ -89,8 +89,8 @@ agpu::Decision AgpuEmitter::walkRegion(Region &region, am::Block &into) {
 agpu::Decision
 AgpuEmitter::walkRegion(Region &region, am::Block &into,
                         const llvm::function_ref<agpu::Decision()> &atEnd) {
-  if (!walkBlock(region.front(), into).ok())
-    return agpu::Decision::failed();
+  if (const agpu::Decision d = walkBlock(region.front(), into); !d.ok())
+    return d;
   const CurBlock here(*this, into);
   return atEnd();
 }

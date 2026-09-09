@@ -4,9 +4,9 @@
 
 #include "agpu/emit/KernelAbi.h"
 #include "agpu/msl/Context.h"
-#include "agpu/msl/FuncSize.h"
 #include "agpu/msl/GuardFuse.h"
 #include "agpu/msl/GuardSink.h"
+#include "agpu/plan/ShrinkPlan.h"
 
 #include <algorithm>
 #include <functional>
@@ -36,13 +36,13 @@ struct KernelFacts {
   int64_t poolBytes = 0;
   int64_t coreBudget = kTGCoreBudgetBytes;
   DebugChannels debug;
-  msl::RollPrediction predictedRoll;
+  RollPrediction predictedRoll;
 };
 
 struct KernelResult {
   msl::Function *fn = nullptr;
   msl::FuncSize size;
-  msl::ShrinkPlan shrink;
+  ShrinkPlan shrink;
   bool reemitted = false;
   int64_t poolBytes = 0;
   Decision decision = Decision::failed();
@@ -153,9 +153,9 @@ inline KernelResult emitKernel(msl::Context &c, const KernelFacts &f,
   if (f.predictedRoll.roll) {
     BuiltBody rolled = assemble(/*rollK=*/true);
     const msl::FuncSize after = msl::measure(rolled.stmts);
-    const msl::FuncSize before = msl::unrolledFrom(after, f.predictedRoll);
-    const msl::ShrinkPlan plan = msl::planShrink(before);
-    if (plan.needsReemit() && msl::shrinkHelped(before, after)) {
+    const msl::FuncSize before = unrolledFrom(after, f.predictedRoll);
+    const ShrinkPlan plan = planShrink(before);
+    if (plan.needsReemit() && shrinkHelped(before, after)) {
       body = std::move(rolled.stmts);
       bodyPool = rolled.poolBytes;
       r.size = after;
@@ -169,12 +169,12 @@ inline KernelResult emitKernel(msl::Context &c, const KernelFacts &f,
     body = std::move(flat.stmts);
     bodyPool = flat.poolBytes;
     r.size = msl::measure(body);
-    r.shrink = msl::planShrink(r.size);
+    r.shrink = planShrink(r.size);
 
     if (r.shrink.needsReemit()) {
       BuiltBody rolled = assemble(/*rollK=*/true);
       const msl::FuncSize after = msl::measure(rolled.stmts);
-      if (msl::shrinkHelped(r.size, after)) {
+      if (shrinkHelped(r.size, after)) {
         body = std::move(rolled.stmts);
         bodyPool = rolled.poolBytes;
         r.size = after;

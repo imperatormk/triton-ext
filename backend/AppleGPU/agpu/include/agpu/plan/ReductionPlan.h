@@ -226,6 +226,48 @@ groupSurvivors(const std::vector<CoordKey> &regCoords, int axis) {
   return groups;
 }
 
+// What the layout says about one reduction.
+struct ReductionFacts {
+  int axis = 0;
+  std::vector<CoordKey> regCoords; // register r's full coordinate vector
+  std::vector<int32_t> laneBases;  // the reduced axis's lane bases, per bit
+  std::vector<int32_t> warpBases;
+  int64_t numWarps = 1;
+  std::vector<ElemType> elems;
+  std::vector<int64_t> regsPerOperand;
+  Combiner combiner = Combiner::Generic;
+};
+
+inline Decision reductionDecline(const ReductionFacts &f) {
+  if (groupSurvivors(f.regCoords, f.axis).empty())
+    return Decision::declined("tt.reduce", "no survivor group for this layout");
+  for (std::size_t k = 1; k < f.regsPerOperand.size(); ++k)
+    if (f.regsPerOperand[k] != f.regsPerOperand[0])
+      return Decision::declined(
+          "tt.reduce", "the operands are not addressed by the same registers");
+  return Decision::emitted();
+}
+
+inline ReductionPlan planReduction(const ReductionFacts &f) {
+  ReductionPlan p;
+  p.reducedAxis = f.axis;
+  p.groups = groupSurvivors(f.regCoords, f.axis);
+  p.laneSteps = laneStepsFromMask(reduceMaskFromBases(f.laneBases));
+  p.warpMask = reduceMaskFromBases(f.warpBases);
+  p.warpSubset = subsetsOf(p.warpMask, (int)f.numWarps);
+  p.elems = f.elems;
+  p.regsPerOperand = f.regsPerOperand;
+  p.combiner = f.combiner;
+  // numWarps slots per group: every warp publishes, including ones this
+  // reduction does not span.
+  if (p.crossWarp()) {
+    const int64_t groupSlots = f.numWarps * kWarpSize;
+    p.scratch = ScratchLayout{(int64_t)p.groups.size() * groupSlots, kWarpSize,
+                              groupSlots};
+  }
+  return p;
+}
+
 } // namespace agpu
 
 #endif // AGPU_REDUCTION_PLAN_H

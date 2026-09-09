@@ -228,8 +228,26 @@ int main() {
     const ConvertPlan unpack = planConvert(e4m3(), f16(), Rounding::Default);
     CHECK(unpack.usable());
     CHECK(unpack.kind == ConvertKind::Fp8Unpack);
+    CHECK(unpack.narrows == ConvertKind::Cast);
 
     CHECK(!planConvert(f32(), e4m3(), Rounding::Default).widensOperand);
+  }
+
+  CASE("fp8 to bfloat narrows through the same helper f32 does");
+  {
+    const ConvertPlan p = planConvert(e4m3(), bf16(), Rounding::Default);
+    CHECK(p.kind == ConvertKind::Fp8Unpack);
+    CHECK(p.narrows == ConvertKind::NarrowRtne);
+    msl::Context c;
+    const std::string out = render(convertExpr(c, p, c.var("b"), bf16()));
+    CHECK(out.find("__agpu_rtne_bfloat(__agpu_e4m3_to_f32(b))") !=
+          std::string::npos);
+    CHECK(out.find("(bfloat)") == std::string::npos);
+    HelperSet h;
+    h.require(p);
+    CHECK(h.has(Helper::Fp8UnpackE4M3));
+    CHECK(h.has(Helper::RtneBfloat));
+    CHECK(h.has(Helper::RtneIntBfloat));
   }
 
   CASE("fp8 to a non-float still declines");

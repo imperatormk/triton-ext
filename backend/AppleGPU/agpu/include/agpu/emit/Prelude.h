@@ -136,6 +136,8 @@ public:
     add(h);
     if (const std::optional<Helper> ih = narrowIntHelperFor(p))
       add(*ih);
+    if (p.narrows != ConvertKind::None)
+      require(p.narrowing());
   }
 
 private:

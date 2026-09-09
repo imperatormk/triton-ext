@@ -60,6 +60,17 @@ struct ConvertPlan {
   // first. f16 and bf16 are subsets of f32, so this is exact.
   bool widensOperand = false;
 
+  // Fp8Unpack only: what the f32 the unpacker returns becomes, chosen the
+  // way any f32 -> `to` conversion is.
+  ConvertKind narrows = ConvertKind::None;
+
+  ConvertPlan narrowing() const {
+    ConvertPlan n;
+    n.kind = narrows;
+    n.to = to;
+    return n;
+  }
+
   bool needsHelper() const {
     return kind == ConvertKind::NarrowRtz || kind == ConvertKind::NarrowRtne ||
            kind == ConvertKind::Fp8Pack || kind == ConvertKind::Fp8Unpack;
@@ -99,6 +110,8 @@ inline ConvertPlan planConvert(ElemType from, ElemType to, Rounding r) {
   if (srcFp8 != Fp8Kind::None) {
     p.kind = toReachesF32 ? ConvertKind::Fp8Unpack : ConvertKind::Unsupported;
     p.fp8 = srcFp8;
+    if (toReachesF32 && to.bits < 32)
+      p.narrows = planConvert(f32(), to, r).kind;
     return p;
   }
 

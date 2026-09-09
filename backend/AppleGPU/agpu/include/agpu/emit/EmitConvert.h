@@ -39,9 +39,9 @@ inline msl::Expr *convertExpr(msl::Context &c, const ConvertPlan &p,
   case ConvertKind::Fp8Unpack: {
     // fp8 travels as a byte; the helper takes raw storage and returns f32.
     msl::Expr *call = c.call(convertHelperName(p), {value});
-    if (to.kind == ElemType::Kind::Float && to.bits < 32)
-      return c.cast(mslTypeOf(to), call);
-    return call;
+    if (p.narrows == ConvertKind::None)
+      return call;
+    return convertExpr(c, p.narrowing(), call, to);
   }
 
   case ConvertKind::Unsupported:

@@ -96,10 +96,13 @@ agpu::Decision AgpuEmitter::reductionPlanOf(triton::ReduceOp red,
   out.reducedAxis = axis;
   out.combiner = combinerOf(red.getSingleCombiner());
 
-  // numWarps slots: every warp publishes, including ones this reduction does
-  // not span.
-  if (out.crossWarp())
-    out.scratch = agpu::ScratchLayout{warps * agpu::kWarpSize, agpu::kWarpSize};
+  // numWarps slots per group: every warp publishes, including ones this
+  // reduction does not span.
+  if (out.crossWarp()) {
+    const int64_t groupSlots = warps * agpu::kWarpSize;
+    out.scratch = agpu::ScratchLayout{(int64_t)out.groups.size() * groupSlots,
+                                      agpu::kWarpSize, groupSlots};
+  }
 
   // Accumulator element type is carried per operand: an integer reduction
   // through float is exact only to 2^24.

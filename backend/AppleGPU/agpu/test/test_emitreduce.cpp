@@ -334,6 +334,42 @@ int main() {
     CHECK(p.scratch.slotFor(7, 31) < p.scratch.slotsPerOperand);
   }
 
+  CASE("survivor groups of one cross-warp reduction share the barriers");
+  {
+    msl::Context c;
+    ReductionPlan p = onePlan(2, 0, 0b001, 8);
+    ReductionGroup g1;
+    g1.key = CoordKey({1});
+    g1.sourceRegs = {2, 3};
+    p.groups.push_back(g1);
+    p.scratch = ScratchLayout{2 * 8 * 32, 32, 8 * 32};
+
+    msl::Block body;
+    auto res = emitReduce(c, body, p, 8, sources(1, 4), nm, adder(c));
+    CHECK_EQ(res.size(), 2u);
+    const std::string out = render(body);
+
+    CHECK_EQ(countOf(out, "threadgroup_barrier"), 3);
+    CHECK(out.find("scr0[warp * 32 + lane] = acc0_0;") != std::string::npos);
+    CHECK(out.find("scr0[warp * 32 + lane + 256] = acc1_0;") !=
+          std::string::npos);
+    CHECK(out.find("float accw0_0 = scr0[(warp & 6) * 32 + lane];") !=
+          std::string::npos);
+    CHECK(out.find("float accw1_0 = scr0[(warp & 6) * 32 + lane + 256];") !=
+          std::string::npos);
+    CHECK(out.find("scr0[(warp & 6) * 32 + lane + 256 + 32]") !=
+          std::string::npos);
+
+    // Both publishes precede the middle barrier; both reads follow it.
+    const std::size_t pub1 = out.find("+ 256] = acc1_0;");
+    const std::size_t bar1 = out.find("threadgroup_barrier", pub1);
+    const std::size_t rd0 = out.find("float accw0_0");
+    CHECK(pub1 < bar1);
+    CHECK(bar1 < rd0);
+    CHECK(p.scratch.groupBase(1) + p.scratch.slotFor(7, 31) <
+          p.scratch.slotsPerOperand);
+  }
+
   CASE("every operand travels the same topology");
   {
     msl::Context c;

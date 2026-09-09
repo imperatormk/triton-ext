@@ -67,9 +67,15 @@ struct ScratchLayout {
   int64_t slotsPerOperand = 0;
   int64_t warpSize = kWarpSize;
 
+  // Slots between consecutive survivor groups' publishes; zero when groups
+  // share one range.
+  int64_t groupStride = 0;
+
   int64_t slotFor(int64_t warp, int64_t lane) const {
     return warp * warpSize + lane;
   }
+
+  int64_t groupBase(int64_t group) const { return group * groupStride; }
 
   // The same address with the warp as a runtime value: the caller adds its
   // lane.

@@ -35,8 +35,13 @@ inline msl::Expr *anchorExpr(msl::Context &c, const ScratchLayout &slots,
 }
 
 inline msl::Expr *slotExpr(msl::Context &c, const ScratchLayout &slots,
-                           msl::Expr *warp, const msl::Str &lane) {
-  return c.binary(msl::BinOp::Add, anchorExpr(c, slots, warp), c.var(lane));
+                           msl::Expr *warp, const msl::Str &lane,
+                           int groupIdx = 0) {
+  msl::Expr *e =
+      c.binary(msl::BinOp::Add, anchorExpr(c, slots, warp), c.var(lane));
+  if (const int64_t base = slots.groupBase(groupIdx))
+    e = c.binary(msl::BinOp::Add, e, c.lit(base));
+  return e;
 }
 
 inline msl::Expr *shuffleXor(msl::Context &c, const msl::Str &v, int64_t mask,
@@ -99,72 +104,79 @@ inline void emitLaneSteps(msl::Context &c, msl::Block &body,
   }
 }
 
-// The cross-warp phase: publish to scratch, barrier, then combine the warps
-// this reduction spans. Each warp reads its own subset, anchored on its id.
+// The cross-warp phase for every survivor group at once: each group publishes
+// to its own slot range, one barrier, then each warp combines its own subset,
+// anchored on its id. Groups of one reduction are independent, so they share
+// the opening and closing barriers.
 inline void emitWarpSteps(msl::Context &c, msl::Block &body,
                           const ReductionPlan &plan, int64_t numWarps,
-                          msl::SmallVec<msl::Str, 4> &accs,
-                          const ReduceNames &nm, int groupIdx,
-                          const CombineFn &combine) {
-  if (!plan.crossWarp())
+                          std::vector<msl::SmallVec<msl::Str, 4>> &groupAccs,
+                          const ReduceNames &nm, const CombineFn &combine) {
+  if (!plan.crossWarp() || groupAccs.empty())
     return;
-  const int nOp = (int)accs.size();
+  const int nOp = (int)groupAccs[0].size();
   const ScratchLayout &slots = plan.scratch;
 
   // Every warp publishes, including those outside this reduction's subset, so
-  // the reservation is numWarps slots.
+  // the reservation is numWarps slots per group.
   body.push_back(c.barrier());
-  for (int k = 0; k < nOp; ++k) {
-    msl::Expr *idx = slotExpr(c, slots, c.var(nm.warpId), nm.laneId);
-    body.push_back(c.assign(c.subscript(c.var(nm.scratch[(std::size_t)k]), idx),
-                            c.var(accs[k])));
-  }
-  body.push_back(c.barrier());
-
-  // The executing warp's subset anchor: `(warp & ~warpMask) * 32 + lane`.
-  // warpSubset holds XOR offsets, so reads are relative to this anchor.
-  msl::Expr *base =
-      slotExpr(c, slots,
-               c.binary(msl::BinOp::And, c.var(nm.warpId),
-                        c.lit((int64_t)plan.anchorMask(numWarps))),
-               nm.laneId);
-
-  // Re-seed from the anchor slot; for a non-anchor warp that is not `accs`.
-  msl::SmallVec<msl::Str, 4> wacc;
-  for (int k = 0; k < nOp; ++k) {
-    const msl::Str w =
-        nm.acc + "w" + std::to_string(groupIdx) + "_" + std::to_string(k);
-    body.push_back(
-        c.declStmt(mslTypeOf(plan.elemAt(k)), w,
-                   c.subscript(c.var(nm.scratch[(std::size_t)k]), base)));
-    wacc.push_back(w);
-  }
-
-  for (std::size_t wi = 1; wi < plan.warpSubset.size(); ++wi) {
-    msl::SmallVec<msl::Str, 4> peers;
+  for (std::size_t gi = 0; gi < groupAccs.size(); ++gi)
     for (int k = 0; k < nOp; ++k) {
-      const msl::Str p = nm.peer + "w" + std::to_string(groupIdx) + "_" +
-                         std::to_string(wi) + "_" + std::to_string(k);
-      msl::Expr *idx = c.binary(msl::BinOp::Add, base,
-                                c.lit(slots.anchorSlots(plan.warpSubset[wi])));
+      msl::Expr *idx = slotExpr(c, slots, c.var(nm.warpId), nm.laneId, (int)gi);
       body.push_back(
-          c.declStmt(mslTypeOf(plan.elemAt(k)), p,
-                     c.subscript(c.var(nm.scratch[(std::size_t)k]), idx)));
-      peers.push_back(p);
+          c.assign(c.subscript(c.var(nm.scratch[(std::size_t)k]), idx),
+                   c.var(groupAccs[gi][k])));
     }
-    msl::SmallVec<msl::Str, 4> out = combine(body, wacc, peers);
-    for (int k = 0; k < nOp; ++k)
-      body.push_back(c.assign(c.var(wacc[k]), c.var(out[k])));
+  body.push_back(c.barrier());
+
+  for (std::size_t gi = 0; gi < groupAccs.size(); ++gi) {
+    // The executing warp's subset anchor: `(warp & ~warpMask) * 32 + lane`.
+    // warpSubset holds XOR offsets, so reads are relative to this anchor.
+    msl::Expr *base =
+        slotExpr(c, slots,
+                 c.binary(msl::BinOp::And, c.var(nm.warpId),
+                          c.lit((int64_t)plan.anchorMask(numWarps))),
+                 nm.laneId, (int)gi);
+
+    // Re-seed from the anchor slot; for a non-anchor warp that is not `accs`.
+    msl::SmallVec<msl::Str, 4> wacc;
+    for (int k = 0; k < nOp; ++k) {
+      const msl::Str w =
+          nm.acc + "w" + std::to_string(gi) + "_" + std::to_string(k);
+      body.push_back(
+          c.declStmt(mslTypeOf(plan.elemAt(k)), w,
+                     c.subscript(c.var(nm.scratch[(std::size_t)k]), base)));
+      wacc.push_back(w);
+    }
+
+    for (std::size_t wi = 1; wi < plan.warpSubset.size(); ++wi) {
+      msl::SmallVec<msl::Str, 4> peers;
+      for (int k = 0; k < nOp; ++k) {
+        const msl::Str p = nm.peer + "w" + std::to_string(gi) + "_" +
+                           std::to_string(wi) + "_" + std::to_string(k);
+        msl::Expr *idx =
+            c.binary(msl::BinOp::Add, base,
+                     c.lit(slots.anchorSlots(plan.warpSubset[wi])));
+        body.push_back(
+            c.declStmt(mslTypeOf(plan.elemAt(k)), p,
+                       c.subscript(c.var(nm.scratch[(std::size_t)k]), idx)));
+        peers.push_back(p);
+      }
+      msl::SmallVec<msl::Str, 4> out = combine(body, wacc, peers);
+      for (int k = 0; k < nOp; ++k)
+        body.push_back(c.assign(c.var(wacc[k]), c.var(out[k])));
+    }
+    groupAccs[gi] = wacc;
   }
-  accs = wacc;
 
   // Closes the scratch epoch: the pool overlays this scratch with other
   // regions, so a later write there must not overtake these reads.
   body.push_back(c.barrier());
 }
 
-// A whole reduction: for each survivor group, fold locally, then across lanes,
-// then across warps. Returns the accumulator names per group, in plan order.
+// A whole reduction: for each survivor group, fold locally, then across lanes;
+// then all groups across warps. Returns the accumulator names per group, in
+// plan order.
 inline std::vector<msl::SmallVec<msl::Str, 4>>
 emitReduce(msl::Context &c, msl::Block &body, const ReductionPlan &plan,
            int64_t numWarps,
@@ -186,9 +198,9 @@ emitReduce(msl::Context &c, msl::Block &body, const ReductionPlan &plan,
     msl::SmallVec<msl::Str, 4> accs =
         emitLocalFold(c, body, plan, g, srcNames, nm, gi, combine);
     emitLaneSteps(c, body, plan, accs, nm, gi, combine);
-    emitWarpSteps(c, body, plan, numWarps, accs, nm, gi, combine);
     results.push_back(accs);
   }
+  emitWarpSteps(c, body, plan, numWarps, results, nm, combine);
   return results;
 }
 

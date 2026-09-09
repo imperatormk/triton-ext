@@ -707,7 +707,7 @@ int main() {
           StageAction{0, 1, false, {0, 0}, CoordGuard::unguarded()});
       back.names.push_back("r" + std::to_string(rows.lo));
       back.bases.push_back("");
-      return back;
+      return Result<ReadbackInputs>::of(back);
     };
     CoordSource cs;
     LayoutBasis row, col;

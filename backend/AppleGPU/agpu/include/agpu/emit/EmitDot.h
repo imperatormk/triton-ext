@@ -26,11 +26,11 @@ struct DotInputs {
   OperandSource a, b;
 
   // Per-tile staging and readback, for the panel path.
-  std::function<PanelInputs(const PanelTile &)> tileInputs;
+  std::function<Result<PanelInputs>(const PanelTile &)> tileInputs;
 
   // C's readback for the direct path, per band of rows. Null means the caller
   // addresses `poolC` itself and wants nothing read back.
-  std::function<ReadbackInputs(const Range &)> readbackFor;
+  ReadbackFn readbackFor;
 
   // Where a fused dot's C stores straight to device (`Plan::storesCDirect`
   // says whether it did). Empty base means the drain goes through the pool.
@@ -63,13 +63,13 @@ inline WarpGrid gridOf(const Plan &p) {
 //
 // The warp program is planned once here and shared by the loop body's MMAs
 // and the stores, so they refer to the same fragments.
-inline Decision
-emitFusedLoop(msl::Context &c, msl::Block &body, const Plan &p,
-              const DirectNames &nm,
-              const std::function<ReadbackInputs(const Range &)> &readbackFor,
-              const CoordSource &cCoords, const DeviceStoreTarget &cStore,
-              const std::vector<DrainStep> &cSteps,
-              const std::function<Decision()> &emitLoop) {
+inline Decision emitFusedLoop(msl::Context &c, msl::Block &body, const Plan &p,
+                              const DirectNames &nm,
+                              const ReadbackFn &readbackFor,
+                              const CoordSource &cCoords,
+                              const DeviceStoreTarget &cStore,
+                              const std::vector<DrainStep> &cSteps,
+                              const std::function<Decision()> &emitLoop) {
   const bool direct = p.storesCDirect();
   if (direct ? !cStore.ok() : !readbackFor)
     return Decision::failed();
@@ -81,7 +81,10 @@ emitFusedLoop(msl::Context &c, msl::Block &body, const Plan &p,
   // A direct drain needs no result registers: the fragments are the result.
   ReadbackInputs back;
   if (!direct) {
-    back = readbackFor(Range{0, cv.extentAt(0)});
+    const Result<ReadbackInputs> rb = readbackFor(Range{0, cv.extentAt(0)});
+    if (!rb.ok())
+      return rb.why;
+    back = rb.value;
     if (back.empty())
       return Decision::declined("emitFusedLoop",
                                 "C's layout stopped resolving");
@@ -161,11 +164,13 @@ inline Decision emitDot(msl::Context &c, msl::Block &body, const Plan &p,
     // operands.
     if (!in.readbackFor)
       return Decision::failed();
-    const ReadbackInputs back =
+    const Result<ReadbackInputs> back =
         in.readbackFor(Range{0, p.cStagedView().extentAt(0)});
-    if (back.empty())
+    if (!back.ok())
+      return back.why;
+    if (back.value.empty())
       return Decision::declined("emitDot", "C's layout stopped resolving");
-    emitScalarDot(c, body, p, in.a, in.b, back, in.coords.c, in.direct);
+    emitScalarDot(c, body, p, in.a, in.b, back.value, in.coords.c, in.direct);
     return Decision::emitted();
   }
 
@@ -187,27 +192,33 @@ inline Decision emitDot(msl::Context &c, msl::Block &body, const Plan &p,
 
     // A Fused dot's accumulators belong to the loop around it: declared
     // before it, drained after it.
-    emitDirectDot(c, body, prog, grid, di, cv, in.direct, bandRows,
-                  in.readbackFor, in.coords.c, DotPassSchedule::of(p));
-    return Decision::emitted();
+    return emitDirectDot(c, body, prog, grid, di, cv, in.direct, bandRows,
+                         in.readbackFor, in.coords.c, DotPassSchedule::of(p));
   }
 
   case Plan::Kind::Panel: {
     if (!in.tileInputs)
       return Decision::failed();
     FragReuse reuse(body);
+    Decision tiles = Decision::emitted();
     // Per tile: the grid is the tile's fragment counts and a ragged final
     // tile has fewer.
     forEachPanelTile(p.facts, p.panel().panel, [&](const PanelTile &t) {
+      if (!tiles.ok())
+        return;
       const WarpGrid grid =
           panelWarpGrid(t, warpsFor(p.facts), p.facts.numWarps);
+      Result<PanelInputs> ti = in.tileInputs(t);
+      if (!ti.ok()) {
+        tiles = ti.why;
+        return;
+      }
       // `rollK` is the kernel's: overwrite whatever the callback returned.
-      PanelInputs ti = in.tileInputs(t);
-      ti.rollK = in.rollK;
-      emitPanelTile(c, body, t, in.panel, ti, in.coords, grid,
+      ti.value.rollK = in.rollK;
+      emitPanelTile(c, body, t, in.panel, ti.value, in.coords, grid,
                     planWarpProgram(grid), &reuse);
     });
-    return Decision::emitted();
+    return tiles;
   }
   }
   return Decision::failed();

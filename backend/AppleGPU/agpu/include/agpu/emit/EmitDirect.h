@@ -2,6 +2,7 @@
 #ifndef AGPU_EMIT_DIRECT_H
 #define AGPU_EMIT_DIRECT_H
 
+#include "agpu/core/Decline.h"
 #include "agpu/core/Names.h"
 #include "agpu/emit/EmitEpilogue.h"
 #include "agpu/emit/EmitPanel.h"
@@ -505,15 +506,19 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
     c.guardedInto(body, t.uniformGuard, std::move(drained));
 }
 
+// C's readback for one band of rows, or why the caller could not resolve it.
+using ReadbackFn = std::function<Result<ReadbackInputs>(const Range &)>;
+
 // The whole direct path: for each band of C rows the pool can hold and each
 // block the program calls for, declare accumulators, accumulate, store, then
 // read that band back out. A C that fits whole is one band, one pass.
-inline void
-emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
-              const WarpGrid &grid, const DirectInputs &in, const TileView &cv,
-              const DirectNames &nm, int64_t bandRows,
-              const std::function<ReadbackInputs(const Range &)> &readbackFor,
-              const CoordSource &cCoords, DotPassSchedule sched = {}) {
+inline Decision emitDirectDot(msl::Context &c, msl::Block &body,
+                              const WarpProgram &prog, const WarpGrid &grid,
+                              const DirectInputs &in, const TileView &cv,
+                              const DirectNames &nm, int64_t bandRows,
+                              const ReadbackFn &readbackFor,
+                              const CoordSource &cCoords,
+                              DotPassSchedule sched = {}) {
   const int64_t rows = cv.extentAt(0);
   if (bandRows <= 0 || bandRows > rows)
     bandRows = rows;
@@ -540,8 +545,13 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
 
     const bool renaming =
         sched.drain == DotPassSchedule::Drain::Rename && readbackFor;
-    const ReadbackInputs renamed =
-        renaming ? readbackFor(band) : ReadbackInputs{};
+    ReadbackInputs renamed;
+    if (renaming) {
+      const Result<ReadbackInputs> rb = readbackFor(band);
+      if (!rb.ok())
+        return rb.why;
+      renamed = rb.value;
+    }
 
     emitWarpBlocks(
         c, body, prog, grid, nm.warpId,
@@ -565,7 +575,7 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
 
     // No drain: fragments stay live for the caller. Such a pass is one band.
     if (!sched.drainsC() || sched.drain == DotPassSchedule::Drain::Rename)
-      return;
+      return Decision::emitted();
 
     // Drained but no readback requested: remaining bands still need MMAs.
     if (!readbackFor)
@@ -575,7 +585,10 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
     // may pull elements other warps wrote. The band buffer holds rows
     // [band.lo, band.hi) while a register's coordinate is in the whole tile's
     // frame; `originAt` absorbs the difference.
-    const ReadbackInputs back = readbackFor(band);
+    const Result<ReadbackInputs> rb = readbackFor(band);
+    if (!rb.ok())
+      return rb.why;
+    const ReadbackInputs &back = rb.value;
     body.push_back(c.barrier());
     emitReadback(c, body, cv.originAt({band.lo, 0}), nm.poolC, back.actions,
                  back.names, back.bases, cCoords, back.elem, back.regElem);
@@ -583,6 +596,7 @@ emitDirectDot(msl::Context &c, msl::Block &body, const WarpProgram &prog,
     if (band.hi < rows)
       body.push_back(c.barrier());
   }
+  return Decision::emitted();
 }
 
 } // namespace agpu

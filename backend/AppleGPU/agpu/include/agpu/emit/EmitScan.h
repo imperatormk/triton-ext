@@ -76,12 +76,12 @@ inline msl::Expr *axisLane(msl::Context &c, const ScanPlan &p,
 
 // One rung of the lane ladder. Lanes at the far end have no source and the
 // shuffle leaves their value undefined, hence the guard.
-inline void emitScanStep(msl::Context &c, msl::Block &body, const ScanPlan &p,
-                         const ScanStep &step, msl::SmallVec<msl::Str, 4> &accs,
-                         const ScanNames &nm, int stepIdx,
-                         const CombineFn &combine) {
+inline Decision emitScanStep(msl::Context &c, msl::Block &body,
+                             const ScanPlan &p, const ScanStep &step,
+                             CombineNames &accs, const ScanNames &nm,
+                             int stepIdx, const CombineFn &combine) {
   const int nOp = (int)accs.size();
-  msl::SmallVec<msl::Str, 4> peers;
+  CombineNames peers;
   for (int k = 0; k < nOp; ++k) {
     const msl::Str pn =
         nm.peer + std::to_string(stepIdx) + "_" + std::to_string(k);
@@ -94,9 +94,11 @@ inline void emitScanStep(msl::Context &c, msl::Block &body, const ScanPlan &p,
   // Peer first: the combine takes the earlier element as its first argument
   // group and `shuffle_up` fetches from the lane before this one.
   msl::Block inner;
-  msl::SmallVec<msl::Str, 4> out = combine(inner, peers, accs);
+  const Result<CombineNames> out = combine(inner, peers, accs);
+  if (!out.ok())
+    return out.why;
   for (int k = 0; k < nOp; ++k)
-    inner.push_back(c.assign(c.var(accs[k]), c.var(out[k])));
+    inner.push_back(c.assign(c.var(accs[k]), c.var(out.value[k])));
 
   msl::Expr *cond =
       step.guarded && !p.fills()
@@ -104,18 +106,23 @@ inline void emitScanStep(msl::Context &c, msl::Block &body, const ScanPlan &p,
                      c.lit(p.guardBound(step.delta, p.scratch.warpSize)))
           : nullptr;
   c.guardedInto(body, cond, std::move(inner));
+  return Decision::emitted();
 }
 
 // The lane phase: the ladder, in increasing delta.
-inline void emitScanLanes(msl::Context &c, msl::Block &body, const ScanPlan &p,
-                          msl::SmallVec<msl::Str, 4> &accs, const ScanNames &nm,
-                          const CombineFn &combine) {
+inline Decision emitScanLanes(msl::Context &c, msl::Block &body,
+                              const ScanPlan &p, CombineNames &accs,
+                              const ScanNames &nm, const CombineFn &combine) {
   if (const char *fn = p.laneIntrinsic(p.scratch.warpSize)) {
     body.push_back(c.assign(c.var(accs[0]), c.call(fn, {c.var(accs[0])})));
-    return;
+    return Decision::emitted();
   }
   for (std::size_t i = 0; i < p.laneSteps.size(); ++i)
-    emitScanStep(c, body, p, p.laneSteps[i], accs, nm, (int)i, combine);
+    if (const Decision d =
+            emitScanStep(c, body, p, p.laneSteps[i], accs, nm, (int)i, combine);
+        !d.ok())
+      return d;
+  return Decision::emitted();
 }
 
 // ── the cross-warp phase ──────────────────────────────────────────────────
@@ -184,15 +191,16 @@ inline msl::Expr *scanTotalSlot(msl::Context &c, const ScanPlan &p,
 // register. The first `carryFoldOrder` entry seeds the carry unguarded, each
 // later one folds in under its own guard, and the application runs once under
 // the seed's guard.
-inline void emitScanCarry(msl::Context &c, msl::Block &body, const ScanPlan &p,
-                          int64_t numWarps,
-                          const std::vector<msl::SmallVec<msl::Str, 8>> &acc,
-                          const ScanNames &nm, const CombineFn &combine) {
+inline Decision
+emitScanCarry(msl::Context &c, msl::Block &body, const ScanPlan &p,
+              int64_t numWarps,
+              const std::vector<msl::SmallVec<msl::Str, 8>> &acc,
+              const ScanNames &nm, const CombineFn &combine) {
   if (!p.crossWarp)
-    return;
+    return Decision::emitted();
   const std::vector<int64_t> fold = p.carryFoldOrder(numWarps);
   if (fold.empty() || acc.empty())
-    return;
+    return Decision::emitted();
   const int nOp = (int)acc.size();
 
   // This warp's position within its subset: `warpId` masked by what the axis
@@ -200,7 +208,7 @@ inline void emitScanCarry(msl::Context &c, msl::Block &body, const ScanPlan &p,
   msl::Expr *position =
       c.binary(msl::BinOp::And, c.var(nm.warpId), c.lit((int64_t)p.warpMask));
 
-  msl::SmallVec<msl::Str, 4> carry;
+  CombineNames carry;
   for (int k = 0; k < nOp; ++k) {
     const msl::Str v = nm.carry + std::to_string(k);
     body.push_back(c.declStmt(mslTypeOf(p.elemAt(k)), v,
@@ -210,7 +218,7 @@ inline void emitScanCarry(msl::Context &c, msl::Block &body, const ScanPlan &p,
   for (std::size_t i = 1; i < fold.size(); ++i) {
     const int64_t w = fold[i];
     msl::Block inner;
-    msl::SmallVec<msl::Str, 4> peers;
+    CombineNames peers;
     for (int k = 0; k < nOp; ++k) {
       const msl::Str v = nm.carry + std::to_string(w) + "_" + std::to_string(k);
       inner.push_back(c.declStmt(mslTypeOf(p.elemAt(k)), v,
@@ -218,9 +226,11 @@ inline void emitScanCarry(msl::Context &c, msl::Block &body, const ScanPlan &p,
       peers.push_back(v);
     }
     // The carry so far is the earlier value, so it leads.
-    msl::SmallVec<msl::Str, 4> out = combine(inner, carry, peers);
+    const Result<CombineNames> out = combine(inner, carry, peers);
+    if (!out.ok())
+      return out.why;
     for (int k = 0; k < nOp; ++k)
-      inner.push_back(c.assign(c.var(carry[k]), c.var(out[k])));
+      inner.push_back(c.assign(c.var(carry[k]), c.var(out.value[k])));
     c.guardedInto(body, c.binary(p.carryOp(), position, c.lit(w)),
                   std::move(inner));
   }
@@ -230,12 +240,15 @@ inline void emitScanCarry(msl::Context &c, msl::Block &body, const ScanPlan &p,
   msl::Block apply;
   const std::size_t regs = acc[0].size();
   for (std::size_t r = 0; r < regs; ++r) {
-    msl::SmallVec<msl::Str, 4> regAcc;
+    CombineNames regAcc;
     for (int k = 0; k < nOp; ++k)
       regAcc.push_back(acc[(std::size_t)k][r]);
-    msl::SmallVec<msl::Str, 4> out = combine(apply, carry, regAcc);
+    const Result<CombineNames> out = combine(apply, carry, regAcc);
+    if (!out.ok())
+      return out.why;
     for (int k = 0; k < nOp; ++k)
-      apply.push_back(c.assign(c.var(acc[(std::size_t)k][r]), c.var(out[k])));
+      apply.push_back(
+          c.assign(c.var(acc[(std::size_t)k][r]), c.var(out.value[k])));
   }
   c.guardedInto(body, c.binary(p.carryOp(), position, c.lit(fold[0])),
                 std::move(apply));
@@ -243,6 +256,7 @@ inline void emitScanCarry(msl::Context &c, msl::Block &body, const ScanPlan &p,
   // Closes the scratch epoch: the pool overlays this scratch with other
   // regions, so a later write there must not overtake these reads.
   body.push_back(c.barrier());
+  return Decision::emitted();
 }
 
 // The running segment total between a chained scan's windows, carried through
@@ -336,16 +350,24 @@ inline msl::SmallVec<msl::Str, 4> emitScanChainBroadcast(
   return carry;
 }
 
+using ScanResults = msl::SmallVec<msl::SmallVec<msl::Str, 8>, 4>;
+
 // A whole scan over one thread's registers. `srcNames[k][r]` is operand k's
 // register r in axis order, reversed by the caller for a reverse scan; that
 // ordering applies to the local pass only. Returns `results[k][r]`.
-inline msl::SmallVec<msl::SmallVec<msl::Str, 8>, 4>
-emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
-         const msl::SmallVec<msl::SmallVec<msl::Str, 8>, 4> &srcNames,
-         const ScanNames &nm, const CombineFn &combine) {
-  msl::SmallVec<msl::SmallVec<msl::Str, 8>, 4> results;
+inline Result<ScanResults> emitScan(msl::Context &c, msl::Block &body,
+                                    const ScanPlan &p, int64_t numWarps,
+                                    const ScanResults &srcNames,
+                                    const ScanNames &nm,
+                                    const CombineFn &combine) {
+  using R = Result<ScanResults>;
+  const auto refused = [] {
+    return R::no(Decision::declined(
+        "emitScan", "the emitter refused the plan it was given"));
+  };
+  ScanResults results;
   if (!p.usable || srcNames.empty() || srcNames[0].empty())
-    return results;
+    return refused();
 
   const int nOp = (int)srcNames.size();
   const int64_t regs = (int64_t)srcNames[0].size();
@@ -354,7 +376,7 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
   // mismatch here means the caller's names don't match what it planned.
   for (int k = 1; k < nOp; ++k)
     if ((int64_t)srcNames[k].size() != regs)
-      return results;
+      return refused();
 
   // A thread's registers are not always one window: `windowRegs` of them go
   // through the shuffle-and-carry machinery, the rest are other columns or
@@ -387,25 +409,30 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
       rn.peer = nm.peer + tag;
       rn.carry = nm.carry + tag;
 
-      const auto got = emitScan(c, body, p, numWarps, window, rn, combine);
+      const R inner = emitScan(c, body, p, numWarps, window, rn, combine);
+      if (!inner.ok())
+        return inner;
+      const ScanResults &got = inner.value;
       if (got.size() != (std::size_t)nOp)
-        return {};
+        return refused();
 
       // The previous segments' running total, into every register of this
       // one. Unguarded: a preceding segment precedes every element here.
       if (inChain > 0) {
-        const msl::SmallVec<msl::Str, 4> chain =
+        const CombineNames chain =
             p.crossWarp ? emitScanChainRead(c, body, p, numWarps, nOp,
                                             (inChain - 1) & 1, rn)
                         : segCarry;
         for (int64_t i = 0; i < n; ++i) {
-          msl::SmallVec<msl::Str, 4> regAcc;
+          CombineNames regAcc;
           for (int k = 0; k < nOp; ++k)
             regAcc.push_back(got[(std::size_t)k][(std::size_t)i]);
-          msl::SmallVec<msl::Str, 4> out = combine(body, chain, regAcc);
+          const Result<CombineNames> out = combine(body, chain, regAcc);
+          if (!out.ok())
+            return R::no(out.why);
           for (int k = 0; k < nOp; ++k)
             body.push_back(c.assign(c.var(got[(std::size_t)k][(std::size_t)i]),
-                                    c.var(out[k])));
+                                    c.var(out.value[k])));
         }
       }
 
@@ -422,11 +449,11 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
         for (const msl::Str &s : got[(std::size_t)k])
           results[(std::size_t)k].push_back(s);
     }
-    return results;
+    return R::of(std::move(results));
   }
 
   if (p.crossWarp && (int)nm.scratch.size() < nOp)
-    return {};
+    return refused();
 
   // `acc[k][r]` is operand k's accumulator for register r; it ends holding
   // that register's own prefix.
@@ -440,26 +467,31 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
     }
 
   auto at = [&](int64_t r) {
-    msl::SmallVec<msl::Str, 4> out;
+    CombineNames out;
     for (int k = 0; k < nOp; ++k)
       out.push_back(acc[(std::size_t)k][(std::size_t)r]);
     return out;
   };
-  auto storeAt = [&](msl::Block &into, int64_t r,
-                     const msl::SmallVec<msl::Str, 4> &from) {
+  auto fold = [&](msl::Block &into, const CombineNames &lhs,
+                  int64_t r) -> Decision {
+    const Result<CombineNames> out = combine(into, lhs, at(r));
+    if (!out.ok())
+      return out.why;
     for (int k = 0; k < nOp; ++k)
-      into.push_back(
-          c.assign(c.var(acc[(std::size_t)k][(std::size_t)r]), c.var(from[k])));
+      into.push_back(c.assign(c.var(acc[(std::size_t)k][(std::size_t)r]),
+                              c.var(out.value[k])));
+    return Decision::emitted();
   };
 
   // The local pass: register r absorbs register r-1's running total in place
   // and keeps its own partial.
   for (int64_t r = 1; r < regs; ++r)
-    storeAt(body, r, combine(body, at(r - 1), at(r)));
+    if (const Decision d = fold(body, at(r - 1), r); !d.ok())
+      return R::no(d);
 
   // The cross-lane phases run on a separate accumulator, seeded from the last
   // register, which holds this thread's whole running total.
-  msl::SmallVec<msl::Str, 4> laneScan;
+  CombineNames laneScan;
   for (int k = 0; k < nOp; ++k) {
     const msl::Str a = nm.acc + "x" + std::to_string(k);
     body.push_back(
@@ -468,7 +500,9 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
     laneScan.push_back(a);
   }
 
-  emitScanLanes(c, body, p, laneScan, nm, combine);
+  if (const Decision d = emitScanLanes(c, body, p, laneScan, nm, combine);
+      !d.ok())
+    return R::no(d);
 
   // Published straight after the ladder: a warp publishes its whole total,
   // which the ladder just left in its top lane.
@@ -483,12 +517,13 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
     body.push_back(
         c.declStmt(mslTypeOf(p.elemAt(0)), a,
                    c.call(fn, {c.var(acc[0][(std::size_t)(regs - 1)])})));
-    const msl::SmallVec<msl::Str, 4> prefix = {a};
+    const CombineNames prefix = {a};
     for (int64_t r = 0; r < regs; ++r)
-      storeAt(body, r, combine(body, prefix, at(r)));
+      if (const Decision d = fold(body, prefix, r); !d.ok())
+        return R::no(d);
   } else if (!p.laneSteps.empty()) {
     const int64_t low = p.laneSteps.front().delta;
-    msl::SmallVec<msl::Str, 4> prefix;
+    CombineNames prefix;
     for (int k = 0; k < nOp; ++k) {
       const msl::Str a = nm.acc + "p" + std::to_string(k);
       body.push_back(
@@ -498,7 +533,8 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
     }
     msl::Block inner;
     for (int64_t r = 0; r < regs; ++r)
-      storeAt(inner, r, combine(inner, prefix, at(r)));
+      if (const Decision d = fold(inner, prefix, r); !d.ok())
+        return R::no(d);
     msl::Expr *cond =
         p.fills() ? nullptr
                   : c.binary(p.guardOp(), axisLane(c, p, nm),
@@ -507,7 +543,9 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
   }
 
   // The warps before this one: one carry, folded into every register.
-  emitScanCarry(c, body, p, numWarps, acc, nm, combine);
+  if (const Decision d = emitScanCarry(c, body, p, numWarps, acc, nm, combine);
+      !d.ok())
+    return R::no(d);
 
   for (int k = 0; k < nOp; ++k) {
     msl::SmallVec<msl::Str, 8> one;
@@ -515,7 +553,7 @@ emitScan(msl::Context &c, msl::Block &body, const ScanPlan &p, int64_t numWarps,
       one.push_back(acc[(std::size_t)k][(std::size_t)r]);
     results.push_back(std::move(one));
   }
-  return results;
+  return R::of(std::move(results));
 }
 
 } // namespace agpu

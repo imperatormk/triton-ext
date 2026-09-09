@@ -9,11 +9,12 @@ using namespace agpu;
 
 namespace {
 
-BufferAccess scalar(int buf, AccessKind kind, int depth) {
+// `loop` numbers the outermost loop around the access; 0 is outside any.
+BufferAccess scalar(int buf, AccessKind kind, int loop) {
   BufferAccess a;
   a.buffer = buf;
   a.kind = kind;
-  a.loopDepth = depth;
+  a.loop = loop > 0 ? loop : -1;
   return a;
 }
 BufferAccess tile(int buf, AccessKind kind, int depth) {

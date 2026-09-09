@@ -17,7 +17,7 @@ enum class AccessKind { Load, Store };
 struct BufferAccess {
   int buffer = 0; // index of the kernel argument it traces back to
   AccessKind kind = AccessKind::Load;
-  int loopDepth = 0; // 0 = outside any loop
+  int loop = -1; // the outermost loop around the access; -1 outside any
 
   // A per-lane address into a tile.
   bool isTensor = false;
@@ -72,12 +72,13 @@ private:
 inline CoherencePlan planCoherence(const CoherenceFacts &f) {
   CoherencePlan p;
 
-  // 1. A loop that both stores and loads one buffer through a scalar address.
-  //    Tensor accesses do not qualify: each iteration addresses a different
-  //    window and no lane re-reads what another wrote.
+  // 1. A loop that both stores and loads one buffer through a scalar address,
+  //    at any nesting inside it. Tensor accesses do not qualify: each
+  //    iteration addresses a different window and no lane re-reads what
+  //    another wrote.
   p.addPublished(f, [](const BufferAccess &store, const BufferAccess &load) {
-    return store.loopDepth > 0 && !store.isTensor && !load.isTensor &&
-           load.loopDepth == store.loopDepth;
+    return store.loop >= 0 && !store.isTensor && !load.isTensor &&
+           load.loop == store.loop;
   });
 
   // 2. A device barrier. Tensor accesses do qualify here: a section guarded

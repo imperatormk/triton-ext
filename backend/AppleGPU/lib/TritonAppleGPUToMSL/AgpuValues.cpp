@@ -66,12 +66,12 @@ static BlockArgument traceToKernelArg(Value v) {
   return BlockArgument();
 }
 
-static int loopDepthOf(Operation *op) {
-  int depth = 0;
+static Operation *outermostLoopOf(Operation *op) {
+  Operation *outer = nullptr;
   for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
     if (isa<LoopLikeOpInterface>(p))
-      ++depth;
-  return depth;
+      outer = p;
+  return outer;
 }
 
 static bool ordersDeviceMemory(Operation *op) {
@@ -86,6 +86,7 @@ static bool ordersDeviceMemory(Operation *op) {
 agpu::CoherenceFacts AgpuEmitter::coherenceFactsOf(triton::FuncOp func) {
   agpu::CoherenceFacts f;
   Block &entry = func.getBody().front();
+  llvm::DenseMap<Operation *, int> loopIds;
 
   auto record = [&](Operation *op, Value ptr, agpu::AccessKind kind) {
     const BlockArgument base = traceToKernelArg(ptr);
@@ -94,7 +95,8 @@ agpu::CoherenceFacts AgpuEmitter::coherenceFactsOf(triton::FuncOp func) {
     agpu::BufferAccess a;
     a.buffer = (int)base.getArgNumber();
     a.kind = kind;
-    a.loopDepth = loopDepthOf(op);
+    if (Operation *loop = outermostLoopOf(op))
+      a.loop = loopIds.try_emplace(loop, (int)loopIds.size()).first->second;
     a.isTensor = isa<RankedTensorType>(ptr.getType());
     f.accesses.push_back(a);
   };

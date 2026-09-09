@@ -28,8 +28,6 @@ inline msl::Scalar scalarOfWord(AtomicWord w) {
     return msl::Scalar::I32;
   case AtomicWord::U32:
     return msl::Scalar::U32;
-  case AtomicWord::I64:
-    return msl::Scalar::I64;
   case AtomicWord::F32:
     return msl::Scalar::F32;
   }

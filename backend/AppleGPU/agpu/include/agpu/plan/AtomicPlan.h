@@ -26,7 +26,7 @@ enum class AtomicStrategy {
 
 // Not the value's own type: unsigned max is done in unsigned and every float
 // strategy goes through a 32-bit word.
-enum class AtomicWord { I32, U32, I64, F32 };
+enum class AtomicWord { I32, U32, F32 };
 
 enum class EmuRmw : int { Add = 0, Max = 1, Min = 2, Xchg = 3 };
 
@@ -109,7 +109,7 @@ inline AtomicWord wordFor(const AtomicFacts &f) {
     return AtomicWord::F32;
   if (f.op == RmwOp::UMax || f.op == RmwOp::UMin)
     return AtomicWord::U32;
-  return f.bits == 64 ? AtomicWord::I64 : AtomicWord::I32;
+  return AtomicWord::I32;
 }
 
 struct RmwBuiltin {
@@ -308,10 +308,7 @@ inline AtomicPlan planAtomic(const AtomicFacts &f, MemOrder order) {
   }
 
   p.packedElem = f.packedElem;
-
-  // The emulated paths go through prelude helpers with their own ordering.
-  if (p.strategy == AtomicStrategy::Native)
-    p.fences = fencesFor(order);
+  p.fences = fencesFor(order);
 
   p.replicas = ReplicaMap{f.regFree};
   p.election = electFor(f);

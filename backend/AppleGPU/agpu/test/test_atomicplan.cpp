@@ -157,15 +157,21 @@ int main() {
     CHECK(f.after);
   }
 
-  CASE("only the native path carries fences");
+  CASE("every strategy carries the requested fences");
   {
     AtomicPlan native = planAtomic(intAtomic(RmwOp::Add), MemOrder::Acquire);
     CHECK(native.fences.after);
 
     AtomicPlan cas = planAtomic(floatAtomic(RmwOp::Max), MemOrder::Acquire);
     CHECK(cas.strategy == AtomicStrategy::FloatCas);
-    CHECK(!cas.fences.after);
+    CHECK(cas.fences.after);
     CHECK(!cas.fences.before);
+
+    AtomicPlan packed =
+        planAtomic(floatAtomic(RmwOp::Add, 16), MemOrder::AcquireRelease);
+    CHECK(packed.strategy == AtomicStrategy::Packed16);
+    CHECK(packed.fences.before);
+    CHECK(packed.fences.after);
   }
 
   // ── replicas ───────────────────────────────────────────────────────────

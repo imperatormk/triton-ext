@@ -177,8 +177,12 @@ PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
     auto srcTy = red.getSrcs().empty()
                      ? RankedTensorType()
                      : dyn_cast<RankedTensorType>(red.getSrcs()[0].getType());
-    agpu::ReductionPlan plan;
-    if (srcTy && reductionPlanOf(red, srcTy, plan).ok() && plan.crossWarp())
+    if (!srcTy)
+      return need;
+    const agpu::Result<agpu::ReductionPlan> planned =
+        reductionPlanOf(red, srcTy);
+    const agpu::ReductionPlan &plan = planned.value;
+    if (planned.ok() && plan.crossWarp())
       for (int k = 0; k < (int)red.getSrcs().size(); ++k) {
         const agpu::ElemType e = plan.elemAt(k);
         need.add(agpu::reduceScratchKey(k), e,
@@ -190,9 +194,11 @@ PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
     auto srcTy = scan.getSrcs().empty()
                      ? RankedTensorType()
                      : dyn_cast<RankedTensorType>(scan.getSrcs()[0].getType());
-    agpu::ScanFacts facts;
-    if (srcTy && scanPlanOf(scan, srcTy, facts).ok()) {
-      const agpu::ScanPlan plan = agpu::planScan(facts);
+    const agpu::Result<agpu::ScanFacts> facts =
+        srcTy ? scanPlanOf(scan, srcTy)
+              : agpu::Result<agpu::ScanFacts>::no(agpu::Decision::notMine());
+    if (facts.ok()) {
+      const agpu::ScanPlan plan = agpu::planScan(facts.value);
       if (plan.usable && plan.crossWarp)
         for (int k = 0; k < (int)scan.getSrcs().size(); ++k) {
           const agpu::ElemType e = plan.elemAt(k);

@@ -257,10 +257,10 @@ agpu::Decision AgpuEmitter::declineOp(Operation *op, const agpu::Decision &d,
                                       std::string_view name) {
   agpu_.declines.record(d, agpu::DeclineSite{std::string(name), ""});
 
-  const std::string what =
-      d.keepLooking() ? "no handler for " + std::string(name)
-      : d.isBug()     ? "handler failure " + d.message()
-                      : d.message();
+  const std::string what = d.keepLooking()
+                               ? "no handler for " + std::string(name)
+                           : d.isBug() ? "handler failure " + d.message()
+                                       : d.message();
   // compiler.py scans stderr for an out-of-budget message. Full detail goes
   // to AGPU_DECLINE_LOG.
   op->emitError() << "AgpuEmitter: " << what;

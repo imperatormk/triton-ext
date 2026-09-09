@@ -52,16 +52,17 @@ static Operation *singleScanCombiner(triton::ScanOp scan) {
   return op;
 }
 
-agpu::Decision AgpuEmitter::reductionPlanOf(triton::ReduceOp red,
-                                            RankedTensorType srcTy,
-                                            agpu::ReductionPlan &out) {
+agpu::Result<agpu::ReductionPlan>
+AgpuEmitter::reductionPlanOf(triton::ReduceOp red, RankedTensorType srcTy) {
+  using R = agpu::Result<agpu::ReductionPlan>;
+  agpu::ReductionPlan out;
   const int axis = (int)red.getAxis();
   const LinearLayout ll = gpu::toLinearLayout(srcTy);
   MLIRContext *ctx = srcTy.getContext();
 
   const std::optional<StringAttr> dim = outDimAt(ll, axis);
   if (!dim)
-    return declined("tt.reduce", "the layout has no such axis");
+    return R::no(declined("tt.reduce", "the layout has no such axis"));
 
   // Registers that fold together: coordinates agree on every dimension but the
   // reduced one.
@@ -71,8 +72,8 @@ agpu::Decision AgpuEmitter::reductionPlanOf(triton::ReduceOp red,
     const std::optional<std::vector<int64_t>> c =
         registerCoordAt(srcTy, (int)r);
     if (!c)
-      return declined("tt.reduce",
-                      "a register has no coordinate under this layout");
+      return R::no(declined("tt.reduce",
+                            "a register has no coordinate under this layout"));
     agpu::CoordKey::Storage k;
     for (int64_t v : *c)
       k.push_back((int32_t)v);
@@ -80,7 +81,7 @@ agpu::Decision AgpuEmitter::reductionPlanOf(triton::ReduceOp red,
   }
   out.groups = agpu::groupSurvivors(regCoords, axis);
   if (out.groups.empty())
-    return declined("tt.reduce", "no survivor group for this layout");
+    return R::no(declined("tt.reduce", "no survivor group for this layout"));
 
   // Lane/warp bits that move the reduced axis. A non-zero basis bit spreads it
   // across threads, needing a shuffle (lane) or threadgroup memory (warp).
@@ -109,18 +110,18 @@ agpu::Decision AgpuEmitter::reductionPlanOf(triton::ReduceOp red,
   for (Value s : red.getSrcs()) {
     const std::optional<agpu::ElemType> e = elemTypeOf(s.getType());
     if (!e)
-      return declined("tt.reduce", "an operand has no element type");
+      return R::no(declined("tt.reduce", "an operand has no element type"));
     out.elems.push_back(*e);
     auto ty = dyn_cast<RankedTensorType>(s.getType());
     if (!ty)
-      return declined("tt.reduce", "an operand is not a ranked tensor");
+      return R::no(declined("tt.reduce", "an operand is not a ranked tensor"));
     out.regsPerOperand.push_back(registerCount(ty));
   }
   if (!out.operandsShareLayout())
-    return declined("tt.reduce",
-                    "the operands are not addressed by the same registers");
+    return R::no(declined(
+        "tt.reduce", "the operands are not addressed by the same registers"));
 
-  return agpu::Decision::emitted();
+  return R::of(std::move(out));
 }
 
 am::SmallVec<am::Str, 4>
@@ -247,10 +248,10 @@ agpu::Decision AgpuEmitter::emitReduceOp(triton::ReduceOp red) {
     return rs.why;
   const RankedTensorType srcTy = rs.srcTy;
 
-  agpu::ReductionPlan plan;
-  const agpu::Decision d = reductionPlanOf(red, srcTy, plan);
-  if (!d.ok())
-    return d;
+  const agpu::Result<agpu::ReductionPlan> planned = reductionPlanOf(red, srcTy);
+  if (!planned.ok())
+    return planned.why;
+  const agpu::ReductionPlan &plan = planned.value;
 
   if (const agpu::Decision g =
           gatherRegionNames(red.getSrcs(), {}, "tt.reduce", rs);
@@ -332,16 +333,17 @@ static std::vector<agpu::AxisBit> axisBitsOf(const LinearLayout &ll,
   return bits;
 }
 
-agpu::Decision AgpuEmitter::scanPlanOf(triton::ScanOp scan,
-                                       RankedTensorType srcTy,
-                                       agpu::ScanFacts &out) {
+agpu::Result<agpu::ScanFacts> AgpuEmitter::scanPlanOf(triton::ScanOp scan,
+                                                      RankedTensorType srcTy) {
+  using R = agpu::Result<agpu::ScanFacts>;
+  agpu::ScanFacts out;
   const int axis = (int)scan.getAxis();
   const LinearLayout ll = gpu::toLinearLayout(srcTy);
   MLIRContext *ctx = srcTy.getContext();
 
   const std::optional<StringAttr> dim = outDimAt(ll, axis);
   if (!dim)
-    return declined("tt.scan", "the layout has no such axis");
+    return R::no(declined("tt.scan", "the layout has no such axis"));
 
   out.laneBits = axisBitsOf(ll, ctx, lldim::Lane, *dim);
   out.warpBits = axisBitsOf(ll, ctx, lldim::Warp, *dim);
@@ -358,23 +360,24 @@ agpu::Decision AgpuEmitter::scanPlanOf(triton::ScanOp scan,
   for (Value s : scan.getSrcs()) {
     const std::optional<agpu::ElemType> e = elemTypeOf(s.getType());
     if (!e)
-      return declined("tt.scan", "an operand has no element type");
+      return R::no(declined("tt.scan", "an operand has no element type"));
     out.elems.push_back(*e);
     auto ty = dyn_cast<RankedTensorType>(s.getType());
     if (!ty)
-      return declined("tt.scan", "an operand is not a ranked tensor");
+      return R::no(declined("tt.scan", "an operand is not a ranked tensor"));
     out.regsPerOperand.push_back(registerCount(ty));
   }
 
-  return agpu::Decision::emitted();
+  return R::of(std::move(out));
 }
 
 // The order a scan consumes registers in: increasing along the axis, decreasing
 // for reverse. Register index order is not axis order and emitScan folds r into
 // r+1.
-agpu::Decision AgpuEmitter::scanRegisterOrder(RankedTensorType srcTy, int axis,
-                                              bool reverse,
-                                              std::vector<int> &out) {
+agpu::Result<std::vector<int>>
+AgpuEmitter::scanRegisterOrder(RankedTensorType srcTy, int axis, bool reverse) {
+  using R = agpu::Result<std::vector<int>>;
+  std::vector<int> out;
   const int64_t regs = registerCount(srcTy);
 
   // Sorted by the other axes first, then along the scanned one: registers
@@ -385,8 +388,8 @@ agpu::Decision AgpuEmitter::scanRegisterOrder(RankedTensorType srcTy, int axis,
     const std::optional<std::vector<int64_t>> c =
         registerCoordAt(srcTy, (int)r);
     if (!c || axis < 0 || (std::size_t)axis >= c->size())
-      return declined("tt.scan",
-                      "a register has no coordinate under this layout");
+      return R::no(declined("tt.scan",
+                            "a register has no coordinate under this layout"));
     ScanRegisterKey k;
     for (std::size_t d = 0; d < c->size(); ++d)
       if ((int)d != axis)
@@ -406,7 +409,7 @@ agpu::Decision AgpuEmitter::scanRegisterOrder(RankedTensorType srcTy, int axis,
       });
   for (const ScanRegisterKey &k : byCoord)
     out.push_back(k.reg);
-  return agpu::Decision::emitted();
+  return R::of(std::move(out));
 }
 
 agpu::Decision AgpuEmitter::emitScanOp(triton::ScanOp scan) {
@@ -416,9 +419,10 @@ agpu::Decision AgpuEmitter::emitScanOp(triton::ScanOp scan) {
     return rs.why;
   const RankedTensorType srcTy = rs.srcTy;
 
-  agpu::ScanFacts facts;
-  if (const agpu::Decision d = scanPlanOf(scan, srcTy, facts); !d.ok())
-    return d;
+  const agpu::Result<agpu::ScanFacts> planned = scanPlanOf(scan, srcTy);
+  if (!planned.ok())
+    return planned.why;
+  const agpu::ScanFacts &facts = planned.value;
 
   const agpu::ScanPlan plan = agpu::planScan(facts);
   if (!plan.usable)
@@ -426,11 +430,11 @@ agpu::Decision AgpuEmitter::emitScanOp(triton::ScanOp scan) {
     // condition over the axis bits.
     return agpu::scanDecline(facts);
 
-  std::vector<int> order;
-  if (const agpu::Decision d =
-          scanRegisterOrder(srcTy, (int)scan.getAxis(), plan.reverse, order);
-      !d.ok())
-    return d;
+  const agpu::Result<std::vector<int>> ordered =
+      scanRegisterOrder(srcTy, (int)scan.getAxis(), plan.reverse);
+  if (!ordered.ok())
+    return ordered.why;
+  const std::vector<int> &order = ordered.value;
 
   // The operands' registers in axis order, which is what emitScan consumes.
   if (const agpu::Decision g =

@@ -203,17 +203,17 @@ private:
 
   agpu::Decision emitReduceOp(triton::ReduceOp red);
 
-  agpu::Decision reductionPlanOf(triton::ReduceOp red, RankedTensorType srcTy,
-                                 agpu::ReductionPlan &out);
+  agpu::Result<agpu::ReductionPlan> reductionPlanOf(triton::ReduceOp red,
+                                                    RankedTensorType srcTy);
 
   agpu::Decision emitScanOp(triton::ScanOp scan);
 
-  agpu::Decision scanPlanOf(triton::ScanOp scan, RankedTensorType srcTy,
-                            agpu::ScanFacts &out);
+  agpu::Result<agpu::ScanFacts> scanPlanOf(triton::ScanOp scan,
+                                           RankedTensorType srcTy);
 
   // Register index order is not axis order; folding must walk axis order.
-  agpu::Decision scanRegisterOrder(RankedTensorType srcTy, int axis,
-                                   bool reverse, std::vector<int> &out);
+  agpu::Result<std::vector<int>> scanRegisterOrder(RankedTensorType srcTy,
+                                                   int axis, bool reverse);
 
   agpu::Decision emitMapOp(triton::MapElementwiseOp map);
 
@@ -255,7 +255,7 @@ private:
 
   agpu::Decision emitted(const agpu::Decision &d, Operation *op,
                          std::string_view name) {
-    return d.ok() ? d : declineOp(op, d, name);
+    return d.ok() || d.isRecorded() ? d : declineOp(op, d, name);
   }
 
   // Pre-pass facts only: clamp targets and live buffer bytes. Pool
@@ -422,30 +422,39 @@ private:
     }
   }
 
-  // Declares one value per register from build(r) and binds the result.
+  // Declares one value per register from build(r) and binds the result. The
+  // statements land in a local block first, so a register that cannot be
+  // built leaves the current block as it was.
   template <typename BuildFn>
   agpu::Decision emitPerRegister(const agpu::OpView &o, int64_t regs,
                                  const agpu::ElemType &elem, char tag,
                                  BuildFn build) {
     agpu::ValueNames names;
-    for (int64_t r = 0; r < regs; ++r) {
-      const RegValue v = build(r);
-      if (!v.value)
-        return declined(o.name, "cannot build register " + std::to_string(r));
+    agpu::msl::Block built;
+    {
+      const CurBlock here(*this, built);
+      for (int64_t r = 0; r < regs; ++r) {
+        const RegValue v = build(r);
+        if (!v.value)
+          return declined(o.name, "cannot build register " + std::to_string(r));
 
-      const agpu::msl::Str n = nameFor(tag, o.results[0], r);
-      const agpu::msl::Type ty = agpu::mslTypeOf(elem);
+        const agpu::msl::Str n = nameFor(tag, o.results[0], r);
+        const agpu::msl::Type ty = agpu::mslTypeOf(elem);
 
-      if (!v.guard) {
-        cur_->push_back(agpu_.context().declStmt(ty, n, v.value));
-      } else {
-        cur_->push_back(agpu_.context().declStmt(ty, n, v.init));
-        agpu::msl::Block one;
-        one.push_back(agpu_.context().assign(agpu_.context().var(n), v.value));
-        agpu_.context().guardedInto(*cur_, v.guard, std::move(one));
+        if (!v.guard) {
+          built.push_back(agpu_.context().declStmt(ty, n, v.value));
+        } else {
+          built.push_back(agpu_.context().declStmt(ty, n, v.init));
+          agpu::msl::Block one;
+          one.push_back(
+              agpu_.context().assign(agpu_.context().var(n), v.value));
+          agpu_.context().guardedInto(built, v.guard, std::move(one));
+        }
+        names.push_back(n);
       }
-      names.push_back(n);
     }
+    for (agpu::msl::Stmt *s : built)
+      cur_->push_back(s);
     body_.sym.bindRegs(o.results[0], std::move(names));
     // Null for tt.poison, which reaches here with no `elemFor_` entry.
     const agpu::ElemType *ir = elemOf(o.results[0]);

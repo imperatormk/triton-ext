@@ -169,8 +169,17 @@ inline int64_t mathBitMaskOf(MathFn fn, ElemType operand) {
   const bool isFp8 = operand.kind == ElemType::Kind::Float && operand.bits == 8;
   if (fn != MathFn::Abs || !isFp8)
     return 0;
-  // Both fp8 encodings put the sign in the top bit.
+  // All four fp8 encodings put the sign in the top bit.
   return 0x7f;
+}
+
+// The FNUZ encodings spell NaN as 0x80 and have no negative zero, so the
+// mask alone would turn NaN into +0.
+inline constexpr int64_t kFp8FnuzNan = 0x80;
+
+inline bool fp8AbsKeepsNan(ElemType operand) {
+  return operand.floatKind == FloatKind::E4B8 ||
+         operand.floatKind == FloatKind::E5B16;
 }
 
 inline const char *mathNameOf(MathFn fn, ElemType operand) {

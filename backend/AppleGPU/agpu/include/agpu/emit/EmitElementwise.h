@@ -115,8 +115,13 @@ inline msl::Expr *mathExpr(msl::Context &c, MathFn fn, ElemType operand,
                            msl::Expr *v) {
   // fp8's `abs` is bit arithmetic (clear the sign bit); the call form does
   // not compile.
-  if (const int64_t mask = mathBitMaskOf(fn, operand))
-    return c.binary(msl::BinOp::And, v, c.lit(mask));
+  if (const int64_t mask = mathBitMaskOf(fn, operand)) {
+    msl::Expr *masked = c.binary(msl::BinOp::And, v, c.lit(mask));
+    if (!fp8AbsKeepsNan(operand))
+      return masked;
+    return c.ternary(c.binary(msl::BinOp::Eq, v, c.litHex(kFp8FnuzNan)), v,
+                     masked);
+  }
 
   msl::Expr *call = c.call(mathNameOf(fn, operand), {v});
   if (!mathResultNarrows(fn, operand))

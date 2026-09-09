@@ -55,7 +55,7 @@ agpu::Decision AgpuEmitter::emitPoisonOp(const agpu::OpView &o) {
   const Value res = mlirValueOf(o.results[0]);
   if (!res)
     return declined("ub.poison", "result type was never recorded");
-  const std::optional<agpu::ElemType> held = heldTypeOf(res.getType());
+  const std::optional<agpu::ElemType> held = heldTypeFor(res);
   if (!held)
     return declined("ub.poison", "no representation for this type");
 

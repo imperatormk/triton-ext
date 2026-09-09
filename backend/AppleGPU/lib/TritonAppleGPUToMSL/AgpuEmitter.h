@@ -681,6 +681,10 @@ private:
   // coherent qualifier, so the fact travels on the access instead.
   bool coherentBuffer(Value ptr) const;
 
+  // `heldTypeOf` with the coherent qualifier a pointer into such a buffer
+  // must declare.
+  std::optional<agpu::ElemType> heldTypeFor(Value v) const;
+
   ModuleAxisInfoAnalysis &axisInfo() {
     if (!axisInfo_)
       axisInfo_ = std::make_unique<ModuleAxisInfoAnalysis>(mod_);

@@ -15,7 +15,7 @@ agpu::CarriedValue AgpuEmitter::carriedFresh(Value v) {
   cv.regs = freshNames(v, registersHeldByType(v.getType()));
   // Uses the held type: a carried pointer needs the address's own type,
   // which `elemTypeOf`'s pointee does not give.
-  if (const std::optional<agpu::ElemType> e = heldTypeOf(v.getType()))
+  if (const std::optional<agpu::ElemType> e = heldTypeFor(v))
     cv.elem = *e;
   bindCarried(v, cv);
 
@@ -97,7 +97,7 @@ AgpuEmitter::walkRegion(Region &region, am::Block &into,
 
 agpu::Decision AgpuEmitter::carriedFor(Value v, agpu::Carried &out,
                                        const agpu::ValueNames &names) {
-  const std::optional<agpu::ElemType> e = heldTypeOf(v.getType());
+  const std::optional<agpu::ElemType> e = heldTypeFor(v);
   if (!e)
     return declined("scf.for", "a carried value has no element type");
   agpu::CarriedValue cv;

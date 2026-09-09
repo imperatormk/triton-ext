@@ -32,6 +32,9 @@ struct ElemType {
   // select between two `!tt.ptr<i32>` would truncate a 64-bit address to 32.
   msl::Scalar pointee = msl::Scalar::I32;
   msl::AddrSpace addrSpace = msl::AddrSpace::Device;
+  // MSL forbids dropping the qualifier on assignment, so a copy of a coherent
+  // buffer's address must declare it too.
+  bool coherent = false;
 
   bool isPointer() const { return kind == Kind::Pointer; }
 
@@ -40,7 +43,8 @@ struct ElemType {
         floatKind != o.floatKind)
       return false;
     // The pointee is part of the type only when there is one.
-    return !isPointer() || (pointee == o.pointee && addrSpace == o.addrSpace);
+    return !isPointer() || (pointee == o.pointee && addrSpace == o.addrSpace &&
+                            coherent == o.coherent);
   }
 };
 
@@ -103,7 +107,8 @@ inline msl::Type mslTypeOf(ElemType e) {
     // 64 lands on F32: Metal has no double.
     return msl::Type::scalar(e.bits == 16 ? S::F16 : S::F32);
   case ElemType::Kind::Pointer:
-    return msl::Type::scalar(e.pointee).pointerTo(e.addrSpace);
+    return msl::Type::scalar(e.pointee).pointerTo(
+        e.addrSpace, e.coherent ? msl::Type::Coherent : msl::Type::QualNone);
   case ElemType::Kind::Int:
     break;
   }

@@ -25,12 +25,36 @@ agpu::LaunchFacts launchFactsOf(Operation *scope) {
   return f;
 }
 
+// A loop's region argument stands for its init operand: a pointer carried
+// through `scf.for iter_args` still addresses the buffer it started from.
+static Value loopInitOf(BlockArgument arg) {
+  Operation *owner = arg.getOwner()->getParentOp();
+  const unsigned n = arg.getArgNumber();
+  if (auto f = dyn_cast_or_null<scf::ForOp>(owner))
+    return n == 0 ? Value() : f.getInitArgs()[n - 1];
+  if (auto w = dyn_cast_or_null<scf::WhileOp>(owner)) {
+    if (arg.getOwner() == w.getBeforeBody())
+      return w.getInits()[n];
+    return w.getConditionOp().getArgs()[n];
+  }
+  return Value();
+}
+
 static BlockArgument traceToKernelArg(Value v) {
   while (v) {
-    if (BlockArgument arg = dyn_cast<BlockArgument>(v))
+    if (BlockArgument arg = dyn_cast<BlockArgument>(v)) {
+      if (Value init = loopInitOf(arg)) {
+        v = init;
+        continue;
+      }
       return arg;
+    }
     Operation *def = v.getDefiningOp();
-    if (auto ap = dyn_cast_or_null<triton::AddPtrOp>(def))
+    if (auto f = dyn_cast_or_null<scf::ForOp>(def))
+      v = f.getInitArgs()[cast<OpResult>(v).getResultNumber()];
+    else if (auto w = dyn_cast_or_null<scf::WhileOp>(def))
+      v = w.getInits()[cast<OpResult>(v).getResultNumber()];
+    else if (auto ap = dyn_cast_or_null<triton::AddPtrOp>(def))
       v = ap.getPtr();
     else if (auto sp = dyn_cast_or_null<triton::SplatOp>(def))
       v = sp.getSrc();
@@ -90,6 +114,13 @@ agpu::CoherenceFacts AgpuEmitter::coherenceFactsOf(triton::FuncOp func) {
 bool AgpuEmitter::coherentBuffer(Value ptr) const {
   const BlockArgument arg = traceToKernelArg(ptr);
   return arg && coherentArgs_.count((int)arg.getArgNumber()) > 0;
+}
+
+std::optional<agpu::ElemType> AgpuEmitter::heldTypeFor(Value v) const {
+  std::optional<agpu::ElemType> e = heldTypeOf(v.getType());
+  if (e && e->isPointer())
+    e->coherent = coherentBuffer(v);
+  return e;
 }
 
 void AgpuEmitter::markBasePointer(agpu::ValueId v) { body_.basePtrs.insert(v); }

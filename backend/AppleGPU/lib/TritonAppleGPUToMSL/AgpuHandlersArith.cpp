@@ -76,10 +76,10 @@ agpu::Decision AgpuEmitter::emitReinterpretCast(const agpu::OpView &o,
   const Value fromV = mlirValueOf(o.operands[0]);
   const Value toV = mlirValueOf(o.results[0]);
   if (fromV)
-    if (const std::optional<agpu::ElemType> h = heldTypeOf(fromV.getType()))
+    if (const std::optional<agpu::ElemType> h = heldTypeFor(fromV))
       from = *h;
   if (toV)
-    if (const std::optional<agpu::ElemType> h = heldTypeOf(toV.getType()))
+    if (const std::optional<agpu::ElemType> h = heldTypeFor(toV))
       to = *h;
 
   const am::Type toTy = agpu::mslTypeOf(to);
@@ -334,7 +334,7 @@ agpu::Decision AgpuEmitter::emitSelectOp(const agpu::OpView &o) {
   // ready.elem is the pointee type.
   const Value res = mlirValueOf(o.results[0]);
   const std::optional<agpu::ElemType> held =
-      res ? heldTypeOf(res.getType()) : std::optional<agpu::ElemType>();
+      res ? heldTypeFor(res) : std::optional<agpu::ElemType>();
   const agpu::ElemType elem = held ? *held : ready.elem;
 
   return emitPerRegister(o, ready.regs, elem, 's', [&](int64_t r) {

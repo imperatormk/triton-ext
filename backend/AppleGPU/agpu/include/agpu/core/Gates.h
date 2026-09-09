@@ -5,6 +5,7 @@
 
 #include "agpu/core/EnumBitset.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -46,10 +47,14 @@ inline constexpr std::size_t gateCount() {
   return sizeof(kGates) / sizeof(kGates[0]);
 }
 
+static_assert(gateCount() == std::size_t(Gate::Count),
+              "every Gate needs a row in kGates");
+
 inline const GateSpec &gateSpec(Gate g) {
   for (const GateSpec &s : kGates)
     if (s.gate == g)
       return s;
+  assert(false && "a Gate with no row");
   return kGates[0];
 }
 

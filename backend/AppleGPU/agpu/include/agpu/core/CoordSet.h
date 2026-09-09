@@ -15,16 +15,6 @@ struct CoordSet {
   bool contains(int32_t addr) const {
     return valid && (addr & ~freeMask) == (base & ~freeMask);
   }
-
-  int64_t size() const {
-    if (!valid)
-      return 0;
-    int64_t n = 1;
-    for (int b = 0; b < 32; ++b)
-      if (freeMask & (1 << b))
-        n *= 2;
-    return n;
-  }
 };
 
 inline CoordSet unknownCoords() { return CoordSet{}; }

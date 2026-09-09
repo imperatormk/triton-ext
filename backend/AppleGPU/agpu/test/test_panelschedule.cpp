@@ -2,6 +2,47 @@
 #include "agpu/plan/PanelSchedule.h"
 #include "harness.h"
 
+namespace {
+
+using namespace agpu;
+
+// Every (batch, m, n) position reads C back exactly once.
+bool readbackIsExactlyOncePerPosition(const DotFacts &f, const PanelSchedule &s,
+                                      const Panel &p) {
+  const int64_t panelsM = (f.M + p.mp - 1) / p.mp;
+  const int64_t panelsN = (f.N + p.np - 1) / p.np;
+  return s.readbackCount() == f.Bd * panelsM * panelsN;
+}
+
+// Every element of the output is covered by exactly one (batch, m, n).
+bool tilesCoverOutput(const DotFacts &f, const PanelSchedule &s) {
+  std::vector<int> hit((std::size_t)(f.Bd * f.M * f.N), 0);
+  for (const PanelTile &t : s.tiles) {
+    if (!t.finalK)
+      continue;
+    for (int64_t i = t.m.lo; i < t.m.hi; ++i)
+      for (int64_t j = t.n.lo; j < t.n.hi; ++j)
+        ++hit[(std::size_t)((t.batch * f.M + i) * f.N + j)];
+  }
+  for (int h : hit)
+    if (h != 1)
+      return false;
+  return true;
+}
+
+// Every K panel is visited exactly once per output position.
+bool contractionIsComplete(const DotFacts &f, const PanelSchedule &s,
+                           const Panel &p) {
+  const int64_t panelsK = (f.K + p.kp - 1) / p.kp;
+  int64_t perPosition = 0;
+  for (const PanelTile &t : s.tiles)
+    if (t.batch == 0 && t.m.lo == 0 && t.n.lo == 0)
+      ++perPosition;
+  return perPosition == panelsK;
+}
+
+} // namespace
+
 using namespace agpu;
 
 namespace {

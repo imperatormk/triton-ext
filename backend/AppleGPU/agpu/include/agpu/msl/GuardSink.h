@@ -14,8 +14,8 @@
 // What it buys: on a masked store of n registers, the shape a vectorised
 // store emits, this collapses n guards to 1. GuardFuse alone collapses none
 // of them, because the interleaved temps break adjacency.
-#ifndef AGPU_SINK_H
-#define AGPU_SINK_H
+#ifndef AGPU_MSL_GUARD_SINK_H
+#define AGPU_MSL_GUARD_SINK_H
 
 #include "agpu/core/CoordSet.h"
 #include "agpu/msl/Analysis.h"
@@ -139,4 +139,4 @@ inline int sinkGuardedStores(Block &b, CoordsFn coordsOf) {
 } // namespace msl
 } // namespace agpu
 
-#endif // AGPU_SINK_H
+#endif // AGPU_MSL_GUARD_SINK_H

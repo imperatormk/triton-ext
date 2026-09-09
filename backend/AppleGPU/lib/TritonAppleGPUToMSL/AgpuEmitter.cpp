@@ -185,6 +185,17 @@ agpu::Decision AgpuEmitter::walkOp(Operation *op) {
   if (auto map = dyn_cast<triton::MapElementwiseOp>(op))
     return emitted(emitMapOp(map), op, "tt.map_elementwise");
 
+  const agpu::OpView view = opViewOf(op);
+  body_.pool.carve(poolNeedOf(op));
+
+  if (agpu_.gates.on(agpu::Gate::TraceOps))
+    traceOp(op, view);
+
+  std::string who;
+  return emitted(table_.runNamed(view, who), op, view.name);
+}
+
+agpu::OpView AgpuEmitter::opViewOf(Operation *op) {
   agpu::OpView view;
   view.name = opName(op);
   for (Value v : op->getOperands())
@@ -229,28 +240,22 @@ agpu::Decision AgpuEmitter::walkOp(Operation *op) {
     if (!konst.empty())
       constantFor_[id] = konst;
   }
+  return view;
+}
 
-  body_.pool.carve(poolNeedOf(op));
-
-  if (agpu_.gates.on(agpu::Gate::TraceOps)) {
-    std::ostringstream os;
-    os << view.name;
-    for (Value v : op->getOperands())
-      if (auto t = dyn_cast<RankedTensorType>(v.getType()))
-        os << "  in=" << t.getShape()[0] << "x"
-           << (t.getRank() > 1 ? t.getShape()[1] : 1) << "/"
-           << registerCount(t);
-    for (Value v : op->getResults())
-      if (auto t = dyn_cast<RankedTensorType>(v.getType()))
-        os << "  out=" << t.getShape()[0] << "x"
-           << (t.getRank() > 1 ? t.getShape()[1] : 1) << "/"
-           << registerCount(t);
-    os << "\n";
-    appendLog(agpu::Gate::TraceOps, os.str());
-  }
-
-  std::string who;
-  return emitted(table_.runNamed(view, who), op, view.name);
+void AgpuEmitter::traceOp(Operation *op, const agpu::OpView &view) {
+  std::ostringstream os;
+  os << view.name;
+  for (Value v : op->getOperands())
+    if (auto t = dyn_cast<RankedTensorType>(v.getType()))
+      os << "  in=" << t.getShape()[0] << "x"
+         << (t.getRank() > 1 ? t.getShape()[1] : 1) << "/" << registerCount(t);
+  for (Value v : op->getResults())
+    if (auto t = dyn_cast<RankedTensorType>(v.getType()))
+      os << "  out=" << t.getShape()[0] << "x"
+         << (t.getRank() > 1 ? t.getShape()[1] : 1) << "/" << registerCount(t);
+  os << "\n";
+  appendLog(agpu::Gate::TraceOps, os.str());
 }
 
 agpu::Decision AgpuEmitter::declineOp(Operation *op, const agpu::Decision &d,
@@ -282,7 +287,7 @@ agpu::Decision AgpuEmitter::walkBlock(Block &block, am::Block &out) {
 // Fires only when the panel dots alone clear the shrink thresholds, a lower
 // bound of what the measured body would show, so it never rolls a kernel the
 // measured path would keep unrolled.
-am::RollPrediction AgpuEmitter::predictRollFor(triton::FuncOp func) {
+agpu::RollPrediction AgpuEmitter::predictRollFor(triton::FuncOp func) {
   agpu::PanelMmaSize u, ro;
   func.walk([&](triton::DotOp dot) {
     const DotShape shape = dotShapeOf(dot);
@@ -303,12 +308,12 @@ am::RollPrediction AgpuEmitter::predictRollFor(triton::FuncOp func) {
     ro.mma += dr.mma;
   });
 
-  am::RollPrediction out;
+  agpu::RollPrediction out;
   out.declDelta = u.decls - ro.decls;
   out.fragDelta = u.fragDecls - ro.fragDecls;
   out.mmaDelta = u.mma - ro.mma;
-  out.roll = u.load() > am::kDeclBudget && u.fragDecls >= am::kRollFragFloor &&
-             u.load() > ro.load();
+  out.roll = u.load() > agpu::kDeclBudget &&
+             u.fragDecls >= agpu::kRollFragFloor && u.load() > ro.load();
   return out;
 }
 
@@ -435,8 +440,8 @@ LogicalResult AgpuEmitter::emit() {
       if (!kr.fn)
         continue;
       llvm::errs() << "[budget] "
-                   << am::budgetReport(std::string_view(kr.fn->name), kr.size,
-                                       kr.shrink, kr.reemitted)
+                   << agpu::budgetReport(std::string_view(kr.fn->name), kr.size,
+                                         kr.shrink, kr.reemitted)
                    << "\n";
     }
   }

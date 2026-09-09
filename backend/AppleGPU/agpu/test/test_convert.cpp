@@ -102,10 +102,10 @@ int main() {
 
   CASE("signedness and float variant are separate states");
   {
-    CHECK(fp8KindOf(e5m2()) == Fp8Kind::E5M2);
-    CHECK(fp8KindOf(e4m3()) == Fp8Kind::E4M3);
+    CHECK(fp8KindOf(e5m2()) == FloatKind::E5M2);
+    CHECK(fp8KindOf(e4m3()) == FloatKind::E4M3);
     ElemType u32{ElemType::Kind::Int, 32, true};
-    CHECK(fp8KindOf(u32) == Fp8Kind::None);
+    CHECK(!fp8KindOf(u32));
     CHECK(mslTypeOf(u32).scalarKind() == msl::Scalar::U32);
   }
 
@@ -115,7 +115,7 @@ int main() {
   {
     ConvertPlan pack = planConvert(f32(), e4m3(), Rounding::Default);
     CHECK(pack.kind == ConvertKind::Fp8Pack);
-    CHECK(pack.fp8 == Fp8Kind::E4M3);
+    CHECK(pack.fp8 == FloatKind::E4M3);
 
     ConvertPlan unpack = planConvert(e4m3(), f32(), Rounding::Default);
     CHECK(unpack.kind == ConvertKind::Fp8Unpack);
@@ -125,9 +125,9 @@ int main() {
   {
     // e4m3 has 4 exponent bits with bias 7, e5m2 has 5 with bias 15. Using
     // one encoding's helper for the other scales every value by a power of two.
-    CHECK(fp8KindOf(e4m3()) == Fp8Kind::E4M3);
-    CHECK(fp8KindOf(e5m2()) == Fp8Kind::E5M2);
-    CHECK(fp8KindOf(f32()) == Fp8Kind::None);
+    CHECK(fp8KindOf(e4m3()) == FloatKind::E4M3);
+    CHECK(fp8KindOf(e5m2()) == FloatKind::E5M2);
+    CHECK(!fp8KindOf(f32()));
 
     msl::Context c;
     msl::Block a, b;
@@ -143,8 +143,8 @@ int main() {
   {
     // e4b8 has e4m3's mantissa split and a bias of 8; e5b16 has e5m2's and a
     // bias of 16.
-    CHECK(fp8KindOf(e4b8()) == Fp8Kind::E4B8);
-    CHECK(fp8KindOf(e5b16()) == Fp8Kind::E5B16);
+    CHECK(fp8KindOf(e4b8()) == FloatKind::E4B8);
+    CHECK(fp8KindOf(e5b16()) == FloatKind::E5B16);
     CHECK(!(e4b8() == e4m3()));
     CHECK(!(e5b16() == e5m2()));
 

@@ -344,7 +344,7 @@ agpu::Decision AgpuEmitter::emitCallOp(const agpu::OpView &o) {
       resultNames.push_back(nameFor('q', o.results[k], r));
 
   const agpu::KernelNames knm;
-  agpu::CallerContext caller;
+  agpu::DeviceFnNames caller;
   caller.threadgroupPos = knm.threadgroupPos;
   caller.threadId = knm.threadId;
   caller.gridSize = knm.gridSize;

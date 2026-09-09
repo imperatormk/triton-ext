@@ -1,11 +1,12 @@
-#include "agpu/msl/FuncSize.h"
 #include "agpu/msl/GuardFuse.h"
 #include "agpu/msl/Printer.h"
+#include "agpu/plan/ShrinkPlan.h"
 #include "fixtures.h"
 #include "harness.h"
 
 #include <sstream>
 
+using namespace agpu;
 using namespace agpu::msl;
 using agpu_test::countOf;
 
@@ -74,29 +75,6 @@ int main() {
   {
     CHECK(shrinkHelped(sized(20000, 5000), sized(9000, 500)));
     CHECK(!shrinkHelped(sized(20000, 5000), sized(20000, 5000)));
-  }
-
-  // ── the cost model ─────────────────────────────────────────────────────
-
-  CASE("a run of one is never fused");
-  {
-    FuseCost cost{8};
-    CHECK(!cost.worthFusing(1));
-    CHECK(!cost.worthFusing(0));
-  }
-
-  CASE("fusing pays as soon as it removes more than it adds");
-  {
-    FuseCost cost{8};
-    CHECK(cost.worthFusing(2));
-    CHECK(cost.worthFusing(8));
-  }
-
-  CASE("a longer condition makes fusing pay sooner");
-  {
-    FuseCost wide{40};
-    FuseCost narrow{1};
-    CHECK(wide.perStatement() > narrow.perStatement());
   }
 
   // ── fusing ─────────────────────────────────────────────────────────────

@@ -133,7 +133,8 @@ int main() {
     msl::Block body;
     e.dot(body, gemm(64, 64, 12), dotInputs());
     CHECK_EQ(e.declines.size(), 1u);
-    CHECK(e.declines.declined("shape is not fragment-aligned"));
+    CHECK_EQ(e.declines.entries()[0].why(),
+             std::string("shape is not fragment-aligned"));
   }
 
   CASE("an autotune sweep over one shape reads as one problem");

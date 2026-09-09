@@ -149,12 +149,6 @@ public:
     return n;
   }
 
-  bool isDense() const { return sizeElems() == cosizeElems() - origin_; }
-
-  bool innermostContiguous() const {
-    return !stride_.empty() && stride_.back() == 1;
-  }
-
   bool operator==(const TileView &o) const {
     return extent_ == o.extent_ && stride_ == o.stride_ && origin_ == o.origin_;
   }

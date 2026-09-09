@@ -55,7 +55,6 @@ int main() {
   CASE("contains agrees with the base-and-mask definition");
   {
     const CoordSet s{64, 7, true};
-    CHECK_EQ((int)s.size(), 8);
     const std::set<int32_t> r = reach(s);
     CHECK_EQ((int)r.size(), 8);
     for (int32_t a = 64; a < 72; ++a)
@@ -71,7 +70,6 @@ int main() {
     CHECK(!provablyDisjoint(exactCoord(4), unknown));
     CHECK(!provablyDisjoint(unknown, unknown));
     CHECK(!provablyDisjoint(unknown, CoordSet{1024, 0, true}));
-    CHECK_EQ((int)unknown.size(), 0);
   }
 
   CASE("two exact addresses are disjoint exactly when they differ");

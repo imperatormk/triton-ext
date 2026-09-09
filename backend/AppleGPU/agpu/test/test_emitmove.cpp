@@ -467,27 +467,5 @@ int main() {
     CHECK(p.peel);
   }
 
-  // ── declining ──────────────────────────────────────────────────────────
-
-  CASE("a scalar access declines and is no bug");
-  {
-    MoveFacts f = loadOf(4, 32, 1, 1);
-    MovePlan p = planMove(f);
-    Decision d = moveDecision(p, f);
-    CHECK(d.isDecline());
-    CHECK(!d.isBug());
-    CHECK_EQ(d.where(), std::string("emitLoad"));
-  }
-
-  CASE("a store names itself when it declines");
-  {
-    // 64-bit has no vector form.
-    MoveFacts f = loadOf(4, 64, 1, 1);
-    f.isStore = true;
-    Decision d = moveDecision(planMove(f), f);
-    CHECK_EQ(d.where(), std::string("emitStore"));
-    CHECK_EQ(d.why(), std::string("element width has no vector type"));
-  }
-
   return ::agpu_test::report("EmitMove");
 }

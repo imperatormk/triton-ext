@@ -189,6 +189,8 @@ private:
   std::map<std::string, DeviceFnEntry> deviceFns_;
 
   agpu::Decision walkOp(Operation *op);
+  agpu::OpView opViewOf(Operation *op);
+  void traceOp(Operation *op, const agpu::OpView &view);
 
   RegionSources regionSourcesOf(ValueRange srcs, ResultRange results,
                                 std::string_view where);
@@ -228,12 +230,14 @@ private:
 
   agpu::CarriedValue carriedFresh(Value v);
 
-  agpu::Decision carriedFrom(Value v, const agpu::CarriedValue &like,
-                             agpu::CarriedValue &out, std::string_view where,
-                             std::string_view why);
+  agpu::Result<agpu::CarriedValue> carriedFrom(Value v,
+                                               const agpu::CarriedValue &like,
+                                               std::string_view where,
+                                               std::string_view why);
 
-  agpu::Decision carriedOperands(Operation *term, const agpu::Carried &like,
-                                 agpu::Carried &out, std::string_view where);
+  agpu::Result<agpu::Carried> carriedOperands(Operation *term,
+                                              const agpu::Carried &like,
+                                              std::string_view where);
 
   // Restores cur_, which a handler appends through.
   agpu::Decision walkRegion(Region &region, agpu::msl::Block &into);
@@ -247,8 +251,8 @@ private:
 
   agpu::Decision emitWhileOp(scf::WhileOp wh);
 
-  agpu::Decision carriedFor(Value v, agpu::Carried &out,
-                            const agpu::ValueNames &names);
+  agpu::Result<agpu::CarriedValue> carriedFor(Value v,
+                                              const agpu::ValueNames &names);
 
   agpu::Decision declineOp(Operation *op, const agpu::Decision &d,
                            std::string_view name);
@@ -577,8 +581,7 @@ private:
                          agpu::DotInputs &in);
 
   void setTileInputs(const DotOperands &ops, const agpu::Plan &plan,
-                     const agpu::ElemType &stagedAElem,
-                     const agpu::ElemType &stagedBElem, agpu::DotInputs &in);
+                     agpu::DotInputs &in);
 
   agpu::Decision setReadbackFor(const DotOperands &ops, const agpu::Plan &plan,
                                 agpu::DotInputs &in);
@@ -676,7 +679,7 @@ private:
   agpu::Decision emitDotOp(const agpu::OpView &o);
   void logDotPlan(const DotOperands &ops, const agpu::Plan &plan);
 
-  agpu::msl::RollPrediction predictRollFor(triton::FuncOp func);
+  agpu::RollPrediction predictRollFor(triton::FuncOp func);
 
   agpu::BuiltBody buildKernelBody(Region &region);
 
@@ -685,6 +688,10 @@ private:
   std::vector<agpu::LayoutBasis> layoutDimsOf(Value v);
 
   agpu::MaskBound maskBoundOf(Value mask, Value laidOut);
+
+  agpu::MoveFacts moveFactsOf(Value ptr, Value laidOut,
+                              const agpu::ElemType *elem, int64_t regs,
+                              bool isStore);
 
   // A wide access casts to an unqualified vector pointer, stripping the
   // coherent qualifier, so the fact travels on the access instead.
@@ -725,17 +732,16 @@ private:
   agpu::msl::SmallVec<agpu::msl::Str, 8> stagedNamesOf(agpu::ValueId v,
                                                        int64_t regs);
 
-  agpu::PanelInputs
-  panelInputsFor(const agpu::PanelTile &t, const agpu::Plan &plan,
-                 agpu::ValueId aId, RankedTensorType aTy, agpu::ValueId bId,
-                 RankedTensorType bTy, agpu::ValueId cId, RankedTensorType cTy,
-                 const agpu::OperandSource &deviceA,
-                 const agpu::msl::Str &poolAName,
-                 const agpu::msl::SmallVec<agpu::msl::Str, 8> &cIn,
-                 const agpu::ElemType &aElem, const agpu::ElemType &bElem,
-                 const agpu::ElemType &cElem,
-                 const agpu::msl::SmallVec<agpu::msl::Str, 8> &aNames,
-                 const agpu::msl::SmallVec<agpu::msl::Str, 8> &bNames);
+  struct PanelStaging {
+    agpu::OperandSource deviceA;
+    agpu::msl::Str poolA;
+    agpu::msl::SmallVec<agpu::msl::Str, 8> aNames, bNames;
+  };
+
+  agpu::PanelInputs panelInputsFor(const agpu::PanelTile &t,
+                                   const DotOperands &ops,
+                                   const agpu::Plan &plan,
+                                   const PanelStaging &staged);
 
   agpu::Decision stageWholeTensor(agpu::ValueId v, RankedTensorType ty,
                                   const agpu::msl::Str &buffer,

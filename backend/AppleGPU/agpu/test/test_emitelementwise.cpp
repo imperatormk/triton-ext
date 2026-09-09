@@ -70,10 +70,8 @@ int main() {
     CHECK(checkEw(EwOp::DivF, i32()).isDecline());
   }
 
-  CASE("float remainder declines to an operator and names its family");
+  CASE("float remainder is the fmod call");
   {
-    Decision d = checkEw(EwOp::RemF, f32());
-    CHECK(d.isDecline());
     CHECK(checkMath2(MathFn2::Fmod, f32()).ok());
   }
 

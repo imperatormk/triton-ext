@@ -7,7 +7,7 @@
 #ifndef AGPU_ASSERT_PLAN_H
 #define AGPU_ASSERT_PLAN_H
 
-#include "agpu/msl/Containers.h"
+#include "agpu/plan/RecordBuffer.h"
 
 #include <cstdint>
 #include <string>
@@ -61,27 +61,7 @@ inline constexpr std::int32_t assertHeaderWord(AssertHeader h) {
 // kernel printing in a hot loop cannot push the assert record out.
 inline constexpr std::int32_t kAssertBufferRecords = 64;
 
-class AssertCapacity {
-public:
-  AssertCapacity() = default;
-  explicit AssertCapacity(std::int32_t records) : records_(records) {}
-
-  std::int32_t records() const { return records_; }
-
-  std::int64_t words() const {
-    return (std::int64_t)kAssertHeaderWords +
-           (std::int64_t)records_ * kAssertRecordWords;
-  }
-  std::int64_t bytes() const { return words() * 4; }
-
-  std::int64_t wordOfRecord(std::int32_t slot) const {
-    return (std::int64_t)kAssertHeaderWords +
-           (std::int64_t)slot * kAssertRecordWords;
-  }
-
-private:
-  std::int32_t records_ = 0;
-};
+using AssertCapacity = RecordCapacity<kAssertHeaderWords, kAssertRecordWords>;
 
 inline AssertCapacity assertCapacity() {
   return AssertCapacity(kAssertBufferRecords);
@@ -121,51 +101,17 @@ struct AssertSite {
 
 // The kernel's ABI depends on whether this is empty: no sites means no
 // binding and no allocation.
-class AssertPlan {
+class AssertPlan : public SiteList<AssertSite> {
 public:
-  std::int32_t add(AssertSite site) {
-    site.site = (std::int32_t)sites_.size();
-    sites_.push_back(std::move(site));
-    return sites_.back().site;
-  }
-
-  void clear() { sites_.clear(); }
-
-  // Not `clear()`: earlier kernels' sites must survive a rebuild, since the
-  // module numbers messages across all of them.
-  void truncate(std::size_t n) {
-    if (n < sites_.size())
-      sites_.resize(n);
-  }
-
-  bool asserts() const { return !sites_.empty(); }
-  std::size_t siteCount() const { return sites_.size(); }
-  const std::vector<AssertSite> &sites() const { return sites_; }
-
+  bool asserts() const { return !empty(); }
   AssertCapacity capacity() const { return assertCapacity(); }
-
-private:
-  std::vector<AssertSite> sites_;
 };
 
 inline constexpr const char *kAssertLayoutTag = "AGPU-ASSERT-LAYOUT";
 
-// Rendered for the host to parse, so the launcher does not restate the record
-// layout.
 inline msl::Str assertLayoutText(const AssertPlan &plan) {
-  const AssertCapacity cap = plan.capacity();
-  msl::Str out;
-  out += msl::Str(kAssertLayoutTag) +
-         " headerWords=" + std::to_string(kAssertHeaderWords) + "\n";
-  out += msl::Str(kAssertLayoutTag) +
-         " headWord=" + std::to_string(assertHeaderWord(AssertHeader::Head)) +
-         "\n";
-  out += msl::Str(kAssertLayoutTag) +
-         " recordWords=" + std::to_string(kAssertRecordWords) + "\n";
-  out += msl::Str(kAssertLayoutTag) +
-         " records=" + std::to_string(cap.records()) + "\n";
-  out += msl::Str(kAssertLayoutTag) + " bytes=" + std::to_string(cap.bytes()) +
-         "\n";
+  msl::Str out = recordLayoutHeader(
+      kAssertLayoutTag, assertHeaderWord(AssertHeader::Head), plan.capacity());
 
   for (const auto &f : kAssertFieldNames)
     out += msl::Str(kAssertLayoutTag) + " field." + f.name + "=" +
@@ -174,20 +120,11 @@ inline msl::Str assertLayoutText(const AssertPlan &plan) {
   out += msl::Str(kAssertLayoutTag) +
          " sites=" + std::to_string(plan.siteCount()) + "\n";
   for (const AssertSite &s : plan.sites()) {
-    // The description is line-oriented, so escape newlines.
-    msl::Str safe;
-    for (const char ch : s.message) {
-      if (ch == '\n')
-        safe += "\\n";
-      else if (ch == '\\')
-        safe += "\\\\";
-      else
-        safe += ch;
-    }
     const msl::Str at = std::to_string(s.site);
     out += msl::Str(kAssertLayoutTag) + " where." + at + "=" + s.file + ":" +
            std::to_string(s.line) + "\n";
-    out += msl::Str(kAssertLayoutTag) + " msg." + at + "=" + safe + "\n";
+    out += msl::Str(kAssertLayoutTag) + " msg." + at + "=" +
+           escapeLayoutLine(s.message) + "\n";
   }
   return out;
 }

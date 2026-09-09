@@ -11,6 +11,7 @@
 #define AGPU_PRINT_PLAN_H
 
 #include "agpu/plan/Elementwise.h"
+#include "agpu/plan/RecordBuffer.h"
 
 #include <cstdint>
 #include <string>
@@ -88,27 +89,7 @@ inline constexpr std::int32_t printHeaderWord(PrintHeader h) {
   return static_cast<std::int32_t>(h);
 }
 
-class PrintCapacity {
-public:
-  PrintCapacity() = default;
-  explicit PrintCapacity(std::int32_t records) : records_(records) {}
-
-  std::int32_t records() const { return records_; }
-
-  std::int64_t words() const {
-    return (std::int64_t)kPrintHeaderWords +
-           (std::int64_t)records_ * kPrintRecordWords;
-  }
-  std::int64_t bytes() const { return words() * 4; }
-
-  std::int64_t wordOfRecord(std::int32_t slot) const {
-    return (std::int64_t)kPrintHeaderWords +
-           (std::int64_t)slot * kPrintRecordWords;
-  }
-
-private:
-  std::int32_t records_ = 0;
-};
+using PrintCapacity = RecordCapacity<kPrintHeaderWords, kPrintRecordWords>;
 
 // A budget: a print inside a data-dependent loop has no static record count.
 // Overflow is reported.
@@ -151,67 +132,33 @@ struct PrintSite {
 
 // The kernel's ABI depends on whether this is empty: a kernel that does not
 // print takes no print buffer.
-class PrintPlan {
+class PrintPlan : public SiteList<PrintSite> {
 public:
-  // Sites number in add order and a body may be built twice, so a caller
-  // that re-walks must clear() first.
-  std::int32_t add(PrintSite site) {
-    site.site = (std::int32_t)sites_.size();
-    sites_.push_back(std::move(site));
-    return sites_.back().site;
-  }
-
-  void clear() { sites_.clear(); }
-
-  // Not `clear()`: an earlier kernel's sites must survive this kernel's
-  // rebuild, prefixes are numbered across the whole module.
-  void truncate(std::size_t n) {
-    if (n < sites_.size())
-      sites_.resize(n);
-  }
-
-  bool prints() const { return !sites_.empty(); }
-  std::size_t siteCount() const { return sites_.size(); }
-  const std::vector<PrintSite> &sites() const { return sites_; }
-
+  bool prints() const { return !empty(); }
   PrintCapacity capacity() const { return printCapacity(); }
-
-private:
-  std::vector<PrintSite> sites_;
 };
 
 // The launcher finds the description by this string in the module, the way
 // it finds the kernel name by `kernel void`.
 inline constexpr const char *kPrintLayoutTag = "AGPU-PRINT-LAYOUT";
 
-// One `key=value` per line, all decimal, so the parser needs no schema of
-// its own. `sites` is the count; the prefixes follow, one per line.
-inline msl::Str printLayoutText(const PrintPlan &plan) {
-  const PrintCapacity cap = plan.capacity();
-  msl::Str out;
-  out += msl::Str(kPrintLayoutTag) +
-         " headerWords=" + std::to_string(kPrintHeaderWords) + "\n";
-  out += msl::Str(kPrintLayoutTag) +
-         " headWord=" + std::to_string(printHeaderWord(PrintHeader::Head)) +
-         "\n";
-  out += msl::Str(kPrintLayoutTag) +
-         " recordWords=" + std::to_string(kPrintRecordWords) + "\n";
-  out += msl::Str(kPrintLayoutTag) +
-         " records=" + std::to_string(cap.records()) + "\n";
-  out += msl::Str(kPrintLayoutTag) + " bytes=" + std::to_string(cap.bytes()) +
-         "\n";
+// The field names the host decodes by.
+inline constexpr struct {
+  const char *name;
+  PrintField field;
+} kPrintFieldNames[] = {
+    {"site", PrintField::Site},       {"pid", PrintField::Pid},
+    {"tid", PrintField::Tid},         {"index", PrintField::Index},
+    {"type", PrintField::Type},       {"value", PrintField::Value},
+    {"operand", PrintField::Operand},
+};
 
-  // The field names the host decodes by.
-  const struct {
-    const char *name;
-    PrintField field;
-  } fields[] = {
-      {"site", PrintField::Site},       {"pid", PrintField::Pid},
-      {"tid", PrintField::Tid},         {"index", PrintField::Index},
-      {"type", PrintField::Type},       {"value", PrintField::Value},
-      {"operand", PrintField::Operand},
-  };
-  for (const auto &f : fields)
+// `sites` is the count; the prefixes follow, one per line.
+inline msl::Str printLayoutText(const PrintPlan &plan) {
+  msl::Str out = recordLayoutHeader(
+      kPrintLayoutTag, printHeaderWord(PrintHeader::Head), plan.capacity());
+
+  for (const auto &f : kPrintFieldNames)
     out += msl::Str(kPrintLayoutTag) + " field." + f.name + "=" +
            std::to_string(printFieldWord(f.field)) + "\n";
 
@@ -230,21 +177,11 @@ inline msl::Str printLayoutText(const PrintPlan &plan) {
   out += msl::Str(kPrintLayoutTag) +
          " sites=" + std::to_string(plan.siteCount()) + "\n";
   for (const PrintSite &s : plan.sites()) {
-    // A newline would end the line the parser reads.
-    msl::Str safe;
-    for (const char ch : s.prefix) {
-      if (ch == '\n')
-        safe += "\\n";
-      else if (ch == '\\')
-        safe += "\\\\";
-      else
-        safe += ch;
-    }
     // Operand count: the host labels values only when there is more than one.
     out += msl::Str(kPrintLayoutTag) + " nops." + std::to_string(s.site) + "=" +
            std::to_string(s.operands.size()) + "\n";
     out += msl::Str(kPrintLayoutTag) + " site." + std::to_string(s.site) + "." +
-           (s.hex ? "hex" : "dec") + "=" + safe + "\n";
+           (s.hex ? "hex" : "dec") + "=" + escapeLayoutLine(s.prefix) + "\n";
   }
   return out;
 }

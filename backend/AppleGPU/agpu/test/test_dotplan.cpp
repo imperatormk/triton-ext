@@ -64,8 +64,6 @@ int main() {
   CASE("bytes and elements do not mix silently");
   {
     Bytes b(1024);
-    CHECK_EQ(b.inElems(4).count(), 256);
-    CHECK_EQ(b.inElems(2).count(), 512);
     CHECK_EQ((b + Bytes(1024)).count(), 2048);
     CHECK(minBytes(Bytes(10), Bytes(20)) == Bytes(10));
     CHECK(maxBytes(Bytes(10), Bytes(20)) == Bytes(20));
@@ -77,7 +75,6 @@ int main() {
     CHECK_EQ(tgResidency(22000), 2);
     CHECK_EQ(tgResidency(32768), 2);
     CHECK_EQ(tgResidency(8192), 8);
-    CHECK_EQ(tgPoolForResidency(4), 16384);
   }
 
   // ── strategy selection ─────────────────────────────────────────────────
@@ -197,7 +194,7 @@ int main() {
     const Bytes plain(
         stagedTileBytes(64, fragAlignedExtent(64), kAccBytes, false));
     CHECK(padded <= kBudget);
-    CHECK_EQ(plain.count(), tgPoolForResidency(4));
+    CHECK_EQ(plain.count(), kTGCoreBudgetBytes / 4);
     CHECK(tgResidency(padded.count()) < tgResidency(plain.count()));
     CHECK(!planDot(f, kBudget).padStagedC());
 

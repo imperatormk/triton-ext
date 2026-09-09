@@ -88,7 +88,6 @@ int main() {
     msl::Context c;
     msl::Block body;
     ShufflePlan p = planShuffle({0, 1}, {xorLanes(4), xorLanes(4)});
-    CHECK(p.uniformLanePerm);
     CHECK(p.linearLanePerm);
     emitShuffle(c, body, p, names("v", 2), names("d", 2), elem, nm);
     const std::string out = render(body);
@@ -101,7 +100,6 @@ int main() {
     // The lane index is built once, so two registers wanting different
     // permutations have no single form.
     ShufflePlan p = planShuffle({0, 1}, {xorLanes(4), xorLanes(8)});
-    CHECK(!p.uniformLanePerm);
     CHECK(!p.usable());
 
     msl::Context c;
@@ -224,7 +222,6 @@ int main() {
     const ShufflePlan p = planShuffleFromElems({src}, {dst});
     CHECK(p.usable());
     CHECK(!p.isRebind());
-    CHECK(p.uniformLanePerm);
     CHECK(p.linearLanePerm);
     CHECK_EQ(p.shuffleCount(), (int64_t)1);
   }

@@ -32,6 +32,17 @@ DeviceFnFacts fnOf(const char *name, std::vector<DeviceValue> params,
   return f;
 }
 
+DeviceFnNames caller(const char *tg, const char *ti, const char *nt,
+                     const char *pl, const char *as) {
+  DeviceFnNames n;
+  n.threadgroupPos = tg;
+  n.threadId = ti;
+  n.gridSize = nt;
+  n.pool = pl;
+  n.assertBuffer = as;
+  return n;
+}
+
 } // namespace
 
 int main() {
@@ -224,10 +235,10 @@ int main() {
     f.moduleNeedsPool = true;
     DeviceFnAbi abi = planDeviceFn(f);
 
-    CallerContext caller{"tgid", "tid", "tgcount", "pool", ""};
     msl::Context c;
     msl::Block body;
-    emitDeviceCall(c, body, f, abi, {"x"}, caller, {});
+    emitDeviceCall(c, body, f, abi, {"x"},
+                   caller("tgid", "tid", "tgcount", "pool", ""), {});
     CHECK_EQ(render(body), std::string("g(x, tgid, tid, tgcount, pool);\n"));
   }
 
@@ -240,9 +251,9 @@ int main() {
 
     msl::Context c;
     msl::Function *def = emitDeviceFn(c, f, abi, {"p0", "p1"}, {});
-    CallerContext caller{"TG", "TI", "NT", "PL", ""};
     msl::Block body;
-    emitDeviceCall(c, body, f, abi, {"A0", "A1"}, caller, {});
+    emitDeviceCall(c, body, f, abi, {"A0", "A1"},
+                   caller("TG", "TI", "NT", "PL", ""), {});
     const std::string call = render(body);
 
     const std::vector<std::string> expect = {"A0", "A1", "TG",
@@ -263,9 +274,9 @@ int main() {
     DeviceFnAbi abi = planDeviceFn(f);
 
     msl::Context c;
-    CallerContext caller{"tgid", "tid", "tgcount", "", ""};
     msl::Block body;
-    emitDeviceCall(c, body, f, abi, {"p"}, caller, {"v0", "v1"}, "t");
+    emitDeviceCall(c, body, f, abi, {"p"},
+                   caller("tgid", "tid", "tgcount", "", ""), {"v0", "v1"}, "t");
     const std::string s = render(body);
     CHECK(s.find("load_tile_ret t = load_tile(p, tgid, tid, tgcount);") !=
           std::string::npos);
@@ -283,8 +294,7 @@ int main() {
     DeviceFnAbi abi = planDeviceFn(f);
     msl::Context c;
     msl::Block body;
-    emitDeviceCall(c, body, f, abi, {}, CallerContext{"a", "b", "c", "", ""},
-                   {});
+    emitDeviceCall(c, body, f, abi, {}, caller("a", "b", "c", "", ""), {});
     CHECK_EQ(render(body), std::string("g(a, b, c);\n"));
   }
 
@@ -294,7 +304,7 @@ int main() {
     DeviceFnAbi abi = planDeviceFn(f);
     msl::Context c;
     msl::Block body;
-    emitDeviceCall(c, body, f, abi, {"x"}, CallerContext{"a", "b", "c", "", ""},
+    emitDeviceCall(c, body, f, abi, {"x"}, caller("a", "b", "c", "", ""),
                    {"r"});
     const std::string s = render(body);
     CHECK_EQ(s, std::string("float r = g(x, a, b, c);\n"));

@@ -55,19 +55,16 @@ static Operation *singleScanCombiner(triton::ScanOp scan) {
 agpu::Result<agpu::ReductionPlan>
 AgpuEmitter::reductionPlanOf(triton::ReduceOp red, RankedTensorType srcTy) {
   using R = agpu::Result<agpu::ReductionPlan>;
-  agpu::ReductionPlan out;
-  const int axis = (int)red.getAxis();
+  agpu::ReductionFacts facts;
+  facts.axis = (int)red.getAxis();
   const LinearLayout ll = gpu::toLinearLayout(srcTy);
   MLIRContext *ctx = srcTy.getContext();
 
-  const std::optional<StringAttr> dim = outDimAt(ll, axis);
+  const std::optional<StringAttr> dim = outDimAt(ll, facts.axis);
   if (!dim)
     return R::no(declined("tt.reduce", "the layout has no such axis"));
 
-  // Registers that fold together: coordinates agree on every dimension but the
-  // reduced one.
   const int64_t regs = registerCount(srcTy);
-  std::vector<agpu::CoordKey> regCoords;
   for (int64_t r = 0; r < regs; ++r) {
     const std::optional<std::vector<int64_t>> c =
         registerCoordAt(srcTy, (int)r);
@@ -77,33 +74,15 @@ AgpuEmitter::reductionPlanOf(triton::ReduceOp red, RankedTensorType srcTy) {
     agpu::CoordKey::Storage k;
     for (int64_t v : *c)
       k.push_back((int32_t)v);
-    regCoords.push_back(agpu::CoordKey(std::move(k)));
+    facts.regCoords.push_back(agpu::CoordKey(std::move(k)));
   }
-  out.groups = agpu::groupSurvivors(regCoords, axis);
-  if (out.groups.empty())
-    return R::no(declined("tt.reduce", "no survivor group for this layout"));
 
-  // Lane/warp bits that move the reduced axis. A non-zero basis bit spreads it
-  // across threads, needing a shuffle (lane) or threadgroup memory (warp).
   const agpu::BasisRow laneB = basisRow(ll, ctx, lldim::Lane, *dim);
   const agpu::BasisRow warpB = basisRow(ll, ctx, lldim::Warp, *dim);
-  out.laneSteps = agpu::laneStepsFromMask(agpu::reduceMaskFromBases(
-      std::vector<int32_t>(laneB.begin(), laneB.end())));
-  out.warpMask = agpu::reduceMaskFromBases(
-      std::vector<int32_t>(warpB.begin(), warpB.end()));
-
-  const int64_t warps = numWarps();
-  out.warpSubset = agpu::subsetsOf(out.warpMask, (int)warps);
-  out.reducedAxis = axis;
-  out.combiner = combinerOf(red.getSingleCombiner());
-
-  // numWarps slots per group: every warp publishes, including ones this
-  // reduction does not span.
-  if (out.crossWarp()) {
-    const int64_t groupSlots = warps * agpu::kWarpSize;
-    out.scratch = agpu::ScratchLayout{(int64_t)out.groups.size() * groupSlots,
-                                      agpu::kWarpSize, groupSlots};
-  }
+  facts.laneBases.assign(laneB.begin(), laneB.end());
+  facts.warpBases.assign(warpB.begin(), warpB.end());
+  facts.numWarps = numWarps();
+  facts.combiner = combinerOf(red.getSingleCombiner());
 
   // Accumulator element type is carried per operand: an integer reduction
   // through float is exact only to 2^24.
@@ -111,17 +90,16 @@ AgpuEmitter::reductionPlanOf(triton::ReduceOp red, RankedTensorType srcTy) {
     const std::optional<agpu::ElemType> e = elemTypeOf(s.getType());
     if (!e)
       return R::no(declined("tt.reduce", "an operand has no element type"));
-    out.elems.push_back(*e);
+    facts.elems.push_back(*e);
     auto ty = dyn_cast<RankedTensorType>(s.getType());
     if (!ty)
       return R::no(declined("tt.reduce", "an operand is not a ranked tensor"));
-    out.regsPerOperand.push_back(registerCount(ty));
+    facts.regsPerOperand.push_back(registerCount(ty));
   }
-  if (!out.operandsShareLayout())
-    return R::no(declined(
-        "tt.reduce", "the operands are not addressed by the same registers"));
 
-  return R::of(std::move(out));
+  if (const agpu::Decision d = agpu::reductionDecline(facts); !d.ok())
+    return R::no(d);
+  return R::of(agpu::planReduction(facts));
 }
 
 am::SmallVec<am::Str, 4>

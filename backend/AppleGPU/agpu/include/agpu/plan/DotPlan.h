@@ -92,6 +92,21 @@ inline Bytes stagedTileBytes(int64_t rows, int64_t cols, int64_t elemBytes,
                elemBytes);
 }
 
+// The whole C tile as staged: whole fragments, fp32 accumulators. Every
+// reservation, fit test and view of C reads these three.
+inline TileView cTileView(const DotFacts &f, bool pad = true) {
+  return stagedTileView(f.M, fragAlignedExtent(f.N), kAccBytes, pad);
+}
+
+inline Bytes cTileBytes(const DotFacts &f, bool pad = true) {
+  return stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes, pad);
+}
+
+// One band of C: 8 rows, what simdgroup_store writes at a time.
+inline Bytes cBandBytes(const DotFacts &f, bool pad = true) {
+  return Bytes(kSgFragDim * cTileView(f, pad).strideAt(0) * kAccBytes);
+}
+
 // The whole staged operand, batch axis included: Bd slices laid back to back,
 // batch stride the slice cosize. Only the scalar dot stages a batched operand
 // whole; the MMA strategies go to the panel walk, one slice at a time.
@@ -390,10 +405,7 @@ struct Plan {
   }
 
   // The C tile as staged: fragment-aligned, at this plan's pitch.
-  TileView cStagedView() const {
-    return stagedTileView(facts.M, fragAlignedExtent(facts.N), kAccBytes,
-                          padStagedC());
-  }
+  TileView cStagedView() const { return cTileView(facts, padStagedC()); }
 
   // Rows of C the pool holds at once. Only a Direct plan bands; everything
   // else crosses whole.
@@ -437,10 +449,7 @@ struct Plan {
     if (!cThroughPool())
       return {0, false};
     if (kind == Kind::Fused)
-      return {stagedTileBytes(facts.M, fragAlignedExtent(facts.N), kAccBytes,
-                              padStagedC())
-                  .count(),
-              true};
+      return {cTileBytes(facts, padStagedC()).count(), true};
     if (kind == Kind::Panel)
       return {std::max(panel().panel.cBytes.count(), kMinPoolPtrBytes), true};
     return {std::max(pool.cReserve().count(), kMinPoolPtrBytes), false};
@@ -461,18 +470,8 @@ struct CReserve {
   Bytes stagedAB;
   Bytes budget;
 
-  // Whole fragments: a 60-row C occupies 64 rows.
-  Bytes cFull(bool pad = true) const {
-    return stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes, pad);
-  }
-
-  // One band of C: 8 rows, what simdgroup_store writes at a time.
-  Bytes cBand(bool pad = true) const {
-    return Bytes(kSgFragDim *
-                 stagedTileView(f.M, fragAlignedExtent(f.N), kAccBytes, pad)
-                     .strideAt(0) *
-                 kAccBytes);
-  }
+  Bytes cFull(bool pad = true) const { return cTileBytes(f, pad); }
+  Bytes cBand(bool pad = true) const { return cBandBytes(f, pad); }
 
   // A scalar dot keeps its running sum in a register.
   Bytes operator()(const ScalarParams &) const { return stagedAB; }
@@ -546,13 +545,10 @@ struct PoolDependent {
     dp.disjointC = pool.cReserve() > Bytes(0);
     // Asked as bytes: the whole tile's last row is short of the pad, so the
     // row division would come out one row shy.
-    const Bytes full =
-        stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes, dp.stagePad);
+    const Bytes full = cTileBytes(f, dp.stagePad);
     dp.bandRows = f.cRename || pool.cReserve() >= full
                       ? fragAlignedExtent(f.M)
-                      : bandRowsFor(stagedTileView(f.M, fragAlignedExtent(f.N),
-                                                   kAccBytes, dp.stagePad)
-                                        .strideAt(0),
+                      : bandRowsFor(cTileView(f, dp.stagePad).strideAt(0),
                                     pool.cReserve(), kAccBytes);
   }
 };
@@ -765,13 +761,9 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
     DotFacts staged = f;
     staged.aDirect = false;
     const bool wholePadded =
-        planStageBytes(staged).ab() +
-            stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes) <=
-        budget;
+        planStageBytes(staged).ab() + cTileBytes(f) <= budget;
     const bool wholePlain =
-        planStageBytes(staged, false).ab() +
-            stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes, false) <=
-        budget;
+        planStageBytes(staged, false).ab() + cTileBytes(f, false) <= budget;
     if (wholePadded || wholePlain)
       f.aDirect = false;
   }
@@ -793,13 +785,7 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   //    can emit unpadded, so a shape only the plain pitch admits must not
   //    panel.
   const auto bandBytes = [&](bool pad) {
-    return Bytes(
-        f.cCostsPoolNothing() || mayRename
-            ? 0
-            : kSgFragDim *
-                  stagedTileView(f.M, fragAlignedExtent(f.N), kAccBytes, pad)
-                      .strideAt(0) *
-                  kAccBytes);
+    return f.cCostsPoolNothing() || mayRename ? Bytes(0) : cBandBytes(f, pad);
   };
   const bool fitsPadded = p.stage.ab() + bandBytes(true) <= budget;
   const bool fitsPlain =
@@ -810,11 +796,8 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   // the overlay's max at one pitch, because C shares the pool's bytes with
   // operands staged at that same pitch. Asked at both pitches.
   const auto wholeCBytes = [&](bool pad) {
-    const Bytes cWhole(
-        f.cCostsPoolNothing() || mayRename
-            ? 0
-            : stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes, pad)
-                  .count());
+    const Bytes cWhole =
+        f.cCostsPoolNothing() || mayRename ? Bytes(0) : cTileBytes(f, pad);
     return maxBytes(planStageBytes(f, pad).ab(), cWhole);
   };
   const auto wholeCFits = [&](bool pad) { return wholeCBytes(pad) <= budget; };
@@ -882,12 +865,10 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
     // whole where padded bands, or if the padded pitch does not fit at all,
     // which would put the reservation over the budget it was admitted under.
     // A shape that bands at both pitches keeps the pad.
-    const Bytes cPadded(
-        stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes, true));
+    const Bytes cPadded = cTileBytes(f, true);
     if (p.stage.ab() + cPadded > budget) {
       const StageBytes plain = planStageBytes(f, /*pad=*/false);
-      const Bytes cPlain(
-          stagedTileBytes(f.M, fragAlignedExtent(f.N), kAccBytes, false));
+      const Bytes cPlain = cTileBytes(f, false);
       if (plain.ab() + cPlain <= budget || !fitsPadded) {
         dp.stagePad = false;
         p.stage = plain;

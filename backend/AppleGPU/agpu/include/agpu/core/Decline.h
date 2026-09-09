@@ -163,13 +163,6 @@ public:
     tags_.erase(tags_.begin() + (std::ptrdiff_t)mark, tags_.end());
   }
 
-  bool declined(const msl::Str &why) const {
-    for (const Decision &d : entries_)
-      if (d.why() == why)
-        return true;
-    return false;
-  }
-
   // One row per (gate, reason, tag), with occurrences and distinct sites
   // counted separately from distinct configs.
   std::vector<DeclineTally> summary() const {

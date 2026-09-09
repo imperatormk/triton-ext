@@ -54,7 +54,6 @@ int main() {
     const Math2Name *m = math2For("arith.remf");
     CHECK(m != nullptr);
     CHECK(m->fn == MathFn2::Fmod);
-    CHECK(checkEw(EwOp::RemF, f32()).isDecline());
     CHECK(checkMath2(MathFn2::Fmod, f32()).ok());
   }
 

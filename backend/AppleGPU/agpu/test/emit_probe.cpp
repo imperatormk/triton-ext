@@ -560,8 +560,12 @@ void printDeviceFnModule(std::ostream &os) {
       c, kf,
       [&](msl::Context &cc, bool) {
         msl::Block b;
-        const CallerContext caller{knm.threadgroupPos, knm.threadId,
-                                   knm.gridSize, knm.pool, knm.assertBuffer};
+        DeviceFnNames caller;
+        caller.threadgroupPos = knm.threadgroupPos;
+        caller.threadId = knm.threadId;
+        caller.gridSize = knm.gridSize;
+        caller.pool = knm.pool;
+        caller.assertBuffer = knm.assertBuffer;
         emitDeviceCall(cc, b, f, abi, {"in", "n"}, caller, {"v0", "v1"});
         b.push_back(
             cc.assign(cc.subscript(cc.var("out"), cc.var(knm.laneId)),

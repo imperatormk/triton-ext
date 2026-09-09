@@ -20,8 +20,6 @@ int main() {
     CHECK_EQ(v.offsetOf({63, 31}), 64 * 32 - 1);
     CHECK_EQ(v.cosizeElems(), 64 * 32);
     CHECK_EQ(v.sizeElems(), 64 * 32);
-    CHECK(v.isDense());
-    CHECK(v.innermostContiguous());
   }
 
   CASE("fragment (mi,ni) in a row-major N-strided C tile");
@@ -77,7 +75,6 @@ int main() {
     CHECK_EQ(panel.offsetOf({0, 0}), m0 * K + k0);
     CHECK_EQ(panel.offsetOf({1, 0}), (m0 + 1) * K + k0);
     CHECK_EQ(panel.stride(), Coord({K, 1}));
-    CHECK(!panel.isDense());
   }
 
   CASE("rank-3 batch slice removes the rank test");
@@ -103,8 +100,6 @@ int main() {
     CHECK_EQ(p.offsetOf({1, 0}), cols + pad);
     CHECK_EQ(p.sizeElems(), rows * cols);
     CHECK_EQ(p.cosizeElems(), (rows - 1) * (cols + pad) + cols);
-    CHECK(!p.isDense());
-    CHECK(p.innermostContiguous());
   }
 
   CASE("ragged final panel is a smaller subview, same strides");
@@ -155,7 +150,6 @@ int main() {
     TileView bCol({K, N}, {1, K});
     CHECK_EQ(bRow.offsetOf({2, 3}), 2 * N + 3);
     CHECK_EQ(bCol.offsetOf({2, 3}), 2 + 3 * K);
-    CHECK(!bCol.innermostContiguous());
     CHECK_EQ(bCol.cosizeElems(), K * N);
   }
 

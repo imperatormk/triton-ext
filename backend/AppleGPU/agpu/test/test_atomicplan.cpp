@@ -108,10 +108,10 @@ int main() {
 
   // ── the op table ───────────────────────────────────────────────────────
 
-  CASE("every op the strategy admits is renderable");
+  CASE("every op the strategy admits has a builtin");
   {
     for (RmwOp op : kAllOps) {
-      CHECK(isRenderable(intAtomic(op)));
+      CHECK(planAtomic(intAtomic(op), MemOrder::Relaxed).usable());
       CHECK(builtinFor(op) != nullptr);
     }
   }

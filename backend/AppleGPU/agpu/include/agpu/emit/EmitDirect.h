@@ -276,6 +276,110 @@ emitGuardedScalarEdgeStores(msl::Context &c, msl::Block &edge,
   }
 }
 
+inline std::string slotCoordKey(const SlotCoord &p) {
+  return std::to_string(p.constant) + ":" + std::to_string(p.warpScale) + ":" +
+         std::to_string(p.warpDiv) + ":" + std::to_string(p.warpMod);
+}
+
+// Operand reads with a `memoElem` are memoised into `memoInto`, so a store
+// between two slots' reads cannot force a reload.
+class DrainChain {
+public:
+  DrainChain(msl::Context &c, const DeviceStoreTarget &t,
+             const std::vector<DrainStep> &steps, const DirectNames &nm)
+      : c_(c), t_(t), steps_(steps), nm_(nm) {}
+
+  void memoInto(msl::Block &b) { memoInto_ = &b; }
+  msl::Block &memoInto() const { return *memoInto_; }
+
+  msl::Expr *at(const WarpSlot &s, msl::Expr *value, msl::Expr *row,
+                msl::Expr *col, const std::string &memoElem = std::string()) {
+    msl::Expr *cur = value;
+    ElemType curElem = f32();
+    int stepIdx = 0;
+    std::vector<msl::Expr *> ran{value};
+    for (const DrainStep &st : steps_) {
+      if (st.roundBefore) {
+        cur = c_.cast(mslTypeOf(t_.elem), cur);
+        curElem = t_.elem;
+      }
+      msl::Expr *rhs = nullptr;
+      if (st.operand.kind == DrainOperand::Kind::AccChain) {
+        const int at = st.branchBase < stepIdx ? st.branchBase : stepIdx;
+        msl::Expr *b = ran[(std::size_t)(at < 0 ? 0 : at)];
+        int li = 0;
+        for (const DrainBranchLink &lk : st.branch)
+          b = epilogueExpr(
+              c_,
+              {std::string_view(lk.op),
+               operandRead(s, lk.operand,
+                           std::to_string(stepIdx) + "b" + std::to_string(li++),
+                           row, col, memoElem)},
+              b);
+        rhs = b;
+      } else {
+        rhs = operandRead(s, st.operand, std::to_string(stepIdx), row, col,
+                          memoElem);
+      }
+      cur = epilogueExpr(c_, {std::string_view(st.op), rhs}, cur, curElem);
+      ++stepIdx;
+      ran.push_back(cur);
+    }
+    if (t_.narrows())
+      cur = c_.cast(mslTypeOf(t_.elem), cur);
+    return cur;
+  }
+
+private:
+  msl::Expr *operandRead(const WarpSlot &s, const DrainOperand &od,
+                         const std::string &keyAt, msl::Expr *row,
+                         msl::Expr *col, const std::string &memoElem) {
+    msl::Expr *rhs = nullptr;
+    switch (od.kind) {
+    default:
+      break;
+    case DrainOperand::Kind::Splat:
+      rhs = od.splat;
+      break;
+    case DrainOperand::Kind::Row:
+      rhs = c_.subscript(basePtr(c_, od.base, od.baseOffset), col);
+      break;
+    case DrainOperand::Kind::Col:
+      rhs = c_.subscript(basePtr(c_, od.base, od.baseOffset), row);
+      break;
+    case DrainOperand::Kind::Tile:
+      rhs = c_.subscript(
+          basePtr(c_, od.base, od.baseOffset),
+          c_.binary(msl::BinOp::Add, od.leadingDim.scale(c_, row), col));
+      break;
+    }
+    if (!rhs || memoElem.empty() || od.kind == DrainOperand::Kind::Splat)
+      return rhs;
+    std::string key = keyAt + "|";
+    if (od.kind != DrainOperand::Kind::Col)
+      key += slotCoordKey(s.ni) + "@" + memoElem;
+    if (od.kind != DrainOperand::Kind::Row)
+      key += "|" + slotCoordKey(s.mi);
+    auto it = reads_.find(key);
+    if (it == reads_.end()) {
+      const msl::Str rn = nm_.frag + "r" + std::to_string(readSeq_++);
+      // The operand's own element: a wider memo would promote the step
+      // consuming it and round differently.
+      memoInto_->push_back(c_.declStmt(mslTypeOf(od.elem), rn, rhs));
+      it = reads_.emplace(key, rn).first;
+    }
+    return c_.var(it->second);
+  }
+
+  msl::Context &c_;
+  const DeviceStoreTarget &t_;
+  const std::vector<DrainStep> &steps_;
+  const DirectNames &nm_;
+  std::map<std::string, msl::Str> reads_;
+  int readSeq_ = 0;
+  msl::Block *memoInto_ = nullptr;
+};
+
 // Drain each accumulator straight to its fragment's place in the device
 // tensor, for `Plan::storesCDirect`: no pool, no readback, no barrier.
 //
@@ -294,14 +398,8 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
   msl::Expr *allIn = wholeTileInBounds(c, t);
 
   msl::Block fast, slow;
-  // The unguarded arms' operand reads, memoised so a store between two slots'
-  // reads cannot force a reload. Only valid where the arm is unguarded and
-  // covers the whole tile; guarded arms read in place. `memoInto` is whichever
-  // unguarded block is being built.
-  std::map<std::string, msl::Str> fastReads;
-  int fastReadSeq = 0;
-  msl::Block *memoInto = &fast;
-  // Memo arms' stores, deferred until after all reads, same reason.
+  DrainChain chain(c, t, steps, nm);
+  chain.memoInto(fast);
   msl::Block memoStores;
   if (allIn && !t.edgeScratch.empty())
     declareEdgeScratch(c, slow, t, nm);
@@ -328,90 +426,6 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
            t.leadingDim.expr(c)})));
     };
 
-    const auto chainAt = [&](msl::Expr *value, msl::Expr *row, msl::Expr *col,
-                             const std::string &memoElem =
-                                 std::string()) -> msl::Expr * {
-      // `key` keeps a spine step's memoised read distinct from a branch
-      // link's.
-      const auto operandRead = [&](const DrainOperand &od,
-                                   const std::string &keyAt) -> msl::Expr * {
-        msl::Expr *rhs = nullptr;
-        switch (od.kind) {
-        default:
-          break;
-        case DrainOperand::Kind::Splat:
-          rhs = od.splat;
-          break;
-        case DrainOperand::Kind::Row:
-          rhs = c.subscript(basePtr(c, od.base, od.baseOffset), col);
-          break;
-        case DrainOperand::Kind::Col:
-          rhs = c.subscript(basePtr(c, od.base, od.baseOffset), row);
-          break;
-        case DrainOperand::Kind::Tile:
-          rhs = c.subscript(
-              basePtr(c, od.base, od.baseOffset),
-              c.binary(msl::BinOp::Add, od.leadingDim.scale(c, row), col));
-          break;
-        }
-        if (rhs && !memoElem.empty() && od.kind != DrainOperand::Kind::Splat) {
-          const auto coord = [](const SlotCoord &p) {
-            return std::to_string(p.constant) + ":" +
-                   std::to_string(p.warpScale) + ":" +
-                   std::to_string(p.warpDiv) + ":" + std::to_string(p.warpMod);
-          };
-          std::string key = keyAt + "|";
-          if (od.kind != DrainOperand::Kind::Col)
-            key += coord(s.ni) + "@" + memoElem;
-          if (od.kind != DrainOperand::Kind::Row)
-            key += "|" + coord(s.mi);
-          auto it = fastReads.find(key);
-          if (it == fastReads.end()) {
-            const msl::Str rn = nm.frag + "r" + std::to_string(fastReadSeq++);
-            // The operand's own element: a wider memo would promote the step
-            // consuming it and round differently.
-            memoInto->push_back(c.declStmt(mslTypeOf(od.elem), rn, rhs));
-            it = fastReads.emplace(key, rn).first;
-          }
-          rhs = c.var(it->second);
-        }
-        return rhs;
-      };
-
-      msl::Expr *cur = value;
-      ElemType curElem = f32();
-      int stepIdx = 0;
-      std::vector<msl::Expr *> ran{value};
-      for (const DrainStep &st : steps) {
-        if (st.roundBefore) {
-          cur = c.cast(mslTypeOf(t.elem), cur);
-          curElem = t.elem;
-        }
-        msl::Expr *rhs = nullptr;
-        if (st.operand.kind == DrainOperand::Kind::AccChain) {
-          const int at = st.branchBase < stepIdx ? st.branchBase : stepIdx;
-          msl::Expr *b = ran[(std::size_t)(at < 0 ? 0 : at)];
-          int li = 0;
-          for (const DrainBranchLink &lk : st.branch)
-            b = epilogueExpr(
-                c,
-                {std::string_view(lk.op),
-                 operandRead(lk.operand, std::to_string(stepIdx) + "b" +
-                                             std::to_string(li++))},
-                b);
-          rhs = b;
-        } else {
-          rhs = operandRead(st.operand, std::to_string(stepIdx));
-        }
-        cur = epilogueExpr(c, {std::string_view(st.op), rhs}, cur, curElem);
-        ++stepIdx;
-        ran.push_back(cur);
-      }
-      if (t.narrows())
-        cur = c.cast(mslTypeOf(t.elem), cur);
-      return cur;
-    };
-
     const auto elemRow = [&](int64_t) {
       return c.binary(msl::BinOp::Add, rowE(), fragLaneRowExpr(c, nm.laneId));
     };
@@ -425,16 +439,15 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
     // `simdgroup_store` deduces its pointer type from the fragment.
     const auto wholeFragment = [&](msl::Block &into, bool memo) {
       if (memo)
-        memoInto = &into;
-      const auto memoFor = [&](int64_t i) {
-        return memo ? std::to_string(i) : std::string();
+        chain.memoInto(into);
+      const auto chained = [&](int64_t i) {
+        return chain.at(s, fragElemExpr(c, acc, i), elemRow(i), elemCol(i),
+                        memo ? std::to_string(i) : std::string());
       };
       if (!t.narrows()) {
         if (!steps.empty())
           for (int64_t i = 0; i < kFragElemsPerLane; ++i)
-            into.push_back(c.assign(fragElemExpr(c, acc, i),
-                                    chainAt(fragElemExpr(c, acc, i), elemRow(i),
-                                            elemCol(i), memoFor(i))));
+            into.push_back(c.assign(fragElemExpr(c, acc, i), chained(i)));
         sgStore(memo ? memoStores : into, acc);
         return;
       }
@@ -443,9 +456,7 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
           kSimdgroup8x8.mslTypeNode(msl::spell(mslTypeOf(t.elem).scalarKind())),
           narrow, nullptr));
       for (int64_t i = 0; i < kFragElemsPerLane; ++i)
-        into.push_back(c.assign(fragElemExpr(c, narrow, i),
-                                chainAt(fragElemExpr(c, acc, i), elemRow(i),
-                                        elemCol(i), memoFor(i))));
+        into.push_back(c.assign(fragElemExpr(c, narrow, i), chained(i)));
       sgStore(memo ? memoStores : into, narrow);
     };
 
@@ -468,7 +479,7 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
 
     const DrainValueAt valueAt = [&](msl::Expr *value, msl::Expr *row,
                                      msl::Expr *col) {
-      return chainAt(value, row, col);
+      return chain.at(s, value, row, col);
     };
 
     msl::Block edge;
@@ -484,7 +495,7 @@ inline void emitAccumDeviceStores(msl::Context &c, msl::Block &body,
         slow.push_back(st);
   }
   for (msl::Stmt *st : memoStores)
-    memoInto->push_back(st);
+    chain.memoInto().push_back(st);
   if (allIn)
     into.push_back(c.ifElse(allIn, std::move(fast), std::move(slow)));
   else

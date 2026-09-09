@@ -3,11 +3,13 @@
 // Most casts are `static_cast`. Two families are not: narrowing f32 to half or
 // bfloat has a rounding mode and fp8 has no MSL type, so every fp8 conversion
 // is a pack or unpack.
-#ifndef AGPU_CONVERT_H
-#define AGPU_CONVERT_H
+#ifndef AGPU_TYPE_CONVERT_H
+#define AGPU_TYPE_CONVERT_H
 
 #include "agpu/core/Decline.h"
-#include "agpu/plan/Elementwise.h"
+#include "agpu/plan/ElemType.h"
+
+#include <optional>
 
 namespace agpu {
 
@@ -18,23 +20,18 @@ enum class Rounding {
   RTZ,     // round toward zero
 };
 
-// The fp8 encodings Metal has no type for.
-enum class Fp8Kind { None, E4M3, E5M2, E4B8, E5B16 };
-
-inline Fp8Kind fp8KindOf(ElemType e) {
+// The fp8 encoding of a type Metal has no type for, or nothing.
+inline std::optional<FloatKind> fp8KindOf(ElemType e) {
   if (e.kind != ElemType::Kind::Float || e.bits != 8)
-    return Fp8Kind::None;
+    return std::nullopt;
   switch (e.floatKind) {
   case FloatKind::E4M3:
-    return Fp8Kind::E4M3;
   case FloatKind::E5M2:
-    return Fp8Kind::E5M2;
   case FloatKind::E4B8:
-    return Fp8Kind::E4B8;
   case FloatKind::E5B16:
-    return Fp8Kind::E5B16;
+    return e.floatKind;
   default:
-    return Fp8Kind::None;
+    return std::nullopt;
   }
 }
 
@@ -51,7 +48,8 @@ enum class ConvertKind {
 
 struct ConvertPlan {
   ConvertKind kind = ConvertKind::Cast;
-  Fp8Kind fp8 = Fp8Kind::None;
+  // The fp8 side's encoding, for the pack and unpack kinds.
+  FloatKind fp8 = FloatKind::Ieee;
 
   // The helper name depends on it.
   ElemType to;
@@ -88,10 +86,10 @@ inline bool narrowsFloat(ElemType from, ElemType to) {
 inline ConvertPlan planConvert(ElemType from, ElemType to, Rounding r) {
   ConvertPlan p;
   p.to = to;
-  const Fp8Kind srcFp8 = fp8KindOf(from);
-  const Fp8Kind dstFp8 = fp8KindOf(to);
+  const std::optional<FloatKind> srcFp8 = fp8KindOf(from);
+  const std::optional<FloatKind> dstFp8 = fp8KindOf(to);
 
-  if (srcFp8 != Fp8Kind::None && dstFp8 != Fp8Kind::None) {
+  if (srcFp8 && dstFp8) {
     // fp8 to fp8 would be unpack-then-pack. Nothing asks for it yet.
     p.kind = ConvertKind::Unsupported;
     return p;
@@ -101,15 +99,15 @@ inline ConvertPlan planConvert(ElemType from, ElemType to, Rounding r) {
       from.kind == ElemType::Kind::Float && from.bits <= 32;
   const bool toReachesF32 = to.kind == ElemType::Kind::Float && to.bits <= 32;
 
-  if (dstFp8 != Fp8Kind::None) {
+  if (dstFp8) {
     p.kind = fromReachesF32 ? ConvertKind::Fp8Pack : ConvertKind::Unsupported;
-    p.fp8 = dstFp8;
+    p.fp8 = *dstFp8;
     p.widensOperand = from.bits < 32;
     return p;
   }
-  if (srcFp8 != Fp8Kind::None) {
+  if (srcFp8) {
     p.kind = toReachesF32 ? ConvertKind::Fp8Unpack : ConvertKind::Unsupported;
-    p.fp8 = srcFp8;
+    p.fp8 = *srcFp8;
     if (toReachesF32 && to.bits < 32)
       p.narrows = planConvert(f32(), to, r).kind;
     return p;
@@ -146,4 +144,4 @@ inline Decision convertDecision(const ConvertPlan &p) {
 
 } // namespace agpu
 
-#endif // AGPU_CONVERT_H
+#endif // AGPU_TYPE_CONVERT_H

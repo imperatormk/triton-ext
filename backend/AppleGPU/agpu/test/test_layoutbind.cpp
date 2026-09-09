@@ -139,19 +139,5 @@ int main() {
     CHECK(decls.find(first) < decls.find(second));
   }
 
-  CASE("LayoutSource hands over exactly the four dimensions");
-  {
-    LayoutSource s;
-    s.reg = {64};
-    s.lane = {1, 2, 4, 8, 16};
-    s.warp = {32};
-    const LayoutBasis lb = s.basis();
-    CHECK_EQ(lb.reg, s.reg);
-    CHECK_EQ(lb.lane, s.lane);
-    CHECK_EQ(lb.warp, s.warp);
-    CHECK(lb.block.empty());
-    CHECK(!lb.needsBlockId());
-  }
-
   return ::agpu_test::report("LayoutBind");
 }

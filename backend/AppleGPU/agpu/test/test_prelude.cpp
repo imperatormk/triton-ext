@@ -96,13 +96,6 @@ int main() {
 
     CHECK(out.find("op == " + std::to_string(emuRmwCode(EmuRmw::Max)) +
                    " ? metal::max(cur, v)") != std::string::npos);
-    CHECK_EQ(emuRmwLadder("old"), [&] {
-      std::string s = emuRmwLadder("cur");
-      for (std::size_t i = s.find("cur"); i != std::string::npos;
-           i = s.find("cur", i + 3))
-        s.replace(i, 3, "old");
-      return s;
-    }());
   }
 
   CASE("the packed atomic narrows through a dedicated helper");

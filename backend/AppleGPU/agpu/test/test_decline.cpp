@@ -84,10 +84,9 @@ int main() {
     log.record(Decision::declined("emitScan", "gapped-stride-ladder"));
     log.record(Decision::declined("emitAtomicRMW", "int64-unsupported"));
 
-    CHECK(log.declined("gapped-stride-ladder"));
-    CHECK(log.declined("int64-unsupported"));
-    CHECK(!log.declined("never-happened"));
     CHECK_EQ(log.size(), 3u);
+    CHECK_EQ(log.entries()[1].why(), std::string("gapped-stride-ladder"));
+    CHECK_EQ(log.entries()[2].why(), std::string("int64-unsupported"));
   }
 
   CASE("the same reason from two sites is recorded twice");

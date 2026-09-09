@@ -137,11 +137,6 @@ inline const char *builtinFor(RmwOp op) {
   return nullptr;
 }
 
-inline bool isRenderable(const AtomicFacts &f) {
-  return strategyFor(f) != AtomicStrategy::Unsupported &&
-         (strategyFor(f) != AtomicStrategy::Native || builtinFor(f.op));
-}
-
 inline constexpr int emuRmwCode(EmuRmw op) { return static_cast<int>(op); }
 
 inline EmuRmw emuRmwFor(RmwOp op) {

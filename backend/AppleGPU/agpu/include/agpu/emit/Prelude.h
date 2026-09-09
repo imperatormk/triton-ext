@@ -43,16 +43,16 @@ inline const char *helperName(Helper h) {
 
 // One row per fp8 encoding: which helper packs it and which unpacks it.
 struct Fp8Helpers {
-  Fp8Kind kind;
+  FloatKind kind;
   Helper pack;
   Helper unpack;
 };
 
 inline constexpr Fp8Helpers kFp8Helpers[] = {
-    {Fp8Kind::E4M3, Helper::Fp8PackE4M3, Helper::Fp8UnpackE4M3},
-    {Fp8Kind::E5M2, Helper::Fp8PackE5M2, Helper::Fp8UnpackE5M2},
-    {Fp8Kind::E4B8, Helper::Fp8PackE4B8, Helper::Fp8UnpackE4B8},
-    {Fp8Kind::E5B16, Helper::Fp8PackE5B16, Helper::Fp8UnpackE5B16},
+    {FloatKind::E4M3, Helper::Fp8PackE4M3, Helper::Fp8UnpackE4M3},
+    {FloatKind::E5M2, Helper::Fp8PackE5M2, Helper::Fp8UnpackE5M2},
+    {FloatKind::E4B8, Helper::Fp8PackE4B8, Helper::Fp8UnpackE4B8},
+    {FloatKind::E5B16, Helper::Fp8PackE5B16, Helper::Fp8UnpackE5B16},
 };
 
 inline bool convertHelper(const ConvertPlan &p, Helper &out) {
@@ -160,13 +160,6 @@ inline msl::Expr *emuRmwLadderExpr(msl::Context &c, const char *cur) {
                    c.ternary(isOp(EmuRmw::Max), callOn(msl::builtin::math::Max),
                              c.ternary(isOp(EmuRmw::Min),
                                        callOn(msl::builtin::math::Min), v)));
-}
-
-inline std::string emuRmwLadder(const char *cur) {
-  msl::Context c;
-  std::ostringstream os;
-  msl::Printer(os).printExpr(emuRmwLadderExpr(c, cur));
-  return os.str();
 }
 
 inline msl::Function *helperFn(msl::Context &c, const char *name,

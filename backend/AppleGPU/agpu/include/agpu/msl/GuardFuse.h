@@ -4,29 +4,14 @@
 // `if (c) a; if (c) b; if (c) d;` becomes `if (c) { a; b; d; }`. Requires
 // structurally equal conditions and no statement in the run writing a name the
 // condition reads.
-#ifndef AGPU_MSL_FUSE_H
-#define AGPU_MSL_FUSE_H
+#ifndef AGPU_MSL_GUARD_FUSE_H
+#define AGPU_MSL_GUARD_FUSE_H
 
 #include "Analysis.h"
 #include "Context.h"
 #include "Equal.h"
 
 namespace agpu::msl {
-
-struct FuseCost {
-  int64_t condChars = 0;  // rendered width of the condition
-  int64_t braceChars = 2; // `{` and `}` on their own lines
-
-  // `if (` + cond + `) ` per guarded statement.
-  int64_t perStatement() const { return 4 + condChars + 2; }
-
-  bool worthFusing(int64_t runLength) const {
-    if (runLength < 2)
-      return false;
-    const int64_t saved = (runLength - 1) * perStatement();
-    return saved > braceChars;
-  }
-};
 
 // `opaque` is set when the expression contains a call: `f(x) > 0` reads more
 // than `x`.
@@ -81,26 +66,24 @@ inline std::size_t fusableRun(const Block &b, std::size_t i) {
   return j - i;
 }
 
-inline int64_t fuseGuards(Context &c, Block &body, int64_t condWidth = 8);
+inline int64_t fuseGuards(Context &c, Block &body);
 
-inline int64_t fuseGuardsIn(Context &c, Stmt *s, int64_t condWidth) {
+inline int64_t fuseGuardsIn(Context &c, Stmt *s) {
   int64_t n = 0;
-  forEachChildBlock(
-      s, [&](Block &nested) { n += fuseGuards(c, nested, condWidth); });
+  forEachChildBlock(s, [&](Block &nested) { n += fuseGuards(c, nested); });
   return n;
 }
 
-inline int64_t fuseGuards(Context &c, Block &body, int64_t condWidth) {
+inline int64_t fuseGuards(Context &c, Block &body) {
   int64_t fused = 0;
   Block kept;
   kept.reserve(body.size());
 
-  const FuseCost cost{condWidth};
   for (std::size_t i = 0; i < body.size();) {
-    fused += fuseGuardsIn(c, body[i], condWidth);
+    fused += fuseGuardsIn(c, body[i]);
 
     const std::size_t run = fusableRun(body, i);
-    if (!cost.worthFusing((int64_t)run)) {
+    if (run < 2) {
       kept.push_back(body[i]);
       ++i;
       continue;
@@ -109,7 +92,7 @@ inline int64_t fuseGuards(Context &c, Block &body, int64_t condWidth) {
     Block merged;
     for (std::size_t k = i; k < i + run; ++k) {
       if (k > i)
-        fused += fuseGuardsIn(c, body[k], condWidth);
+        fused += fuseGuardsIn(c, body[k]);
       auto *g = static_cast<If *>(body[k]);
       for (Stmt *inner : g->thenBody)
         merged.push_back(inner);
@@ -125,4 +108,4 @@ inline int64_t fuseGuards(Context &c, Block &body, int64_t condWidth) {
 
 } // namespace agpu::msl
 
-#endif // AGPU_MSL_FUSE_H
+#endif // AGPU_MSL_GUARD_FUSE_H

@@ -137,6 +137,22 @@ PtrOffset AgpuEmitter::offsetSum(agpu::ValueId basePtr, int64_t reg,
   return PtrOffset{name, am::Context::i32(), true};
 }
 
+agpu::MoveFacts AgpuEmitter::moveFactsOf(Value ptr, Value laidOut,
+                                         const agpu::ElemType *elem,
+                                         int64_t regs, bool isStore) {
+  agpu::MoveFacts f;
+  f.regCount = regs;
+  f.isStore = isStore;
+  f.elemBits = elem ? elem->bits : 0; // unknown element: every access scalar
+  f.coherent = coherentBuffer(ptr);
+  if (elem)
+    f.ptr = ptrDimsOf(ptr, *elem);
+  const std::vector<agpu::LayoutBasis> dims = layoutDimsOf(laidOut);
+  f.bases = agpu::regBasesOf(dims);
+  f.runtime = agpu::runtimeSpanOf(dims);
+  return f;
+}
+
 agpu::Decision AgpuEmitter::emitLoad(const agpu::OpView &o,
                                      std::size_t maskIndex) {
   const Ready ready = readyFor(o, 1);
@@ -156,18 +172,11 @@ agpu::Decision AgpuEmitter::emitLoad(const agpu::OpView &o,
     if (!addressAt(o.operands[0], r))
       return declined(o.name, "cannot build register " + std::to_string(r));
 
-  agpu::MoveFacts f;
-  f.regCount = ready.regs;
-  f.elemBits = ready.elem.bits;
+  agpu::MoveFacts f =
+      moveFactsOf(mlirValueOf(o.operands[0]), mlirValueOf(o.results[0]),
+                  &ready.elem, ready.regs, /*isStore=*/false);
   f.hasMask = o.operands.size() > maskIndex;
   f.hasOther = hasOther;
-  f.coherent = coherentBuffer(mlirValueOf(o.operands[0]));
-  f.ptr = ptrDimsOf(mlirValueOf(o.operands[0]), ready.elem);
-
-  const std::vector<agpu::LayoutBasis> lDims =
-      layoutDimsOf(mlirValueOf(o.results[0]));
-  f.bases = agpu::regBasesOf(lDims);
-  f.runtime = agpu::runtimeSpanOf(lDims);
   if (f.hasMask)
     f.bound = maskBoundOf(mlirValueOf(o.operands[maskIndex]),
                           mlirValueOf(o.results[0]));
@@ -256,18 +265,8 @@ agpu::Decision AgpuEmitter::emitStore(const agpu::OpView &o,
       return declined(o.name, "pointer has no recorded offset");
 
   const agpu::ElemType *ve = elemOf(o.operands[1]);
-  agpu::MoveFacts f;
-  f.regCount = regs;
-  f.isStore = true;
-  f.elemBits = ve ? ve->bits : 0; // unknown element: every access scalar
+  agpu::MoveFacts f = moveFactsOf(ptrV, ptrV, ve, regs, /*isStore=*/true);
   f.hasMask = o.operands.size() > maskIndex || elected != nullptr;
-  f.coherent = coherentBuffer(ptrV);
-  if (ve)
-    f.ptr = ptrDimsOf(ptrV, *ve);
-
-  const std::vector<agpu::LayoutBasis> sDims = layoutDimsOf(ptrV);
-  f.bases = agpu::regBasesOf(sDims);
-  f.runtime = agpu::runtimeSpanOf(sDims);
   f.guardHasRuntimeTerm = elected != nullptr;
   if (o.operands.size() > maskIndex)
     f.bound = maskBoundOf(mlirValueOf(o.operands[maskIndex]), ptrV);

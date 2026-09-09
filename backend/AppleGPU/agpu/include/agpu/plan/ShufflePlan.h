@@ -62,20 +62,8 @@ inline bool permIsLinear(const std::vector<int32_t> &perm,
   return true;
 }
 
-// Whether every step shares one permutation, so the lane index is computed
-// once for all registers.
-inline bool permIsUniform(const std::vector<ShuffleStep> &steps) {
-  if (steps.size() < 2)
-    return true;
-  for (std::size_t i = 1; i < steps.size(); ++i)
-    if (steps[i].srcLane != steps[0].srcLane)
-      return false;
-  return true;
-}
-
 struct ShufflePlan {
   std::vector<ShuffleStep> steps;
-  bool uniformLanePerm = false;
   bool linearLanePerm = false;
   std::vector<int32_t> laneBasis;
   int32_t laneOffset = 0; // where lane 0 lands
@@ -141,7 +129,6 @@ planShuffle(const std::vector<int> &srcRegs,
     p.steps.push_back(ShuffleStep{srcRegs[r], laneMaps[r]});
   }
 
-  p.uniformLanePerm = permIsUniform(p.steps);
   if (const std::vector<int32_t> *perm = p.shufflePerm())
     p.linearLanePerm = permIsLinear(*perm, p.laneBasis, p.laneOffset);
   return p;

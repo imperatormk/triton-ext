@@ -157,7 +157,7 @@ agpu::Decision AgpuEmitter::stageDotOperands(const DotOperands &ops,
       agpu::PanelCoords{coordSourceOf(ops.aStageTy),
                         coordSourceOf(ops.bStageTy), coordSourceOf(ops.cOutTy)};
 
-  setTileInputs(ops, plan, stagedAElem, stagedBElem, in);
+  setTileInputs(ops, plan, in);
 
   // A drain that stores straight to device has no readback, so C's register
   // layout is never asked for.
@@ -167,25 +167,15 @@ agpu::Decision AgpuEmitter::stageDotOperands(const DotOperands &ops,
 }
 
 void AgpuEmitter::setTileInputs(const DotOperands &ops, const agpu::Plan &plan,
-                                const agpu::ElemType &stagedAElem,
-                                const agpu::ElemType &stagedBElem,
                                 agpu::DotInputs &in) {
-  const agpu::ValueId aId = ops.aStage, bId = ops.bStage;
-  const agpu::ValueId cId = ops.cOut;
-  const RankedTensorType aTy = ops.aStageTy, bTy = ops.bStageTy;
-  const RankedTensorType cTy = ops.cOutTy;
-  // `in.a` is the device source when A is read in place. The staged case
-  // rebuilds a per-tile pool source inside the callback: a panel tile's pitch
-  // is the tile's.
-  // Resolved once here: narrowing a widened register mints a temporary, which
-  // belongs in this block.
-  in.tileInputs = [this, plan, aId, aTy, bId, bTy, cId, cTy, deviceA = in.a,
-                   poolA = in.panel.poolA, cIn = ops.cIn, stagedAElem,
-                   stagedBElem, aNames = stagedNamesOf(aId, registerCount(aTy)),
-                   bNames = stagedNamesOf(bId, registerCount(bTy)),
-                   cElem = ops.shape.cElem](const agpu::PanelTile &t) {
-    return panelInputsFor(t, plan, aId, aTy, bId, bTy, cId, cTy, deviceA, poolA,
-                          cIn, stagedAElem, stagedBElem, cElem, aNames, bNames);
+  // Names are resolved here: narrowing a widened register mints a temporary,
+  // which belongs in this block.
+  const PanelStaging staged{
+      in.a, in.panel.poolA,
+      stagedNamesOf(ops.aStage, registerCount(ops.aStageTy)),
+      stagedNamesOf(ops.bStage, registerCount(ops.bStageTy))};
+  in.tileInputs = [this, ops, plan, staged](const agpu::PanelTile &t) {
+    return panelInputsFor(t, ops, plan, staged);
   };
 }
 
@@ -295,14 +285,10 @@ AgpuEmitter::planTileActions(agpu::ValueId v, RankedTensorType ty,
   return agpu::Decision::emitted();
 }
 
-agpu::PanelInputs AgpuEmitter::panelInputsFor(
-    const agpu::PanelTile &t, const agpu::Plan &plan, agpu::ValueId aId,
-    RankedTensorType aTy, agpu::ValueId bId, RankedTensorType bTy,
-    agpu::ValueId cId, RankedTensorType cTy, const agpu::OperandSource &deviceA,
-    const am::Str &poolAName, const am::SmallVec<am::Str, 8> &cIn,
-    const agpu::ElemType &aElem, const agpu::ElemType &bElem,
-    const agpu::ElemType &cElem, const am::SmallVec<am::Str, 8> &aNames,
-    const am::SmallVec<am::Str, 8> &bNames) {
+agpu::PanelInputs AgpuEmitter::panelInputsFor(const agpu::PanelTile &t,
+                                              const DotOperands &ops,
+                                              const agpu::Plan &plan,
+                                              const PanelStaging &staged) {
   if (agpu_.gates.on(agpu::Gate::TraceOps)) {
     std::ostringstream os;
     os << "  panelInputsFor m=" << t.m.lo << ".." << t.m.hi << " n=" << t.n.lo
@@ -310,9 +296,9 @@ agpu::PanelInputs AgpuEmitter::panelInputsFor(
     appendLog(agpu::Gate::TraceOps, os.str());
   }
   agpu::PanelInputs in;
-  in.aElem = aElem;
-  in.bElem = bElem;
-  in.cRegElem = cElem;
+  in.aElem = stagedElemOf(plan, ops.shape.aElem);
+  in.bElem = stagedElemOf(plan, ops.shape.bElem);
+  in.cRegElem = ops.shape.cElem;
 
   // Every operand plans even after one declines, so each `Actions` vector is
   // filled; the first decline is kept for its reason.
@@ -326,30 +312,31 @@ agpu::PanelInputs AgpuEmitter::panelInputsFor(
   // A device-resident A plans no staging: the MMA reads it through `deviceA`
   // with this tile's corner as origin, since fragment indices are tile-local.
   if (t.aDirect) {
-    in.a = deviceA;
+    in.a = staged.deviceA;
     in.a.rowOrigin = t.m.lo;
     in.a.colOrigin = t.k.lo;
   } else {
-    in.a.buffer = poolAName;
+    in.a.buffer = staged.poolA;
     in.a.leadingDim = agpu::Stride(t.aView().strideAt(0));
-    in.aNames = aNames;
-    plan1(planTileActions(aId, aTy, t.aWindows(), t.aStagedView(), aElem.bits,
-                          in.aActions, "tt.dot"),
+    in.aNames = staged.aNames;
+    plan1(planTileActions(ops.aStage, ops.aStageTy, t.aWindows(),
+                          t.aStagedView(), in.aElem.bits, in.aActions,
+                          "tt.dot"),
           "A");
   }
-  in.bNames = bNames;
-  plan1(planTileActions(bId, bTy, t.bWindows(), t.bStagedView(), bElem.bits,
-                        in.bActions, "tt.dot"),
+  in.bNames = staged.bNames;
+  plan1(planTileActions(ops.bStage, ops.bStageTy, t.bWindows(), t.bStagedView(),
+                        in.bElem.bits, in.bActions, "tt.dot"),
         "B");
 
   // C is the dot's result and has no bound names yet, so they are minted below.
-  plan1(planTileActions(cId, cTy, t.cWindows(), t.cStagedView(),
+  plan1(planTileActions(ops.cOut, ops.cOutTy, t.cWindows(), t.cStagedView(),
                         (int)agpu::kAccBits, in.cActions, "tt.dot"),
         "C");
-  for (int64_t r = 0; r < registerCount(cTy); ++r)
-    in.cNames.push_back(accName(cId, r));
+  for (int64_t r = 0; r < registerCount(ops.cOutTy); ++r)
+    in.cNames.push_back(accName(ops.cOut, r));
 
-  in.cBases = cIn;
+  in.cBases = ops.cIn;
   in.cBases.resize(in.cNames.size());
   if (plan.readsBackByRename())
     in.cRename = agpu::panelTileReadback(plan.facts, t);

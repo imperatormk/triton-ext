@@ -146,7 +146,7 @@ struct MovePlan {
 
   MaskGuards guards;
 
-  // Read by `moveDecision` for the reason the access did not vectorise.
+  // The width analysis the runs came from.
   AccessPlan access;
 
   int64_t width() const { return runs.width; }
@@ -163,16 +163,6 @@ inline MovePlan planMove(const MoveFacts &f) {
   p.init = initFor(f);
   p.coherent = f.coherent;
   return p;
-}
-
-inline Decision moveDecision(const MovePlan &p, const MoveFacts &f) {
-  if (p.vectorised())
-    return Decision::emitted();
-  const Decision w = widthDecision(p.access, p.elem);
-  if (w.ok())
-    return Decision::declined(f.where(),
-                              "registers do not form an aligned run");
-  return Decision::declined(f.where(), w.why());
 }
 
 } // namespace agpu

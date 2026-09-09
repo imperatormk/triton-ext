@@ -160,34 +160,6 @@ int main() {
     CHECK(regionDecision(f, p).isDecline());
   }
 
-  CASE("reachability follows the edges from the entry");
-  {
-    RegionFacts f;
-    f.blocks.resize(3);
-    f.blocks[0].term = TermKind::Branch;
-    f.blocks[0].edges = {Edge{1, {}}};
-    f.blocks[1].term = TermKind::Return;
-    f.blocks[2].term = TermKind::Return; // nothing branches here
-
-    const std::vector<bool> seen = reachableBlocks(f);
-    CHECK(seen[0]);
-    CHECK(seen[1]);
-    CHECK(!seen[2]);
-  }
-
-  CASE("a cycle in the edges still terminates the search");
-  {
-    RegionFacts f;
-    f.blocks.resize(2);
-    f.blocks[0].term = TermKind::Branch;
-    f.blocks[0].edges = {Edge{1, {}}};
-    f.blocks[1].term = TermKind::Branch;
-    f.blocks[1].edges = {Edge{0, {}}};
-    const std::vector<bool> seen = reachableBlocks(f);
-    CHECK(seen[0]);
-    CHECK(seen[1]);
-  }
-
   CASE("a region emits its hoists, then a dispatch loop");
   {
     RegionFacts f = chain();

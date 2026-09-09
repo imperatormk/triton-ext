@@ -1,4 +1,5 @@
-#pragma once
+#ifndef TRITON_APPLEGPU_IR_DIALECT_H
+#define TRITON_APPLEGPU_IR_DIALECT_H
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
@@ -11,3 +12,5 @@
 #include "Dialect/TritonAppleGPU/IR/TritonAppleGPUAttrDefs.h.inc"
 
 #include "LinearLayoutDims.h"
+
+#endif // TRITON_APPLEGPU_IR_DIALECT_H

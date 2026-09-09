@@ -25,15 +25,13 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
     if (cv.elem.isPointer())
       markBasePointer(idOf(arg));
 
-    agpu::CarriedValue iv;
-    if (const agpu::Decision d =
-            carriedFrom(init, cv, iv, "scf.for",
-                        "a loop's initial value has no register names");
-        !d.ok())
-      return d;
+    const agpu::Result<agpu::CarriedValue> iv = carriedFrom(
+        init, cv, "scf.for", "a loop's initial value has no register names");
+    if (!iv.ok())
+      return iv.why;
 
     carriedNames.push_back(cv.regs);
-    initNamesOf.push_back(iv.regs);
+    initNamesOf.push_back(iv.value.regs);
     carriedShape.push_back(cv);
   }
 
@@ -77,13 +75,12 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
         continue;
       }
 
-      agpu::CarriedValue got;
-      if (const agpu::Decision d =
-              carriedFrom(y.getOperand(i), carriedShape[i], got, "scf.for",
-                          "a yielded value has no register names");
-          !d.ok())
-        return d;
-      yieldValues.push_back(got);
+      const agpu::Result<agpu::CarriedValue> got =
+          carriedFrom(y.getOperand(i), carriedShape[i], "scf.for",
+                      "a yielded value has no register names");
+      if (!got.ok())
+        return got.why;
+      yieldValues.push_back(got.value);
     }
     return agpu::Decision::emitted();
   });
@@ -100,12 +97,14 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
     if (inFragments(fused, idOf(res)))
       continue;
 
-    if (const agpu::Decision d = carriedFor(res, carried, carriedNames[i]);
-        !d.ok())
-      return d;
-    if (const agpu::Decision d = carriedFor(res, inits, initNamesOf[i]);
-        !d.ok())
-      return d;
+    const agpu::Result<agpu::CarriedValue> c = carriedFor(res, carriedNames[i]);
+    if (!c.ok())
+      return c.why;
+    const agpu::Result<agpu::CarriedValue> in = carriedFor(res, initNamesOf[i]);
+    if (!in.ok())
+      return in.why;
+    carried.push_back(c.value);
+    inits.push_back(in.value);
     yielded.push_back(yieldValues[i]);
   }
 
@@ -139,8 +138,10 @@ agpu::Decision AgpuEmitter::emitIfOp(scf::IfOp ifOp) {
   const auto walkArm = [&](Region &region, am::Block &into,
                            agpu::Carried &yielded) {
     return walkRegion(region, into, [&] {
-      return carriedOperands(region.front().getTerminator(), results, yielded,
-                             "scf.if");
+      const agpu::Result<agpu::Carried> y =
+          carriedOperands(region.front().getTerminator(), results, "scf.if");
+      yielded = y.value;
+      return y.why;
     });
   };
 
@@ -176,13 +177,12 @@ agpu::Decision AgpuEmitter::emitWhileOp(scf::WhileOp wh) {
   for (BlockArgument arg : wh.getBeforeArguments())
     carried.push_back(carriedFresh(arg));
   for (std::size_t i = 0; i < carried.size(); ++i) {
-    agpu::CarriedValue iv;
-    if (const agpu::Decision d =
-            carriedFrom(wh.getInits()[i], carried[i], iv, "scf.while",
-                        "a loop's initial value has no register names");
-        !d.ok())
-      return d;
-    inits.push_back(iv);
+    const agpu::Result<agpu::CarriedValue> iv =
+        carriedFrom(wh.getInits()[i], carried[i], "scf.while",
+                    "a loop's initial value has no register names");
+    if (!iv.ok())
+      return iv.why;
+    inits.push_back(iv.value);
   }
 
   agpu::Carried results;
@@ -204,14 +204,13 @@ agpu::Decision AgpuEmitter::emitWhileOp(scf::WhileOp wh) {
 
   agpu::Carried forwarded;
   for (std::size_t i = 0; i < results.size(); ++i) {
-    agpu::CarriedValue cv;
-    if (const agpu::Decision d =
-            carriedFrom(condOp.getArgs()[i], results[i], cv, "scf.while",
-                        "a forwarded value has no register names");
-        !d.ok())
-      return d;
-    forwarded.push_back(cv);
-    bindCarried(wh.getAfterArguments()[i], cv);
+    const agpu::Result<agpu::CarriedValue> cv =
+        carriedFrom(condOp.getArgs()[i], results[i], "scf.while",
+                    "a forwarded value has no register names");
+    if (!cv.ok())
+      return cv.why;
+    forwarded.push_back(cv.value);
+    bindCarried(wh.getAfterArguments()[i], cv.value);
   }
 
   agpu::Carried yielded;
@@ -219,8 +218,10 @@ agpu::Decision AgpuEmitter::emitWhileOp(scf::WhileOp wh) {
   if (const agpu::Decision d = walkRegion(
           wh.getAfter(), afterArm,
           [&] {
-            return carriedOperands(wh.getAfter().front().getTerminator(),
-                                   carried, yielded, "scf.while");
+            const agpu::Result<agpu::Carried> y = carriedOperands(
+                wh.getAfter().front().getTerminator(), carried, "scf.while");
+            yielded = y.value;
+            return y.why;
           });
       !d.ok())
     return d;

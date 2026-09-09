@@ -114,36 +114,12 @@ inline msl::Function *emitDeviceFn(msl::Context &c, const DeviceFnFacts &f,
 
 // ── the call side ─────────────────────────────────────────────────────────
 
-// Names the caller holds for the implicit arguments it passes down. Order
-// comes from the ABI.
-struct CallerContext {
-  msl::Str threadgroupPos;
-  msl::Str threadId;
-  msl::Str gridSize;
-  msl::Str pool;
-  msl::Str assertBuffer;
-
-  const msl::Str &of(ImplicitArg a) const {
-    switch (a) {
-    case ImplicitArg::ThreadgroupPos:
-      return threadgroupPos;
-    case ImplicitArg::ThreadId:
-      return threadId;
-    case ImplicitArg::ThreadgroupCount:
-      return gridSize;
-    case ImplicitArg::Pool:
-      return pool;
-    case ImplicitArg::Asserts:
-      return assertBuffer;
-    }
-    return pool;
-  }
-};
-
+// `caller` names what the calling function holds for the implicit
+// arguments, in the order the ABI appends them.
 inline msl::Expr *deviceCallExpr(msl::Context &c, const DeviceFnFacts &f,
                                  const DeviceFnAbi &abi,
                                  const std::vector<msl::Str> &args,
-                                 const CallerContext &caller) {
+                                 const DeviceFnNames &caller) {
   msl::SmallVec<msl::Expr *, 4> all;
   for (const msl::Str &a : args)
     all.push_back(c.var(a));
@@ -157,7 +133,7 @@ inline msl::Expr *deviceCallExpr(msl::Context &c, const DeviceFnFacts &f,
 inline void emitDeviceCall(msl::Context &c, msl::Block &body,
                            const DeviceFnFacts &f, const DeviceFnAbi &abi,
                            const std::vector<msl::Str> &args,
-                           const CallerContext &caller,
+                           const DeviceFnNames &caller,
                            const std::vector<msl::Str> &resultNames,
                            const msl::Str &tmp = "callret",
                            const DeviceFnNames &nm = {}) {

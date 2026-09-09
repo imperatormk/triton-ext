@@ -146,27 +146,6 @@ inline Decision regionDecision(const RegionFacts &f, const RegionPlan &p) {
   return Decision::emitted();
 }
 
-// An unreachable block is legal to emit, but usually means the caller built
-// the edges wrong.
-inline std::vector<bool> reachableBlocks(const RegionFacts &f) {
-  std::vector<bool> seen(f.blocks.size(), false);
-  if (f.blocks.empty())
-    return seen;
-
-  std::vector<BlockId> work{f.entry};
-  seen[(std::size_t)f.entry] = true;
-  while (!work.empty()) {
-    const BlockId b = work.back();
-    work.pop_back();
-    for (const Edge &e : f.blocks[(std::size_t)b].edges)
-      if (!seen[(std::size_t)e.to]) {
-        seen[(std::size_t)e.to] = true;
-        work.push_back(e.to);
-      }
-  }
-  return seen;
-}
-
 } // namespace agpu
 
 #endif // AGPU_REGION_PLAN_H

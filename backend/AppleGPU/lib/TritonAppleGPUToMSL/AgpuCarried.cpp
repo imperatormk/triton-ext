@@ -24,13 +24,14 @@ agpu::CarriedValue AgpuEmitter::carriedFresh(Value v) {
   return cv;
 }
 
-agpu::Decision AgpuEmitter::carriedFrom(Value v, const agpu::CarriedValue &like,
-                                        agpu::CarriedValue &out,
-                                        std::string_view where,
-                                        std::string_view why) {
+agpu::Result<agpu::CarriedValue>
+AgpuEmitter::carriedFrom(Value v, const agpu::CarriedValue &like,
+                         std::string_view where, std::string_view why) {
+  using R = agpu::Result<agpu::CarriedValue>;
   const Operand from(body_.sym, idOf(v), (int64_t)like.regs.size());
   if (!from.ok())
-    return declined(where, std::string(why));
+    return R::no(declined(where, std::string(why)));
+  agpu::CarriedValue out;
   out.elem = like.elem;
 
   // A carried variable holds an address. Elsewhere `addptr` binds the base
@@ -55,25 +56,26 @@ agpu::Decision AgpuEmitter::carriedFrom(Value v, const agpu::CarriedValue &like,
                                agpu_.context().var(off->second.name))));
     out.regs.push_back(addr);
   }
-  return agpu::Decision::emitted();
+  return R::of(std::move(out));
 }
 
-agpu::Decision AgpuEmitter::carriedOperands(Operation *term,
-                                            const agpu::Carried &like,
-                                            agpu::Carried &out,
-                                            std::string_view where) {
+agpu::Result<agpu::Carried>
+AgpuEmitter::carriedOperands(Operation *term, const agpu::Carried &like,
+                             std::string_view where) {
+  using R = agpu::Result<agpu::Carried>;
   if (!term || term->getNumOperands() != like.size())
-    return declined(where, "the yield does not match its carried values");
+    return R::no(
+        declined(where, "the yield does not match its carried values"));
+  agpu::Carried out;
   for (std::size_t i = 0; i < like.size(); ++i) {
-    agpu::CarriedValue cv;
-    if (const agpu::Decision d =
-            carriedFrom(term->getOperand(i), like[i], cv, where,
-                        "a yielded value has no register names");
-        !d.ok())
-      return d;
-    out.push_back(cv);
+    const agpu::Result<agpu::CarriedValue> cv =
+        carriedFrom(term->getOperand(i), like[i], where,
+                    "a yielded value has no register names");
+    if (!cv.ok())
+      return R::no(cv.why);
+    out.push_back(cv.value);
   }
-  return agpu::Decision::emitted();
+  return R::of(std::move(out));
 }
 
 void AgpuEmitter::bindCarried(Value v, const agpu::CarriedValue &cv) {
@@ -95,17 +97,17 @@ AgpuEmitter::walkRegion(Region &region, am::Block &into,
   return atEnd();
 }
 
-agpu::Decision AgpuEmitter::carriedFor(Value v, agpu::Carried &out,
-                                       const agpu::ValueNames &names) {
+agpu::Result<agpu::CarriedValue>
+AgpuEmitter::carriedFor(Value v, const agpu::ValueNames &names) {
+  using R = agpu::Result<agpu::CarriedValue>;
   const std::optional<agpu::ElemType> e = heldTypeFor(v);
   if (!e)
-    return declined("scf.for", "a carried value has no element type");
+    return R::no(declined("scf.for", "a carried value has no element type"));
   agpu::CarriedValue cv;
   cv.elem = *e;
   for (const am::Str &n : names)
     cv.regs.push_back(n);
-  out.push_back(std::move(cv));
-  return agpu::Decision::emitted();
+  return R::of(std::move(cv));
 }
 
 } // namespace mlir::triton::applegpu::bridge

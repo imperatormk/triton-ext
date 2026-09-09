@@ -23,11 +23,9 @@ enum class EwOp {
   DivU,
   RemS,
   RemU,
-  // Float division and remainder. DivS/DivU promote their operands to a
-  // signedness, which is meaningless for a float and `%` does not apply to
-  // floats: RemF is `fmod`.
+  // Float division. DivS/DivU promote their operands to a signedness, which
+  // is meaningless for a float. Float remainder is `fmod`, in MathFn2.
   DivF,
-  RemF,
   // Bitwise.
   And,
   Or,
@@ -285,8 +283,6 @@ inline constexpr EwSpelling kEwSpellings[] = {
     {EwOp::CmpGtU, msl::BinOp::Gt},
     {EwOp::CmpGeS, msl::BinOp::Ge},
     {EwOp::CmpGeU, msl::BinOp::Ge},
-    // RemF has no operator: `%` does not apply to floats. It is `fmod`,
-    // routed to the math family by checkEw.
 };
 
 // The table row for an operation, or null when it has no spelling.
@@ -434,9 +430,6 @@ inline FCmpPlan planFCmp(FCmp p) {
 
 // Whether an operation applies to an element type at all.
 inline Decision checkEw(EwOp op, ElemType elem) {
-  if (op == EwOp::RemF)
-    return Decision::declined("elementwise", "float remainder is fmod");
-
   const EwSpelling *s = spellingRow(op);
   if (!s)
     return Decision::declined("elementwise", "no spelling for this operation");

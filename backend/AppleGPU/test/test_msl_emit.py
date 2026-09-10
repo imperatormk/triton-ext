@@ -1,7 +1,7 @@
 """Asserts on the MSL emitted for checked-in TTGIR fixtures.
 
 Run: pytest backend/AppleGPU/test/test_msl_emit.py
-Needs TRITON_PLUGIN_PATHS pointing at the built libapplegpu_backend dylib.
+Needs the backend built, so its dylib sits beside triton_apple_backend.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def _plugin_loaded() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _plugin_loaded(),
-    reason="AppleGPU plugin not loaded (set TRITON_PLUGIN_PATHS)")
+    reason="AppleGPU plugin not loaded (build the backend)")
 
 
 def emit(fixture: str) -> str:

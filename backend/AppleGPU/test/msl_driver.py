@@ -26,8 +26,8 @@ def _plugin():
     plugin = getattr(passes, "plugin", None)
     if plugin is None or not hasattr(plugin, "add_emit_msl"):
         print(
-            "AppleGPU plugin not loaded: set TRITON_PLUGIN_PATHS to the "
-            "libapplegpu_backend dylib built from this tree.",
+            "AppleGPU plugin not loaded: build the backend so the dylib "
+            "sits beside triton_apple_backend.",
             file=sys.stderr)
         raise SystemExit(EXIT_NO_PLUGIN)
     return plugin

@@ -54,7 +54,6 @@ add_mlir_library(TritonAppleGPUBackend
 )
 
 target_link_libraries(TritonAppleGPUBackend PUBLIC MLIRMathTransforms)
-target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-dead_strip)
 
 target_compile_options(TritonAppleGPUBackend PRIVATE
     -Wall -Wextra -Wno-missing-field-initializers)
@@ -67,7 +66,8 @@ set_target_properties(TritonAppleGPUBackend PROPERTIES
 # On macOS with shared LLVM, use flat namespace so the plugin can resolve
 # LLVM symbols from any loaded dylib (not just the one it was linked against).
 if(APPLE)
-    target_link_options(TritonAppleGPUBackend PRIVATE -Wl,-flat_namespace)
+    target_link_options(TritonAppleGPUBackend PRIVATE
+        -Wl,-dead_strip -Wl,-flat_namespace)
 endif()
 
 install(TARGETS TritonAppleGPUBackend

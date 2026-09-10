@@ -16,7 +16,7 @@ triton-ext/backend/AppleGPU/
         └── triton_apple_backend/
               ├── compiler.py    TTIR → TTGIR → MSL → metallib
               ├── driver.py      MPS dispatch, buffer binding, scalar packing
-              └── metal_utils.m  ObjC++ Metal bridge, built beside its source
+              └── metal_torch.m  ObjC++ Metal bridge, built beside its source
 ```
 
 ## Scope
@@ -49,7 +49,7 @@ ninja -C build libapplegpu_backend.dylib
 
 This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/`.
 
-The plugin target also builds two ObjC++ bridges. `metal_utils` links the torch
+The plugin target also builds two ObjC++ bridges. `metal_torch` links the torch
 cmake found and dispatches MPS tensors zero-copy on torch's own stream; point
 `-DTorch_DIR` at a different torch and it links that one. `metal_native` links
 only Metal and is what the driver uses when torch is not installed: it owns a

@@ -1,5 +1,5 @@
 """Apple GPU Triton backend driver. Dispatch pipeline:
-  metallib bytes -> metal_utils.load_metallib(bytes) -> MetalLibrary.get_function(name)
+  metallib bytes -> metal_torch.load_metallib(bytes) -> MetalLibrary.get_function(name)
   -> MetalKernel (PSO) -> kernel(*tensors, threads=, group_size=)
 """
 
@@ -19,13 +19,13 @@ from triton_apple_backend.tables import TY_TO_CPP as _TY_TO_CPP
 
 class _TorchRuntime:
     """Zero-copy dispatch of MPS tensors on torch's own MPS stream, through
-    metal_utils (linked against libtorch)."""
+    metal_torch (linked against libtorch)."""
 
     def __init__(self):
         import torch
-        from triton_apple_backend import metal_utils
+        from triton_apple_backend import metal_torch
         self.torch = torch
-        self.metal = metal_utils
+        self.metal = metal_torch
 
     def is_available(self):
         return self.torch.backends.mps.is_available()
@@ -176,7 +176,7 @@ def _pack_scalars(scalar_types, scalar_values, total_size, offsets):
 
 
 class MetalUtils:
-    """Metal GPU utils. JIT-compiles metal_utils.m for zero-copy MPS tensor
+    """Metal GPU utils. JIT-compiles metal_torch.m for zero-copy MPS tensor
     dispatch."""
 
     def __init__(self):

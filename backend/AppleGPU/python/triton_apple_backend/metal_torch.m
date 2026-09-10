@@ -1,4 +1,4 @@
-// metal_utils - Triton Apple backend Metal runtime. Links against the user's
+// metal_torch - Triton Apple backend Metal runtime. Links against the user's
 // libtorch for getMTLBufferStorage() (zero-copy MPS tensor dispatch).
 // Requires PyTorch 2.0+ with MPS.
 
@@ -118,7 +118,7 @@ static bool packArguments(PyObject *args, std::vector<ArgInfo> *out) {
       if (!t.defined() || !t.has_storage()) {
         PyErr_Format(PyExc_RuntimeError,
                      "Arg %zd: tensor is undefined or has no storage "
-                     "(rebuild metal_utils against the current libtorch?)",
+                     "(rebuild metal_torch against the current libtorch?)",
                      i);
         return false;
       }
@@ -257,7 +257,7 @@ static PyGetSetDef MetalKernel_getset[] = {{"max_total_threads_per_threadgroup",
 
 static PyTypeObject MetalKernelType = {
     .ob_base = PyVarObject_HEAD_INIT(NULL, 0).tp_name =
-        "metal_utils.MetalKernel",
+        "metal_torch.MetalKernel",
     .tp_basicsize = sizeof(MetalKernelObject),
     .tp_dealloc = (destructor)MetalKernel_dealloc,
     .tp_call = (ternaryfunc)MetalKernel_call,
@@ -337,7 +337,7 @@ static PyGetSetDef MetalLibrary_getset[] = {
 
 static PyTypeObject MetalLibraryType = {
     .ob_base = PyVarObject_HEAD_INIT(NULL, 0).tp_name =
-        "metal_utils.MetalLibrary",
+        "metal_torch.MetalLibrary",
     .tp_basicsize = sizeof(MetalLibraryObject),
     .tp_dealloc = (destructor)MetalLibrary_dealloc,
     .tp_flags = Py_TPFLAGS_DEFAULT,
@@ -521,11 +521,11 @@ static PyMethodDef module_methods[] = {
     {NULL}};
 
 static struct PyModuleDef module_def = {
-    PyModuleDef_HEAD_INIT, "metal_utils",
+    PyModuleDef_HEAD_INIT, "metal_torch",
     "Triton Metal runtime: zero-copy MPS dispatch via libtorch", -1,
     module_methods};
 
-PyMODINIT_FUNC PyInit_metal_utils(void) {
+PyMODINIT_FUNC PyInit_metal_torch(void) {
   PyObject *m = PyModule_Create(&module_def);
   if (!m)
     return NULL;

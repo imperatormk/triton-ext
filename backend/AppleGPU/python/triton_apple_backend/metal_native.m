@@ -15,6 +15,8 @@
 - (dispatch_data_t)libraryDataContents;
 @end
 
+// Read and written under the GIL. `sync_gpu` is the one place that drops it,
+// and it takes `g_last` before releasing and reaps after reacquiring.
 static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;
 static id<MTLCommandBuffer> g_last = nil;

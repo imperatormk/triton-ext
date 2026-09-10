@@ -47,8 +47,17 @@ cmake -S . -B build -G Ninja -DPython_EXECUTABLE=$(which python)
 ninja -C build libapplegpu_backend.dylib
 ```
 
-The plugin target also builds `metal_utils`, the ObjC++ bridge that links the
-torch cmake found. Point `-DTorch_DIR` at a different torch to link that one.
+This builds `libapplegpu_backend.dylib` (or `.so`) under `build/lib/`.
+
+The plugin target also builds two ObjC++ bridges. `metal_utils` links the torch
+cmake found and dispatches MPS tensors zero-copy on torch's own stream; point
+`-DTorch_DIR` at a different torch and it links that one. `metal_native` links
+only Metal and is what the driver uses when torch is not installed: it owns a
+command queue, and kernel pointer arguments are `metal_native.MetalBuffer`
+objects, from `alloc(nbytes, dtype)` or `wrap(array)` over numpy /
+buffer-protocol memory (zero-copy where Metal accepts the address; the
+documented requirement is page alignment). Read results back through the buffer
+protocol (`np.frombuffer(buf, dtype)`), which waits for the queue.
 
 ## Run
 

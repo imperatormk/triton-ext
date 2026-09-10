@@ -15,8 +15,6 @@ from __future__ import annotations
 import sysconfig
 from pathlib import Path
 
-import triton._C.libtriton as libtriton
-
 PLUGIN_DIR = Path(__file__).resolve().parent
 PLUGIN_NAME = "libapplegpu_backend.dylib"
 PLUGIN_LIBRARY = next(
@@ -25,4 +23,5 @@ PLUGIN_LIBRARY = next(
                  PLUGIN_NAME) if p.exists()), None)
 
 if PLUGIN_LIBRARY is not None:
+    import triton._C.libtriton as libtriton
     libtriton.passes.plugin.extend_with(str(PLUGIN_LIBRARY))  # adds passes

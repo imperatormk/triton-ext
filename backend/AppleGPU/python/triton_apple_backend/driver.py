@@ -3,10 +3,10 @@
   -> MetalKernel (PSO) -> kernel(*tensors, threads=, group_size=)
 """
 
+import importlib.util as _importlib_util
 import os as _os
 import re as _re
 import struct as _struct
-import torch
 from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -17,9 +17,110 @@ from triton_apple_backend.tables import SCALAR_PACK_INFO as _SCALAR_PACK_INFO
 from triton_apple_backend.tables import TY_TO_CPP as _TY_TO_CPP
 
 
-def _load_metal_utils():
-    from triton_apple_backend import metal_utils
-    return metal_utils
+class _TorchRuntime:
+    """Zero-copy dispatch of MPS tensors on torch's own MPS stream, through
+    metal_utils (linked against libtorch)."""
+
+    def __init__(self):
+        import torch
+        from triton_apple_backend import metal_utils
+        self.torch = torch
+        self.metal = metal_utils
+
+    def is_available(self):
+        return self.torch.backends.mps.is_available()
+
+    def core_count(self):
+        return getattr(self.torch._C, '_mps_get_core_count', lambda: 10)()
+
+    def zeros_i32(self, n):
+        return self.torch.zeros(n, dtype=self.torch.int32, device='mps')
+
+    def as_u32(self, buf):
+        return buf.cpu().numpy().view('uint32')
+
+    def device_interface(self):
+        return self.torch.mps
+
+    def active_device(self):
+        return self.torch.device("mps", 0)
+
+    def empty_cache(self):
+        return self.torch.empty(256 * 1024 * 1024 // 4,
+                                dtype=self.torch.int32,
+                                device='mps')
+
+    def clear_cache(self, cache):
+        cache.zero_()
+
+
+class _NativeDeviceInterface:
+
+    def __init__(self, metal):
+        self._metal = metal
+
+    def synchronize(self):
+        self._metal.synchronize()
+
+    def current_device(self):
+        return 0
+
+
+class _NativeRuntime:
+    """Dispatch without torch, through metal_native: its own command queue,
+    and pointer arguments are metal_native.MetalBuffer objects (alloc, or
+    wrap over numpy / buffer-protocol memory)."""
+
+    def __init__(self):
+        from triton_apple_backend import metal_native
+        self.metal = metal_native
+
+    def is_available(self):
+        return self.metal.is_available()
+
+    def core_count(self):
+        return 10
+
+    def zeros_i32(self, n):
+        import numpy as np
+        return self.metal.alloc(n * 4, np.dtype('int32'))
+
+    def as_u32(self, buf):
+        import numpy as np
+        return np.frombuffer(buf, dtype=np.uint32)
+
+    def device_interface(self):
+        return _NativeDeviceInterface(self.metal)
+
+    def active_device(self):
+        raise RuntimeError("no torch device: torch is not installed")
+
+    def empty_cache(self):
+        import numpy as np
+        return self.metal.alloc(256 * 1024 * 1024, np.dtype('int32'))
+
+    def clear_cache(self, cache):
+        import numpy as np
+        np.frombuffer(cache, dtype=np.int32)[:] = 0
+
+
+_RUNTIME = None
+
+
+def _torch_installed():
+    try:
+        return _importlib_util.find_spec("torch") is not None
+    except Exception:
+        return False
+
+
+def _runtime():
+    """Torch wins whenever it is installed; metal_native serves a box without
+    it."""
+    global _RUNTIME
+    if _RUNTIME is None:
+        _RUNTIME = (_TorchRuntime if _torch_installed() else _NativeRuntime)()
+    return _RUNTIME
 
 
 def ty_to_cpp(ty):
@@ -79,7 +180,8 @@ class MetalUtils:
     dispatch."""
 
     def __init__(self):
-        self._metal = _load_metal_utils()
+        self._rt = _runtime()
+        self._metal = self._rt.metal
 
     def load_binary(self, name, metallib_bytes, shared_mem, device):
         """Returns (module, function, n_regs, n_spills, n_max_threads)."""
@@ -109,12 +211,9 @@ class MetalUtils:
 
     def get_device_properties(self, device):
         return {
-            "warpSize":
-            _WARP_SIZE,
-            "max_shared_mem":
-            _TG_BUDGET_BYTES,
-            "multiprocessorCount":
-            getattr(torch._C, '_mps_get_core_count', lambda: 10)(),
+            "warpSize": _WARP_SIZE,
+            "max_shared_mem": _TG_BUDGET_BYTES,
+            "multiprocessorCount": self._rt.core_count(),
         }
 
     def get_current_device(self):
@@ -238,16 +337,15 @@ class MetalLauncher:
             """Recursively flatten an arg value, expanding tuples to leaves."""
             if isinstance(a, TensorWrapper):
                 out.append(a.base)
-            elif isinstance(a, torch.Tensor):
-                # Don't unwrap to `a._base`: that drops storage_offset, which
-                # the launcher applies separately via setBuffer:offset:.
-                out.append(a)
             elif isinstance(a, TensorDescriptor):
                 out.extend(decompose_descriptor(a))
             elif isinstance(a, tuple):
                 for elem in a:
                     _flatten_arg(elem, out)
             else:
+                # A tensor stays whole: unwrapping to `a._base` drops
+                # storage_offset, which the launcher applies separately via
+                # setBuffer:offset:.
                 out.append(a)
 
         all_flat_args = []
@@ -315,7 +413,7 @@ class MetalDriver(DriverBase):
     @staticmethod
     def is_active():
         try:
-            return torch.backends.mps.is_available()
+            return _runtime().is_available()
         except Exception:
             return False
 
@@ -323,14 +421,14 @@ class MetalDriver(DriverBase):
         return ty_to_cpp(ty)
 
     def get_device_interface(self):
-        return torch.mps
+        return _runtime().device_interface()
 
     def get_current_target(self):
         from triton.backends.compiler import GPUTarget
         return GPUTarget(_TARGET, "apple_m", _WARP_SIZE)
 
     def get_active_torch_device(self):
-        return torch.device("mps", 0)
+        return _runtime().active_device()
 
     def get_current_device(self):
         return 0
@@ -346,9 +444,7 @@ class MetalDriver(DriverBase):
         return do_bench
 
     def get_empty_cache_for_benchmark(self):
-        return torch.empty(256 * 1024 * 1024 // 4,
-                           dtype=torch.int32,
-                           device='mps')
+        return _runtime().empty_cache()
 
     def clear_cache(self, cache):
-        cache.zero_()
+        _runtime().clear_cache(cache)

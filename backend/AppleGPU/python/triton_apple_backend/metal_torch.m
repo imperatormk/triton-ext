@@ -113,8 +113,10 @@ static bool packArguments(PyObject *args, std::vector<ArgInfo> *out) {
       info.bytesPtr = PyBytes_AS_STRING(arg);
       info.bytesLen = PyBytes_GET_SIZE(arg);
     } else {
-      PyErr_Format(PyExc_TypeError, "Arg %zd: expected an MPS tensor or the "
-                                    "packed scalar bytes", i);
+      PyErr_Format(PyExc_TypeError,
+                   "Arg %zd: expected an MPS tensor or the "
+                   "packed scalar bytes",
+                   i);
       return false;
     }
   }

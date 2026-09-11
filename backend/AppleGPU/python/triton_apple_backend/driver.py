@@ -319,7 +319,10 @@ class MetalLauncher:
         if _os.environ.get('TRITON_MSL_TRACE'):
             _threads = [gridX * self.lx, gridY * self.ly, gridZ * self.lz]
             _gs = [self.lx, self.ly, self.lz]
-            _say = lambda m: print(m, file=_sys.stderr)
+
+            def _say(m):
+                print(m, file=_sys.stderr)
+
             _say(f'[MSL] threads={_threads} group_size={_gs} '
                  f'grid=({gridX},{gridY},{gridZ})')
             _say(f'[MSL] reordered_args={reordered_args}')

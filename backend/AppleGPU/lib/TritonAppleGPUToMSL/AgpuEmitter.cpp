@@ -276,9 +276,9 @@ agpu::Decision AgpuEmitter::declineOp(Operation *op, const agpu::Decision &d,
 agpu::Decision AgpuEmitter::walkBlock(Block &block, am::Block &out) {
   const CurBlock here(*this, out);
   for (Operation &op : block) {
-    // By name too: a plugin with its own MLIR compares TypeIDs that never
-    // match.
-    if (op.hasTrait<OpTrait::IsTerminator>() || agpu::isTerminator(opName(&op)))
+    // By name: `hasTrait` compares a TypeID the plugin and the host generate
+    // separately, so it answers false wherever they do not share one.
+    if (agpu::isTerminator(opName(&op)))
       continue;
     if (const agpu::Decision d = walkOp(&op); !d.ok())
       return d;

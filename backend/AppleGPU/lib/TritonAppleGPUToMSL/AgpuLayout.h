@@ -12,14 +12,12 @@
 #include "triton/Tools/LinearLayout.h"
 
 #include <optional>
-#include <set>
 #include <vector>
 
 namespace mlir::triton::applegpu::bridge {
 
 namespace lldim = mlir::triton::applegpu::lldim;
 
-// Consumers treat a missing dimension and an all-zero-basis one alike.
 // Consumers treat a missing dimension and an all-zero-basis one alike.
 inline agpu::BasisRow basisRow(const LinearLayout &ll, MLIRContext *ctx,
                                llvm::StringRef inDim, StringAttr outDim) {
@@ -102,9 +100,7 @@ inline std::optional<std::vector<int64_t>> registerCoordAt(RankedTensorType rt,
   return std::vector<int64_t>(c->begin(), c->end());
 }
 
-// Whether a difference of two registers' lane-0 coordinates holds in every
-// lane, on every axis. True only where register bases and lane/warp/block
-// into the tensor's shape. Meaningful only when it does not depend on lane.
+// Register `reg`'s lane-0 position as one flat, row-major index.
 inline std::optional<int64_t> flatElemAt(RankedTensorType rt, int reg) {
   const std::optional<std::vector<int64_t>> coord = registerCoordAt(rt, reg);
   if (!coord)
@@ -113,8 +109,8 @@ inline std::optional<int64_t> flatElemAt(RankedTensorType rt, int reg) {
   return flatIndex(rt.getShape(), *coord);
 }
 
-// Whether two layouts put the same element in the same register of the same
-// thread, so a value under one can be renamed to the other.
+// Bitmask of this dimension's bases that move nothing: a set bit is an index
+// bit the layout ignores, so the value is replicated across it.
 inline unsigned freeBitsOf(const LinearLayout &ll, MLIRContext *ctx,
                            llvm::StringRef inDim) {
   const auto dim = StringAttr::get(ctx, inDim);
@@ -144,9 +140,6 @@ inline int64_t registerCount(RankedTensorType rt) {
   return registerCount(gpu::toLinearLayout(rt), rt.getContext());
 }
 
-// Which elements one warp of a layout holds, as a set of flat indices.
-// Whether every warp holds the same elements under both layouts, so a
-// shuffle can move them without crossing a warp boundary.
 } // namespace mlir::triton::applegpu::bridge
 
 #endif // AGPU_BRIDGE_LAYOUT_H

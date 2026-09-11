@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0")
+# Default to the oldest macOS this backend supports, but never override an
+# explicit choice: -DCMAKE_OSX_DEPLOYMENT_TARGET and the environment's
+# MACOSX_DEPLOYMENT_TARGET both win. Guard on CACHE{} rather than a plain
+# `if(NOT DEFINED)`: project() defines the normal variable from the cache, so
+# the plain form stopped applying on reconfigure and the same tree built with
+# or without the pin depending on how the build directory came to exist.
+# Setting it before project() also preempts CMake's own env-var default, which
+# is why that is tested here too.
+if(NOT DEFINED CACHE{CMAKE_OSX_DEPLOYMENT_TARGET}
+   AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS version")
 endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -11,28 +20,15 @@ project(applegpu_backend LANGUAGES C CXX)
 include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/triton-ext.cmake")
 configure_triton_extension()
 
-set(APPLE_GPU_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
-set(APPLE_GPU_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}")
-
-include_directories(${TRITON_EXT_SUPPORT_DIR})
-include_directories(${APPLE_GPU_INCLUDE_DIR})
-
-set(AGPU_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/agpu/include")
-include_directories(${AGPU_INCLUDE_DIR})
-include_directories(${APPLE_GPU_GEN_DIR})
-
-file(MAKE_DIRECTORY "${APPLE_GPU_GEN_DIR}/TritonAppleGPUTransforms")
-
-set(LLVM_TARGET_DEFINITIONS
-    ${APPLE_GPU_INCLUDE_DIR}/TritonAppleGPUTransforms/Passes.td)
-mlir_tablegen(TritonAppleGPUTransforms/Passes.h.inc -gen-pass-decls -name TritonAppleGPU)
-add_public_tablegen_target(TritonAppleGPUTransformsPassesIncGen)
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}/include"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/agpu/include")
 
 set(TO_MSL lib/TritonAppleGPUToMSL)
 
+# ExportAppleGPU.cpp writes tritonGetPluginInfo by hand, so support/Export.cpp
+# -- which defines the same symbol off its own registries -- is not linked.
 add_mlir_library(TritonAppleGPUBackend
     ExportAppleGPU.cpp
-    "${TRITON_EXT_SUPPORT_DIR}/Export.cpp"
 
     lib/TritonAppleGPUTransforms/EmitMSL.cpp
 
@@ -46,14 +42,9 @@ add_mlir_library(TritonAppleGPUBackend
     SHARED
     EXCLUDE_FROM_LIBMLIR
 
-    DEPENDS
-    TritonAppleGPUTransformsPassesIncGen
-
     LINK_LIBS PUBLIC
     ${TRITON_LIB}
 )
-
-target_link_libraries(TritonAppleGPUBackend PUBLIC MLIRMathTransforms)
 
 target_compile_options(TritonAppleGPUBackend PRIVATE
     -Wall -Wextra -Wno-missing-field-initializers)
@@ -63,48 +54,32 @@ set_target_properties(TritonAppleGPUBackend PROPERTIES
     OUTPUT_NAME "applegpu_backend"
     CXX_STANDARD 17)
 
-# On macOS with shared LLVM, use flat namespace so the plugin can resolve
-# LLVM symbols from any loaded dylib (not just the one it was linked against).
-if(APPLE)
-    target_link_options(TritonAppleGPUBackend PRIVATE
-        -Wl,-dead_strip -Wl,-flat_namespace)
-endif()
-
 install(TARGETS TritonAppleGPUBackend
         LIBRARY DESTINATION triton_apple_backend)
 
 if(APPLE)
+    # Flat namespace so the plugin resolves LLVM symbols from any loaded
+    # dylib, not just the one it was linked against.
+    target_link_options(TritonAppleGPUBackend PRIVATE
+        -Wl,-dead_strip -Wl,-flat_namespace)
+
     find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
     list(APPEND CMAKE_PREFIX_PATH "${Python_SITEARCH}/torch/share/cmake")
-    find_package(Torch QUIET)
+    # Required, not optional: the driver dispatches through torch's MPS stream
+    # and has no other runtime. Failing here beats producing a wheel whose
+    # backend silently deactivates at import.
+    find_package(Torch REQUIRED)
     set(BRIDGE_PY
         "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend")
 
-    python_add_library(metal_native MODULE "${BRIDGE_PY}/metal_native.m"
+    python_add_library(metal_torch MODULE "${BRIDGE_PY}/metal_torch.m"
                        WITH_SOABI)
-    target_compile_options(metal_native PRIVATE
-        -ObjC++ -fobjc-arc -std=c++20 -O3 -Wno-deprecated-declarations)
-    target_link_libraries(metal_native PRIVATE
+    target_compile_options(metal_torch PRIVATE
+        -ObjC++ -std=c++20 -O3 -Wno-deprecated-declarations)
+    target_link_libraries(metal_torch PRIVATE "${TORCH_LIBRARIES}"
         "-framework Metal" "-framework Foundation")
-    target_link_options(metal_native PRIVATE -undefined dynamic_lookup)
-    set_target_properties(metal_native PROPERTIES
+    target_link_options(metal_torch PRIVATE -undefined dynamic_lookup)
+    set_target_properties(metal_torch PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${BRIDGE_PY}")
-    add_dependencies(TritonAppleGPUBackend metal_native)
-
-    if(Torch_FOUND)
-        python_add_library(metal_torch MODULE "${BRIDGE_PY}/metal_torch.m"
-                           WITH_SOABI)
-        target_compile_options(metal_torch PRIVATE
-            -ObjC++ -std=c++20 -O3 -Wno-deprecated-declarations)
-        target_link_libraries(metal_torch PRIVATE "${TORCH_LIBRARIES}"
-            "-framework Metal" "-framework Foundation")
-        target_link_options(metal_torch PRIVATE -undefined dynamic_lookup)
-        set_target_properties(metal_torch PROPERTIES
-            LIBRARY_OUTPUT_DIRECTORY "${BRIDGE_PY}")
-        add_dependencies(TritonAppleGPUBackend metal_torch)
-    else()
-        message(WARNING
-            "torch not found in ${Python_SITEARCH} (or -DTorch_DIR): skipping "
-            "metal_torch; the backend will dispatch through metal_native only")
-    endif()
+    add_dependencies(TritonAppleGPUBackend metal_torch)
 endif()

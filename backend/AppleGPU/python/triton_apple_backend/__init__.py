@@ -10,8 +10,6 @@ An editable install serves this file from the source tree while cmake installs
 the library into site-packages, so both are searched.
 """
 
-from __future__ import annotations
-
 import sysconfig
 from pathlib import Path
 

@@ -9,23 +9,11 @@ namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
 
-// Sets `bases` and `runtime`; leaves them empty for a value with no layout.
-std::vector<agpu::LayoutBasis> AgpuEmitter::layoutDimsOf(Value v) {
-  const auto rt =
-      v ? dyn_cast<RankedTensorType>(v.getType()) : RankedTensorType();
-  if (!rt)
-    return {};
-  const agpu::CoordSource cs = coordSourceOf(rt);
-  if ((int)cs.dims.size() != rt.getRank())
-    return {};
-  return cs.dims;
-}
-
 PtrOffset AgpuEmitter::offsetSum(agpu::ValueId basePtr, int64_t reg,
                                  const am::Str &added) {
   const auto prior = body_.offsetOf.find({basePtr, reg});
   if (prior == body_.offsetOf.end())
-    return PtrOffset{added, am::Context::i32(), false};
+    return PtrOffset{added, am::Context::i32()};
 
   const am::Str name = "off" + std::to_string(basePtr) + "_" +
                        std::to_string(reg) + "_" +
@@ -35,7 +23,7 @@ PtrOffset AgpuEmitter::offsetSum(agpu::ValueId basePtr, int64_t reg,
       agpu_.context().binary(am::BinOp::Add,
                              agpu_.context().var(prior->second.name),
                              agpu_.context().var(added))));
-  return PtrOffset{name, am::Context::i32(), true};
+  return PtrOffset{name, am::Context::i32()};
 }
 
 agpu::Decision AgpuEmitter::emitLoad(const agpu::OpView &o,

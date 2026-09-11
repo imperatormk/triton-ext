@@ -9,11 +9,7 @@
 
 #include "mlir/IR/BuiltinTypes.h"
 
-#include <algorithm>
 #include <cstdint>
-#include <map>
-#include <string>
-#include <vector>
 
 namespace mlir::triton::applegpu::bridge {
 

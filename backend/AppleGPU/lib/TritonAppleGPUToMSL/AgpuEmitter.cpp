@@ -6,8 +6,6 @@
 #include "agpu/msl/Printer.h"
 #include "agpu/plan/Vestigial.h"
 
-#include <cstdlib>
-#include <fstream>
 #include <sstream>
 
 namespace mlir::triton::applegpu::bridge {
@@ -25,9 +23,7 @@ void AgpuEmitter::inheritOffset(agpu::ValueId from, int64_t fromReg,
   const auto off = body_.offsetOf.find({from, fromReg});
   if (off == body_.offsetOf.end())
     return;
-  PtrOffset copy = off->second;
-  copy.owned = false;
-  body_.offsetOf[{to, toReg}] = std::move(copy);
+  body_.offsetOf[{to, toReg}] = off->second;
 }
 
 am::Expr *AgpuEmitter::addressAt(agpu::ValueId ptr, int64_t reg) {
@@ -190,12 +186,9 @@ agpu::Decision AgpuEmitter::walkOp(Operation *op) {
     }
   }
 
-  // An op lowers here, outside the dispatch table, when it needs a region to
-  // walk or an attribute OpView cannot carry. OpView holds no
-  // Operation * on purpose, so that agpu/bind/ builds and tests without MLIR,
-  // which is what makes these inexpressible as table handlers. The dyn_casts
-  // further down read attributes into `ints` and still dispatch; only the ones
-  // here return early. An op with neither an arm here nor a table handler
+  // OpView holds no Operation * on purpose, so that agpu/bind/ builds and
+  // tests without MLIR. Attributes a handler needs are read out here into
+  // `ints`; one arm per op the dispatch table covers. An op with no handler
   // declines by name.
   agpu::OpView view;
   view.name = opName(op);
@@ -205,32 +198,10 @@ agpu::Decision AgpuEmitter::walkOp(Operation *op) {
     view.ints.push_back(mr.getStart());
   if (auto cmp = dyn_cast<arith::CmpIOp>(op))
     view.ints.push_back((int64_t)cmp.getPredicate());
-  if (auto cmp = dyn_cast<arith::CmpFOp>(op))
-    view.ints.push_back((int64_t)cmp.getPredicate());
-  if (auto fp = dyn_cast<triton::FpToFpOp>(op))
-    if (const std::optional<triton::RoundingMode> rm = fp.getRounding())
-      view.ints.push_back((int64_t)*rm);
-  if (auto fp4 = dyn_cast<triton::gpu::Fp4ToFpOp>(op))
-    view.ints.push_back((int64_t)fp4.getAxis());
-  if (auto ga = dyn_cast<triton::GatherOp>(op))
-    view.ints.push_back((int64_t)ga.getAxis());
-  if (auto cas = dyn_cast<triton::AtomicCASOp>(op))
-    view.ints.push_back((int64_t)cas.getSem());
-  if (auto rmw = dyn_cast<triton::AtomicRMWOp>(op)) {
-    view.ints.push_back((int64_t)rmw.getAtomicRmwOp());
-    view.ints.push_back((int64_t)rmw.getSem());
-  }
   if (auto pid = dyn_cast<triton::GetProgramIdOp>(op))
     view.ints.push_back((int64_t)pid.getAxisAsInt());
   if (auto np = dyn_cast<triton::GetNumProgramsOp>(op))
     view.ints.push_back((int64_t)np.getAxisAsInt());
-  if (auto bar = dyn_cast<gpu::BarrierOp>(op))
-    view.ints.push_back((int64_t)(uint32_t)bar.getAddrSpace());
-  // metal::clamp is min(max(...)) and drops NaN.
-  if (auto cl = dyn_cast<triton::ClampFOp>(op))
-    view.ints.push_back(cl.getPropagateNan() == triton::PropagateNan::ALL);
-  if (auto call = dyn_cast<triton::CallOp>(op))
-    view.text = call.getCallee();
   std::vector<ConstantValue> konst;
   if (auto k = dyn_cast<arith::ConstantOp>(op))
     konst = constantsOf(k);
@@ -254,11 +225,6 @@ agpu::Decision AgpuEmitter::declineOp(Operation *op, const agpu::Decision &d,
   return d;
 }
 
-int64_t AgpuEmitter::registersHeldByType(Type t) const {
-  auto rt = dyn_cast<RankedTensorType>(t);
-  return rt ? registerCount(rt) : 1;
-}
-
 agpu::Decision AgpuEmitter::walkBlock(Block &block, am::Block &out) {
   const CurBlock here(*this, out);
   for (Operation &op : block) {
@@ -272,20 +238,15 @@ agpu::Decision AgpuEmitter::walkBlock(Block &block, am::Block &out) {
 
 // MSL has no goto, so a multi-block body needs the dispatch-loop lowering that
 // arrives with control flow.
-agpu::Decision AgpuEmitter::walkWholeRegion(Region &region, am::Block &out,
-                                            const TerminatorFn &atTerminator) {
+agpu::Decision AgpuEmitter::walkWholeRegion(Region &region, am::Block &out) {
   if (!region.hasOneBlock())
     return declined("region", "a multi-block body needs a dispatch loop");
-  Block &only = region.front();
-  if (const agpu::Decision d = walkBlock(only, out); !d.ok())
-    return d;
-  return atTerminator ? atTerminator(only, out) : agpu::Decision::emitted();
+  return walkBlock(region.front(), out);
 }
 
-// Pool views, then live buffers, then coordinates, then body: each references
-// only names declared before it.
+// Hoisted coordinate declarations first, then the body: each references only
+// names declared before it.
 agpu::BuiltBody AgpuEmitter::buildKernelBody(Region &region) {
-  // MSL has no goto; a multi-block body lowers to a dispatch loop instead.
   am::Block body;
   if (!walkWholeRegion(region, body).ok()) {
     bodyOk_ = false;

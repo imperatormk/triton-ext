@@ -1,8 +1,7 @@
 // AgpuEmitter - the walk. TTGIR in, agpu facts out, MSL text on a stream.
 //
-// Split across AgpuEmitter.cpp (walk core), AgpuValues.cpp (value identity,
-// coherence, pointers and layout queries), AgpuPool.cpp (threadgroup pool) and
-// AgpuHandlers*.cpp (dispatch-table families).
+// Split across AgpuEmitter.cpp (walk core) and AgpuHandlers*.cpp
+// (dispatch-table families).
 #ifndef AGPU_BRIDGE_EMITTER_H
 #define AGPU_BRIDGE_EMITTER_H
 
@@ -24,7 +23,6 @@
 
 #include <map>
 #include <set>
-#include <sstream>
 #include <string>
 
 namespace mlir::triton::applegpu::bridge {
@@ -42,8 +40,6 @@ inline agpu::Decision declined(const agpu::OpView &o, agpu::msl::Str why) {
 struct PtrOffset {
   agpu::msl::Str name;
   agpu::msl::Type type = agpu::msl::Context::i32();
-  // Whether this pointer minted the variable or reuses the index operand's.
-  bool owned = false;
 };
 
 struct BodyState {
@@ -87,15 +83,9 @@ private:
 
   agpu::Decision walkBlock(Block &block, agpu::msl::Block &out);
 
-  using TerminatorFn =
-      std::function<agpu::Decision(Block &, agpu::msl::Block &)>;
-
-  agpu::Decision walkWholeRegion(Region &region, agpu::msl::Block &out,
-                                 const TerminatorFn &atTerminator = nullptr);
+  agpu::Decision walkWholeRegion(Region &region, agpu::msl::Block &out);
 
   agpu::Decision walkOp(Operation *op);
-
-  int64_t registersHeldByType(Type t) const;
 
   agpu::Decision declineOp(Operation *op, const agpu::Decision &d,
                            std::string_view name);
@@ -105,8 +95,7 @@ private:
     return d.ok() ? d : declineOp(op, d, name);
   }
 
-  // Pre-pass facts only: clamp targets and live buffer bytes. Pool
-  // scratch is sized from what the built bodies used.
+  // Interns a Value, minting an id on first sight.
   agpu::ValueId idOf(Value v);
 
   LogicalResult bindArgs(triton::FuncOp func,
@@ -294,12 +283,6 @@ private:
 
   void inheritBasePointer(agpu::ValueId from, agpu::ValueId to);
 
-  // Metal has no 16-bit atomic; both 16-bit paths operate on the containing
-  // 32-bit word plus a flag for which half.
-  bool declarePacked16Word(agpu::msl::Expr *addr,
-                           const agpu::msl::Str &wordName,
-                           const agpu::msl::Str &highName);
-
   agpu::msl::Expr *maskAt(const agpu::OpView &o, std::size_t maskIndex,
                           int64_t reg);
 
@@ -319,8 +302,6 @@ private:
   agpu::Decision emitMemoryOp(const agpu::OpView &o);
 
   agpu::BuiltBody buildKernelBody(Region &region);
-
-  std::vector<agpu::LayoutBasis> layoutDimsOf(Value v);
 
   agpu::CoordSource coordSourceOf(RankedTensorType ty);
 

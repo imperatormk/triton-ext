@@ -1,11 +1,13 @@
 """Apple GPU Triton backend driver. Dispatch pipeline:
   metallib bytes -> metal_torch.load_metallib(bytes) -> MetalLibrary.get_function(name)
   -> MetalKernel (PSO) -> kernel(*tensors, threads=, group_size=)
+
+Pointer arguments are MPS tensors, dispatched zero-copy on torch's own stream.
 """
 
-import importlib.util as _importlib_util
 import os as _os
 import re as _re
+import sys as _sys
 import struct as _struct
 from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
 from triton.runtime.errors import OutOfResources
@@ -33,12 +35,6 @@ class _TorchRuntime:
     def core_count(self):
         return getattr(self.torch._C, '_mps_get_core_count', lambda: 10)()
 
-    def zeros_i32(self, n):
-        return self.torch.zeros(n, dtype=self.torch.int32, device='mps')
-
-    def as_u32(self, buf):
-        return buf.cpu().numpy().view('uint32')
-
     def device_interface(self):
         return self.torch.mps
 
@@ -54,72 +50,15 @@ class _TorchRuntime:
         cache.zero_()
 
 
-class _NativeDeviceInterface:
-
-    def __init__(self, metal):
-        self._metal = metal
-
-    def synchronize(self):
-        self._metal.synchronize()
-
-    def current_device(self):
-        return 0
-
-
-class _NativeRuntime:
-    """Dispatch without torch, through metal_native: its own command queue,
-    and pointer arguments are metal_native.MetalBuffer objects (alloc, or
-    wrap over numpy / buffer-protocol memory)."""
-
-    def __init__(self):
-        from triton_apple_backend import metal_native
-        self.metal = metal_native
-
-    def is_available(self):
-        return self.metal.is_available()
-
-    def core_count(self):
-        return 10
-
-    def zeros_i32(self, n):
-        import numpy as np
-        return self.metal.alloc(n * 4, np.dtype('int32'))
-
-    def as_u32(self, buf):
-        import numpy as np
-        return np.frombuffer(buf, dtype=np.uint32)
-
-    def device_interface(self):
-        return _NativeDeviceInterface(self.metal)
-
-    def active_device(self):
-        raise RuntimeError("no torch device: torch is not installed")
-
-    def empty_cache(self):
-        import numpy as np
-        return self.metal.alloc(256 * 1024 * 1024, np.dtype('int32'))
-
-    def clear_cache(self, cache):
-        import numpy as np
-        np.frombuffer(cache, dtype=np.int32)[:] = 0
-
-
 _RUNTIME = None
 
 
-def _torch_installed():
-    try:
-        return _importlib_util.find_spec("torch") is not None
-    except Exception:
-        return False
-
-
 def _runtime():
-    """Torch wins whenever it is installed; metal_native serves a box without
-    it."""
+    """Built on first use: importing torch at module scope would pay for it
+    during backend discovery, which runs on every `import triton`."""
     global _RUNTIME
     if _RUNTIME is None:
-        _RUNTIME = (_TorchRuntime if _torch_installed() else _NativeRuntime)()
+        _RUNTIME = _TorchRuntime()
     return _RUNTIME
 
 
@@ -176,8 +115,8 @@ def _pack_scalars(scalar_types, scalar_values, total_size, offsets):
 
 
 class MetalUtils:
-    """Metal GPU utils. JIT-compiles metal_torch.m for zero-copy MPS tensor
-    dispatch."""
+    """Metal GPU utils, over the metal_torch extension that CMake builds
+    beside its source."""
 
     def __init__(self):
         self._rt = _runtime()
@@ -232,7 +171,6 @@ class MetalLauncher:
 
     def __init__(self, src, metadata):
         self.signature = dict(src.signature)
-        self.constants = getattr(src, "constants", {})
 
         # Constexpr args appear in Python *args but not the compiled IR;
         # strip them so Metal buffer slots match IR arg positions.
@@ -365,7 +303,7 @@ class MetalLauncher:
         ]
 
         # Emitted kernel signature is [ptr0, ptr1, ..., packed_scalar_buf].
-        # See emitFunc's argbuf packing in EmitMSLFunc.cpp.
+        # The other side of this ABI is agpu/emit/KernelAbi.h.
         ptr_args = [flat_args[i] for i in self.ptr_indices]
         scalar_values = [flat_args[i] for i in self.scalar_indices]
 
@@ -378,20 +316,18 @@ class MetalLauncher:
         else:
             reordered_args = tuple(ptr_args)
 
-        if _os.environ.get('TRITON_MSL_DEBUG'):
+        if _os.environ.get('TRITON_MSL_TRACE'):
             _threads = [gridX * self.lx, gridY * self.ly, gridZ * self.lz]
             _gs = [self.lx, self.ly, self.lz]
-            print(
-                f'[MSL] threads={_threads} group_size={_gs} grid=({gridX},{gridY},{gridZ})'
-            )
-            print(f'[MSL] reordered_args={reordered_args}')
+            _say = lambda m: print(m, file=_sys.stderr)
+            _say(f'[MSL] threads={_threads} group_size={_gs} '
+                 f'grid=({gridX},{gridY},{gridZ})')
+            _say(f'[MSL] reordered_args={reordered_args}')
             if scalar_values:
-                print(
-                    f'[MSL] scalar_types={self.scalar_types} scalar_values={scalar_values}'
-                )
-                print(
-                    f'[MSL] packed_bytes={packed_bytes.hex()} total_size={self.total_size}'
-                )
+                _say(f'[MSL] scalar_types={self.scalar_types} '
+                     f'scalar_values={scalar_values}')
+                _say(f'[MSL] packed_bytes={packed_bytes.hex()} '
+                     f'total_size={self.total_size}')
         function(
             *reordered_args,
             threads=[gridX * self.lx, gridY * self.ly, gridZ * self.lz],

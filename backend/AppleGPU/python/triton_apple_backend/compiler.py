@@ -20,10 +20,6 @@ from triton_apple_backend.hw_constants import WARP_SIZE as _WARP_SIZE
 
 _plugin = passes.plugin
 
-# Set by the emit-msl pass; also spelled in agpu/plan/LaunchPlan.h.
-
-# Also spelled in agpu/plan/PoolPlan.h.
-
 _MSL_PREAMBLE_END = 'using namespace metal;\n'
 
 
@@ -42,11 +38,6 @@ def _disable_fp_contraction(msl):
             "the fp-contract pragma to")
     at += len(_MSL_PREAMBLE_END)
     return msl[:at] + pragma + msl[at:]
-
-
-def _pmaybe_enable_debug(pm):
-    if os.environ.get('TRITON_MSL_DEBUG'):
-        pm.enable_debug()
 
 
 def _metallib_from_source(msl):
@@ -175,7 +166,7 @@ class MetalBackend(BaseBackend):
 
     def make_ttir(self, mod, metadata, options):
         pm = ir.pass_manager(mod.context)
-        _pmaybe_enable_debug(pm)
+        pm.enable_debug()
         passes.common.add_inliner(pm)
         passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
@@ -190,7 +181,7 @@ class MetalBackend(BaseBackend):
 
     def make_ttgir(self, mod, metadata, options):
         pm = ir.pass_manager(mod.context)
-        _pmaybe_enable_debug(pm)
+        pm.enable_debug()
 
         passes.ttir.add_convert_to_ttgpuir(pm, _target_arch(options.arch),
                                            options.num_warps,
@@ -226,7 +217,7 @@ class MetalBackend(BaseBackend):
         with tempfile.NamedTemporaryFile(suffix='.metal', delete=False) as f:
             msl_path = f.name
         pm = ir.pass_manager(mod.context)
-        _pmaybe_enable_debug(pm)
+        pm.enable_debug()
         _plugin.add_emit_msl(pm, [msl_path])
         try:
             pm.run(mod, 'make_msl')
@@ -238,9 +229,6 @@ class MetalBackend(BaseBackend):
         os.unlink(msl_path)
         if not options.enable_fp_fusion:
             msl = _disable_fp_contraction(msl)
-        if os.environ.get('TRITON_MSL_DEBUG'):
-            print("=== emitted MSL ===")
-            print(msl)
         m = re.search(r'kernel void (\w+)\(', msl)
         if not m:
             raise RuntimeError("no 'kernel void' entry found in emitted MSL")
@@ -248,7 +236,6 @@ class MetalBackend(BaseBackend):
             if os.path.isdir(dump):
                 # Keyed on the input (ttgir + options), so two emitters' runs
                 # of one kernel get the same name.
-                import hashlib
                 key = hashlib.sha1((str(_ttgir_for_dump) +
                                     options.hash()).encode()).hexdigest()[:8]
                 dump = os.path.join(dump, f'{m.group(1)}.{key}')
@@ -258,6 +245,10 @@ class MetalBackend(BaseBackend):
                 with open(dump + suffix, 'w') as df:
                     df.write(text)
         metadata["name"] = m.group(1)
+        # Overwrites make_ttgir's ttg.shared on purpose. The emitter declares
+        # no threadgroup parameter, so the launcher must bind no threadgroup
+        # memory; a nonzero value here would set a length for a slot the
+        # kernel does not have. Revisit with the first shared-memory op.
         metadata["shared"] = 0
         return msl
 

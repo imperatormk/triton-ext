@@ -1,7 +1,6 @@
-// Exports the Apple GPU passes and dialect through the Triton plugin API.
+// Exports the Apple GPU passes through the Triton plugin API.
 
 #include "TritonAppleGPUToMSL/Passes.h"
-#include "TritonAppleGPUTransforms/Passes.h"
 #include "triton/Tools/PluginUtils.h"
 
 #include <iterator>

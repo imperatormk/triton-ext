@@ -30,6 +30,21 @@ inline bool isVestigial(std::string_view op) {
   return false;
 }
 
+// Block terminators the walk carries no statement for.
+inline constexpr std::string_view kTerminators[] = {
+    "tt.return",
+    "func.return",
+    "cf.br",
+    "cf.cond_br",
+};
+
+inline bool isTerminator(std::string_view op) {
+  for (const std::string_view t : kTerminators)
+    if (t == op)
+      return true;
+  return false;
+}
+
 // `notMine()` for anything else, so the dispatcher falls through to the next
 // family.
 inline Decision vestigialDecision(std::string_view op) {

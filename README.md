@@ -55,6 +55,7 @@ Extensions live in subdirectories, each built as a separate Triton wheel:
 - Ninja
 - Python 3, for tests and build scripts; install dependencies with
   `pip install -r requirements.txt`
+- [`uv`], which `make install` uses to place each extension's wheel
 - Triton, built with `TRITON_EXT_ENABLED=ON`, see
   [`download_triton_wheel.py`][download_triton]. Note: Extensions are enabled by
   default in Triton releases 3.7 and beyond.
@@ -118,6 +119,29 @@ Run the test suite to verify the extensions are working correctly:
 make test
 ```
 
+### Serving a dependency from another index
+
+An extension that needs a package from somewhere other than PyPI names the index
+in its own `pyproject.toml`. `explicit` keeps that index out of the search for
+every other package:
+
+```toml
+[project]
+dependencies = ["torch"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+```
+
+Here that avoids the CUDA runtime, over a gigabyte of it, that the Linux torch
+on PyPI depends on, along with a released `triton` that would sit on top of the
+pinned nightly.
+
 ## Use
 
 Extensions are loaded by Triton by their `__init__.py` file (see
@@ -148,3 +172,4 @@ import triton-<extension>
 [triton-plugins]: https://github.com/triton-lang/triton/tree/main/examples/plugins
 [utlx]: ./extensions/utlx/
 [`gh`]: https://cli.github.com/
+[`uv`]: https://docs.astral.sh/uv/

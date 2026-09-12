@@ -1,3 +1,6 @@
+# The name in pyproject.toml, so a rebuild replaces this wheel
+# and leaves everything it depends on alone.
+WHEEL_NAME := triton-example
 WHEEL_DIR ?= dist
 
 .PHONY: build
@@ -6,7 +9,7 @@ build:
 
 .PHONY: install
 install:
-	pip install $(WHEEL_DIR)/*.whl --force-reinstall
+	uv pip install $(WHEEL_DIR)/*.whl --reinstall-package $(WHEEL_NAME)
 
 .PHONY: test
 test:

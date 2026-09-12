@@ -11,7 +11,9 @@ WARP_SIZE = 32
 SG_FRAG_DIM = 8
 TG_BUDGET_BYTES = 32768
 
-# Torch calls the Apple GPU device "mps", so Triton's target must agree.
+# Torch calls the Apple GPU device "mps", so Triton's target must agree. The
+# `apple` entry point in pyproject.toml is a separate name: Triton picks a
+# backend by is_active(), and only this target reaches device code.
 TARGET = "mps"
 
 

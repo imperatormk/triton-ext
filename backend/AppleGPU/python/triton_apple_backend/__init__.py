@@ -12,6 +12,7 @@ the library into site-packages, so both are searched.
 
 import sys
 import sysconfig
+import warnings
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent
@@ -25,3 +26,11 @@ PLUGIN_LIBRARY = next(
 if PLUGIN_LIBRARY is not None:
     import triton._C.libtriton as libtriton
     libtriton.passes.plugin.extend_with(str(PLUGIN_LIBRARY))  # adds passes
+else:
+    # Otherwise the first symptom is an AttributeError on add_emit_msl, raised
+    # from inside the compiler.
+    warnings.warn(
+        f"{PLUGIN_NAME} not found next to {PLUGIN_DIR} or in site-packages; "
+        "the Apple GPU backend will not compile kernels. Build the backend.",
+        RuntimeWarning,
+        stacklevel=2)

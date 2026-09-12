@@ -149,12 +149,12 @@ void AgpuEmitter::registerAddPtrHandler() {
 
 agpu::Decision AgpuEmitter::emitMemoryOp(const agpu::OpView &o) {
   const bool isLoad = o.name == kLoad;
-  const std::size_t maskAt = isLoad ? 1u : 2u;
+  const std::size_t maskIndex = isLoad ? 1u : 2u;
 
-  if (!isLoad && o.operands.size() > maskAt + 1)
+  if (!isLoad && o.operands.size() > maskIndex + 1)
     return declined(o.name, "store with an unexpected extra operand");
 
-  return isLoad ? emitLoad(o, maskAt) : emitStore(o, maskAt);
+  return isLoad ? emitLoad(o, maskIndex) : emitStore(o, maskIndex);
 }
 
 void AgpuEmitter::registerMemoryHandler() {

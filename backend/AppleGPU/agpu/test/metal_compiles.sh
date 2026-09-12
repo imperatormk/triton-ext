@@ -4,8 +4,8 @@
 # Skips when there is no Metal toolchain. A toolchain that is present and
 # rejects the output is a failure.
 #
-# TOOLCHAINS is required on Xcode 27: without it `xcrun metal` reports the
-# toolchain as missing even when it is installed.
+# Some Xcode 27 builds report the toolchain as missing unless TOOLCHAINS names
+# it, so a first failure is retried against AGPU_METAL_TOOLCHAIN.
 set -e
 
 generator=$1
@@ -19,8 +19,15 @@ fi
 
 "$generator" > "$out.metal"
 
-if ! TOOLCHAINS="$AGPU_METAL_TOOLCHAIN" xcrun metal -c "$out.metal" \
-     -o "$out.air" 2> "$out.err"; then
+compile() {
+  if [ -n "$1" ]; then
+    TOOLCHAINS="$1" xcrun metal -c "$out.metal" -o "$out.air" 2> "$out.err"
+  else
+    xcrun metal -c "$out.metal" -o "$out.air" 2> "$out.err"
+  fi
+}
+
+if ! compile "" && ! compile "$AGPU_METAL_TOOLCHAIN"; then
   # A toolchain that is selected but not downloaded is an absent one.
   if grep -q "missing Metal Toolchain" "$out.err"; then
     echo "SKIP: metal toolchain not installed"

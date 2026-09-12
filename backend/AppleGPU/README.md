@@ -51,8 +51,8 @@ Two requirements are non-negotiable:
   Official PyPI wheels are built with it; a source build is not.
 - **An asserts build of LLVM.** `configure_triton_extension()` checks
   `LLVM_ENABLE_ABI_BREAKING_CHECKS=1`, because that flag changes the mangled
-  type of every `ilist_iterator` and a mismatch shows up as undefined symbols
-  at `dlopen` time, not at link time.
+  type of every `ilist_iterator` and a mismatch shows up as undefined symbols at
+  `dlopen` time, not at link time.
 
 A worked source build, macOS, Triton `v3.8.0`:
 
@@ -87,7 +87,7 @@ pip install -e . --no-build-isolation
 
 Confirm the two requirements landed, in the generated cmake cache:
 
-```
+```text
 TRITON_EXT_ENABLED:BOOL=1
 CMAKE_BUILD_TYPE:STRING=TritonRelBuildWithAsserts
 ```
@@ -129,9 +129,10 @@ cmake -S . -B build -G Ninja \
 ninja -C build libapplegpu_backend.dylib
 ```
 
-A Triton *build* tree works as `LLVM_INSTALL_DIR` as well as an install tree —
-it has `lib/cmake/mlir`, `bin/mlir-tblgen` and `include/llvm/Config/abi-breaking.h`,
-which is all the configure step reads. The prebuilt LLVM that Triton downloads
+A Triton *build* tree works as `LLVM_INSTALL_DIR` as well as an install tree -
+it has `lib/cmake/mlir`, `bin/mlir-tblgen` and
+`include/llvm/Config/abi-breaking.h`, which is all the configure step reads. The
+prebuilt LLVM that Triton downloads
 (`~/.triton/llvm/llvm-<hash>-<platform>-<build>`) also works, and is the same
 pinned commit.
 
@@ -147,19 +148,19 @@ import.
 
 ### If the backend is already installed
 
-Once `triton_apple_backend` is pip-installed, `cmake -S . -B build` can fail
-at *"Could not import Triton"*. The real error is above it: the configure step
-runs `ci/probe_triton_wheel.py`, which imports Triton, which walks the
+Once `triton_apple_backend` is pip-installed, `cmake -S . -B build` can fail at
+*"Could not import Triton"*. The real error is above it: the configure step runs
+`ci/probe_triton_wheel.py`, which imports Triton, which walks the
 `triton.backends` entry points, which imports this package. Any import error
-here — on 3.8.x, `passes.plugin` has no `extend_with` — takes the probe down
+here - a stale dylib against a rebuilt `libtriton`, say - takes the probe down
 with it. Skip entry-point discovery for the probe:
 
 ```bash
 TRITON_BACKENDS_IN_TREE=1 cmake -S . -B build -G Ninja ...
 ```
 
-It affects only that subprocess; the resulting build is identical. `ninja`
-needs no such flag.
+It affects only that subprocess; the resulting build is identical. `ninja` needs
+no such flag.
 
 ### After a rebuild
 
@@ -185,22 +186,6 @@ entry point, and `__init__.py` hands the bundled plugin library to
 export LLVM_INSTALL_DIR=/path/to/triton/.llvm-project/build
 pip install -e backend/AppleGPU --no-build-isolation --no-deps
 ```
-
-> On Triton 3.8.x, `extend_with` does not exist yet — it landed on `main` after
-> the release branched — so this import raises `AttributeError` and takes
-> `import triton` down with it. Until the backend is pinned to a Triton that
-> has it, load the plugin the way 3.8.x does support, by setting
-> `TRITON_PLUGIN_PATHS` **before** `import triton`, and alias the pass, which
-> 3.8.x registers under its bare name rather than `add_<name>`:
->
-> ```python
-> import os
-> os.environ["TRITON_PLUGIN_PATHS"] = "/path/to/build/lib/libapplegpu_backend.dylib"
-> # ... then, once triton is imported, before the first launch:
-> #   p = triton._C.libtriton.passes.plugin
-> #   p.extend_with = lambda _path: None
-> #   p.add_emit_msl = p.emit_msl
-> ```
 
 ```python
 import torch, triton, triton.language as tl
@@ -232,14 +217,6 @@ print("vecadd ok")
   `<path>`.
 - `TRITON_MSL_TRACE=1` - print the launcher's threads/group_size/args per
   dispatch.
-- `MSL_WALLCLOCK_BENCH=0` - read by `triton38_shim`, not the backend. Keeps
-  Triton's own `triton.testing.do_bench`; the shim otherwise replaces it with a
-  wall-clock timer, because
-  `torch.mps.Event.elapsed_time()` raises `End event N was not recorded after
-  start event M` for any kernel fast enough that the queue drains before the
-  end event records. That is a torch/MPS limitation -- it reproduces with a
-  bare `x + y` and no Triton imported -- so `do_bench` cannot benchmark small
-  kernels here at all. See part 2 of `triton38_shim.py`'s docstring.
 
 The dump knobs are silent for a kernel already in Triton's cache, exactly as
 `MLIR_ENABLE_DUMP` is: a cache hit runs no passes. Prefix with

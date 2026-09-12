@@ -6,7 +6,7 @@ build:
 
 .PHONY: install
 install:
-	pip install $(WHEEL_DIR)/*.whl --force-reinstall
+	pip install $(WHEEL_DIR)/*.whl
 
 .PHONY: test
 test:

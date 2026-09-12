@@ -10,11 +10,13 @@ An editable install serves this file from the source tree while cmake installs
 the library into site-packages, so both are searched.
 """
 
+import sys
 import sysconfig
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent
-PLUGIN_NAME = "libapplegpu_backend.dylib"
+PLUGIN_SUFFIX = ".dylib" if sys.platform == "darwin" else ".so"
+PLUGIN_NAME = "libapplegpu_backend" + PLUGIN_SUFFIX
 PLUGIN_LIBRARY = next(
     (p for p in (PLUGIN_DIR / PLUGIN_NAME,
                  Path(sysconfig.get_paths()["purelib"]) / PLUGIN_DIR.name /

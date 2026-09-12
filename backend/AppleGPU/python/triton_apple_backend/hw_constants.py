@@ -18,4 +18,3 @@ TARGET = "mps"
 def target_arch(arch):
     """The `backend:arch` string Triton's target parser expects."""
     return f"{TARGET}:{arch}"
-

@@ -30,11 +30,14 @@ inline bool isVestigial(std::string_view op) {
   return false;
 }
 
-// Block terminators the walk carries no statement for.
+// Block terminators the walk carries no statement for. Every op carrying
+// MLIR's Terminator trait that can reach the walk belongs here: the trait
+// itself compares a TypeID the plugin and the host generate separately, so it
+// answers false wherever the two do not share one.
 inline constexpr std::string_view kTerminators[] = {
-    "tt.return",
-    "func.return",
-    "cf.br",
+    "tt.return",      "tt.reduce.return",
+    "tt.scan.return", "tt.map_elementwise.return",
+    "func.return",    "cf.br",
     "cf.cond_br",
 };
 

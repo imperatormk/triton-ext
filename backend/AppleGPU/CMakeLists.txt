@@ -58,10 +58,11 @@ install(TARGETS TritonAppleGPUBackend
         LIBRARY DESTINATION triton_apple_backend)
 
 if(APPLE)
-    # Flat namespace so the plugin resolves LLVM symbols from any loaded
-    # dylib, not just the one it was linked against.
+    # The plugin's MLIR symbols are resolved at load from libtriton. Two-level
+    # namespace keeps that lookup scoped; -flat_namespace would expose every
+    # other loaded dylib to it as well.
     target_link_options(TritonAppleGPUBackend PRIVATE
-        -Wl,-dead_strip -Wl,-flat_namespace)
+        -Wl,-dead_strip -Wl,-undefined,dynamic_lookup)
 
     find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
     list(APPEND CMAKE_PREFIX_PATH "${Python_SITEARCH}/torch/share/cmake")
@@ -72,14 +73,30 @@ if(APPLE)
     set(BRIDGE_PY
         "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend")
 
-    python_add_library(metal_torch MODULE "${BRIDGE_PY}/metal_torch.m"
+    python_add_library(metal_torch MODULE "${BRIDGE_PY}/metal_torch.mm"
                        WITH_SOABI)
     target_compile_options(metal_torch PRIVATE
-        -ObjC++ -std=c++20 -O3 -Wno-deprecated-declarations)
+        -std=c++20 -O3 -Wno-deprecated-declarations)
     target_link_libraries(metal_torch PRIVATE "${TORCH_LIBRARIES}"
         "-framework Metal" "-framework Foundation")
     target_link_options(metal_torch PRIVATE -undefined dynamic_lookup)
+    # THPVariable_* lives in libtorch_python, which TORCH_LIBRARIES omits.
+    get_filename_component(TORCH_LIB_DIR "${TORCH_LIBRARY}" DIRECTORY)
+    find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_LIB_DIR}"
+                 NO_DEFAULT_PATH REQUIRED)
+    target_link_libraries(metal_torch PRIVATE "${TORCH_PYTHON_LIBRARY}")
+    # cmake strips the build rpath on install, and libtorch is not on the
+    # loader's default search path.
     set_target_properties(metal_torch PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY "${BRIDGE_PY}")
+        INSTALL_RPATH "${TORCH_LIB_DIR}"
+        BUILD_WITH_INSTALL_RPATH TRUE)
+    install(TARGETS metal_torch LIBRARY DESTINATION triton_apple_backend)
     add_dependencies(TritonAppleGPUBackend metal_torch)
+endif()
+
+# Off by default: pip builds the wheel through this file and has no use for the
+# probe. `ctest` in agpu/build still works standalone.
+option(AGPU_BUILD_TESTS "Build the agpu emitter probe and its ctest" OFF)
+if(AGPU_BUILD_TESTS)
+    add_subdirectory(agpu)
 endif()

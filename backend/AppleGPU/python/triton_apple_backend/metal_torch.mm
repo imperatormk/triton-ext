@@ -29,6 +29,7 @@ typedef struct {
 } MetalKernelObject;
 
 static void MetalKernel_dealloc(MetalKernelObject *self) {
+  [self->pso release];
   self->pso = nil;
   Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -52,6 +53,26 @@ struct LaunchGeometry {
   long tgmem;
 };
 
+// False with the Python error set. Three positive ints: they divide, and they
+// reach MTLSizeMake unsigned, so a negative dispatches 2^64 threads.
+static bool readDims(PyObject *seq, const char *what, long *out) {
+  if (!PyList_Check(seq) || PyList_GET_SIZE(seq) != 3) {
+    PyErr_Format(PyExc_TypeError, "%s must be a list of 3 ints", what);
+    return false;
+  }
+  for (Py_ssize_t i = 0; i < 3; i++) {
+    out[i] = PyLong_AsLong(PyList_GET_ITEM(seq, i));
+    if (out[i] == -1 && PyErr_Occurred())
+      return false;
+    if (out[i] <= 0) {
+      PyErr_Format(PyExc_ValueError, "%s[%zd] must be positive, got %ld", what,
+                   i, out[i]);
+      return false;
+    }
+  }
+  return true;
+}
+
 // False with the Python error set.
 static bool readLaunchGeometry(PyObject *kwargs, LaunchGeometry *out) {
   PyObject *threads_obj = NULL, *group_obj = NULL, *tgmem_obj = NULL;
@@ -68,14 +89,24 @@ static bool readLaunchGeometry(PyObject *kwargs, LaunchGeometry *out) {
   // Dynamic threadgroup memory: when nonzero the kernel declares a trailing
   // addrspace(3) param; bind its byte length at TG location-index 0 (a separate
   // index space from device setBuffer, so no clash with the buffer args).
-  out->tgmem = tgmem_obj ? PyLong_AsLong(tgmem_obj) : 0;
+  out->tgmem = 0;
+  if (tgmem_obj) {
+    out->tgmem = PyLong_AsLong(tgmem_obj);
+    if (out->tgmem == -1 && PyErr_Occurred())
+      return false;
+    if (out->tgmem < 0) {
+      PyErr_SetString(PyExc_ValueError, "threadgroup_mem must not be negative");
+      return false;
+    }
+  }
 
-  out->tx = PyLong_AsLong(PyList_GetItem(threads_obj, 0));
-  out->ty = PyLong_AsLong(PyList_GetItem(threads_obj, 1));
-  out->tz = PyLong_AsLong(PyList_GetItem(threads_obj, 2));
-  out->gx = PyLong_AsLong(PyList_GetItem(group_obj, 0));
-  out->gy = PyLong_AsLong(PyList_GetItem(group_obj, 1));
-  out->gz = PyLong_AsLong(PyList_GetItem(group_obj, 2));
+  long threads[3], group[3];
+  if (!readDims(threads_obj, "threads", threads) ||
+      !readDims(group_obj, "group_size", group))
+    return false;
+
+  out->tx = threads[0], out->ty = threads[1], out->tz = threads[2];
+  out->gx = group[0], out->gy = group[1], out->gz = group[2];
   return true;
 }
 
@@ -177,7 +208,12 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
   if (!packArguments(args, &argInfos))
     return NULL;
 
+  // Nothing below touches Python, and the args tuple keeps the borrowed
+  // pointers in argInfos alive. Holding the GIL here would deadlock anything
+  // on the MPS queue that wants it.
+  PyThreadState *saved = PyEval_SaveThread();
   encodeDispatch(self, geom, argInfos);
+  PyEval_RestoreThread(saved);
   Py_RETURN_NONE;
 }
 
@@ -208,6 +244,7 @@ typedef struct {
 } MetalLibraryObject;
 
 static void MetalLibrary_dealloc(MetalLibraryObject *self) {
+  [self->library release];
   self->library = nil;
   Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -228,6 +265,7 @@ static PyObject *MetalLibrary_get_function(MetalLibraryObject *self,
   NSError *error = nil;
   id<MTLComputePipelineState> pso =
       [get_device() newComputePipelineStateWithFunction:fn error:&error];
+  [fn release];
   if (!pso) {
     // The PSO compiler often leaves localizedDescription useless and puts the
     // real diagnostic in userInfo or the underlying error.
@@ -246,6 +284,10 @@ static PyObject *MetalLibrary_get_function(MetalLibraryObject *self,
   }
 
   MetalKernelObject *kernel = PyObject_New(MetalKernelObject, &MetalKernelType);
+  if (!kernel) {
+    [pso release];
+    return NULL;
+  }
   kernel->pso = pso;
   kernel->maxThreads = [pso maxTotalThreadsPerThreadgroup];
   return (PyObject *)kernel;
@@ -279,6 +321,7 @@ static PyObject *py_load_metallib(PyObject *self, PyObject *args) {
 
     NSError *error = nil;
     id<MTLLibrary> lib = [get_device() newLibraryWithData:dd error:&error];
+    dispatch_release(dd);
     if (!lib) {
       PyErr_Format(PyExc_RuntimeError, "Failed to load metallib: %s",
                    [[error localizedDescription] UTF8String]);
@@ -287,6 +330,10 @@ static PyObject *py_load_metallib(PyObject *self, PyObject *args) {
 
     MetalLibraryObject *obj =
         PyObject_New(MetalLibraryObject, &MetalLibraryType);
+    if (!obj) {
+      [lib release];
+      return NULL;
+    }
     obj->library = lib;
     return (PyObject *)obj;
   }

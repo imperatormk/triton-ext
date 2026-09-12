@@ -107,8 +107,6 @@ inline Decision abiDecision(const KernelAbi &abi) {
                             "more buffer bindings than Metal allows");
 }
 
-// Unpinned, the compiler budgets registers for a worst-case threadgroup and
-// can cap the pipeline below the actual launch, failing at dispatch with
 } // namespace agpu
 
 #endif // AGPU_KERNEL_ABI_H

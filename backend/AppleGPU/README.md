@@ -16,7 +16,7 @@ triton-ext/backend/AppleGPU/
         └── triton_apple_backend/
               ├── compiler.py    TTIR → TTGIR → MSL → metallib
               ├── driver.py      MPS dispatch, buffer binding, scalar packing
-              └── metal_torch.m  ObjC++ Metal bridge over torch's MPS stream
+              └── metal_torch.mm ObjC++ Metal bridge over torch's MPS stream
 ```
 
 ## Scope
@@ -224,9 +224,12 @@ The dump knobs are silent for a kernel already in Triton's cache, exactly as
 
 ## Tests
 
-`ctest` in `agpu/build` runs `metal_compiles`, which feeds
-`agpu/test/emit_probe.cpp`'s output to `xcrun metal` and fails if the toolchain
-rejects it. Numerical correctness is proved by running a kernel, as above.
+`pytest backend/AppleGPU/test` covers discovery, compilation and, on an Apple
+GPU, a kernel end to end.
+
+`metal_compiles` feeds `agpu/test/emit_probe.cpp`'s output to `xcrun metal` and
+fails if the toolchain rejects it. Configure `agpu/` on its own, or pass
+`-DAGPU_BUILD_TESTS=ON` here, then `ctest` in the build directory.
 
 ## Known limitations
 

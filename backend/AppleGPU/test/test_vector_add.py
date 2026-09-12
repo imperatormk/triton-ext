@@ -8,14 +8,12 @@ everywhere else; the compile-only coverage lives in `test_backend_discovery`.
 from __future__ import annotations
 
 import pytest
+import torch
+import triton
+import triton.language as tl
 
-torch = pytest.importorskip("torch", reason="the dispatch path is torch's")
-
-if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+if not torch.backends.mps.is_available():
     pytest.skip("needs an Apple GPU", allow_module_level=True)
-
-import triton  # noqa: E402
-import triton.language as tl  # noqa: E402
 
 
 @triton.jit

@@ -65,6 +65,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           echo "pip version: $(pip --version)"
           echo "pip location: $(which pip)"
           echo "python version: $(python --version)"
@@ -96,6 +97,8 @@ jobs:
         run: make install
 
       - name: Run tests
+        env:
+          TRITON_EXT_REQUIRE_APPLEGPU: 1
         run: make test
 
       - name: List files

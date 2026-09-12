@@ -2,24 +2,17 @@
 """
 Download a pre-built Triton wheel to the current directory.
 
-The wheel is selected based on:
+Only wheels this interpreter and platform can install are considered, and the
+newest of those is downloaded. The wheel is selected based on:
 
 - `channel`: "nightly" or "release" (default: nightly)
-- `wheel-pattern`: the name of a Triton wheel, with glob wildcards allowed
-  (default: on nightly, match the pinned Triton commit, Python tags, and current
-  architecture)
+- `wheel-pattern`: narrows that set, with glob wildcards allowed (default: on
+  nightly, the Triton commit `ci/triton-hash.txt` pins)
 
-For ease of use, the wheel can be specified as a glob pattern, e.g.:
+Wheel filenames are long, so a pattern is usually a fragment:
 
-- `triton-*`: will match the first wheel fetched by `list_triton_wheels.py`
-- `triton-*+git0d7dc8626*`: will match a nightly wheel with the given commit
-  hash
-- `triton-3.8.0-*x86_64.whl`: will match an x86 release wheel at version 3.8.0
-
-This is helpful given that wheel filenames may be quite long, e.g.:
-
-- `triton-3.8.0-cp314-cp314-linux_x86_64.whl`
-- `triton-3.5.0+git07dc8626-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl`
+- `triton-*+git0d7dc8626*`: a nightly built from that commit
+- `triton-3.8.0-*`: pins release 3.8.0
 
 Usage (NOTE: quote the pattern to avoid shell expansion):
     python ci/download_triton_wheel.py [channel] ['wheel-pattern']
@@ -31,8 +24,7 @@ import os
 import sys
 
 import common
-import list_triton_wheels as wheels
-import probe_sysinfo
+import download_wheel
 
 USAGE = "Usage: python ci/download_triton_wheel.py [channel] ['wheel-pattern']"
 LOG = logging.getLogger(os.path.basename(__file__))
@@ -45,33 +37,6 @@ def read_triton_hash():
     return open(file).read().strip()
 
 
-def probe_python_tag():
-    """Return the CPython tag for the current Python version."""
-    major, minor = sys.version_info[:2]
-    return f"cp{major}{minor}"
-
-
-def normalize_arch(arch):
-    """
-    Normalise an arch name and return the substring that identifies it in
-    Triton wheel platform tags ("x86_64" or "aarch64").
-    """
-    if arch in ("x64", "x86_64", "amd64"):
-        return "x86_64"
-    if arch in ("arm64", "aarch64"):
-        return "aarch64"
-    LOG.error(f"Unrecognised arch: {arch!r}; expected 'x64' or 'arm64'")
-    sys.exit(1)
-
-
-def download_wheel(url, filename, channel):
-    """Stream-download a wheel file with a progress bar; skip if present."""
-    # The Azure DevOps feed only serves the full index to requests that look
-    # like pip; otherwise authentication is required.
-    headers = wheels.HEADERS if channel == "nightly" else {}
-    common.download_file(url, filename, headers=headers)
-
-
 def main(
     channel: str,
     pattern: str | None,
@@ -81,36 +46,11 @@ def main(
     Download a Triton wheel from the given `channel`, optionally matching a
     wheel `pattern`.
     """
-    if channel not in wheels.CHANNELS:
-        LOG.error(f"Invalid channel: {channel}")
-        print(USAGE, file=sys.stderr)
-        sys.exit(1)
-
-    # Construct pattern if missing on nightly channel.
+    # A nightly is published per commit, so pin the one this repo tracks.
     if channel == "nightly" and pattern is None:
-        ref = read_triton_hash()
-        pytag = probe_python_tag()
-        os, probed_arch = probe_sysinfo.run()
-        arch = normalize_arch(probed_arch)
-        pattern = f"triton-*+git{ref[:8]}-{pytag}-{pytag}-*{os}*_{arch}*.whl"
+        pattern = f"triton-*+git{read_triton_hash()[:8]}-*"
 
-    if not pattern:
-        LOG.error("No wheel pattern specified.")
-        print(USAGE, file=sys.stderr)
-        sys.exit(1)
-
-    candidates = wheels.run(channel, pattern)
-    if not candidates:
-        LOG.error(f"No wheel found matching pattern: {pattern}")
-        sys.exit(1)
-    wheel = candidates[0]
-
-    if not dry_run:
-        download_wheel(wheel.url, wheel.filename, channel)
-        if wheel.sha256:
-            common.verify_checksum(wheel.filename, wheel.sha256)
-
-    print(wheel.filename)
+    download_wheel.main(channel, pattern, dry_run, USAGE)
 
 
 if __name__ == "__main__":

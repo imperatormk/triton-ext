@@ -6,9 +6,9 @@ List all available Triton wheel versions.
   (default)
 - **release** wheels come from `PyPI`_
 
-This module exports the :class:`Wheel` class and the :func:`run` function, which
-fetches a list of wheels for a given channel (a `PEP 503`_ index). When run as a
-script it prints the retrieved wheel names to stdout.
+This module exports the :func:`run` function, which fetches a list of wheels for
+a given Triton channel (a `PEP 503`_ index read by :mod:`wheel_index`). When run
+as a script it prints the retrieved wheel names to stdout.
 
 Usage:
     python ci/list_triton_wheels.py [nightly|release] ['wheel-pattern']
@@ -22,142 +22,14 @@ import doctest
 import logging
 import os
 import sys
-from dataclasses import dataclass
-from fnmatch import fnmatch
-from html.parser import HTMLParser
 
-import requests
+import wheel_index
 
 LOG = logging.getLogger(os.path.basename(__file__))
-CHANNELS = {
-    "nightly":
-    "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/triton/",
-    "release": "https://pypi.org/simple/triton/"
-}
-HEADERS = {"User-Agent": "pip/24.0"}
-
-
-@dataclass
-class Wheel:
-    """A Triton wheel retrieved from a PEP 503 index."""
-    filename: str
-    url: str
-    sha256: str | None
-
-    def __init__(self, filename: str, url: str):
-        self.filename = filename
-        if "#sha256=" in url:
-            self.sha256 = url.split("#sha256=", 1)[1]
-            self.url = url.split("#", 1)[0]
-        else:
-            self.sha256 = None
-            self.url = url
-
-    def __str__(self):
-        return f"{self.filename}"
-
-    def version(self) -> str:
-        """
-        Return the base version string from a wheel filename.
-
-        >>> Wheel("triton-3.8.0-cp314-cp314-linux_x86_64.whl", "https://...").version()
-        '3.8.0'
-        >>> Wheel("triton-3.8.0+gitf6ef5434-cp314-cp314-linux_x86_64.whl", "https://...").version()
-        '3.8.0+gitf6ef5434'
-        >>> Wheel("triton-3.7.1+gitf6ef5434-cp314-cp314-linux_x86_64.whl", "https://...").version()
-        '3.7.1+gitf6ef5434'
-        """
-        return self.filename.split("-")[1]
-
-    def tags(self) -> tuple[str, str, str]:
-        """
-        Return the Python tags (interpreter, ABI, platform) from a wheel
-        filename.
-
-        >>> Wheel("triton-3.8.0-cp314-cp314-linux_x86_64.whl", "https://...").tags()
-        ('cp314', 'cp314', 'linux_x86_64')
-        >>> Wheel("triton-3.8.0+gitf6ef5434-cp314-cp314-linux_x86_64.whl", "https://...").tags()
-        ('cp314', 'cp314', 'linux_x86_64')
-        """
-        stem = self.filename.rsplit(".", 1)[0]
-        interpreter, abi, platform = stem.split("-")[2:]
-        return (interpreter, abi, platform)
-
-
-def _fetch_index(channel: str) -> str:
-    """Fetch the PEP 503 simple index for the given channel; return raw HTML."""
-    url = CHANNELS[channel]
-    # The Azure DevOps feed only serves the full index to requests that look
-    # like pip; otherwise authentication is required.
-    headers = HEADERS if channel == "nightly" else {}
-    LOG.debug(f"Fetching index: {url}")
-    response = requests.get(url, timeout=60, headers=headers)
-    response.raise_for_status()
-    return response.text
-
-
-class _WheelIndexParser(HTMLParser):
-    """Parse a PEP 503 simple index; see `_parse_anchors`."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.results: list[Wheel] = []
-        self._href: str | None = None
-        self._text: str | None = None
-        self._in_anchor = False
-
-    def handle_starttag(self, tag: str,
-                        attrs: list[tuple[str, str | None]]) -> None:
-        if tag != "a":
-            return
-        self._in_anchor = True
-        self._href = dict(attrs).get("href", "")
-
-    def handle_data(self, data: str) -> None:
-        if self._in_anchor and self._href and data.strip().endswith(".whl"):
-            self.results.append(Wheel(data.strip(), self._href))
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "a":
-            self._in_anchor = False
-            self._href = None
-
-
-def _parse_anchors(html: str) -> list[Wheel]:
-    """Parse a PEP 503 simple-index HTML page."""
-    parser = _WheelIndexParser()
-    parser.feed(html)
-    return parser.results
-
-
-def _filter_wheels(candidates: list[Wheel], pattern: str) -> list[Wheel]:
-    """
-    Return the subset of `candidates` whose filenames match `pattern`.
-
-    >>> _filter_wheels([], "triton-*")
-    []
-    >>> _filter_wheels([Wheel("triton-3.8.0-cp314-...whl", "https://...")], "triton-*")[0].version()
-    '3.8.0'
-    >>> wheels = [
-    ...   Wheel("triton-3.8.0+gitf6ef5434-...x86_64.whl", "https://..."),
-    ...   Wheel("triton-3.8.0+gitf6ef5434-...aarch64.whl", "https://..."),
-    ... ]
-    >>> _filter_wheels(wheels, "triton-*f6ef5434*aarch64*")[0].filename
-    'triton-3.8.0+gitf6ef5434-...aarch64.whl'
-    """
-    return [w for w in candidates if fnmatch(w.filename, pattern)]
-
-
-def run(channel, pattern=None) -> list[Wheel]:
-    """Return all wheel entries for the given channel, optionally filtered by pattern."""
-    html = _fetch_index(channel)
-    wheels = _parse_anchors(html)
-    LOG.debug(f"Parsed {len(wheels)} wheel anchors from {channel} index")
-    if pattern:
-        wheels = _filter_wheels(wheels, pattern)
-        LOG.debug(f"Filtered to {len(wheels)} wheels matching: {pattern}")
-    return wheels
-
+CHANNELS = wheel_index.CHANNELS
+run = wheel_index.run
+USAGE = ("Usage: python ci/list_triton_wheels.py [nightly|release] "
+         "['wheel-pattern']")
 
 if __name__ == "__main__":
     import signal
@@ -173,9 +45,7 @@ if __name__ == "__main__":
 
     channel = sys.argv[1] if len(sys.argv) > 1 else "nightly"
     if channel not in CHANNELS:
-        print(
-            "Usage: python ci/list_triton_wheels.py [nightly|release] ['wheel-pattern']",
-            file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         sys.exit(1)
 
     pattern = sys.argv[2] if len(sys.argv) > 2 else None

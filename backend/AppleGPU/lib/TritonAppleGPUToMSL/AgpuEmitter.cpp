@@ -167,6 +167,8 @@ agpu::Decision AgpuEmitter::walkOp(Operation *op) {
     return emitted(emitAssertOp(typed), op, "tt.assert");
   if (auto typed = dyn_cast<triton::PrintOp>(op))
     return emitted(emitPrintOp(typed), op, "tt.print");
+  if (auto typed = dyn_cast<LLVM::AssumeOp>(op))
+    return emitted(emitAssumeOp(typed), op, "llvm.intr.assume");
   if (auto typed = dyn_cast<scf::ForOp>(op))
     return emitted(emitForOp(typed), op, "scf.for");
   if (auto typed = dyn_cast<scf::IfOp>(op))

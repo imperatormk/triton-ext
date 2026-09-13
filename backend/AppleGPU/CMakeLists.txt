@@ -57,6 +57,7 @@ add_mlir_library(TritonAppleGPUBackend
     lib/TritonAppleGPUTransforms/EmitMSL.cpp
     lib/TritonAppleGPUTransforms/StoreShuffleLayout.cpp
 
+    ${TO_MSL}/AgpuAssume.cpp
     ${TO_MSL}/AgpuCarried.cpp
     ${TO_MSL}/AgpuControl.cpp
     ${TO_MSL}/AgpuDebug.cpp

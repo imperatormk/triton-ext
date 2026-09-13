@@ -11,8 +11,6 @@ int main() {
     CHECK(isVestigial("scf.yield"));
     CHECK(vestigialDecision("scf.yield").ok());
 
-    CHECK(vestigialDecision("llvm.intr.assume").ok());
-    CHECK(vestigialDecision("llvm.assume").keepLooking());
     CHECK(vestigialDecision("ttg.local_dealloc").ok());
     CHECK(vestigialDecision("scf.condition").ok());
   }
@@ -31,6 +29,9 @@ int main() {
 
     CHECK(!isVestigial("tt.assert"));
     CHECK(vestigialDecision("tt.assert").keepLooking());
+
+    CHECK(!isVestigial("llvm.intr.assume"));
+    CHECK(vestigialDecision("llvm.intr.assume").keepLooking());
   }
 
   CASE("every row is free to drop -- no row declines");

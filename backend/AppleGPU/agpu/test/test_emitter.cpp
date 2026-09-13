@@ -251,7 +251,7 @@ int main() {
     e.site = DeclineSite{"kernel.py:41", "w4"};
 
     CHECK(e.vestigial("scf.yield").ok());
-    CHECK(e.vestigial("llvm.intr.assume").ok());
+    CHECK(e.vestigial("ttg.local_dealloc").ok());
     CHECK(e.declines.empty());
 
     std::ostringstream os;

@@ -52,8 +52,8 @@ public:
     return d;
   }
 
-  // Ops handled by emitting nothing (`scf.yield`, `llvm.intr.assume`). Returns
-  // `notMine()` for an op outside the table.
+  // Ops handled by emitting nothing (`scf.yield`, `ttg.local_dealloc`).
+  // Returns `notMine()` for an op outside the table.
   Decision vestigial(std::string_view op) {
     const Decision d = vestigialDecision(op);
     declines.record(d, site);

@@ -34,6 +34,7 @@
 #include "agpu/plan/LaunchPlan.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Analysis/AxisInfo.h"
@@ -260,6 +261,8 @@ private:
   agpu::Decision emitAssertOp(triton::AssertOp as);
 
   agpu::Decision emitPrintOp(triton::PrintOp pr);
+
+  agpu::Decision emitAssumeOp(LLVM::AssumeOp as);
 
   PoolNeed poolNeedOf(Operation *op);
 

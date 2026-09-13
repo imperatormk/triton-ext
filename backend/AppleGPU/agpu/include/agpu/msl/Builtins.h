@@ -129,6 +129,12 @@ inline constexpr const char *Threadgroup = "threadgroup_barrier";
 inline constexpr const char *Simdgroup = "simdgroup_barrier";
 } // namespace barrier
 
+// Clang's, which the Metal compiler is. It generates no code: the condition is
+// a promise the optimiser may rely on.
+namespace clang {
+inline constexpr const char *Assume = "__builtin_assume";
+} // namespace clang
+
 // Metal has none of these; the prelude defines them. Using a name here means
 // also emitting the body, through Prelude.h's `HelperSet`. Named here because
 // plan/ picks some as a lowering and may not include emit/.

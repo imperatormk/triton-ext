@@ -147,8 +147,8 @@ recorded here, because a figure without the date, the machine and the Triton
 revision it was taken on goes stale silently. Measure it when you need it.
 
 A test that inspects LLVM IR does not apply to this path, which emits MSL. Note
-that `llvm.intr.assume` and `ub.poison` are both handled: the first is consumed
-as vestigial, the second has a real lowering.
+that `llvm.intr.assume` and `ub.poison` are both handled: the first becomes a
+`__builtin_assume`, the second has a real lowering.
 
 ## Known Limitations
 

@@ -19,8 +19,6 @@ inline constexpr std::string_view kVestigial[] = {
     "scf.yield",
     "scf.condition",
     "ttg.local_dealloc",
-    // MLIR spells this one `llvm.intr.assume`.
-    "llvm.intr.assume",
 };
 
 inline bool isVestigial(std::string_view op) {

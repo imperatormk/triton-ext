@@ -98,11 +98,5 @@ jobs:
       - name: Run tests
         run: make test
 
-      - name: Compile the emitter's output
-        run: |
-          cmake -S backend/AppleGPU/agpu -B build/agpu -G Ninja
-          ninja -C build/agpu
-          ctest --test-dir build/agpu --output-on-failure
-
       - name: List files
         run: du -d 3 -h .

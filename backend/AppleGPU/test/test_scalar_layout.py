@@ -8,18 +8,11 @@ back from. A drift between them is a silently wrong scalar argument.
 from __future__ import annotations
 
 import random
-import re
-from pathlib import Path
 
 import pytest
 
 from triton_apple_backend.driver import _compute_scalar_layout
 from triton_apple_backend.tables import SCALAR_PACK_INFO
-
-AGPU_INCLUDE = Path(
-    __file__).resolve().parents[1] / "agpu" / "include" / "agpu"
-ELEM_TYPE_H = AGPU_INCLUDE / "plan" / "ElemType.h"
-KERNEL_ABI_H = AGPU_INCLUDE / "emit" / "KernelAbi.h"
 
 BITS = {
     "i1": 1,
@@ -49,18 +42,6 @@ def cpp_layout(types):
         offsets.append(offset)
         offset += size
     return offset, offsets
-
-
-def test_byte_width_still_rounds_the_bit_count():
-    src = ELEM_TYPE_H.read_text()
-    assert re.search(r"\(int64_t\)\(\(e\.bits \+ 7u\) / 8u\)", src), \
-        "byteWidthOf changed; BITS here no longer models it"
-
-
-def test_the_emitter_still_aligns_each_scalar_to_its_own_size():
-    src = KERNEL_ABI_H.read_text()
-    assert re.search(r"off = \(off \+ size - 1\) / size \* size;", src), \
-        "planKernelAbi's alignment changed; cpp_layout no longer models it"
 
 
 def test_every_packable_type_has_a_bit_width():

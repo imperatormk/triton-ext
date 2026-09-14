@@ -92,10 +92,3 @@ if(APPLE)
     install(TARGETS metal_torch LIBRARY DESTINATION triton_apple_backend)
     add_dependencies(TritonAppleGPUBackend metal_torch)
 endif()
-
-# Off by default: pip builds the wheel through this file and has no use for the
-# probe. `ctest` in agpu/build still works standalone.
-option(AGPU_BUILD_TESTS "Build the agpu emitter probe and its ctest" OFF)
-if(AGPU_BUILD_TESTS)
-    add_subdirectory(agpu)
-endif()

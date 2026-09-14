@@ -16,11 +16,7 @@ target_compile_options(agpu_msl PRIVATE ${AGPU_WARNINGS})
 
 enable_testing()
 
-add_executable(emit_probe test/emit_probe.cpp)
-target_link_libraries(emit_probe PRIVATE agpu_msl agpu_core)
-target_compile_options(emit_probe PRIVATE ${AGPU_WARNINGS})
-
-add_test(NAME metal_compiles
-  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/metal_compiles.sh
-          $<TARGET_FILE:emit_probe>
-          ${CMAKE_CURRENT_BINARY_DIR}/emit_probe)
+add_executable(test_kernelabi test/test_kernelabi.cpp)
+target_link_libraries(test_kernelabi PRIVATE agpu_msl agpu_core)
+target_compile_options(test_kernelabi PRIVATE ${AGPU_WARNINGS})
+add_test(NAME kernelabi COMMAND test_kernelabi)

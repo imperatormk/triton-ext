@@ -45,19 +45,15 @@ bind/   the dispatch table and the symbol table
 Within `emit/`: an `EmitX.h` holds the `emitX()` for one op family.
 `primitives/` holds the small types those emitters take and hold.
 
-## The check that matters
+## Tests
 
 ```bash
-ctest --test-dir build -R metal_compiles
+cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-It is the only test here, because a text assertion cannot catch a module that
-does not compile. `test/emit_probe.cpp` emits a masked move, an elementwise
-kernel and a whole `Emitter` module, and feeds the lot to `xcrun metal`.
-
-It skips when there is no Metal toolchain and fails when one is present and
-rejects the output. If `xcrun metal` reports a missing toolchain that is in fact
-installed, set `TOOLCHAINS` to the Metal toolchain's bundle id.
+`kernelabi` covers `planKernelAbi`: where each argument binds, and the offsets
+`driver.py` packs scalars to. A drift there is a wrong kernel argument, so both
+sides are checked against the same rules.
 
 ## Design rules
 

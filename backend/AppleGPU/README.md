@@ -227,9 +227,9 @@ The dump knobs are silent for a kernel already in Triton's cache, exactly as
 `pytest backend/AppleGPU/test` covers discovery, compilation and, on an Apple
 GPU, a kernel end to end.
 
-`metal_compiles` feeds `agpu/test/emit_probe.cpp`'s output to `xcrun metal` and
-fails if the toolchain rejects it. Configure `agpu/` on its own, or pass
-`-DAGPU_BUILD_TESTS=ON` here, then `ctest` in the build directory.
+That includes `agpu/`'s own ctest suite, which pytest configures and builds.
+Standalone:
+`cmake -S agpu -B build && cmake --build build && ctest --test-dir build`.
 
 ## Known limitations
 

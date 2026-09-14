@@ -45,19 +45,18 @@ static std::optional<agpu::TileView> paddedView(gpu::PaddedSharedEncodingAttr p,
   return v;
 }
 
-// A linear encoding states its offsets as a basis matrix, which is only a
-// strided tile when each basis is the stride of one dimension. Checked against
-// the layout itself rather than assumed: a basis this does not model would
-// otherwise address the wrong element.
-static std::optional<agpu::TileView>
-linearView(gpu::SharedLinearEncodingAttr lin, gpu::MemDescType mt) {
-  const SmallVector<unsigned> order = lin.getOrder();
+// An encoding that states its offsets as a basis matrix is a strided tile only
+// when each basis is the stride of one dimension. Checked against the layout
+// itself rather than assumed: a basis this does not model would otherwise
+// address the wrong element.
+static std::optional<agpu::TileView> probedView(gpu::MemDescType mt,
+                                                ArrayRef<unsigned> order) {
   std::optional<agpu::TileView> v = stridedView(mt, order);
   if (!v)
     return std::nullopt;
 
   MLIRContext *ctx = mt.getContext();
-  const LinearLayout ll = lin.toLinearLayout(mt.getShape());
+  const LinearLayout ll = gpu::toLinearLayout(mt);
   const auto kOffset = StringAttr::get(ctx, "offset");
   if (!ll.hasInDim(kOffset))
     return std::nullopt;
@@ -85,7 +84,18 @@ static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
   if (auto p = dyn_cast<gpu::PaddedSharedEncodingAttr>(mt.getEncoding()))
     return paddedView(p, mt);
   if (auto lin = dyn_cast<gpu::SharedLinearEncodingAttr>(mt.getEncoding()))
-    return linearView(lin, mt);
+    return probedView(mt, lin.getOrder());
+  if (auto nv = dyn_cast<gpu::NVMMASharedEncodingAttr>(mt.getEncoding())) {
+    const int rank = mt.getRank();
+    if (rank < 2)
+      return std::nullopt;
+    SmallVector<unsigned> order;
+    for (int d = rank; d-- > 0;)
+      order.push_back((unsigned)d);
+    if (nv.getTransposed())
+      std::swap(order[0], order[1]);
+    return probedView(mt, order);
+  }
 
   auto shared = dyn_cast<gpu::SwizzledSharedEncodingAttr>(mt.getEncoding());
   if (!shared)

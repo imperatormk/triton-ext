@@ -17,7 +17,8 @@ struct MemDesc {
   // `memdesc_subslice`: a sub-rectangle at `offsets`.
   MemDesc subslice(const TileView::Coord &offsets,
                    const TileView::Coord &extent) const {
-    return {buffer, view.subview(offsets, extent)};
+    return {buffer, view.swizzle().permutes() ? view.window(offsets, extent)
+                                              : view.subview(offsets, extent)};
   }
 
   // Subslice with no explicit extent: runs to the end of each dimension.

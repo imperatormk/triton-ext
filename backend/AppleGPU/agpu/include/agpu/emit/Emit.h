@@ -49,6 +49,25 @@ inline msl::Expr *guardExpr(msl::Context &c, const CoordGuard &g, int reg,
   return guardCond(c, g, [&](int dim) { return src.of(c, reg, dim); });
 }
 
+inline bool isPowerOfTwo(int64_t n) { return n > 0 && (n & (n - 1)) == 0; }
+
+inline msl::Expr *divBy(msl::Context &c, msl::Expr *e, int64_t n) {
+  if (n == 1)
+    return e;
+  if (isPowerOfTwo(n))
+    return c.binary(msl::BinOp::Shr, e,
+                    c.lit(__builtin_ctzll((unsigned long long)n)));
+  return c.binary(msl::BinOp::Div, e, c.lit(n));
+}
+
+inline msl::Expr *modBy(msl::Context &c, msl::Expr *e, int64_t n) {
+  if (n == 1)
+    return c.lit(0);
+  if (isPowerOfTwo(n))
+    return c.binary(msl::BinOp::And, e, c.lit(n - 1));
+  return c.binary(msl::BinOp::Rem, e, c.lit(n));
+}
+
 // The runtime twin of `TileView::offsetOf`. Takes no `StageAction::coord`:
 // `src.of` is already the complete coordinate.
 inline msl::Expr *offsetExprOf(msl::Context &c, const TileView &v, int reg,
@@ -57,6 +76,7 @@ inline msl::Expr *offsetExprOf(msl::Context &c, const TileView &v, int reg,
   for (int d = 0; d < v.rank(); ++d)
     coord.push_back(src.of(c, reg, d));
 
+  const Swizzle &sw = v.swizzle();
   return v.linearize<msl::Expr *>(
       coord,
       [&](msl::Expr *t, int64_t s) {
@@ -65,7 +85,20 @@ inline msl::Expr *offsetExprOf(msl::Context &c, const TileView &v, int reg,
       [&](msl::Expr *a, msl::Expr *b) {
         return c.binary(msl::BinOp::Add, a, b);
       },
-      [&](int64_t k) { return c.lit(k); });
+      [&](int64_t k) { return c.lit(k); },
+      [&](msl::Expr *g, const std::vector<msl::Expr *> &all) {
+        const int64_t mp = sw.effectiveMaxPhase(v.extentAt(sw.groupDim));
+        msl::Expr *phase =
+            modBy(c, divBy(c, all[(std::size_t)sw.phaseDim], sw.perPhase), mp);
+        msl::Expr *group = divBy(c, g, sw.vec);
+        msl::Expr *swizzled = c.binary(msl::BinOp::Xor, group, phase);
+        msl::Expr *base =
+            sw.vec == 1 ? swizzled
+                        : c.binary(msl::BinOp::Mul, swizzled, c.lit(sw.vec));
+        return sw.vec == 1
+                   ? base
+                   : c.binary(msl::BinOp::Add, base, modBy(c, g, sw.vec));
+      });
 }
 
 // The address is a runtime expression: the slot depends on the lane holding

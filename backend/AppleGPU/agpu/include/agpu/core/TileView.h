@@ -3,8 +3,6 @@
 // Whoever reserves space for a tile calls cosizeElems() on the same object the
 // emitter addresses through.
 //
-// No permutation here: bank spread comes from a padded stride instead, see
-// core/Padding.h.
 #ifndef AGPU_TILE_VIEW_H
 #define AGPU_TILE_VIEW_H
 
@@ -15,6 +13,32 @@
 #include <vector>
 
 namespace agpu {
+
+// An XOR permutation of the offset inside a row. `vec` elements stay
+// contiguous, `perPhase` consecutive rows share a phase, and `maxPhase` phases
+// cycle. All three at 1 is the identity.
+struct Swizzle {
+  int64_t vec = 1;
+  int64_t perPhase = 1;
+  int64_t maxPhase = 1;
+  int phaseDim = 0;
+  int groupDim = 1;
+  // Of the buffer the swizzle was defined on, which a window keeps so its
+  // phases match the parent's.
+  int64_t groupExtent = 0;
+
+  bool permutes() const { return maxPhase > 1; }
+  bool identity() const { return vec == 1 && perPhase == 1 && maxPhase == 1; }
+
+  // The XOR must land inside the row, so the phase cannot exceed the number of
+  // groups the row holds; `maxPhase` is the nominal cycle, which a narrow row
+  // cannot use in full.
+  int64_t effectiveMaxPhase(int64_t viewExtent) const {
+    const int64_t width = groupExtent > 0 ? groupExtent : viewExtent;
+    const int64_t groups = vec > 0 ? width / vec : 0;
+    return groups > 0 ? std::min(maxPhase, groups) : 1;
+  }
+};
 
 // Extents and strides are in elements, innermost dimension last. Strides are
 // explicit: a padded row or a transposed operand is the same type with
@@ -27,6 +51,12 @@ public:
 
   TileView(Coord extent, Coord stride, int64_t origin = 0)
       : extent_(std::move(extent)), stride_(std::move(stride)),
+        origin_(origin) {
+    assert(extent_.size() == stride_.size());
+  }
+
+  TileView(Coord extent, Coord stride, Swizzle sw, int64_t origin = 0)
+      : extent_(std::move(extent)), stride_(std::move(stride)), swizzle_(sw),
         origin_(origin) {
     assert(extent_.size() == stride_.size());
   }
@@ -60,6 +90,23 @@ public:
     return v;
   }
 
+  const Swizzle &swizzle() const { return swizzle_; }
+  void setSwizzle(Swizzle sw) { swizzle_ = sw; }
+
+  const Coord &shift() const { return shift_; }
+  bool shifted() const { return !shift_.empty(); }
+
+  // A window keeps the offset as a coordinate, because the permutation is
+  // defined on the parent's coordinates and an added origin would miss it.
+  TileView window(const Coord &at, const Coord &ext) const {
+    assert(at.size() == extent_.size() && ext.size() == extent_.size());
+    TileView v(ext, stride_, swizzle_, origin_);
+    v.shift_ = at;
+    for (std::size_t d = 0; d < shift_.size(); ++d)
+      v.shift_[d] += shift_[d];
+    return v;
+  }
+
   int rank() const { return static_cast<int>(extent_.size()); }
   const Coord &extent() const { return extent_; }
   const Coord &stride() const { return stride_; }
@@ -68,30 +115,62 @@ public:
   int64_t strideAt(int d) const { return stride_[d]; }
 
   // Templated over the term type so `offsetOf` (integers) and `offsetExprOf`
-  // in Emit.h (AST nodes) share one loop.
+  // in Emit.h (AST nodes) share one loop. The swizzle folds in here so both
+  // spellings permute alike; a reader and a writer that disagreed would
+  // silently exchange the wrong element.
+  template <typename T, typename ScaleFn, typename AddFn, typename UnitFn,
+            typename SwizzleFn>
+  T linearize(const std::vector<T> &coord, ScaleFn scale, AddFn add,
+              UnitFn unit, SwizzleFn swizzleGroup) const {
+    std::vector<T> at = coord;
+    if (!shift_.empty())
+      for (std::size_t d = 0; d < at.size() && d < shift_.size(); ++d)
+        at[d] = add(at[d], unit(shift_[d]));
+
+    T off = unit(origin_);
+    for (std::size_t d = 0; d < at.size(); ++d) {
+      const int dim = static_cast<int>(d);
+      if (swizzle_.permutes() && dim == swizzle_.groupDim) {
+        off = add(off, scale(swizzleGroup(at[d], at), stride_[d]));
+        continue;
+      }
+      off = add(off, scale(at[d], stride_[d]));
+    }
+    return off;
+  }
+
   template <typename T, typename ScaleFn, typename AddFn, typename UnitFn>
   T linearize(const std::vector<T> &coord, ScaleFn scale, AddFn add,
               UnitFn unit) const {
-    T off = unit(origin_);
-    for (std::size_t d = 0; d < coord.size(); ++d)
-      off = add(off, scale(coord[d], stride_[d]));
-    return off;
+    assert(!swizzle_.permutes() &&
+           "a swizzled view needs the swizzle-aware linearize");
+    return linearize<T>(coord, scale, add, unit,
+                        [](const T &g, const std::vector<T> &) { return g; });
   }
 
   int64_t offsetOf(const Coord &coord) const {
     assert(coord.size() == extent_.size());
+    const Swizzle &sw = swizzle_;
     return linearize<int64_t>(
         coord, [](int64_t v, int64_t s) { return v * s; },
-        [](int64_t a, int64_t b) { return a + b; },
-        [](int64_t v) { return v; });
+        [](int64_t a, int64_t b) { return a + b; }, [](int64_t v) { return v; },
+        [&sw, this](int64_t g, const Coord &all) {
+          const int64_t mp =
+              sw.effectiveMaxPhase(extent_[(std::size_t)sw.groupDim]);
+          const int64_t phase =
+              (all[(std::size_t)sw.phaseDim] / sw.perPhase) % mp;
+          return ((g / sw.vec) ^ phase) * sw.vec + g % sw.vec;
+        });
   }
   int64_t offsetOf(std::initializer_list<int64_t> coord) const {
     return offsetOf(Coord(coord));
   }
 
-  // Keeps this view's strides; the origin absorbs the offset.
+  // Keeps this view's strides; the origin absorbs the offset. An additive
+  // origin cannot carry a permutation, so a swizzled view takes `window`.
   TileView subview(const Coord &at, const Coord &ext) const {
     assert(at.size() == extent_.size() && ext.size() == extent_.size());
+    assert(!swizzle_.permutes());
     return TileView(ext, stride_, offsetOf(at));
   }
   TileView subview(std::initializer_list<int64_t> at,
@@ -103,6 +182,7 @@ public:
   // the tensor's and the origin absorbs the subtraction. The origin goes
   // negative, so `cosizeElems()` on the result is not meaningful.
   TileView originAt(const Coord &at) const {
+    assert(!swizzle_.permutes());
     TileView v = *this;
     v.origin_ = 2 * origin_ - offsetOf(at);
     return v;
@@ -114,6 +194,7 @@ public:
   // Drop a dimension by fixing its coordinate; the origin carries it.
   TileView slice(int64_t at, int dim = 0) const {
     assert(rank() > 1 && dim < rank());
+    assert(!swizzle_.permutes());
     Coord at3(extent_.size(), 0);
     at3[dim] = at;
     const int64_t off = offsetOf(at3);
@@ -127,7 +208,9 @@ public:
     return TileView(std::move(e), std::move(s), off);
   }
 
-  // Sizing query: a pool reservation must be at least this large.
+  // Sizing query: a pool reservation must be at least this large. A swizzle
+  // moves the highest offset off the last coordinate, so the corner no longer
+  // bounds it and the row span does.
   int64_t cosizeElems() const {
     if (extent_.empty())
       return 0;
@@ -137,7 +220,15 @@ public:
         return 0;
       last[d] = extent_[d] - 1;
     }
-    return offsetOf(last) + 1;
+    if (!swizzle_.permutes())
+      return offsetOf(last) + 1;
+
+    const std::size_t g = (std::size_t)swizzle_.groupDim;
+    int64_t span = 0;
+    for (std::size_t d = 0; d < extent_.size(); ++d)
+      if (d != g)
+        span += last[d] * stride_[d];
+    return span + extent_[g] * stride_[g] + origin_;
   }
 
   int64_t sizeElems() const {
@@ -150,13 +241,20 @@ public:
   }
 
   bool operator==(const TileView &o) const {
-    return extent_ == o.extent_ && stride_ == o.stride_ && origin_ == o.origin_;
+    return extent_ == o.extent_ && stride_ == o.stride_ &&
+           origin_ == o.origin_ && swizzle_.vec == o.swizzle_.vec &&
+           swizzle_.perPhase == o.swizzle_.perPhase &&
+           swizzle_.maxPhase == o.swizzle_.maxPhase &&
+           swizzle_.phaseDim == o.swizzle_.phaseDim &&
+           swizzle_.groupDim == o.swizzle_.groupDim;
   }
   bool operator!=(const TileView &o) const { return !(*this == o); }
 
 private:
   Coord extent_;
   Coord stride_;
+  Coord shift_;
+  Swizzle swizzle_;
   int64_t origin_ = 0;
 };
 

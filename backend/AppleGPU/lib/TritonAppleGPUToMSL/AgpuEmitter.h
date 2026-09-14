@@ -620,6 +620,7 @@ private:
 
   agpu::Decision emitLocalAlloc(const agpu::OpView &o);
   agpu::Decision emitLocalLoad(const agpu::OpView &o);
+  agpu::Decision emitLocalStore(const agpu::OpView &o);
 
   agpu::Decision emitHistogramOp(const agpu::OpView &o);
   agpu::Decision emitGatherOp(const agpu::OpView &o);

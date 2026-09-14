@@ -9,14 +9,10 @@ namespace mlir::triton::applegpu::bridge {
 namespace am = agpu::msl;
 
 // Strides follow the shared encoding's order: fastest-varying dimension gets
-// stride 1. Declines a real swizzle (vec/perPhase/maxPhase past 1), which
-// strides can't express.
+// stride 1.
 static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
   auto shared = dyn_cast<gpu::SwizzledSharedEncodingAttr>(mt.getEncoding());
   if (!shared)
-    return std::nullopt;
-  if (shared.getVec() != 1 || shared.getPerPhase() != 1 ||
-      shared.getMaxPhase() != 1)
     return std::nullopt;
   const auto order = shared.getOrder();
   const int rank = mt.getRank();
@@ -30,7 +26,22 @@ static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
     strides[order[i]] = acc;
     acc *= extent[order[i]];
   }
-  return agpu::TileView(std::move(extent), std::move(strides));
+
+  agpu::Swizzle sw;
+  sw.vec = shared.getVec();
+  sw.perPhase = shared.getPerPhase();
+  sw.maxPhase = shared.getMaxPhase();
+  // A rank-1 tile is one row, whose phase is always zero.
+  sw.groupDim = order[0];
+  sw.groupExtent = extent[(std::size_t)order[0]];
+  if (rank > 1) {
+    sw.phaseDim = order[1];
+  } else {
+    sw.phaseDim = order[0];
+    sw.maxPhase = 1;
+  }
+
+  return agpu::TileView(std::move(extent), std::move(strides), sw);
 }
 
 agpu::Decision AgpuEmitter::emitLocalAlloc(const agpu::OpView &o) {
@@ -43,7 +54,8 @@ agpu::Decision AgpuEmitter::emitLocalAlloc(const agpu::OpView &o) {
   auto mt = cast<gpu::MemDescType>(res.getType());
   const std::optional<agpu::TileView> view = tileViewOfMemDesc(mt);
   if (!view)
-    return declined("ttg.local_alloc", "the shared encoding is not unswizzled");
+    return declined("ttg.local_alloc",
+                    "the shared encoding is not a swizzled_shared");
   const std::optional<agpu::ElemType> elem = elemTypeOf(mt.getElementType());
   if (!elem)
     return declined("ttg.local_alloc", "the element has no representation");
@@ -141,11 +153,42 @@ agpu::Decision AgpuEmitter::emitMemDescViewOp(const agpu::OpView &o) {
         k->second[0].isFloat)
       return declined("ttg.memdesc_index",
                       "a runtime buffer index is not addressable");
+    if (parent.view.swizzle().permutes())
+      return declined("ttg.memdesc_index",
+                      "indexing a swizzled buffer is not addressable");
     body_.memDescOf[o.results[0]] = parent.index(k->second[0].i);
   } else {
     return declined(o.name, "the op was never recorded");
   }
   body_.sym.bindDataless(o.results[0]);
+  return agpu::Decision::emitted();
+}
+
+agpu::Decision AgpuEmitter::emitLocalStore(const agpu::OpView &o) {
+  am::Context &mc = agpu_.context();
+  const auto it = body_.memDescOf.find(o.operands[1]);
+  if (it == body_.memDescOf.end())
+    return declined("ttg.local_store",
+                    "the handle was never bound to a buffer");
+  const agpu::MemDesc &md = it->second;
+
+  const Value src = mlirValueOf(o.operands[0]);
+  if (!src)
+    return declined("ttg.local_store", "the source was never recorded");
+  auto srcTy = dyn_cast<RankedTensorType>(src.getType());
+  if (!srcTy)
+    return declined("ttg.local_store", "the source is not a tensor");
+  const std::optional<agpu::ElemType> elem = elemTypeOf(srcTy.getElementType());
+  if (!elem)
+    return declined("ttg.local_store", "the element has no representation");
+
+  cur_->push_back(mc.hardBarrier());
+  if (const agpu::Decision d =
+          stageWholeTensor(idOf(src), srcTy, md.buffer, md.view, *elem,
+                           "ttg.local_store", "a source");
+      !d.ok())
+    return d;
+  cur_->push_back(mc.hardBarrier());
   return agpu::Decision::emitted();
 }
 
@@ -163,6 +206,13 @@ void AgpuEmitter::registerMemDescHandler() {
                  return declined("ttg.local_load",
                                  "unexpected operand or result count");
                return emitLocalLoad(o);
+             }));
+
+  table_.add("localStore",
+             agpu::forOps({"ttg.local_store"}, [this](const agpu::OpView &o) {
+               if (o.operands.size() != 2)
+                 return declined("ttg.local_store", "unexpected operand count");
+               return emitLocalStore(o);
              }));
 
   table_.add("memdescView",

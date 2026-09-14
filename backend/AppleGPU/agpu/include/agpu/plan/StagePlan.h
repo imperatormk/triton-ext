@@ -43,7 +43,11 @@ inline PtrDims tilePtrDims(const TileView &v, int64_t elemBytes) {
   for (int d = 0; d < v.rank(); ++d) {
     PtrInfo p;
     if (v.strideAt(d) == 1) {
-      p.contiguity = v.extentAt(d);
+      // A swizzle keeps only `vec` elements together, so a wider access would
+      // straddle the XOR boundary and reach a permuted neighbour.
+      p.contiguity = v.swizzle().permutes()
+                         ? std::min(v.extentAt(d), v.swizzle().vec)
+                         : v.extentAt(d);
       int64_t align = elemBytes > 0 ? kTGPoolAlignBytes / elemBytes : 1;
       for (int o = 0; o < v.rank(); ++o)
         if (o != d)

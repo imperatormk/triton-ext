@@ -58,9 +58,9 @@ install(TARGETS TritonAppleGPUBackend
         LIBRARY DESTINATION triton_apple_backend)
 
 if(APPLE)
-    # The plugin's MLIR symbols are resolved at load from libtriton. Two-level
-    # namespace keeps that lookup scoped; -flat_namespace would expose every
-    # other loaded dylib to it as well.
+    # The plugin's MLIR symbols are resolved at load from libtriton. This
+    # leaves only those undefined, where -flat_namespace would put every
+    # symbol in the image up for resolution.
     target_link_options(TritonAppleGPUBackend PRIVATE
         -Wl,-dead_strip -Wl,-undefined,dynamic_lookup)
 
@@ -85,10 +85,9 @@ if(APPLE)
     find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_LIB_DIR}"
                  NO_DEFAULT_PATH REQUIRED)
     target_link_libraries(metal_torch PRIVATE "${TORCH_PYTHON_LIBRARY}")
-    # cmake strips the build rpath on install, and libtorch is not on the
-    # loader's default search path.
+    # This module installs beside torch/ in site-packages.
     set_target_properties(metal_torch PROPERTIES
-        INSTALL_RPATH "${TORCH_LIB_DIR}"
+        INSTALL_RPATH "@loader_path/../torch/lib"
         BUILD_WITH_INSTALL_RPATH TRUE)
     install(TARGETS metal_torch LIBRARY DESTINATION triton_apple_backend)
     add_dependencies(TritonAppleGPUBackend metal_torch)

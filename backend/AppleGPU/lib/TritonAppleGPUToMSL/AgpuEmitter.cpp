@@ -4,7 +4,7 @@
 
 #include "agpu/core/Names.h"
 #include "agpu/msl/Printer.h"
-#include "agpu/plan/Vestigial.h"
+#include "agpu/plan/Terminators.h"
 
 #include <sstream>
 
@@ -174,9 +174,6 @@ LogicalResult AgpuEmitter::bindArgs(triton::FuncOp func,
 }
 
 agpu::Decision AgpuEmitter::walkOp(Operation *op) {
-  if (agpu::isVestigial(opName(op)))
-    return agpu::Decision::emitted();
-
   for (Value v : op->getResults()) {
     const agpu::ValueId id = idOf(v);
     valueFor_[id] = v;
@@ -228,8 +225,6 @@ agpu::Decision AgpuEmitter::declineOp(Operation *op, const agpu::Decision &d,
 agpu::Decision AgpuEmitter::walkBlock(Block &block, am::Block &out) {
   const CurBlock here(*this, out);
   for (Operation &op : block) {
-    // By name: `hasTrait` compares a TypeID the plugin and the host generate
-    // separately, so it answers false wherever they do not share one.
     if (agpu::isTerminator(opName(&op)))
       continue;
     if (const agpu::Decision d = walkOp(&op); !d.ok())

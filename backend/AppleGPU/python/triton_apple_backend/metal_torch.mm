@@ -7,6 +7,9 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <exception>
+#include <vector>
+
 // getMTLBufferStorage mirrors PyTorch's ATen/native/mps/OperationUtils.h.
 #include <ATen/Tensor.h>
 #include <ATen/mps/MPSStream.h>
@@ -14,6 +17,31 @@
 
 static inline id<MTLBuffer> getMTLBufferStorage(const at::TensorBase &t) {
   return __builtin_bit_cast(id<MTLBuffer>, t.storage().data());
+}
+
+struct ReleasedGil {
+  PyThreadState *saved = PyEval_SaveThread();
+  ~ReleasedGil() { PyEval_RestoreThread(saved); }
+};
+
+// torch throws c10::Error and Metal raises NSException; either would unwind
+// through CPython's C frames.
+template <class Body> static PyObject *guarded(Body body) {
+  try {
+    @try {
+      return body();
+    } @catch (NSException *e) {
+      PyErr_Format(PyExc_RuntimeError, "%s: %s", [[e name] UTF8String],
+                   [[e reason] UTF8String]);
+      return NULL;
+    }
+  } catch (const std::exception &e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return NULL;
+  } catch (...) {
+    PyErr_SetString(PyExc_RuntimeError, "unknown C++ exception");
+    return NULL;
+  }
 }
 
 // Use PyTorch's MPS device - same device that owns the tensor buffers.
@@ -53,8 +81,8 @@ struct LaunchGeometry {
   long tgmem;
 };
 
-// False with the Python error set. Three positive ints: they divide, and they
-// reach MTLSizeMake unsigned, so a negative dispatches 2^64 threads.
+// False with the Python error set. Three positive ints: they reach MTLSizeMake
+// unsigned, so a negative dispatches 2^64 threads.
 static bool readDims(PyObject *seq, const char *what, long *out) {
   if (!PyList_Check(seq) || PyList_GET_SIZE(seq) != 3) {
     PyErr_Format(PyExc_TypeError, "%s must be a list of 3 ints", what);
@@ -104,6 +132,16 @@ static bool readLaunchGeometry(PyObject *kwargs, LaunchGeometry *out) {
   if (!readDims(threads_obj, "threads", threads) ||
       !readDims(group_obj, "group_size", group))
     return false;
+
+  for (int i = 0; i < 3; i++) {
+    if (threads[i] % group[i]) {
+      PyErr_Format(
+          PyExc_ValueError,
+          "threads[%d] (%ld) is not a multiple of group_size[%d] (%ld)", i,
+          threads[i], i, group[i]);
+      return false;
+    }
+  }
 
   out->tx = threads[0], out->ty = threads[1], out->tz = threads[2];
   out->gx = group[0], out->gy = group[1], out->gz = group[2];
@@ -200,21 +238,24 @@ static void encodeDispatch(MetalKernelObject *self, const LaunchGeometry &geom,
 
 static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
                                   PyObject *kwargs) {
-  LaunchGeometry geom;
-  if (!readLaunchGeometry(kwargs, &geom))
-    return NULL;
+  return guarded([&]() -> PyObject * {
+    LaunchGeometry geom;
+    if (!readLaunchGeometry(kwargs, &geom))
+      return NULL;
 
-  std::vector<ArgInfo> argInfos;
-  if (!packArguments(args, &argInfos))
-    return NULL;
+    std::vector<ArgInfo> argInfos;
+    if (!packArguments(args, &argInfos))
+      return NULL;
 
-  // Nothing below touches Python, and the args tuple keeps the borrowed
-  // pointers in argInfos alive. Holding the GIL here would deadlock anything
-  // on the MPS queue that wants it.
-  PyThreadState *saved = PyEval_SaveThread();
-  encodeDispatch(self, geom, argInfos);
-  PyEval_RestoreThread(saved);
-  Py_RETURN_NONE;
+    // Nothing below touches Python, and the args tuple keeps the borrowed
+    // pointers in argInfos alive. Holding the GIL here would deadlock anything
+    // on the MPS queue that wants it.
+    {
+      ReleasedGil unlocked;
+      encodeDispatch(self, geom, argInfos);
+    }
+    Py_RETURN_NONE;
+  });
 }
 
 static PyObject *MetalKernel_get_max_threads(MetalKernelObject *self,
@@ -228,8 +269,7 @@ static PyGetSetDef MetalKernel_getset[] = {{"max_total_threads_per_threadgroup",
                                            {NULL}};
 
 static PyTypeObject MetalKernelType = {
-    .ob_base = PyVarObject_HEAD_INIT(NULL, 0).tp_name =
-        "metal_torch.MetalKernel",
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "metal_torch.MetalKernel",
     .tp_basicsize = sizeof(MetalKernelObject),
     .tp_dealloc = (destructor)MetalKernel_dealloc,
     .tp_call = (ternaryfunc)MetalKernel_call,
@@ -251,46 +291,49 @@ static void MetalLibrary_dealloc(MetalLibraryObject *self) {
 
 static PyObject *MetalLibrary_get_function(MetalLibraryObject *self,
                                            PyObject *args) {
-  const char *name;
-  if (!PyArg_ParseTuple(args, "s", &name))
-    return NULL;
+  return guarded([&]() -> PyObject * {
+    const char *name;
+    if (!PyArg_ParseTuple(args, "s", &name))
+      return NULL;
 
-  NSString *fnName = [NSString stringWithUTF8String:name];
-  id<MTLFunction> fn = [self->library newFunctionWithName:fnName];
-  if (!fn) {
-    PyErr_Format(PyExc_KeyError, "Function '%s' not found", name);
-    return NULL;
-  }
+    NSString *fnName = [NSString stringWithUTF8String:name];
+    id<MTLFunction> fn = [self->library newFunctionWithName:fnName];
+    if (!fn) {
+      PyErr_Format(PyExc_KeyError, "Function '%s' not found", name);
+      return NULL;
+    }
 
-  NSError *error = nil;
-  id<MTLComputePipelineState> pso =
-      [get_device() newComputePipelineStateWithFunction:fn error:&error];
-  [fn release];
-  if (!pso) {
-    // The PSO compiler often leaves localizedDescription useless and puts the
-    // real diagnostic in userInfo or the underlying error.
-    NSMutableString *full = [NSMutableString string];
-    [full appendFormat:@"%@", [error localizedDescription]];
-    NSDictionary *info = [error userInfo];
-    if (info && [info count])
-      [full appendFormat:@" | userInfo=%@", info];
-    NSError *under = [[error userInfo] objectForKey:NSUnderlyingErrorKey];
-    if (under)
-      [full appendFormat:@" | underlying=%@ (%@)", [under localizedDescription],
-                         [under userInfo]];
-    PyErr_Format(PyExc_RuntimeError, "PSO creation failed: %s",
-                 [full UTF8String]);
-    return NULL;
-  }
+    NSError *error = nil;
+    id<MTLComputePipelineState> pso =
+        [get_device() newComputePipelineStateWithFunction:fn error:&error];
+    [fn release];
+    if (!pso) {
+      // The PSO compiler often leaves localizedDescription useless and puts the
+      // real diagnostic in userInfo or the underlying error.
+      NSMutableString *full = [NSMutableString string];
+      [full appendFormat:@"%@", [error localizedDescription]];
+      NSDictionary *info = [error userInfo];
+      if (info && [info count])
+        [full appendFormat:@" | userInfo=%@", info];
+      NSError *under = [[error userInfo] objectForKey:NSUnderlyingErrorKey];
+      if (under)
+        [full appendFormat:@" | underlying=%@ (%@)",
+                           [under localizedDescription], [under userInfo]];
+      PyErr_Format(PyExc_RuntimeError, "PSO creation failed: %s",
+                   [full UTF8String]);
+      return NULL;
+    }
 
-  MetalKernelObject *kernel = PyObject_New(MetalKernelObject, &MetalKernelType);
-  if (!kernel) {
-    [pso release];
-    return NULL;
-  }
-  kernel->pso = pso;
-  kernel->maxThreads = [pso maxTotalThreadsPerThreadgroup];
-  return (PyObject *)kernel;
+    MetalKernelObject *kernel =
+        PyObject_New(MetalKernelObject, &MetalKernelType);
+    if (!kernel) {
+      [pso release];
+      return NULL;
+    }
+    kernel->pso = pso;
+    kernel->maxThreads = [pso maxTotalThreadsPerThreadgroup];
+    return (PyObject *)kernel;
+  });
 }
 
 static PyMethodDef MetalLibrary_methods[] = {
@@ -299,8 +342,7 @@ static PyMethodDef MetalLibrary_methods[] = {
     {NULL}};
 
 static PyTypeObject MetalLibraryType = {
-    .ob_base = PyVarObject_HEAD_INIT(NULL, 0).tp_name =
-        "metal_torch.MetalLibrary",
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "metal_torch.MetalLibrary",
     .tp_basicsize = sizeof(MetalLibraryObject),
     .tp_dealloc = (destructor)MetalLibrary_dealloc,
     .tp_flags = Py_TPFLAGS_DEFAULT,
@@ -310,33 +352,35 @@ static PyTypeObject MetalLibraryType = {
 // ── Module functions ─────────────────────────────────────────────────────
 
 static PyObject *py_load_metallib(PyObject *self, PyObject *args) {
-  Py_buffer buf;
-  if (!PyArg_ParseTuple(args, "y*", &buf))
-    return NULL;
-
-  @autoreleasepool {
-    dispatch_data_t dd = dispatch_data_create(buf.buf, buf.len, nil,
-                                              DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-    PyBuffer_Release(&buf);
-
-    NSError *error = nil;
-    id<MTLLibrary> lib = [get_device() newLibraryWithData:dd error:&error];
-    dispatch_release(dd);
-    if (!lib) {
-      PyErr_Format(PyExc_RuntimeError, "Failed to load metallib: %s",
-                   [[error localizedDescription] UTF8String]);
+  return guarded([&]() -> PyObject * {
+    Py_buffer buf;
+    if (!PyArg_ParseTuple(args, "y*", &buf))
       return NULL;
-    }
 
-    MetalLibraryObject *obj =
-        PyObject_New(MetalLibraryObject, &MetalLibraryType);
-    if (!obj) {
-      [lib release];
-      return NULL;
+    @autoreleasepool {
+      dispatch_data_t dd = dispatch_data_create(
+          buf.buf, buf.len, nil, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+      PyBuffer_Release(&buf);
+
+      NSError *error = nil;
+      id<MTLLibrary> lib = [get_device() newLibraryWithData:dd error:&error];
+      dispatch_release(dd);
+      if (!lib) {
+        PyErr_Format(PyExc_RuntimeError, "Failed to load metallib: %s",
+                     [[error localizedDescription] UTF8String]);
+        return NULL;
+      }
+
+      MetalLibraryObject *obj =
+          PyObject_New(MetalLibraryObject, &MetalLibraryType);
+      if (!obj) {
+        [lib release];
+        return NULL;
+      }
+      obj->library = lib;
+      return (PyObject *)obj;
     }
-    obj->library = lib;
-    return (PyObject *)obj;
-  }
+  });
 }
 
 static PyObject *py_is_available(PyObject *self, PyObject *Py_UNUSED(args)) {

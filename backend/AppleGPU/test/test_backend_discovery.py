@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import sys
 
 import pytest
 import triton
 import triton.language as tl
+import triton_apple_backend
 from triton._C.libtriton import passes
 from triton.backends.compiler import GPUTarget
 
@@ -18,9 +18,10 @@ from triton_apple_backend.hw_constants import TARGET, WARP_SIZE
 def _require_plugin():
     if hasattr(passes.plugin, "add_emit_msl"):
         return
-    if os.environ.get("TRITON_EXT_REQUIRE_APPLEGPU"):
-        pytest.fail("the plugin registered no add_emit_msl pass")
-    pytest.skip("AppleGPU plugin not loaded (build the backend)")
+    if triton_apple_backend.PLUGIN_LIBRARY is not None:
+        pytest.fail(f"{triton_apple_backend.PLUGIN_LIBRARY} registered no "
+                    "add_emit_msl pass")
+    pytest.skip("AppleGPU plugin not built")
 
 
 @triton.jit

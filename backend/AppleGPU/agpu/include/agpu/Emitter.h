@@ -3,7 +3,7 @@
 #define AGPU_EMITTER_H
 
 #include "agpu/emit/PrintModule.h"
-#include "agpu/plan/Vestigial.h"
+#include "agpu/plan/Terminators.h"
 
 #include <ostream>
 #include <string_view>
@@ -20,14 +20,6 @@ public:
   DeclineSite site;
 
   msl::Context &context() { return ctx_; }
-
-  // Ops handled by emitting nothing (`scf.yield`, `llvm.intr.assume`). Returns
-  // `notMine()` for an op outside the table.
-  Decision vestigial(std::string_view op) {
-    const Decision d = vestigialDecision(op);
-    declines.record(d, site);
-    return d;
-  }
 
   // f64 becomes float: Metal has no double. The kernel still runs, so the
   // loss is recorded.

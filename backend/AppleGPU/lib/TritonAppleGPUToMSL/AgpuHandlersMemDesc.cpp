@@ -10,11 +10,8 @@ namespace am = agpu::msl;
 
 // Strides follow the shared encoding's order: fastest-varying dimension gets
 // stride 1.
-static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
-  auto shared = dyn_cast<gpu::SwizzledSharedEncodingAttr>(mt.getEncoding());
-  if (!shared)
-    return std::nullopt;
-  const auto order = shared.getOrder();
+static std::optional<agpu::TileView> stridedView(gpu::MemDescType mt,
+                                                 ArrayRef<unsigned> order) {
   const int rank = mt.getRank();
   if ((int)order.size() != rank)
     return std::nullopt;
@@ -26,6 +23,76 @@ static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
     strides[order[i]] = acc;
     acc *= extent[order[i]];
   }
+  return agpu::TileView(std::move(extent), std::move(strides));
+}
+
+static std::optional<agpu::TileView> paddedView(gpu::PaddedSharedEncodingAttr p,
+                                                gpu::MemDescType mt) {
+  const SmallVector<unsigned> order = p.getOrder();
+  std::optional<agpu::TileView> v = stridedView(mt, order);
+  if (!v)
+    return std::nullopt;
+
+  const ArrayRef<unsigned> intervals = p.getIntervals();
+  const ArrayRef<unsigned> pads = p.getPaddings();
+  if (intervals.size() != pads.size())
+    return std::nullopt;
+
+  agpu::Padding pad;
+  for (std::size_t i = 0; i < intervals.size(); ++i)
+    pad.rules.push_back({(int64_t)intervals[i], (int64_t)pads[i]});
+  v->setPadding(std::move(pad));
+  return v;
+}
+
+// A linear encoding states its offsets as a basis matrix, which is only a
+// strided tile when each basis is the stride of one dimension. Checked against
+// the layout itself rather than assumed: a basis this does not model would
+// otherwise address the wrong element.
+static std::optional<agpu::TileView>
+linearView(gpu::SharedLinearEncodingAttr lin, gpu::MemDescType mt) {
+  const SmallVector<unsigned> order = lin.getOrder();
+  std::optional<agpu::TileView> v = stridedView(mt, order);
+  if (!v)
+    return std::nullopt;
+
+  MLIRContext *ctx = mt.getContext();
+  const LinearLayout ll = lin.toLinearLayout(mt.getShape());
+  const auto kOffset = StringAttr::get(ctx, "offset");
+  if (!ll.hasInDim(kOffset))
+    return std::nullopt;
+
+  const int rank = mt.getRank();
+  const int32_t offsets = ll.getInDimSize(kOffset);
+  for (int32_t bit = 1; bit < offsets; bit <<= 1) {
+    const SmallVector<std::pair<StringAttr, int32_t>> in{{kOffset, bit}};
+    const SmallVector<std::pair<StringAttr, int32_t>> out = ll.apply(in);
+    if ((int)out.size() != rank)
+      return std::nullopt;
+    agpu::TileView::Coord at(rank, 0);
+    for (int d = 0; d < rank; ++d)
+      at[d] = out[d].second;
+    if (v->offsetOf(at) != bit)
+      return std::nullopt;
+  }
+  return v;
+}
+
+static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
+  if (auto p = dyn_cast<gpu::PaddedSharedEncodingAttr>(mt.getEncoding()))
+    return paddedView(p, mt);
+  if (auto lin = dyn_cast<gpu::SharedLinearEncodingAttr>(mt.getEncoding()))
+    return linearView(lin, mt);
+
+  auto shared = dyn_cast<gpu::SwizzledSharedEncodingAttr>(mt.getEncoding());
+  if (!shared)
+    return std::nullopt;
+  const auto order = shared.getOrder();
+  const int rank = mt.getRank();
+  std::optional<agpu::TileView> base = stridedView(mt, order);
+  if (!base)
+    return std::nullopt;
+  agpu::TileView::Coord extent(mt.getShape().begin(), mt.getShape().end());
 
   agpu::Swizzle sw;
   sw.vec = shared.getVec();
@@ -41,7 +108,8 @@ static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
     sw.maxPhase = 1;
   }
 
-  return agpu::TileView(std::move(extent), std::move(strides), sw);
+  base->setSwizzle(sw);
+  return base;
 }
 
 agpu::Decision AgpuEmitter::emitLocalAlloc(const agpu::OpView &o) {
@@ -55,7 +123,7 @@ agpu::Decision AgpuEmitter::emitLocalAlloc(const agpu::OpView &o) {
   const std::optional<agpu::TileView> view = tileViewOfMemDesc(mt);
   if (!view)
     return declined("ttg.local_alloc",
-                    "the shared encoding is not a swizzled_shared");
+                    "the shared encoding is not addressable");
   const std::optional<agpu::ElemType> elem = elemTypeOf(mt.getElementType());
   if (!elem)
     return declined("ttg.local_alloc", "the element has no representation");

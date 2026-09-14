@@ -40,6 +40,27 @@ struct Swizzle {
   }
 };
 
+// Extra elements spliced into the linear offset: every `interval` elements
+// gain `pad` more. Several rules compose, each measured on the unpadded
+// offset, which keeps the map monotonic and so order-preserving.
+struct Padding {
+  struct Rule {
+    int64_t interval = 0;
+    int64_t pad = 0;
+  };
+  std::vector<Rule> rules;
+
+  bool pads() const { return !rules.empty(); }
+
+  int64_t extraBefore(int64_t offset) const {
+    int64_t extra = 0;
+    for (const Rule &r : rules)
+      if (r.interval > 0)
+        extra += (offset / r.interval) * r.pad;
+    return extra;
+  }
+};
+
 // Extents and strides are in elements, innermost dimension last. Strides are
 // explicit: a padded row or a transposed operand is the same type with
 // different numbers.
@@ -92,6 +113,9 @@ public:
 
   const Swizzle &swizzle() const { return swizzle_; }
   void setSwizzle(Swizzle sw) { swizzle_ = sw; }
+
+  const Padding &padding() const { return padding_; }
+  void setPadding(Padding p) { padding_ = std::move(p); }
 
   const Coord &shift() const { return shift_; }
   bool shifted() const { return !shift_.empty(); }
@@ -151,7 +175,7 @@ public:
   int64_t offsetOf(const Coord &coord) const {
     assert(coord.size() == extent_.size());
     const Swizzle &sw = swizzle_;
-    return linearize<int64_t>(
+    const int64_t off = linearize<int64_t>(
         coord, [](int64_t v, int64_t s) { return v * s; },
         [](int64_t a, int64_t b) { return a + b; }, [](int64_t v) { return v; },
         [&sw, this](int64_t g, const Coord &all) {
@@ -161,6 +185,7 @@ public:
               (all[(std::size_t)sw.phaseDim] / sw.perPhase) % mp;
           return ((g / sw.vec) ^ phase) * sw.vec + g % sw.vec;
         });
+    return off + padding_.extraBefore(off);
   }
   int64_t offsetOf(std::initializer_list<int64_t> coord) const {
     return offsetOf(Coord(coord));
@@ -228,7 +253,8 @@ public:
     for (std::size_t d = 0; d < extent_.size(); ++d)
       if (d != g)
         span += last[d] * stride_[d];
-    return span + extent_[g] * stride_[g] + origin_;
+    const int64_t raw = span + extent_[g] * stride_[g] + origin_;
+    return raw + padding_.extraBefore(raw);
   }
 
   int64_t sizeElems() const {
@@ -255,6 +281,7 @@ private:
   Coord stride_;
   Coord shift_;
   Swizzle swizzle_;
+  Padding padding_;
   int64_t origin_ = 0;
 };
 

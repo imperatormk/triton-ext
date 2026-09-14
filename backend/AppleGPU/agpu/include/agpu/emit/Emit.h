@@ -77,7 +77,7 @@ inline msl::Expr *offsetExprOf(msl::Context &c, const TileView &v, int reg,
     coord.push_back(src.of(c, reg, d));
 
   const Swizzle &sw = v.swizzle();
-  return v.linearize<msl::Expr *>(
+  msl::Expr *off = v.linearize<msl::Expr *>(
       coord,
       [&](msl::Expr *t, int64_t s) {
         return c.binary(msl::BinOp::Mul, t, c.lit(s));
@@ -99,6 +99,16 @@ inline msl::Expr *offsetExprOf(msl::Context &c, const TileView &v, int reg,
                    ? base
                    : c.binary(msl::BinOp::Add, base, modBy(c, g, sw.vec));
       });
+
+  msl::Expr *padded = off;
+  for (const Padding::Rule &r : v.padding().rules) {
+    if (r.interval <= 0 || r.pad == 0)
+      continue;
+    msl::Expr *extra =
+        c.binary(msl::BinOp::Mul, divBy(c, off, r.interval), c.lit(r.pad));
+    padded = c.binary(msl::BinOp::Add, padded, extra);
+  }
+  return padded;
 }
 
 // The address is a runtime expression: the slot depends on the lane holding

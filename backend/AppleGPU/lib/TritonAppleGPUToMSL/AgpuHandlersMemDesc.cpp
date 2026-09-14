@@ -45,39 +45,72 @@ static std::optional<agpu::TileView> paddedView(gpu::PaddedSharedEncodingAttr p,
   return v;
 }
 
-// An encoding that states its offsets as a basis matrix is a strided tile only
-// when each basis is the stride of one dimension. Checked against the layout
-// itself rather than assumed: a basis this does not model would otherwise
-// address the wrong element.
-static std::optional<agpu::TileView> probedView(gpu::MemDescType mt,
-                                                ArrayRef<unsigned> order) {
-  std::optional<agpu::TileView> v = stridedView(mt, order);
-  if (!v)
-    return std::nullopt;
-
+// Whether `v` reproduces the encoding's own offset map, over the whole range
+// rather than a sample: an encoding whose addressing this does not model would
+// otherwise silently address the wrong element.
+static bool viewMatchesLayout(const agpu::TileView &v, gpu::MemDescType mt) {
   MLIRContext *ctx = mt.getContext();
   const LinearLayout ll = gpu::toLinearLayout(mt);
   const auto kOffset = StringAttr::get(ctx, "offset");
   if (!ll.hasInDim(kOffset))
-    return std::nullopt;
+    return false;
 
   const int rank = mt.getRank();
   const int32_t offsets = ll.getInDimSize(kOffset);
-  for (int32_t bit = 1; bit < offsets; bit <<= 1) {
+  for (int32_t off = 0; off < offsets; ++off) {
     // apply() requires every in-dim the layout declares, in its own order.
     SmallVector<std::pair<StringAttr, int32_t>> in;
     for (StringAttr d : ll.getInDimNames())
-      in.push_back({d, d == kOffset ? bit : 0});
+      in.push_back({d, d == kOffset ? off : 0});
     const SmallVector<std::pair<StringAttr, int32_t>> out = ll.apply(in);
     if ((int)out.size() != rank)
-      return std::nullopt;
+      return false;
     agpu::TileView::Coord at(rank, 0);
     for (int d = 0; d < rank; ++d)
       at[d] = out[d].second;
-    if (v->offsetOf(at) != bit)
-      return std::nullopt;
+    if (v.offsetOf(at) != off)
+      return false;
   }
+  return true;
+}
+
+// A strided tile, accepted only when it reproduces the encoding's offsets.
+static std::optional<agpu::TileView> probedView(gpu::MemDescType mt,
+                                                ArrayRef<unsigned> order) {
+  std::optional<agpu::TileView> v = stridedView(mt, order);
+  if (!v || !viewMatchesLayout(*v, mt))
+    return std::nullopt;
   return v;
+}
+
+// An encoding whose offsets are a strided tile permuted by an XOR, which is
+// what a bank-spreading shared layout amounts to however it spells itself.
+// The parameters are searched because the encoding states them in its own
+// terms, and each candidate is checked against the layout.
+static std::optional<agpu::TileView>
+probedSwizzledView(gpu::MemDescType mt, ArrayRef<unsigned> ord) {
+  std::optional<agpu::TileView> base = stridedView(mt, ord);
+  if (!base || mt.getRank() < 2)
+    return std::nullopt;
+
+  const int64_t groupWidth = base->extentAt((int)ord[0]);
+  for (int64_t vec = 1; vec <= groupWidth; vec <<= 1)
+    for (int64_t perPhase = 1; perPhase <= base->extentAt((int)ord[1]);
+         perPhase <<= 1)
+      for (int64_t maxPhase = 2; maxPhase <= groupWidth; maxPhase <<= 1) {
+        agpu::Swizzle sw;
+        sw.vec = vec;
+        sw.perPhase = perPhase;
+        sw.maxPhase = maxPhase;
+        sw.groupDim = ord[0];
+        sw.phaseDim = ord[1];
+        sw.groupExtent = groupWidth;
+        agpu::TileView v = *base;
+        v.setSwizzle(sw);
+        if (viewMatchesLayout(v, mt))
+          return v;
+      }
+  return std::nullopt;
 }
 
 static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
@@ -94,7 +127,9 @@ static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
       order.push_back((unsigned)d);
     if (nv.getTransposed())
       std::swap(order[0], order[1]);
-    return probedView(mt, order);
+    if (std::optional<agpu::TileView> v = probedView(mt, order))
+      return v;
+    return probedSwizzledView(mt, order);
   }
 
   auto shared = dyn_cast<gpu::SwizzledSharedEncodingAttr>(mt.getEncoding());

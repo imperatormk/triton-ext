@@ -98,6 +98,11 @@ struct AppleGPUInferLayoutInterface
     if (!isa<ttg::DistributedEncodingTrait>(srcEnc))
       return emitOptionalError(loc,
                                "Failed MemDescReshapeOp encoding inference");
+    // A reorderable reshape keeps the layout already on its result when that
+    // costs nothing, which is what leaves most reshapes blocked.
+    if (allowReorder && dstEnc &&
+        !ttg::isExpensiveView(srcShape, srcEnc, dstShape, dstEnc))
+      return success();
     auto ctx = srcEnc.getContext();
     auto i32Type = IntegerType::get(ctx, 32, IntegerType::Unsigned);
     auto srcTy = RankedTensorType::get(srcShape, i32Type, srcEnc);

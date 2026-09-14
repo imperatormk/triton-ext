@@ -1,4 +1,5 @@
 WHEEL_DIR ?= dist
+AGPU_BUILD_DIR ?= agpu/build
 
 .PHONY: build
 build:
@@ -10,4 +11,7 @@ install:
 
 .PHONY: test
 test:
+	cmake -S agpu -B $(AGPU_BUILD_DIR)
+	cmake --build $(AGPU_BUILD_DIR)
+	ctest --test-dir $(AGPU_BUILD_DIR) --output-on-failure
 	pytest

@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0")
+# Default to the oldest macOS this backend supports, but never override an
+# explicit choice: -DCMAKE_OSX_DEPLOYMENT_TARGET and the environment's
+# MACOSX_DEPLOYMENT_TARGET both win. Guard on CACHE{} rather than a plain
+# `if(NOT DEFINED)`: project() defines the normal variable from the cache, so
+# the plain form stopped applying on reconfigure and the same tree built with
+# or without the pin depending on how the build directory came to exist.
+# Setting it before project() also preempts CMake's own env-var default, which
+# is why that is tested here too.
+if(NOT DEFINED CACHE{CMAKE_OSX_DEPLOYMENT_TARGET}
+   AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS version")
 endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -108,20 +117,22 @@ set_target_properties(TritonAppleGPUBackend PROPERTIES
     OUTPUT_NAME "applegpu_backend"
     CXX_STANDARD 17)
 
-# On macOS with shared LLVM, use flat namespace so the plugin can resolve
-# LLVM symbols from any loaded dylib (not just the one it was linked against).
-if(APPLE)
-    target_link_options(TritonAppleGPUBackend PRIVATE
-        -Wl,-dead_strip -Wl,-flat_namespace)
-endif()
-
 install(TARGETS TritonAppleGPUBackend
         LIBRARY DESTINATION triton_apple_backend)
 
 if(APPLE)
+    # The plugin's MLIR symbols are resolved at load from libtriton. This
+    # leaves only those undefined, where -flat_namespace would put every
+    # symbol in the image up for resolution.
+    target_link_options(TritonAppleGPUBackend PRIVATE
+        -Wl,-dead_strip -Wl,-undefined,dynamic_lookup)
+
     find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
     list(APPEND CMAKE_PREFIX_PATH "${Python_SITEARCH}/torch/share/cmake")
-    find_package(Torch QUIET)
+    # Required, not optional: the driver dispatches through torch's MPS stream
+    # and has no other runtime. Failing here beats producing a wheel whose
+    # backend silently deactivates at import.
+    find_package(Torch REQUIRED)
     set(BRIDGE_PY
         "${CMAKE_CURRENT_SOURCE_DIR}/python/triton_apple_backend")
 
@@ -133,23 +144,27 @@ if(APPLE)
         "-framework Metal" "-framework Foundation")
     target_link_options(metal_native PRIVATE -undefined dynamic_lookup)
     set_target_properties(metal_native PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY "${BRIDGE_PY}")
+        INSTALL_RPATH "@loader_path/../torch/lib"
+        BUILD_WITH_INSTALL_RPATH TRUE)
+    install(TARGETS metal_native LIBRARY DESTINATION triton_apple_backend)
     add_dependencies(TritonAppleGPUBackend metal_native)
 
-    if(Torch_FOUND)
-        python_add_library(metal_torch MODULE "${BRIDGE_PY}/metal_torch.m"
-                           WITH_SOABI)
-        target_compile_options(metal_torch PRIVATE
-            -ObjC++ -std=c++20 -O3 -Wno-deprecated-declarations)
-        target_link_libraries(metal_torch PRIVATE "${TORCH_LIBRARIES}"
-            "-framework Metal" "-framework Foundation")
-        target_link_options(metal_torch PRIVATE -undefined dynamic_lookup)
-        set_target_properties(metal_torch PROPERTIES
-            LIBRARY_OUTPUT_DIRECTORY "${BRIDGE_PY}")
-        add_dependencies(TritonAppleGPUBackend metal_torch)
-    else()
-        message(WARNING
-            "torch not found in ${Python_SITEARCH} (or -DTorch_DIR): skipping "
-            "metal_torch; the backend will dispatch through metal_native only")
-    endif()
+    python_add_library(metal_torch MODULE "${BRIDGE_PY}/metal_torch.mm"
+                       WITH_SOABI)
+    target_compile_options(metal_torch PRIVATE
+        -std=c++20 -O3 -Wno-deprecated-declarations)
+    target_link_libraries(metal_torch PRIVATE "${TORCH_LIBRARIES}"
+        "-framework Metal" "-framework Foundation")
+    target_link_options(metal_torch PRIVATE -undefined dynamic_lookup)
+    # THPVariable_* lives in libtorch_python, which TORCH_LIBRARIES omits.
+    get_filename_component(TORCH_LIB_DIR "${TORCH_LIBRARY}" DIRECTORY)
+    find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_LIB_DIR}"
+                 NO_DEFAULT_PATH REQUIRED)
+    target_link_libraries(metal_torch PRIVATE "${TORCH_PYTHON_LIBRARY}")
+    # This module installs beside torch/ in site-packages.
+    set_target_properties(metal_torch PROPERTIES
+        INSTALL_RPATH "@loader_path/../torch/lib"
+        BUILD_WITH_INSTALL_RPATH TRUE)
+    install(TARGETS metal_torch LIBRARY DESTINATION triton_apple_backend)
+    add_dependencies(TritonAppleGPUBackend metal_torch)
 endif()

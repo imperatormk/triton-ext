@@ -17,6 +17,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
 #include <map>
 #include <set>
 
@@ -27,6 +28,23 @@ using namespace mlir;
 namespace mlir::triton::applegpu {
 
 namespace {
+
+// MSL_ENABLE_DUMP is the MSL counterpart of Triton's MLIR_ENABLE_DUMP, and
+// lands on the same stream MLIR_ENABLE_DUMP's llvm::dbgs() does, so the two
+// interleave in pipeline order. Read with getenv because
+// triton::tools::getBoolEnv asserts against a whitelist in libtriton's own
+// header, which an out-of-tree backend cannot add to. MLIR_DUMP_PATH does
+// not redirect this one; TRITON_MSL_DUMP writes the MSL to a file.
+bool mslDumpEnabled() {
+  const char *v = std::getenv("MSL_ENABLE_DUMP");
+  if (!v)
+    return false;
+  const StringRef s = StringRef(v).trim();
+  return !s.empty() && !s.equals_insensitive("0") &&
+         !s.equals_insensitive("false") && !s.equals_insensitive("off") &&
+         !s.equals_insensitive("n") && !s.equals_insensitive("no");
+}
+
 class EmitMSLPass : public PassWrapper<EmitMSLPass, OperationPass<ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EmitMSLPass)
@@ -61,10 +79,13 @@ public:
         IntegerAttr::get(IntegerType::get(mod.getContext(), 1),
                          residency == agpu::GridResidency::CoResident));
 
-    if (outPath.empty()) {
-      llvm::errs() << msl;
+    if (mslDumpEnabled())
+      llvm::errs() << "// -----// MSL Dump After EmitMSL "
+                      "('builtin.module' operation) //----- //\n"
+                   << msl;
+
+    if (outPath.empty())
       return;
-    }
     std::error_code ec;
     llvm::raw_fd_ostream out(outPath, ec);
     if (ec) {

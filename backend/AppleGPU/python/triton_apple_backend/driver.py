@@ -163,6 +163,14 @@ def _compute_scalar_layout(scalar_types):
     return current, offsets
 
 
+def _f32_to_bf16(val):
+    """Round to nearest even, as torch and CUDA do."""
+    bits = _struct.unpack('<I', _struct.pack('<f', val))[0]
+    if (bits & 0x7FFFFFFF) > 0x7F800000:
+        return (bits >> 16) | 0x0040
+    return (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+
+
 def _pack_scalars(scalar_types, scalar_values, total_size, offsets):
     buf = bytearray(total_size)
     for ty, val, offset in zip(scalar_types, scalar_values, offsets):
@@ -170,9 +178,7 @@ def _pack_scalars(scalar_types, scalar_values, total_size, offsets):
         if ty in ("i1", "u1"):
             val = 1 if val else 0
         elif ty == "bf16":
-            bits = _struct.unpack('<I', _struct.pack('<f', float(val)))[0]
-            bf16_bits = bits >> 16
-            _struct.pack_into("H", buf, offset, bf16_bits)
+            _struct.pack_into("<H", buf, offset, _f32_to_bf16(float(val)))
             continue
         _struct.pack_into(fmt, buf, offset, val)
     return bytes(buf)

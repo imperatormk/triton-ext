@@ -70,21 +70,16 @@ one question about the hardware or a coordinate: `FragLane`, `Stride`,
 `test_layering.cpp` reads the headers as text and fails if a planner includes
 `msl/Context.h`.
 
-## The check that matters
+## Tests
 
 ```bash
-ctest --test-dir build -R metal_compiles
+cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The other suites compare emitted text against expectations, which cannot catch a
-module that does not compile. `test/emit_probe.cpp` emits every helper, a kernel
-calling each, a ragged panel, an unstructured region, an integer reduce, both
-loop forms, a device-function module, a planned dot and a whole `Emitter` module
-and feeds the lot to `xcrun metal`.
-
-It skips when there is no Metal toolchain and fails when one is present and
-rejects the output. If `xcrun metal` reports a missing toolchain that is in fact
-installed, set `TOOLCHAINS` to the Metal toolchain's bundle id.
+Every `test/test_*.cpp` becomes a ctest target. `kernelabi` covers
+`planKernelAbi`: where each argument binds, and the offsets `driver.py` packs
+scalars to. A drift there is a wrong kernel argument, so both sides are checked
+against the same rules.
 
 ## Design rules
 

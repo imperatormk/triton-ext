@@ -1,5 +1,13 @@
-# triton-apple: Apple GPU backend for Triton
-# Discovered by Triton via entry_points (pyproject.toml)
+"""Register the Apple GPU backend as a Triton plugin.
+
+Importing this package loads the compiled plugin library that is bundled
+alongside this file and hands it to Triton's plugin API. Triton must already be
+imported (so ``libtriton`` is loaded); the plugin resolves its MLIR/LLVM symbols
+from that already-loaded library, so no ``LD_LIBRARY_PATH`` or
+``TRITON_PLUGIN_PATHS`` is required.
+"""
+
+import warnings
 
 import sys as _sys
 import sysconfig as _sysconfig
@@ -61,3 +69,11 @@ _sys.meta_path.insert(0, _LibdevicePatchFinder())
 if PLUGIN_LIBRARY is not None:
     import triton._C.libtriton as _libtriton
     _libtriton.passes.plugin.extend_with(str(PLUGIN_LIBRARY))
+else:
+    # Otherwise the first symptom is an AttributeError on add_emit_msl, raised
+    # from inside the compiler.
+    warnings.warn(
+        f"{PLUGIN_NAME} not found next to {PLUGIN_DIR} or in site-packages; "
+        "the Apple GPU backend will not compile kernels. Build the backend.",
+        RuntimeWarning,
+        stacklevel=2)

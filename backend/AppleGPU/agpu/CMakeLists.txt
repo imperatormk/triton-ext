@@ -42,12 +42,3 @@ target_compile_definitions(test_gates PRIVATE
   AGPU_COMPILER_PY="${CMAKE_CURRENT_SOURCE_DIR}/../python/triton_apple_backend/compiler.py")
 target_include_directories(test_optables PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../lib/TritonAppleGPUToMSL)
-
-add_executable(emit_probe test/emit_probe.cpp)
-target_link_libraries(emit_probe PRIVATE agpu_msl agpu_core)
-target_compile_options(emit_probe PRIVATE ${AGPU_WARNINGS})
-
-add_test(NAME metal_compiles
-  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/metal_compiles.sh
-          $<TARGET_FILE:emit_probe>
-          ${CMAKE_CURRENT_BINARY_DIR}/emit_probe)

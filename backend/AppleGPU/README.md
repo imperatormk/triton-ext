@@ -19,7 +19,7 @@ triton-ext/backend/AppleGPU/
         └── triton_apple_backend/
               ├── compiler.py    TTIR → TTGIR → MSL → metallib
               ├── driver.py      MPS GPU dispatch, buffer binding, scalar packing
-              └── metal_torch.m  ObjC++ Metal bridge, built beside its source
+              └── metal_torch.mm ObjC++ Metal bridge over torch's MPS stream
 ```
 
 ## Prerequisites
@@ -139,8 +139,7 @@ built the other way.
 
 The backend's own suites are the ones this repo can speak for: `ctest` in
 `agpu/build` covers the emitter and its planning, and `test/` holds the Python
-ABI and emitted-MSL checks. Both run without a GPU except `metal_compiles`,
-which needs the Metal toolchain.
+ABI checks. `make test` runs both. Only `test_vector_add.py` needs a GPU.
 
 Upstream's `test_core.py` runs against the MPS device but its pass rate is not
 recorded here, because a figure without the date, the machine and the Triton

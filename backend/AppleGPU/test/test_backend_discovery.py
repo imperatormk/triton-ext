@@ -36,9 +36,8 @@ def add_kernel(x_ptr, y_ptr, o_ptr, n, B: tl.constexpr):
 
 def test_triton_discovery_imports_the_backend():
     _require_plugin()
-    # torch is this backend's only dispatch path, so discovery pulls it in too.
     for mod in ("triton_apple_backend", "triton_apple_backend.driver",
-                "triton_apple_backend.compiler", "torch"):
+                "triton_apple_backend.compiler"):
         assert mod in sys.modules, f"{mod} was not imported by discovery"
 
     from triton_apple_backend import driver

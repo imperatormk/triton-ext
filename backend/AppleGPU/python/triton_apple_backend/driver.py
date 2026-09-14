@@ -9,7 +9,6 @@ import os as _os
 import re as _re
 import sys as _sys
 import struct as _struct
-import torch as _torch
 from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -25,8 +24,9 @@ class _TorchRuntime:
     metal_torch (linked against libtorch)."""
 
     def __init__(self):
+        import torch
         from triton_apple_backend import metal_torch
-        self.torch = _torch
+        self.torch = torch
         self.metal = metal_torch
 
     def is_available(self):

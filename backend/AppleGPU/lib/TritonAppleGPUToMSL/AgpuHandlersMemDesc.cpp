@@ -65,7 +65,10 @@ linearView(gpu::SharedLinearEncodingAttr lin, gpu::MemDescType mt) {
   const int rank = mt.getRank();
   const int32_t offsets = ll.getInDimSize(kOffset);
   for (int32_t bit = 1; bit < offsets; bit <<= 1) {
-    const SmallVector<std::pair<StringAttr, int32_t>> in{{kOffset, bit}};
+    // apply() requires every in-dim the layout declares, in its own order.
+    SmallVector<std::pair<StringAttr, int32_t>> in;
+    for (StringAttr d : ll.getInDimNames())
+      in.push_back({d, d == kOffset ? bit : 0});
     const SmallVector<std::pair<StringAttr, int32_t>> out = ll.apply(in);
     if ((int)out.size() != rank)
       return std::nullopt;

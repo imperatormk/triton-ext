@@ -55,6 +55,9 @@ inline constexpr int64_t kTGCoreBudgetBytes = 65536;
 // Widest launch Metal admits regardless of register appetite. A register-hungry
 // kernel can compile to a pipeline capped at 384 threads and a wider launch is
 
+// Alignment of a threadgroup pool's base address: Metal's widest vector access.
+inline constexpr int64_t kTGPoolAlignBytes = 16;
+
 inline constexpr int64_t kWarpSize = 32;
 
 inline constexpr int64_t threadsFor(int64_t numWarps) {

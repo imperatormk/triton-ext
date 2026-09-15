@@ -134,6 +134,15 @@ int precedence(BinOp op) {
   return 0;
 }
 
+bool needsShiftParens(BinOp parent, const Expr *child) {
+  if (parent != BinOp::Shl && parent != BinOp::Shr)
+    return false;
+  if (!child || child->kind != ExprKind::Binary)
+    return false;
+  const BinOp op = static_cast<const Binary *>(child)->op;
+  return op == BinOp::Add || op == BinOp::Sub;
+}
+
 // Built with `pointerTo` because Metal rejects `device atomic_int` as an
 // automatic variable.
 Type atomicPtr(Scalar s, AddrSpace as) {
@@ -263,10 +272,11 @@ void Printer::printExprAt(const Expr *e, int outerPrec) {
     const bool paren = p < outerPrec;
     if (paren)
       os_ << "(";
-    printExprAt(b->lhs, p);
+    const int additive = precedence(BinOp::Add) + 1;
+    printExprAt(b->lhs, needsShiftParens(b->op, b->lhs) ? additive : p);
     os_ << " " << spell(b->op) << " ";
     // +1 or `a - (b - c)` prints as `a - b - c`.
-    printExprAt(b->rhs, p + 1);
+    printExprAt(b->rhs, needsShiftParens(b->op, b->rhs) ? additive : p + 1);
     if (paren)
       os_ << ")";
     return;
@@ -304,6 +314,18 @@ void Printer::printExprAt(const Expr *e, int outerPrec) {
     }
     return;
   }
+  case ExprKind::Call: {
+    auto *c = static_cast<const Call *>(e);
+    os_ << c->callee;
+    printWrapped(
+        "(",
+        [&] {
+          printList(c->args,
+                    [&](const Expr *a, std::size_t) { printExprAt(a, 0); });
+        },
+        ")");
+    return;
+  }
   case ExprKind::Subscript: {
     auto *s = static_cast<const Subscript *>(e);
     printExprAt(s->base, 12);
@@ -324,6 +346,12 @@ void Printer::printExprAt(const Expr *e, int outerPrec) {
     printExprAt(d->operand, 12);
     return;
   }
+  case ExprKind::AddrOf: {
+    auto *a = static_cast<const AddrOf *>(e);
+    os_ << "&";
+    printExprAt(a->operand, 12);
+    return;
+  }
   }
 }
 
@@ -336,9 +364,62 @@ void Printer::indent() {
     os_ << "  ";
 }
 
+namespace {
+struct BarrierForm {
+  const char *fn;
+  const char *flags;
+};
+
+BarrierForm barrierForm(Barrier::Scope s) {
+  namespace b = builtin::barrier;
+  namespace mf = builtin::memflags;
+  using S = Barrier::Scope;
+  switch (s) {
+  case S::Simdgroup:
+    return {b::Simdgroup, mf::Threadgroup};
+  case S::Device:
+    return {b::Threadgroup, mf::DeviceAndThreadgroup};
+  case S::Threadgroup:
+    return {b::Threadgroup, mf::Threadgroup};
+  }
+  return {b::Threadgroup, mf::Threadgroup};
+}
+} // namespace
+
+void Printer::flushBarrier() {
+  if (!barrierPending_)
+    return;
+  barrierPending_ = false;
+  const BarrierForm f = barrierForm(pendingScope_);
+  indent();
+  os_ << f.fn << "(" << f.flags << ");\n";
+}
+
 void Printer::printBlock(const Block &b) {
-  for (const Stmt *s : b)
+  for (const Stmt *s : b) {
+    if (s && s->kind == StmtKind::Barrier) {
+      // Adjacent barriers collapse to the widest scope requested. A hard
+      // barrier neither absorbs a pending barrier nor is absorbed by one.
+      auto *bar = static_cast<const Barrier *>(s);
+      if (bar->hard) {
+        flushBarrier();
+        indent();
+        const BarrierForm f = barrierForm(bar->scope);
+        os_ << f.fn << "(" << f.flags << ");\n";
+        continue;
+      }
+      if (barrierPending_) {
+        pendingScope_ = Barrier::widest(pendingScope_, bar->scope);
+      } else {
+        barrierPending_ = true;
+        pendingScope_ = bar->scope;
+      }
+      continue;
+    }
+    flushBarrier();
     printStmt(s);
+  }
+  flushBarrier();
 }
 
 void Printer::printInline(const Stmt *s) {
@@ -437,6 +518,19 @@ void Printer::printStmt(const Stmt *s) {
     os_ << ";\n";
     return;
 
+  case StmtKind::ArrayDecl: {
+    auto *d = static_cast<const ArrayDecl *>(s);
+    indent();
+    printType(d->elem);
+    os_ << " " << d->name << "[" << d->count << "];\n";
+    return;
+  }
+  case StmtKind::Barrier:
+    // Only reached when a barrier is printed outside printBlock.
+    barrierPending_ = true;
+    pendingScope_ = static_cast<const Barrier *>(s)->scope;
+    flushBarrier();
+    return;
   case StmtKind::If: {
     auto *n = static_cast<const If *>(s);
     indent();

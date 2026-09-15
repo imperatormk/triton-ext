@@ -82,14 +82,35 @@ public:
   Expr *subscript(Expr *b, Expr *i) { return make<Subscript>(b, i); }
   Expr *member(Expr *b, std::string f) { return make<Member>(b, std::move(f)); }
   Expr *deref(Expr *e) { return make<Deref>(e); }
+  Expr *addrOf(Expr *e) {
+    if (e->kind == ExprKind::Deref)
+      return static_cast<Deref *>(e)->operand;
+    return make<AddrOf>(e);
+  }
+
+  Call *call(std::string callee, SmallVec<Expr *, 4> args) {
+    return make<Call>(std::move(callee), std::move(args));
+  }
 
   // ── statements ──────────────────────────────────────────────────────────
 
   Decl *declStmt(Type t, std::string n, Expr *init = nullptr) {
     return make<Decl>(std::move(t), std::move(n), init);
   }
+  ArrayDecl *arrayDecl(Type elem, std::string n, int64_t count) {
+    return make<ArrayDecl>(std::move(elem), std::move(n), count);
+  }
   Assign *assign(Expr *target, Expr *value) {
     return make<Assign>(target, value);
+  }
+  Barrier *barrier(Barrier::Scope s = Barrier::Scope::Threadgroup) {
+    return make<Barrier>(s);
+  }
+  // Must not merge with an adjacent barrier.
+  Barrier *hardBarrier(Barrier::Scope s = Barrier::Scope::Threadgroup) {
+    auto *b = make<Barrier>(s);
+    b->hard = true;
+    return b;
   }
 
   If *ifStmt(Expr *cond, Block thenBody) {

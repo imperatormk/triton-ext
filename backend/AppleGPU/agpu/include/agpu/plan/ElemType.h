@@ -36,6 +36,7 @@ struct ElemType {
     // The pointee is part of the type only when there is one.
     return !isPointer() || (pointee == o.pointee && addrSpace == o.addrSpace);
   }
+  bool operator!=(const ElemType &o) const { return !(*this == o); }
 };
 
 // Rounded up and never zero: an i1 is one bit wide and one byte stored.

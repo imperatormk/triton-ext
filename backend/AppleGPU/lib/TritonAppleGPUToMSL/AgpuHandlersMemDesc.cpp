@@ -97,7 +97,14 @@ probedSwizzledView(gpu::MemDescType mt, ArrayRef<unsigned> ord) {
   const int64_t slowExtent = base->extentAt((int)ord[1]);
   // A byte-width swizzle repeats within a row, so the span it reaches over is
   // searched alongside its parameters.
-  for (int64_t span = rowWidth; span >= 2; span >>= 1)
+  // A panel layout stores each span-wide slice whole, so its rows are `span`
+  // apart and the next panel a whole panel away.
+  agpu::TileView::Coord panelStride = base->stride();
+  for (int64_t span = rowWidth; span >= 2; span >>= 1) {
+    panelStride[ord[0]] = 1;
+    panelStride[ord[1]] = span;
+    const agpu::TileView panels(base->extent(), panelStride);
+
     for (int64_t vec = 1; vec <= span; vec <<= 1)
       for (int64_t perPhase = 1; perPhase <= slowExtent; perPhase <<= 1)
         for (int64_t maxPhase = 2; maxPhase <= span; maxPhase <<= 1) {
@@ -108,11 +115,19 @@ probedSwizzledView(gpu::MemDescType mt, ArrayRef<unsigned> ord) {
           sw.groupDim = ord[0];
           sw.phaseDim = ord[1];
           sw.groupExtent = span;
-          agpu::TileView v = *base;
-          v.setSwizzle(sw);
-          if (viewMatchesLayout(v, mt))
-            return v;
+
+          agpu::TileView inline_ = *base;
+          inline_.setSwizzle(sw);
+          if (viewMatchesLayout(inline_, mt))
+            return inline_;
+
+          sw.tileStride = slowExtent * span;
+          agpu::TileView panelled = panels;
+          panelled.setSwizzle(sw);
+          if (viewMatchesLayout(panelled, mt))
+            return panelled;
         }
+  }
   return std::nullopt;
 }
 

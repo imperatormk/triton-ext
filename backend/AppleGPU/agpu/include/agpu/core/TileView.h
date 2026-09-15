@@ -27,6 +27,10 @@ struct Swizzle {
   // independent tiles of it, which is how a byte-width swizzle repeats. Kept
   // by a window so its phases match the parent's.
   int64_t groupExtent = 0;
+  // Distance to the next tile. Zero leaves the tiles inline, one row after
+  // another; a byte-width encoding instead stores each as a whole panel, so
+  // the next one starts a rows-worth away.
+  int64_t tileStride = 0;
 
   bool permutes() const { return maxPhase > 1; }
   bool identity() const { return vec == 1 && perPhase == 1 && maxPhase == 1; }
@@ -192,7 +196,8 @@ public:
           const int64_t tile = g / width, within = g % width;
           const int64_t swizzled =
               ((within / sw.vec) ^ phase) * sw.vec + within % sw.vec;
-          return tile * width + swizzled;
+          const int64_t step = sw.tileStride > 0 ? sw.tileStride : width;
+          return tile * step + swizzled;
         });
     return off + padding_.extraBefore(off);
   }
@@ -262,7 +267,12 @@ public:
     for (std::size_t d = 0; d < extent_.size(); ++d)
       if (d != g)
         span += last[d] * stride_[d];
-    const int64_t raw = span + extent_[g] * stride_[g] + origin_;
+    const int64_t width = swizzle_.spanOver(extent_[g]);
+    const int64_t tiles = width > 0 ? (extent_[g] + width - 1) / width : 1;
+    const int64_t step =
+        swizzle_.tileStride > 0 ? swizzle_.tileStride : width * stride_[g];
+    const int64_t raw =
+        span + (tiles - 1) * step + width * stride_[g] + origin_;
     return raw + padding_.extraBefore(raw);
   }
 

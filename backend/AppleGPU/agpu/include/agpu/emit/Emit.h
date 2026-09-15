@@ -100,10 +100,11 @@ inline msl::Expr *offsetExprOf(msl::Context &c, const TileView &v, int reg,
                 : c.binary(msl::BinOp::Add,
                            c.binary(msl::BinOp::Mul, swizzled, c.lit(sw.vec)),
                            modBy(c, within, sw.vec));
-        if (width >= v.extentAt(sw.groupDim))
+        const int64_t step = sw.tileStride > 0 ? sw.tileStride : width;
+        if (width >= v.extentAt(sw.groupDim) && sw.tileStride == 0)
           return inTile;
         msl::Expr *tile =
-            c.binary(msl::BinOp::Mul, divBy(c, g, width), c.lit(width));
+            c.binary(msl::BinOp::Mul, divBy(c, g, width), c.lit(step));
         return c.binary(msl::BinOp::Add, tile, inTile);
       });
 

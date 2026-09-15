@@ -171,6 +171,35 @@ int main() {
         CHECK_EQ(wide.offsetOf({r, c}), plain.offsetOf({r, c}));
   }
 
+  CASE("a panelled swizzle stores each span-wide slice whole");
+  {
+    // The NVMMA shape: 128x128 in 32-wide panels, each panel contiguous, with
+    // the XOR inside it. Sampled against the offsets the encoding reports.
+    Swizzle sw;
+    sw.vec = 8;
+    sw.perPhase = 2;
+    sw.maxPhase = 4;
+    sw.phaseDim = 0;
+    sw.groupDim = 1;
+    sw.groupExtent = 32;
+    sw.tileStride = 128 * 32;
+    TileView v({128, 128}, {32, 1}, sw);
+    CHECK_EQ(v.offsetOf({0, 0}), 0);
+    CHECK_EQ(v.offsetOf({0, 32}), 4096);
+    CHECK_EQ(v.offsetOf({1, 0}), 32);
+    CHECK_EQ(v.offsetOf({2, 0}), 72);
+    CHECK_EQ(v.offsetOf({2, 8}), 64);
+    CHECK_EQ(v.cosizeElems(), 128 * 128);
+
+    std::set<int64_t> seen;
+    for (int64_t r = 0; r < 128; ++r)
+      for (int64_t c = 0; c < 128; ++c) {
+        const int64_t off = v.offsetOf({r, c});
+        CHECK(off >= 0 && off < 128 * 128);
+        CHECK(seen.insert(off).second);
+      }
+  }
+
   CASE("a window addresses like its swizzled parent");
   {
     TileView parent = swizzled(32, 64, 8, 1, 8);

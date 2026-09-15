@@ -23,19 +23,25 @@ struct Swizzle {
   int64_t maxPhase = 1;
   int phaseDim = 0;
   int groupDim = 1;
-  // Of the buffer the swizzle was defined on, which a window keeps so its
-  // phases match the parent's.
+  // How wide the permutation reaches. A row wider than this holds several
+  // independent tiles of it, which is how a byte-width swizzle repeats. Kept
+  // by a window so its phases match the parent's.
   int64_t groupExtent = 0;
 
   bool permutes() const { return maxPhase > 1; }
   bool identity() const { return vec == 1 && perPhase == 1 && maxPhase == 1; }
 
-  // The XOR must land inside the row, so the phase cannot exceed the number of
-  // groups the row holds; `maxPhase` is the nominal cycle, which a narrow row
+  // The span belongs to the encoding, so a window onto a swizzled parent keeps
+  // the parent's and does not shrink to its own width.
+  int64_t spanOver(int64_t viewExtent) const {
+    return groupExtent > 0 ? groupExtent : viewExtent;
+  }
+
+  // The XOR must land inside the span, so the phase cannot exceed the number of
+  // groups the span holds; `maxPhase` is the nominal cycle, which a narrow span
   // cannot use in full.
-  int64_t effectiveMaxPhase(int64_t viewExtent) const {
-    const int64_t width = groupExtent > 0 ? groupExtent : viewExtent;
-    const int64_t groups = vec > 0 ? width / vec : 0;
+  int64_t effectiveMaxPhase(int64_t span) const {
+    const int64_t groups = vec > 0 ? span / vec : 0;
     return groups > 0 ? std::min(maxPhase, groups) : 1;
   }
 };
@@ -179,11 +185,14 @@ public:
         coord, [](int64_t v, int64_t s) { return v * s; },
         [](int64_t a, int64_t b) { return a + b; }, [](int64_t v) { return v; },
         [&sw, this](int64_t g, const Coord &all) {
-          const int64_t mp =
-              sw.effectiveMaxPhase(extent_[(std::size_t)sw.groupDim]);
+          const int64_t width = sw.spanOver(extent_[(std::size_t)sw.groupDim]);
+          const int64_t mp = sw.effectiveMaxPhase(width);
           const int64_t phase =
               (all[(std::size_t)sw.phaseDim] / sw.perPhase) % mp;
-          return ((g / sw.vec) ^ phase) * sw.vec + g % sw.vec;
+          const int64_t tile = g / width, within = g % width;
+          const int64_t swizzled =
+              ((within / sw.vec) ^ phase) * sw.vec + within % sw.vec;
+          return tile * width + swizzled;
         });
     return off + padding_.extraBefore(off);
   }

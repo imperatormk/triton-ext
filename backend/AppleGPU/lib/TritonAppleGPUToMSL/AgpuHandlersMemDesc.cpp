@@ -93,23 +93,26 @@ probedSwizzledView(gpu::MemDescType mt, ArrayRef<unsigned> ord) {
   if (!base || mt.getRank() < 2)
     return std::nullopt;
 
-  const int64_t groupWidth = base->extentAt((int)ord[0]);
-  for (int64_t vec = 1; vec <= groupWidth; vec <<= 1)
-    for (int64_t perPhase = 1; perPhase <= base->extentAt((int)ord[1]);
-         perPhase <<= 1)
-      for (int64_t maxPhase = 2; maxPhase <= groupWidth; maxPhase <<= 1) {
-        agpu::Swizzle sw;
-        sw.vec = vec;
-        sw.perPhase = perPhase;
-        sw.maxPhase = maxPhase;
-        sw.groupDim = ord[0];
-        sw.phaseDim = ord[1];
-        sw.groupExtent = groupWidth;
-        agpu::TileView v = *base;
-        v.setSwizzle(sw);
-        if (viewMatchesLayout(v, mt))
-          return v;
-      }
+  const int64_t rowWidth = base->extentAt((int)ord[0]);
+  const int64_t slowExtent = base->extentAt((int)ord[1]);
+  // A byte-width swizzle repeats within a row, so the span it reaches over is
+  // searched alongside its parameters.
+  for (int64_t span = rowWidth; span >= 2; span >>= 1)
+    for (int64_t vec = 1; vec <= span; vec <<= 1)
+      for (int64_t perPhase = 1; perPhase <= slowExtent; perPhase <<= 1)
+        for (int64_t maxPhase = 2; maxPhase <= span; maxPhase <<= 1) {
+          agpu::Swizzle sw;
+          sw.vec = vec;
+          sw.perPhase = perPhase;
+          sw.maxPhase = maxPhase;
+          sw.groupDim = ord[0];
+          sw.phaseDim = ord[1];
+          sw.groupExtent = span;
+          agpu::TileView v = *base;
+          v.setSwizzle(sw);
+          if (viewMatchesLayout(v, mt))
+            return v;
+        }
   return std::nullopt;
 }
 

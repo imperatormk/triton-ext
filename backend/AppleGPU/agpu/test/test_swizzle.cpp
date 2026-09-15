@@ -27,6 +27,19 @@ TileView swizzled(int64_t rows, int64_t cols, int64_t vec, int64_t perPhase,
   return TileView({rows, cols}, {cols, 1}, sw);
 }
 
+// A swizzle reaching over `span` elements, repeated across a wider row.
+TileView spanned(int64_t rows, int64_t cols, int64_t span, int64_t vec,
+                 int64_t perPhase, int64_t maxPhase) {
+  Swizzle sw;
+  sw.vec = vec;
+  sw.perPhase = perPhase;
+  sw.maxPhase = maxPhase;
+  sw.phaseDim = 0;
+  sw.groupDim = 1;
+  sw.groupExtent = span;
+  return TileView({rows, cols}, {cols, 1}, sw);
+}
+
 // Every element of the tile lands on its own offset, inside the tile's bounds.
 void checkBijective(const TileView &v) {
   std::set<int64_t> seen;
@@ -135,6 +148,27 @@ int main() {
     // Row 1 has phase 1, so group 0 lands where group 1 would sit.
     CHECK_EQ(sw.offsetOf({1, 0}), 32 + 4);
     CHECK_EQ(sw.offsetOf({1, 4}), 32 + 0);
+  }
+
+  CASE("a swizzle narrower than the row repeats across it");
+  {
+    // A 64-byte swizzle over f16 spans 32 elements, so a 128-wide row holds
+    // four independent tiles of it.
+    TileView v = spanned(8, 128, 32, 8, 1, 4);
+    checkBijective(v);
+    for (int64_t r = 0; r < 8; ++r)
+      for (int64_t t = 0; t < 4; ++t)
+        for (int64_t c = 0; c < 32; ++c)
+          CHECK_EQ(v.offsetOf({r, t * 32 + c}), v.offsetOf({r, c}) + t * 32);
+  }
+
+  CASE("a full-width span is the plain swizzle");
+  {
+    TileView wide = spanned(8, 32, 32, 4, 2, 4);
+    TileView plain = swizzled(8, 32, 4, 2, 4);
+    for (int64_t r = 0; r < 8; ++r)
+      for (int64_t c = 0; c < 32; ++c)
+        CHECK_EQ(wide.offsetOf({r, c}), plain.offsetOf({r, c}));
   }
 
   CASE("a window addresses like its swizzled parent");

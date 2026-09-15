@@ -87,17 +87,24 @@ inline msl::Expr *offsetExprOf(msl::Context &c, const TileView &v, int reg,
       },
       [&](int64_t k) { return c.lit(k); },
       [&](msl::Expr *g, const std::vector<msl::Expr *> &all) {
-        const int64_t mp = sw.effectiveMaxPhase(v.extentAt(sw.groupDim));
+        const int64_t width = sw.spanOver(v.extentAt(sw.groupDim));
+        const int64_t mp = sw.effectiveMaxPhase(width);
         msl::Expr *phase =
             modBy(c, divBy(c, all[(std::size_t)sw.phaseDim], sw.perPhase), mp);
-        msl::Expr *group = divBy(c, g, sw.vec);
-        msl::Expr *swizzled = c.binary(msl::BinOp::Xor, group, phase);
-        msl::Expr *base =
-            sw.vec == 1 ? swizzled
-                        : c.binary(msl::BinOp::Mul, swizzled, c.lit(sw.vec));
-        return sw.vec == 1
-                   ? base
-                   : c.binary(msl::BinOp::Add, base, modBy(c, g, sw.vec));
+        msl::Expr *within = modBy(c, g, width);
+        msl::Expr *swizzled =
+            c.binary(msl::BinOp::Xor, divBy(c, within, sw.vec), phase);
+        msl::Expr *inTile =
+            sw.vec == 1
+                ? swizzled
+                : c.binary(msl::BinOp::Add,
+                           c.binary(msl::BinOp::Mul, swizzled, c.lit(sw.vec)),
+                           modBy(c, within, sw.vec));
+        if (width >= v.extentAt(sw.groupDim))
+          return inTile;
+        msl::Expr *tile =
+            c.binary(msl::BinOp::Mul, divBy(c, g, width), c.lit(width));
+        return c.binary(msl::BinOp::Add, tile, inTile);
       });
 
   msl::Expr *padded = off;

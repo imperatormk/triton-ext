@@ -34,8 +34,10 @@ add_mlir_library(TritonAppleGPUBackend
 
     ${TO_MSL}/AgpuEmitter.cpp
     ${TO_MSL}/AgpuHandlersArith.cpp
+    ${TO_MSL}/AgpuHandlersMemDesc.cpp
     ${TO_MSL}/AgpuHandlersMemory.cpp
     ${TO_MSL}/AgpuHandlersValue.cpp
+    ${TO_MSL}/AgpuStage.cpp
 
     agpu/src/Printer.cpp
 

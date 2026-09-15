@@ -5,6 +5,17 @@
 
 namespace agpu::msl::builtin {
 
+namespace memflags {
+inline constexpr const char *Threadgroup = "mem_flags::mem_threadgroup";
+inline constexpr const char *DeviceAndThreadgroup =
+    "mem_flags::mem_threadgroup | mem_flags::mem_device";
+} // namespace memflags
+
+namespace barrier {
+inline constexpr const char *Threadgroup = "threadgroup_barrier";
+inline constexpr const char *Simdgroup = "simdgroup_barrier";
+} // namespace barrier
+
 namespace comp {
 inline constexpr const char *X = "x";
 inline constexpr const char *Y = "y";

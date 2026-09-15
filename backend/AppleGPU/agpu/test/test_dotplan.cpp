@@ -2,52 +2,16 @@
 #include "agpu/plan/DotPassSchedule.h"
 #include "agpu/plan/DotPlan.h"
 #include "agpu/plan/PanelSchedule.h"
+#include "fixtures.h"
 #include "harness.h"
 
 using namespace agpu;
+using agpu_test::gemm;
+using agpu_test::landIn;
 
 namespace {
 
-DotFacts gemm(int64_t M, int64_t N, int64_t K, int64_t warps = 4) {
-  DotFacts f;
-  f.M = M;
-  f.N = N;
-  f.K = K;
-  f.aElemBytes = 2;
-  f.bElemBytes = 2;
-  f.numWarps = warps;
-  return f;
-}
-
 const Bytes kBudget{kTGResidentBudgetBytes};
-
-// C under `apple_mma` with warpsPerCTA [gM, gN]: warps interleave at
-// fragment granularity, low warp bits along columns, repetitions above.
-void landIn(DotFacts &f, int64_t gM, int64_t gN) {
-  LayoutBasis row, col;
-  row.lane = {0, 1, 2, 0, 4};
-  col.lane = {2, 0, 0, 4, 0};
-  row.reg.push_back(0);
-  col.reg.push_back(1);
-  for (int64_t s = kSgFragDim; s < gN * kSgFragDim; s <<= 1) {
-    row.warp.push_back(0);
-    col.warp.push_back((int32_t)s);
-  }
-  for (int64_t s = kSgFragDim; s < gM * kSgFragDim; s <<= 1) {
-    row.warp.push_back((int32_t)s);
-    col.warp.push_back(0);
-  }
-  for (int64_t s = gN * kSgFragDim; s < f.nT() * kSgFragDim; s <<= 1) {
-    row.reg.push_back(0);
-    col.reg.push_back((int32_t)s);
-  }
-  for (int64_t s = gM * kSgFragDim; s < f.mT() * kSgFragDim; s <<= 1) {
-    row.reg.push_back((int32_t)s);
-    col.reg.push_back(0);
-  }
-  f.cDims = {row, col};
-  f.cRegs = 2 * (f.mT() / gM) * (f.nT() / gN);
-}
 
 int kindOf(const Plan &p) { return static_cast<int>(p.kind); }
 const int kScalar = static_cast<int>(Plan::Kind::Scalar);
@@ -1006,17 +970,17 @@ int main() {
     const Plan panelled = planDot(big, kBudget);
     CHECK(!panelled.fit.operandsAndBand);
     const std::string r = dotPlanReport(panelled.facts, panelled.fit);
-    CHECK(r.find("128x128x128") != std::string::npos);
-    CHECK(r.find("fusedAcc=y") != std::string::npos);
-    CHECK(r.find("opsAndBand=n") != std::string::npos);
+    CHECK_HAS(r, "128x128x128");
+    CHECK_HAS(r, "fusedAcc=y");
+    CHECK_HAS(r, "opsAndBand=n");
 
     DotFacts small = gemm(64, 64, 64);
     small.fusedAcc = true;
     const Plan fused = planDot(small, kBudget);
     CHECK(fused.kind == Plan::Kind::Fused);
     const std::string rf = dotPlanReport(fused.facts, fused.fit);
-    CHECK(rf.find("registers across the K loop") != std::string::npos);
-    CHECK(rf.find("wholeC=y") != std::string::npos);
+    CHECK_HAS(rf, "registers across the K loop");
+    CHECK_HAS(rf, "wholeC=y");
   }
 
   CASE("the fit the plan reports is the fit it chose from");

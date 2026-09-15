@@ -78,8 +78,8 @@ int main() {
     emitReduce(c, body, p, kNumWarps, sources(1, 1), nm, adder(c));
 
     const std::string out = render(body);
-    CHECK(out.find("threadgroup float") == std::string::npos);
-    CHECK(out.find("scr0[") != std::string::npos);
+    CHECK_LACKS(out, "threadgroup float");
+    CHECK_HAS(out, "scr0[");
   }
 
   CASE("each operand publishes through its own region");
@@ -92,8 +92,8 @@ int main() {
     p.elems = {f32(), i32()};
     emitReduce(c, body, p, kNumWarps, sources(2, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("scr0[") != std::string::npos);
-    CHECK(out.find("scr1[") != std::string::npos);
+    CHECK_HAS(out, "scr0[");
+    CHECK_HAS(out, "scr1[");
   }
 
   CASE("a lane-local reduction declares no buffer");
@@ -103,7 +103,7 @@ int main() {
     ReductionPlan p = onePlan(1, 0b11111, /*warpBits=*/0, kNumWarps);
     CHECK(!p.crossWarp());
     emitReduce(c, body, p, kNumWarps, sources(1, 1), nm, adder(c));
-    CHECK(render(body).find("threadgroup") == std::string::npos);
+    CHECK_LACKS(render(body), "threadgroup");
   }
 
   CASE("an integer reduction keeps an integer accumulator");
@@ -114,10 +114,10 @@ int main() {
     p.elems = {i32()};
     emitReduce(c, body, p, kNumWarps, sources(1, 2), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("int acc") != std::string::npos);
-    CHECK(out.find("int peer") != std::string::npos);
-    CHECK(out.find("float acc") == std::string::npos);
-    CHECK(out.find("float peer") == std::string::npos);
+    CHECK_HAS(out, "int acc");
+    CHECK_HAS(out, "int peer");
+    CHECK_LACKS(out, "float acc");
+    CHECK_LACKS(out, "float peer");
   }
 
   CASE("an unset element type still means f32, so existing callers are safe");
@@ -128,7 +128,7 @@ int main() {
     CHECK(p.elems.empty());
     emitReduce(c, body, p, kNumWarps, sources(1, 2), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("float acc") != std::string::npos);
+    CHECK_HAS(out, "float acc");
   }
 
   CASE("each operand declares its own type");
@@ -139,8 +139,8 @@ int main() {
     p.elems = {f32(), i32()};
     emitReduce(c, body, p, kNumWarps, sources(2, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("float acc0_0") != std::string::npos);
-    CHECK(out.find("int acc0_1") != std::string::npos);
+    CHECK_HAS(out, "float acc0_0");
+    CHECK_HAS(out, "int acc0_1");
   }
 
   CASE("a reduce whose operands disagree on layout emits nothing");
@@ -195,9 +195,9 @@ int main() {
     emitReduce(c, body, onePlan(4, 0), kNumWarps, sources(1, 4), nm, adder(c));
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "sum"), 3 * 2); // decl + use per combine
-    CHECK(out.find("float acc0_0 = v0_0;") != std::string::npos);
-    CHECK(out.find("v0_1") != std::string::npos);
-    CHECK(out.find("v0_3") != std::string::npos);
+    CHECK_HAS(out, "float acc0_0 = v0_0;");
+    CHECK_HAS(out, "v0_1");
+    CHECK_HAS(out, "v0_3");
   }
 
   CASE("one XOR shuffle per planned lane step, high bit first");
@@ -259,7 +259,7 @@ int main() {
     emitReduce(c, body, p, kNumWarps, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
 
-    CHECK(out.find("scr0[warp * 32 + lane] = acc0_0;") != std::string::npos);
+    CHECK_HAS(out, "scr0[warp * 32 + lane] = acc0_0;");
     CHECK_EQ(countOf(out, "threadgroup_barrier"), 3);
     CHECK_EQ(countOf(out, "sum"), 3 * 2); // three peers combined
 
@@ -267,9 +267,9 @@ int main() {
     // `warp & 4`. Every warp reads its own subset.
     CHECK(out.find("float accw0_0 = scr0[(warp & 4) * 32 + lane];") !=
           std::string::npos);
-    CHECK(out.find("scr0[(warp & 4) * 32 + lane + 32]") != std::string::npos);
-    CHECK(out.find("scr0[(warp & 4) * 32 + lane + 64]") != std::string::npos);
-    CHECK(out.find("scr0[(warp & 4) * 32 + lane + 96]") != std::string::npos);
+    CHECK_HAS(out, "scr0[(warp & 4) * 32 + lane + 32]");
+    CHECK_HAS(out, "scr0[(warp & 4) * 32 + lane + 64]");
+    CHECK_HAS(out, "scr0[(warp & 4) * 32 + lane + 96]");
   }
 
   CASE("the barrier separates publish from read");
@@ -350,15 +350,14 @@ int main() {
     const std::string out = render(body);
 
     CHECK_EQ(countOf(out, "threadgroup_barrier"), 3);
-    CHECK(out.find("scr0[warp * 32 + lane] = acc0_0;") != std::string::npos);
+    CHECK_HAS(out, "scr0[warp * 32 + lane] = acc0_0;");
     CHECK(out.find("scr0[warp * 32 + lane + 256] = acc1_0;") !=
           std::string::npos);
     CHECK(out.find("float accw0_0 = scr0[(warp & 6) * 32 + lane];") !=
           std::string::npos);
     CHECK(out.find("float accw1_0 = scr0[(warp & 6) * 32 + lane + 256];") !=
           std::string::npos);
-    CHECK(out.find("scr0[(warp & 6) * 32 + lane + 256 + 32]") !=
-          std::string::npos);
+    CHECK_HAS(out, "scr0[(warp & 6) * 32 + lane + 256 + 32]");
 
     // Both publishes precede the middle barrier; both reads follow it.
     const std::size_t pub1 = out.find("+ 256] = acc1_0;");
@@ -377,8 +376,8 @@ int main() {
     emitReduce(c, body, onePlan(2, 0b1), kNumWarps, sources(2, 2), nm,
                adder(c));
     const std::string out = render(body);
-    CHECK(out.find("float acc0_0 = v0_0;") != std::string::npos);
-    CHECK(out.find("float acc0_1 = v1_0;") != std::string::npos);
+    CHECK_HAS(out, "float acc0_0 = v0_0;");
+    CHECK_HAS(out, "float acc0_1 = v1_0;");
     CHECK_EQ(countOf(out, "simd_shuffle_xor"), 2);
   }
 
@@ -396,8 +395,8 @@ int main() {
         emitReduce(c, body, p, kNumWarps, sources(1, 4), nm, adder(c)).value;
     CHECK_EQ(res.size(), 2u);
     const std::string out = render(body);
-    CHECK(out.find("float acc0_0 = v0_0;") != std::string::npos);
-    CHECK(out.find("float acc1_0 = v0_2;") != std::string::npos);
+    CHECK_HAS(out, "float acc0_0 = v0_0;");
+    CHECK_HAS(out, "float acc1_0 = v0_2;");
     CHECK_EQ(countOf(out, "sum"), 2 * 2);
   }
 

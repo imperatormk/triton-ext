@@ -7,19 +7,14 @@
 #include "agpu/msl/Context.h"
 #include "agpu/msl/Printer.h"
 #include "harness.h"
+#include "render.h"
 
 #include <sstream>
 
 using namespace agpu::msl;
+using agpu_test::render;
 
-namespace {
-std::string render(const Block &b) {
-  std::ostringstream os;
-  Printer p(os);
-  p.printBlock(b);
-  return os.str();
-}
-} // namespace
+namespace {} // namespace
 
 int main() {
   CASE("B3: a name used only in an array initialiser stays live");

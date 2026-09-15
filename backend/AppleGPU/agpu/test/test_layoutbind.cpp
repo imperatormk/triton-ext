@@ -1,6 +1,7 @@
 // Coordinate expressions, emitted once each.
 #include "agpu/bind/LayoutBind.h"
 #include "agpu/msl/Printer.h"
+#include "fixtures.h"
 #include "harness.h"
 #include "render.h"
 
@@ -8,16 +9,10 @@
 #include <sstream>
 
 using namespace agpu;
+using agpu_test::basis;
 using agpu_test::render;
 
 namespace {
-
-std::string renderBlock(const msl::Block &b) {
-  std::ostringstream os;
-  msl::Printer p(os);
-  p.printBlock(b);
-  return os.str();
-}
 
 std::string unhoisted(const LayoutBasis &lb, int reg) {
   msl::Context c;
@@ -25,8 +20,7 @@ std::string unhoisted(const LayoutBasis &lb, int reg) {
 }
 
 LayoutBasis laneWarp() {
-  return LayoutBasis{/*reg=*/{64}, /*lane=*/{1, 2, 4, 8, 16},
-                     /*warp=*/{32}, /*block=*/{}};
+  return basis(/*reg=*/{64}, /*lane=*/{1, 2, 4, 8, 16}, /*warp=*/{32});
 }
 
 } // namespace
@@ -36,9 +30,9 @@ int main() {
   {
     const std::vector<LayoutBasis> layouts = {
         laneWarp(),
-        LayoutBasis{{32}, {1, 2, 4, 8, 16}, {}, {}},
-        LayoutBasis{{}, {1, 2, 4, 8, 16}, {32, 64}, {}},
-        LayoutBasis{{16}, {1, 2}, {4}, {8}},
+        basis({32}, {1, 2, 4, 8, 16}),
+        basis({}, {1, 2, 4, 8, 16}, {32, 64}),
+        basis({16}, {1, 2}, {4}, {8}),
     };
 
     msl::Context c;
@@ -72,9 +66,9 @@ int main() {
     CHECK_EQ(h.decls.size(), (std::size_t)1);
     CHECK_EQ(h.distinct(), (std::size_t)1);
 
-    const std::string decls = renderBlock(h.decls);
-    CHECK(decls.find("lane & 31") != std::string::npos);
-    CHECK(decls.find(first) != std::string::npos);
+    const std::string decls = render(h.decls);
+    CHECK_HAS(decls, "lane & 31");
+    CHECK_HAS(decls, first);
   }
 
   CASE("different registers of one layout do not share");
@@ -125,8 +119,8 @@ int main() {
     CoordHoist h{ThreadNames{}};
     const LayoutBasis lb{{}, {1, 2, 4}, {}, {8, 16}};
     CHECK(h.coord(c, lb, 0) != nullptr);
-    const std::string decls = renderBlock(h.decls);
-    CHECK(decls.find("tgpos.x") != std::string::npos);
+    const std::string decls = render(h.decls);
+    CHECK_HAS(decls, "tgpos.x");
   }
 
   CASE("declarations come out in creation order");
@@ -135,7 +129,7 @@ int main() {
     CoordHoist h{ThreadNames{}};
     const std::string first = render(h.coord(c, laneWarp(), 0));
     const std::string second = render(h.coord(c, laneWarp(), 1));
-    const std::string decls = renderBlock(h.decls);
+    const std::string decls = render(h.decls);
     CHECK(decls.find(first) < decls.find(second));
   }
 

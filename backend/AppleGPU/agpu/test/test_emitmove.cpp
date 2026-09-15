@@ -9,6 +9,7 @@
 
 using namespace agpu;
 using agpu_test::countOf;
+using agpu_test::has;
 using agpu_test::render;
 
 namespace {
@@ -86,15 +87,13 @@ int main() {
     f.coherent = true;
     msl::Block wide;
     emitMove(c, wide, f, planMove(f), TestSite(c, 4).site, elem);
-    CHECK(render(wide).find("device coherent(device) float4 *") !=
-          std::string::npos);
+    CHECK_HAS(render(wide), "device coherent(device) float4 *");
 
     MoveFacts s = loadOf(3, 32, 1, 4);
     s.coherent = true;
     msl::Block scalar;
     emitMove(c, scalar, s, planMove(s), TestSite(c, 3).site, elem);
-    CHECK(render(scalar).find("device coherent(device) float *") !=
-          std::string::npos);
+    CHECK_HAS(render(scalar), "device coherent(device) float *");
 
     MoveFacts m = loadOf(2, 32, 1, 4);
     m.coherent = true;
@@ -102,8 +101,7 @@ int main() {
     msl::Block masked;
     emitMove(c, masked, m, planMove(m), TestSite(c, 2, /*mask=*/true).site,
              elem);
-    CHECK(render(masked).find("device coherent(device) float *") !=
-          std::string::npos);
+    CHECK_HAS(render(masked), "device coherent(device) float *");
   }
 
   CASE("an ordinary access pays nothing for the coherent path");
@@ -114,8 +112,8 @@ int main() {
     msl::Block body;
     emitMove(c, body, f, planMove(f), TestSite(c, 3).site, elem);
     const std::string out = render(body);
-    CHECK(out.find("coherent") == std::string::npos);
-    CHECK(out.find("float v0 = *p0;") != std::string::npos);
+    CHECK_LACKS(out, "coherent");
+    CHECK_HAS(out, "float v0 = *p0;");
   }
 
   // ── vectorisation ──────────────────────────────────────────────────────
@@ -131,7 +129,7 @@ int main() {
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "float4"), 2);
     CHECK_EQ(countOf(out, "v0_w["), 4);
-    CHECK(out.find("float v1 = v0_w[1];") != std::string::npos);
+    CHECK_HAS(out, "float v1 = v0_w[1];");
   }
 
   CASE("a register count that does not divide the width stays scalar");
@@ -152,7 +150,7 @@ int main() {
     CHECK_EQ(p.width(), 4);
     CHECK(p.runs.packed);
     emitMove(c, body, f, p, TestSite(c, 4).site, elem);
-    CHECK(render(body).find("packed_float4") != std::string::npos);
+    CHECK_HAS(render(body), "packed_float4");
   }
 
   CASE("a scalar load reads each element where it lies");
@@ -164,8 +162,8 @@ int main() {
     CHECK(!p.vectorised());
     emitMove(c, body, f, p, TestSite(c, 2).site, elem);
     const std::string out = render(body);
-    CHECK(out.find("float v0 = *p0;") != std::string::npos);
-    CHECK(out.find("float v1 = *p1;") != std::string::npos);
+    CHECK_HAS(out, "float v0 = *p0;");
+    CHECK_HAS(out, "float v1 = *p1;");
   }
 
   // ── stores ─────────────────────────────────────────────────────────────
@@ -178,7 +176,7 @@ int main() {
     f.isStore = true;
     emitMove(c, body, f, planMove(f), TestSite(c, 2).site, elem);
     const std::string out = render(body);
-    CHECK(out.find("*p0 = v0;") != std::string::npos);
+    CHECK_HAS(out, "*p0 = v0;");
     CHECK_EQ(countOf(out, "float v"), 0);
   }
 
@@ -191,7 +189,7 @@ int main() {
     MovePlan p = planMove(f);
     emitMove(c, body, f, p, TestSite(c, 4).site, elem);
     const std::string out = render(body);
-    CHECK(out.find("float4(v0, v1, v2, v3)") != std::string::npos);
+    CHECK_HAS(out, "float4(v0, v1, v2, v3)");
     CHECK_EQ(countOf(out, "float4(v0"), 1);
   }
 
@@ -207,8 +205,8 @@ int main() {
     f.hasMask = true;
     emitMove(c, body, f, planMove(f), TestSite(c, 2, /*mask=*/true).site, elem);
     const std::string out = render(body);
-    CHECK(out.find("float v0 = 0") != std::string::npos);
-    CHECK(out.find("if (m0)") != std::string::npos);
+    CHECK_HAS(out, "float v0 = 0");
+    CHECK_HAS(out, "if (m0)");
   }
 
   CASE("an unmasked load initialises nothing");
@@ -226,7 +224,7 @@ int main() {
     f.hasOther = true;
     emitMove(c, body, f, planMove(f),
              TestSite(c, 2, /*mask=*/true, /*other=*/true).site, elem);
-    CHECK(render(body).find("float v0 = o0;") != std::string::npos);
+    CHECK_HAS(render(body), "float v0 = o0;");
   }
 
   CASE("a store initialises nothing");
@@ -258,12 +256,11 @@ int main() {
     CHECK(p.peel);
     emitMove(c, body, f, p, TestSite(c, 4, /*mask=*/true).site, elem);
     const std::string out = render(body);
-    CHECK(out.find("else") != std::string::npos);
-    CHECK(out.find("packed_float4") != std::string::npos ||
-          out.find("float4") != std::string::npos);
+    CHECK_HAS(out, "else");
+    CHECK(has(out, "packed_float4") || has(out, "float4"));
     CHECK_EQ(countOf(out, "if (m"), 4 + 1);
     for (int r = 0; r < 4; ++r)
-      CHECK(out.find("if (m" + std::to_string(r) + ")") != std::string::npos);
+      CHECK_HAS(out, "if (m" + std::to_string(r) + ")");
   }
 
   CASE("the peel guard spans every register in one shot");
@@ -279,7 +276,7 @@ int main() {
     emitMove(c, body, f, p, TestSite(c, 8, /*mask=*/true).site, elem);
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "} else {"), 1);
-    CHECK(out.find("m0 && m1") != std::string::npos);
+    CHECK_HAS(out, "m0 && m1");
   }
 
   CASE("a conjunction guard contributes each axis term once");
@@ -297,9 +294,8 @@ int main() {
     };
     emitMove(c, body, f, p, ts.site, elem);
     const std::string out = render(body);
-    CHECK(out.find("if (a0 && b0 && b1 && b2 && b3 && a1) {") !=
-          std::string::npos);
-    CHECK(out.find("if (a1 && b2)") != std::string::npos);
+    CHECK_HAS(out, "if (a0 && b0 && b1 && b2 && b3 && a1) {");
+    CHECK_HAS(out, "if (a1 && b2)");
   }
 
   CASE("a partial cross product still dedups per conjunct");
@@ -317,7 +313,7 @@ int main() {
     };
     emitMove(c, body, f, planMove(f), ts.site, elem);
     const std::string out = render(body);
-    CHECK(out.find("if (a0 && b0 && a1 && b1) {") != std::string::npos);
+    CHECK_HAS(out, "if (a0 && b0 && a1 && b1) {");
   }
 
   CASE("a broadcast mask contributes a single shared term");
@@ -332,8 +328,8 @@ int main() {
                  .site,
              elem);
     const std::string out = render(body);
-    CHECK(out.find("if (m)") != std::string::npos);
-    CHECK(out.find("m && m") == std::string::npos);
+    CHECK_HAS(out, "if (m)");
+    CHECK_LACKS(out, "m && m");
   }
 
   CASE("stores that alias one address keep every guard");
@@ -353,11 +349,11 @@ int main() {
     emitMove(c, body, f, p, t.site, elem);
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "if (m"), 8 + 1);
-    CHECK(out.find("m6 && m7") != std::string::npos);
+    CHECK_HAS(out, "m6 && m7");
     CHECK_EQ(countOf(out, "out[0] = v"), 16);
     for (int r = 0; r < 8; ++r)
-      CHECK(out.find("if (m" + std::to_string(r) + ") out[0] = v" +
-                     std::to_string(r)) != std::string::npos);
+      CHECK_HAS(out, "if (m" + std::to_string(r) + ") out[0] = v" +
+                         std::to_string(r));
   }
 
   // ── a mask the layout decides ──────────────────────────────────────────
@@ -407,8 +403,8 @@ int main() {
     // only the initialiser that defines their names.
     CHECK_EQ(countOf(out, "_w = *"), 6);
     CHECK_EQ(countOf(out, "if (m"), 0);
-    CHECK(out.find("float v24 = 0") != std::string::npos);
-    CHECK(out.find("*p24") == std::string::npos);
+    CHECK_HAS(out, "float v24 = 0");
+    CHECK_LACKS(out, "*p24");
   }
 
   CASE("a register the lanes carry across the bound keeps its guard");
@@ -434,7 +430,7 @@ int main() {
     emitMove(c, body, f, p, TestSite(c, 4, /*mask=*/true).site, elem);
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "if (m"), 4);
-    CHECK(out.find("_w = *") == std::string::npos);
+    CHECK_LACKS(out, "_w = *");
   }
 
   CASE("a second runtime term leaves the mask alone");

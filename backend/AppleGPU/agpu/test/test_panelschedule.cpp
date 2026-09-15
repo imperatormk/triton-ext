@@ -1,5 +1,6 @@
 // PanelSchedule tests.
 #include "agpu/plan/PanelSchedule.h"
+#include "fixtures.h"
 #include "harness.h"
 
 namespace {
@@ -47,17 +48,9 @@ using namespace agpu;
 
 namespace {
 
+// The fourth argument here is the batch, not the warp count.
 DotFacts gemm(int64_t M, int64_t N, int64_t K, int64_t Bd = 1) {
-  DotFacts f;
-  f.M = M;
-  f.N = N;
-  f.K = K;
-  f.Bd = Bd;
-  f.rank = Bd > 1 ? 3 : 2;
-  f.aElemBytes = 2;
-  f.bElemBytes = 2;
-  f.numWarps = 4;
-  return f;
+  return agpu_test::gemm(M, N, K, /*warps=*/4, Bd);
 }
 
 } // namespace

@@ -31,9 +31,9 @@ int main() {
     HelperSet h;
     CHECK(!h.any());
     const std::string out = prelude(h);
-    CHECK(out.find("#include <metal_stdlib>") != std::string::npos);
-    CHECK(out.find("#include <metal_simdgroup_matrix>") != std::string::npos);
-    CHECK(out.find("using namespace metal;") != std::string::npos);
+    CHECK_HAS(out, "#include <metal_stdlib>");
+    CHECK_HAS(out, "#include <metal_simdgroup_matrix>");
+    CHECK_HAS(out, "using namespace metal;");
   }
 
   CASE("a kernel needing no helpers gets the header and nothing else");
@@ -67,7 +67,7 @@ int main() {
                          MemOrder::Relaxed));
     CHECK(h.has(Helper::AtomicRmwF32));
     CHECK(!h.has(Helper::AtomicRmwPacked16));
-    CHECK(prelude(h).find("__agpu_atomic_rmw_f32") != std::string::npos);
+    CHECK_HAS(prelude(h), "__agpu_atomic_rmw_f32");
   }
 
   CASE("a 16-bit float atomic asks for the packed helper");
@@ -77,7 +77,7 @@ int main() {
                          MemOrder::Relaxed));
     CHECK(h.has(Helper::AtomicRmwPacked16));
     CHECK(!h.has(Helper::AtomicRmwF32));
-    CHECK(prelude(h).find("__agpu_atomic_rmw_packed16") != std::string::npos);
+    CHECK_HAS(prelude(h), "__agpu_atomic_rmw_packed16");
   }
 
   CASE("the RMW selectors in the helper body come from the enum");
@@ -104,14 +104,13 @@ int main() {
     h.require(planAtomic(atomicOf(RmwOp::Add, ElemClass::Float, 16),
                          MemOrder::Relaxed));
     const std::string out = prelude(h);
-    CHECK(out.find("__agpu_narrow16<T>(next)") != std::string::npos);
+    CHECK_HAS(out, "__agpu_narrow16<T>(next)");
     CHECK(out.find("as_type<ushort>(T(next))") == std::string::npos);
 
     CHECK(h.has(Helper::RtneIntHalf));
     CHECK(h.has(Helper::RtneIntBfloat));
-    CHECK(out.find("inline ushort __agpu_rtne_int_half") != std::string::npos);
-    CHECK(out.find("inline ushort __agpu_rtne_int_bfloat") !=
-          std::string::npos);
+    CHECK_HAS(out, "inline ushort __agpu_rtne_int_half");
+    CHECK_HAS(out, "inline ushort __agpu_rtne_int_bfloat");
     CHECK(out.find("__agpu_rtne_int_half") <
           out.find("__agpu_atomic_rmw_packed16"));
   }
@@ -129,9 +128,9 @@ int main() {
     HelperSet h;
     h.add(Helper::Erf);
     const std::string out = prelude(h);
-    CHECK(out.find("0.3275911f") != std::string::npos);
-    CHECK(out.find("1.26551223f") == std::string::npos);
-    CHECK(out.find("metal::sign(x)") != std::string::npos);
+    CHECK_HAS(out, "0.3275911f");
+    CHECK_LACKS(out, "1.26551223f");
+    CHECK_HAS(out, "metal::sign(x)");
   }
 
   CASE("erf is a helper because Metal has none");
@@ -139,7 +138,7 @@ int main() {
     HelperSet h;
     h.require(MathFn::Erf);
     CHECK(h.has(Helper::Erf));
-    CHECK(prelude(h).find("__agpu_erf") != std::string::npos);
+    CHECK_HAS(prelude(h), "__agpu_erf");
 
     HelperSet other;
     other.require(MathFn::Exp);
@@ -151,8 +150,7 @@ int main() {
     HelperSet h;
     h.add(Helper::Fp8PackE4M3);
     const std::string out = prelude(h);
-    CHECK(out.find("rem > 0x80000u || rem == 0x80000u && m & 1u") !=
-          std::string::npos);
+    CHECK_HAS(out, "rem > 0x80000u || rem == 0x80000u && m & 1u");
   }
 
   CASE("fp8 encodes subnormals");
@@ -161,7 +159,7 @@ int main() {
     h.add(Helper::Fp8PackE4M3);
     h.add(Helper::Fp8UnpackE4M3);
     const std::string out = prelude(h);
-    CHECK(out.find("if (ex < -6)") != std::string::npos);
+    CHECK_HAS(out, "if (ex < -6)");
     CHECK(out.find("while ((m & 0x8u) == 0u)") != std::string::npos);
   }
 
@@ -171,10 +169,9 @@ int main() {
     h.add(Helper::Fp8PackE4M3);
     h.add(Helper::Fp8PackE5M2);
     const std::string out = prelude(h);
-    CHECK(out.find("ex >= 16 || ex == 15 && mant > 0x600000u") !=
-          std::string::npos);
-    CHECK(out.find("sgn | 0x7eu") != std::string::npos);
-    CHECK(out.find("sgn | 0x7cu") != std::string::npos);
+    CHECK_HAS(out, "ex >= 16 || ex == 15 && mant > 0x600000u");
+    CHECK_HAS(out, "sgn | 0x7eu");
+    CHECK_HAS(out, "sgn | 0x7cu");
   }
 
   CASE("round-toward-zero saturates to the largest finite half");
@@ -182,8 +179,8 @@ int main() {
     HelperSet h;
     h.add(Helper::RtzHalf);
     const std::string out = prelude(h);
-    CHECK(out.find("sgn | 0x7bffu") != std::string::npos);
-    CHECK(out.find("(mant ? 0x200u : 0u)") != std::string::npos);
+    CHECK_HAS(out, "sgn | 0x7bffu");
+    CHECK_HAS(out, "(mant ? 0x200u : 0u)");
   }
 
   CASE("round-to-nearest-even saturates to infinity, unlike toward-zero");
@@ -191,8 +188,8 @@ int main() {
     HelperSet rtne, rtz;
     rtne.add(Helper::RtneIntHalf);
     rtz.add(Helper::RtzHalf);
-    CHECK(prelude(rtne).find("sgn | 0x7c00u") != std::string::npos);
-    CHECK(prelude(rtz).find("sgn | 0x7bffu") != std::string::npos);
+    CHECK_HAS(prelude(rtne), "sgn | 0x7c00u");
+    CHECK_HAS(prelude(rtz), "sgn | 0x7bffu");
   }
 
   CASE("bfloat's nearest-even rounds before truncating");
@@ -201,11 +198,11 @@ int main() {
     ne.add(Helper::RtneIntBfloat);
     z.add(Helper::RtzBfloat);
     const std::string neSrc = prelude(ne);
-    CHECK(neSrc.find("u + 0x7fffu + lsb") != std::string::npos);
+    CHECK_HAS(neSrc, "u + 0x7fffu + lsb");
     // The NaN arm quiets the payload, through a select.
-    CHECK(neSrc.find("0x40u : 0u") != std::string::npos);
+    CHECK_HAS(neSrc, "0x40u : 0u");
     CHECK(neSrc.find("if (") == std::string::npos);
-    CHECK(prelude(z).find("0x7fffu") == std::string::npos);
+    CHECK_LACKS(prelude(z), "0x7fffu");
   }
 
   CASE("asking twice emits one definition");
@@ -249,11 +246,11 @@ int main() {
       const std::string src = helperSource(which);
       CHECK(name != nullptr && *name != '\0');
       CHECK(!src.empty());
-      CHECK(src.find(name) != std::string::npos);
+      CHECK_HAS(src, name);
 
       HelperSet only;
       only.add(which);
-      CHECK(prelude(only).find(name) != std::string::npos);
+      CHECK_HAS(prelude(only), name);
     }
   }
 
@@ -272,7 +269,7 @@ int main() {
           CHECK(h.any());
           const std::string name = convertHelperName(p);
           CHECK(!name.empty());
-          CHECK(prelude(h).find(name) != std::string::npos);
+          CHECK_HAS(prelude(h), name);
         }
       }
   }
@@ -303,7 +300,7 @@ int main() {
         continue;
       CHECK_EQ(std::string(s.name), std::string(helperName(h)));
       const std::string body = helperSource(h);
-      CHECK(body.find(helperName(h)) != std::string::npos);
+      CHECK_HAS(body, helperName(h));
     }
   }
 

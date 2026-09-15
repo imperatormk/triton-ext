@@ -32,8 +32,7 @@ int main() {
     msl::Block body;
     emitAtomic(c, body, planAtomic(intAdd(), MemOrder::Relaxed), "p", "v", nm);
     const std::string out = render(body);
-    CHECK(out.find("atomic_fetch_add_explicit(p, v, memory_order_relaxed)") !=
-          std::string::npos);
+    CHECK_HAS(out, "atomic_fetch_add_explicit(p, v, memory_order_relaxed)");
   }
 
   CASE("an unsupported atomic emits nothing at all");
@@ -93,8 +92,8 @@ int main() {
     msl::Block body;
     emitAtomic(c, body, planAtomic(intAdd(), MemOrder::Acquire), "p", "v", nm);
     const std::string out = render(body);
-    CHECK(out.find("mem_device") != std::string::npos);
-    CHECK(out.find("atomic_thread_fence") == std::string::npos);
+    CHECK_HAS(out, "mem_device");
+    CHECK_LACKS(out, "atomic_thread_fence");
   }
 
   CASE("both barriers sit outside the election guard");
@@ -138,9 +137,9 @@ int main() {
     f.warpFree = 0b10;
     emitAtomic(c, body, planAtomic(f, MemOrder::Relaxed), "p", "v", nm);
     const std::string out = render(body);
-    CHECK(out.find("lane & 1") != std::string::npos);
-    CHECK(out.find("warp & 2") != std::string::npos);
-    CHECK(out.find("&&") != std::string::npos);
+    CHECK_HAS(out, "lane & 1");
+    CHECK_HAS(out, "warp & 2");
+    CHECK_HAS(out, "&&");
   }
 
   CASE("a uniform pointer elects thread 0, by its x component");
@@ -153,8 +152,8 @@ int main() {
     f.uniformPtr = true;
     emitAtomic(c, body, planAtomic(f, MemOrder::Relaxed), "p", "v", nm);
     const std::string out = render(body);
-    CHECK(out.find("if (tid.x == 0)") != std::string::npos);
-    CHECK(out.find("if (tid == 0)") == std::string::npos);
+    CHECK_HAS(out, "if (tid.x == 0)");
+    CHECK_LACKS(out, "if (tid == 0)");
   }
 
   CASE("the fence sits inside the election, with the operation");
@@ -236,8 +235,8 @@ int main() {
     CHECK_EQ(res.size(), 2u);
 
     const std::string out = render(body);
-    CHECK(out.find("hi0") != std::string::npos);
-    CHECK(out.find("hi1") != std::string::npos);
+    CHECK_HAS(out, "hi0");
+    CHECK_HAS(out, "hi1");
   }
 
   CASE("the packed-16 helper is called at a named type");
@@ -289,8 +288,8 @@ int main() {
     f.bits = 32;
     emitAtomic(c, body, planAtomic(f, MemOrder::AcquireRelease), "p", "v", nm);
     const std::string out = render(body);
-    CHECK(out.find("__agpu_atomic_rmw_f32") != std::string::npos);
-    CHECK(out.find("atomic_fetch") == std::string::npos);
+    CHECK_HAS(out, "__agpu_atomic_rmw_f32");
+    CHECK_LACKS(out, "atomic_fetch");
     CHECK_EQ(countOf(out, "atomic_thread_fence"), 0);
   }
 
@@ -303,7 +302,7 @@ int main() {
     f.elem = ElemClass::Float;
     f.bits = 16;
     emitAtomic(c, body, planAtomic(f, MemOrder::Relaxed), "p", "v", nm);
-    CHECK(render(body).find("__agpu_atomic_rmw_packed16") != std::string::npos);
+    CHECK_HAS(render(body), "__agpu_atomic_rmw_packed16");
   }
 
   CASE("no election spells the thread id without a component");
@@ -343,8 +342,8 @@ int main() {
     bn.scratch = "ascr";
     emitAtomic(c, body, planAtomic(f, MemOrder::Relaxed), "p", "v", bn);
     const std::string out = render(body);
-    CHECK(out.find("ascr[0] = old") != std::string::npos);
-    CHECK(out.find("old = ascr[0]") != std::string::npos);
+    CHECK_HAS(out, "ascr[0] = old");
+    CHECK_HAS(out, "old = ascr[0]");
 
     // Every barrier stands outside the election: a threadgroup_barrier under
     // divergent control flow is undefined in Metal. Two bracket the publish,
@@ -366,7 +365,7 @@ int main() {
     bn.scratch = "ascr";
     emitAtomic(c, body, planAtomic(f, MemOrder::Relaxed), "p", "v", bn);
     const std::string out = render(body);
-    CHECK(out.find("ascr") == std::string::npos);
+    CHECK_LACKS(out, "ascr");
     CHECK_EQ(countOf(out, "threadgroup_barrier"), 0);
   }
 

@@ -7,19 +7,9 @@
 
 using namespace agpu;
 using agpu_test::countOf;
+using agpu_test::gemm;
 
 namespace {
-
-DotFacts gemm(int64_t M, int64_t N, int64_t K) {
-  DotFacts f;
-  f.M = M;
-  f.N = N;
-  f.K = K;
-  f.aElemBytes = 2;
-  f.bElemBytes = 2;
-  f.numWarps = 4;
-  return f;
-}
 
 DotInputs dotInputs() {
   DotInputs in;
@@ -54,8 +44,8 @@ int main() {
     CHECK(r.ok());
 
     const std::string out = os.str();
-    CHECK(out.find("#include <metal_stdlib>") != std::string::npos);
-    CHECK(out.find("kernel void k") != std::string::npos);
+    CHECK_HAS(out, "#include <metal_stdlib>");
+    CHECK_HAS(out, "kernel void k");
     CHECK(out.find("#include <metal_stdlib>") < out.find("kernel void k"));
   }
 
@@ -74,7 +64,7 @@ int main() {
     std::ostringstream os;
     CHECK(e.print(os).ok());
     const std::string out = os.str();
-    CHECK(out.find("__agpu_erf") != std::string::npos);
+    CHECK_HAS(out, "__agpu_erf");
     CHECK(out.find("__agpu_erf") < out.find("kernel void k0"));
   }
 
@@ -296,9 +286,9 @@ int main() {
     std::ostringstream os;
     e.printDeclineSummary(os);
     const std::string out = os.str();
-    CHECK(out.find("f64") != std::string::npos);
-    CHECK(out.find("MSL-PLAN-SITE") != std::string::npos);
-    CHECK(out.find("distinct rejects: 0") != std::string::npos);
+    CHECK_HAS(out, "f64");
+    CHECK_HAS(out, "MSL-PLAN-SITE");
+    CHECK_HAS(out, "distinct rejects: 0");
   }
 
   CASE("a type that loses nothing says nothing");

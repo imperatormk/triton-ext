@@ -83,10 +83,10 @@ int main() {
 
     msl::Context c;
     const std::string s = render(emitRetStruct(c, f, abi));
-    CHECK(s.find("struct load_tile_ret {") != std::string::npos);
+    CHECK_HAS(s, "struct load_tile_ret {");
     CHECK_EQ(countOf(s, "float f"), 4);
-    CHECK(s.find("float f0;") != std::string::npos);
-    CHECK(s.find("float f3;") != std::string::npos);
+    CHECK_HAS(s, "float f0;");
+    CHECK_HAS(s, "float f3;");
 
     CHECK_EQ(render(emitDeviceReturn(c, abi, {"r0", "r1", "r2", "r3"})),
              std::string("return {r0, r1, r2, r3};\n"));
@@ -115,9 +115,9 @@ int main() {
 
     msl::Context c;
     const std::string s = render(emitRetStruct(c, f, abi));
-    CHECK(s.find("half f0;") != std::string::npos);
-    CHECK(s.find("half f1;") != std::string::npos);
-    CHECK(s.find("int f2;") != std::string::npos);
+    CHECK_HAS(s, "half f0;");
+    CHECK_HAS(s, "half f1;");
+    CHECK_HAS(s, "int f2;");
   }
 
   // ── the implicit arguments ─────────────────────────────────────────────
@@ -133,11 +133,11 @@ int main() {
     msl::Function *fn = emitDeviceFn(c, f, abi, {"x"}, {});
     const std::string s = render(fn);
     const DeviceFnNames dnm;
-    CHECK(s.find("uint3 " + dnm.threadgroupPos) != std::string::npos);
-    CHECK(s.find("uint3 " + dnm.threadId) != std::string::npos);
-    CHECK(s.find("uint3 " + dnm.gridSize) != std::string::npos);
-    CHECK(s.find("[[") == std::string::npos);
-    CHECK(s.find("kernel ") == std::string::npos);
+    CHECK_HAS(s, "uint3 " + dnm.threadgroupPos);
+    CHECK_HAS(s, "uint3 " + dnm.threadId);
+    CHECK_HAS(s, "uint3 " + dnm.gridSize);
+    CHECK_LACKS(s, "[[");
+    CHECK_LACKS(s, "kernel ");
   }
 
   CASE("a module with a pool threads it down as a fourth parameter");
@@ -152,8 +152,7 @@ int main() {
 
     msl::Context c;
     const std::string s = render(emitDeviceFn(c, f, abi, {}, {}));
-    CHECK(s.find("threadgroup char * " + DeviceFnNames{}.pool) !=
-          std::string::npos);
+    CHECK_HAS(s, "threadgroup char * " + DeviceFnNames{}.pool);
 
     DeviceFnFacts none = fnOf("h", {}, {});
     DeviceFnAbi noPool = planDeviceFn(none);
@@ -176,8 +175,7 @@ int main() {
 
     msl::Context c;
     const std::string s = render(emitDeviceFn(c, f, abi, {}, {}));
-    CHECK(s.find("device atomic_uint * " + DeviceFnNames{}.assertBuffer) !=
-          std::string::npos);
+    CHECK_HAS(s, "device atomic_uint * " + DeviceFnNames{}.assertBuffer);
 
     DeviceFnFacts none = fnOf("h", {}, {});
     DeviceFnAbi noAssert = planDeviceFn(none);
@@ -198,12 +196,12 @@ int main() {
     msl::Context c;
     const std::string proto = render(emitDeviceProto(c, f, abi));
     CHECK(proto.find(");") != std::string::npos);
-    CHECK(proto.find("{") == std::string::npos);
+    CHECK_LACKS(proto, "{");
     CHECK(proto.find("float g(") != std::string::npos);
 
     msl::Function *empty = emitDeviceFn(c, f, abi, {"a", "b"}, {});
     const std::string s = render(empty);
-    CHECK(s.find("{") != std::string::npos);
+    CHECK_HAS(s, "{");
   }
 
   CASE("the prototype and the definition declare the same parameter types");
@@ -280,12 +278,12 @@ int main() {
     const std::string s = render(body);
     CHECK(s.find("load_tile_ret t = load_tile(p, tgid, tid, tgcount);") !=
           std::string::npos);
-    CHECK(s.find("float v0 = t.f0;") != std::string::npos);
-    CHECK(s.find("float v1 = t.f1;") != std::string::npos);
+    CHECK_HAS(s, "float v0 = t.f0;");
+    CHECK_HAS(s, "float v1 = t.f1;");
 
     const std::string decl = render(emitRetStruct(c, f, abi));
-    CHECK(decl.find("float f0;") != std::string::npos);
-    CHECK(decl.find("float f1;") != std::string::npos);
+    CHECK_HAS(decl, "float f0;");
+    CHECK_HAS(decl, "float f1;");
   }
 
   CASE("a void call emits as a bare statement");
@@ -308,7 +306,7 @@ int main() {
                    {"r"});
     const std::string s = render(body);
     CHECK_EQ(s, std::string("float r = g(x, a, b, c);\n"));
-    CHECK(s.find("_ret") == std::string::npos);
+    CHECK_LACKS(s, "_ret");
   }
 
   // ── the module driver ──────────────────────────────────────────────────
@@ -379,10 +377,9 @@ int main() {
     CHECK_EQ(r.poolBytes, 4096);
 
     const std::string out = os.str();
-    CHECK(out.find("threadgroup char pool[4096]") != std::string::npos);
-    CHECK(out.find("pool[64]") == std::string::npos);
-    CHECK(out.find("threadgroup char * " + DeviceFnNames{}.pool) !=
-          std::string::npos);
+    CHECK_HAS(out, "threadgroup char pool[4096]");
+    CHECK_LACKS(out, "pool[64]");
+    CHECK_HAS(out, "threadgroup char * " + DeviceFnNames{}.pool);
   }
 
   CASE("an over-limit module is refused before a character is emitted");
@@ -448,9 +445,8 @@ int main() {
     CHECK(r.ok());
     CHECK_EQ(r.poolBytes, 0);
     const std::string out = os.str();
-    CHECK(out.find("threadgroup char * " + DeviceFnNames{}.pool) ==
-          std::string::npos);
-    CHECK(out.find("threadgroup char pool") == std::string::npos);
+    CHECK_LACKS(out, "threadgroup char * " + DeviceFnNames{}.pool);
+    CHECK_LACKS(out, "threadgroup char pool");
   }
 
   CASE("a module of kernels alone emits no prototypes and no structs");

@@ -49,9 +49,9 @@ int main() {
     msl::Block body;
     CHECK(emitCas(c, body, p, nm, f32()).ok());
     const std::string out = render(body);
-    CHECK(out.find("as_type<uint>(cmp)") != std::string::npos);
-    CHECK(out.find("as_type<uint>(val)") != std::string::npos);
-    CHECK(out.find("as_type<float>(old_w)") != std::string::npos);
+    CHECK_HAS(out, "as_type<uint>(cmp)");
+    CHECK_HAS(out, "as_type<uint>(val)");
+    CHECK_HAS(out, "as_type<float>(old_w)");
   }
 
   CASE("a 16-bit exchange is a 32-bit one on the containing word");
@@ -82,12 +82,12 @@ int main() {
     msl::Block body;
     emitCas(c, body, planCas(casOf(ElemClass::Int, 16)), nm, i32());
     const std::string out = render(body);
-    CHECK(out.find("while (true)") != std::string::npos);
+    CHECK_HAS(out, "while (true)");
     CHECK_EQ(countOf(out, "break;"), 2);
-    CHECK(out.find("old_h != cmp_h") != std::string::npos);
+    CHECK_HAS(out, "old_h != cmp_h");
 
     // The result is declared outside the loop, or it dies at the brace.
-    CHECK(out.find("ushort old_h;") != std::string::npos);
+    CHECK_HAS(out, "ushort old_h;");
     CHECK(out.find("ushort old_h;") < out.find("while (true)"));
   }
 
@@ -101,8 +101,8 @@ int main() {
     msl::Block body;
     CHECK(emitCas(c, body, p, nm, f16()).ok());
     const std::string out = render(body);
-    CHECK(out.find("as_type<ushort>(cmp)") != std::string::npos);
-    CHECK(out.find("as_type<ushort>(val)") != std::string::npos);
+    CHECK_HAS(out, "as_type<ushort>(cmp)");
+    CHECK_HAS(out, "as_type<ushort>(val)");
     CHECK(out.find("as_type<half>(") != std::string::npos);
   }
 
@@ -114,7 +114,7 @@ int main() {
     msl::Block body;
     emitCas(c, body, planCas(casOf(ElemClass::Int, 16)), nm,
             ElemType{ElemType::Kind::Int, 16, false});
-    CHECK(render(body).find("as_type") == std::string::npos);
+    CHECK_LACKS(render(body), "as_type");
   }
 
   CASE("a native exchange retries only a spurious failure");
@@ -138,8 +138,8 @@ int main() {
     msl::Block body;
     emitCas(c, body, planCas(casOf(ElemClass::Int, 32)), nm, i32());
     const std::string out = render(body);
-    CHECK(out.find("&old_w") != std::string::npos);
-    CHECK(out.find("int old = (int)old_w;") != std::string::npos);
+    CHECK_HAS(out, "&old_w");
+    CHECK_HAS(out, "int old = (int)old_w;");
   }
 
   // ── who performs it ────────────────────────────────────────────────────
@@ -153,11 +153,11 @@ int main() {
     msl::Block body;
     emitCas(c, body, p, nm, i32());
     const std::string out = render(body);
-    CHECK(out.find("if (tid.x == 0)") != std::string::npos);
-    CHECK(out.find("threadgroup int casb;") != std::string::npos);
-    CHECK(out.find("casb = old;") != std::string::npos);
-    CHECK(out.find("int old_b = casb;") != std::string::npos);
-    CHECK(out.find("casb = cmp;") != std::string::npos);
+    CHECK_HAS(out, "if (tid.x == 0)");
+    CHECK_HAS(out, "threadgroup int casb;");
+    CHECK_HAS(out, "casb = old;");
+    CHECK_HAS(out, "int old_b = casb;");
+    CHECK_HAS(out, "casb = cmp;");
     CHECK(out.find("casb = cmp;") < out.find("if (tid.x == 0)"));
     // Without a barrier between the seed and the election, a lagging warp's
     // seed can land after the electing thread's answer.
@@ -192,8 +192,8 @@ int main() {
     CHECK(!p.electOne);
     emitCas(c, body, p, nm, i32());
     const std::string out = render(body);
-    CHECK(out.find("if (tid.x == 0)") == std::string::npos);
-    CHECK(out.find("threadgroup") == std::string::npos);
+    CHECK_LACKS(out, "if (tid.x == 0)");
+    CHECK_LACKS(out, "threadgroup");
   }
 
   // ── ordering ───────────────────────────────────────────────────────────
@@ -210,7 +210,7 @@ int main() {
       msl::Block body;
       emitCas(c, body, p, nm, i32());
       const std::string out = render(body);
-      CHECK(out.find("atomic_thread_fence") != std::string::npos);
+      CHECK_HAS(out, "atomic_thread_fence");
       CHECK(out.find("atomic_thread_fence") <
             out.find("atomic_compare_exchange_weak_explicit"));
     }

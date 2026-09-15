@@ -22,18 +22,18 @@ int main() {
   {
     msl::Context c;
     const std::string h = render(poisonDecl(c, "p", f16()));
-    CHECK(h.find("half p =") != std::string::npos);
-    CHECK(h.find("(half)") == std::string::npos);
+    CHECK_HAS(h, "half p =");
+    CHECK_LACKS(h, "(half)");
 
     const std::string f = render(poisonDecl(c, "q", f32()));
-    CHECK(f.find("float q =") != std::string::npos);
+    CHECK_HAS(f, "float q =");
   }
 
   CASE("a poisoned integer is an integer zero");
   {
     msl::Context c;
     const std::string s = render(poisonDecl(c, "p", i32()));
-    CHECK(s.find("int p = 0") != std::string::npos);
+    CHECK_HAS(s, "int p = 0");
   }
 
   CASE("zero keeps a leaked poison in range, whatever it is scaled by");
@@ -60,8 +60,8 @@ int main() {
     const msl::Type ptr =
         msl::Type::scalar(msl::Scalar::I32).pointerTo(msl::AddrSpace::Device);
     const std::string s = render(poisonPointerDecl(c, "p", ptr));
-    CHECK(s.find("nullptr") != std::string::npos);
-    CHECK(s.find("int") != std::string::npos);
+    CHECK_HAS(s, "nullptr");
+    CHECK_HAS(s, "int");
   }
 
   return ::agpu_test::report("EmitPoison");

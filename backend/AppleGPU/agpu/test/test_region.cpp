@@ -172,10 +172,10 @@ int main() {
     emitRegion(c, out, f, p, namesFor(), [&](BlockId) { return msl::Block{}; });
     const std::string s = render(out);
 
-    CHECK(s.find("int v1;") != std::string::npos);
+    CHECK_HAS(s, "int v1;");
     CHECK(s.find("int v1;") < s.find("while ("));
-    CHECK(s.find("__state = 0") != std::string::npos);
-    CHECK(s.find("while (__state != -1)") != std::string::npos);
+    CHECK_HAS(s, "__state = 0");
+    CHECK_HAS(s, "while (__state != -1)");
     CHECK_EQ(countOf(s, "case "), 2);
   }
 
@@ -188,8 +188,8 @@ int main() {
     msl::Block out;
     emitRegion(c, out, f, p, namesFor(), [&](BlockId) { return msl::Block{}; });
     const std::string s = render(out);
-    CHECK(s.find("__state = 1;") != std::string::npos);
-    CHECK(s.find("continue;") != std::string::npos);
+    CHECK_HAS(s, "__state = 1;");
+    CHECK_HAS(s, "continue;");
     CHECK(s.find("__state = 1;") < s.find("continue;"));
   }
 
@@ -202,7 +202,7 @@ int main() {
     msl::Block out;
     emitRegion(c, out, f, p, namesFor(), [&](BlockId) { return msl::Block{}; });
     const std::string s = render(out);
-    CHECK(s.find("__state = -1;") != std::string::npos);
+    CHECK_HAS(s, "__state = -1;");
   }
 
   CASE("a conditional branch emits both edges");
@@ -222,9 +222,9 @@ int main() {
         c, out, f, p, namesFor(), [&](BlockId) { return msl::Block{}; },
         [&](BlockId) { return c.var("cond"); });
     const std::string s = render(out);
-    CHECK(s.find("if (cond)") != std::string::npos);
-    CHECK(s.find("__state = 1;") != std::string::npos);
-    CHECK(s.find("__state = 2;") != std::string::npos);
+    CHECK_HAS(s, "if (cond)");
+    CHECK_HAS(s, "__state = 1;");
+    CHECK_HAS(s, "__state = 2;");
     CHECK_EQ(countOf(s, "continue;"), 2);
   }
 
@@ -239,7 +239,7 @@ int main() {
     msl::Block out;
     emitRegion(c, out, f, p, namesFor(), [&](BlockId) { return msl::Block{}; });
     const std::string s = render(out);
-    CHECK(s.find("v20 = v30;") != std::string::npos);
+    CHECK_HAS(s, "v20 = v30;");
     CHECK(s.find("v20 = v30;") < s.find("__state = 1;"));
     CHECK(s.find("__state = 1;") < s.find("continue;"));
   }
@@ -260,11 +260,11 @@ int main() {
     emitRegion(c, out, f, p, namesFor(), [&](BlockId) { return msl::Block{}; });
     const std::string s = render(out);
 
-    CHECK(s.find("__phi0 = v2") != std::string::npos);
-    CHECK(s.find("__phi1 = v1") != std::string::npos);
+    CHECK_HAS(s, "__phi0 = v2");
+    CHECK_HAS(s, "__phi1 = v1");
     CHECK(s.find("__phi1 = v1") < s.find("v1 = __phi0"));
-    CHECK(s.find("v1 = __phi0") != std::string::npos);
-    CHECK(s.find("v2 = __phi1") != std::string::npos);
+    CHECK_HAS(s, "v1 = __phi0");
+    CHECK_HAS(s, "v2 = __phi1");
   }
 
   CASE("non-overlapping copies need no temporaries");
@@ -278,9 +278,9 @@ int main() {
     msl::Block out;
     emitRegion(c, out, f, p, namesFor(), [&](BlockId) { return msl::Block{}; });
     const std::string s = render(out);
-    CHECK(s.find("__phi") == std::string::npos);
-    CHECK(s.find("v20 = v30;") != std::string::npos);
-    CHECK(s.find("v21 = v31;") != std::string::npos);
+    CHECK_LACKS(s, "__phi");
+    CHECK_HAS(s, "v20 = v30;");
+    CHECK_HAS(s, "v21 = v31;");
   }
 
   CASE("a value held in several registers hoists and copies all of them");
@@ -300,11 +300,11 @@ int main() {
                [&](BlockId) { return msl::Block{}; });
     const std::string s = render(out);
     for (const char *reg : {"v7_0", "v7_1", "v7_2"})
-      CHECK(s.find(std::string("int ") + reg + ";") != std::string::npos);
+      CHECK_HAS(s, std::string("int ") + reg + ";");
     for (int r = 0; r < 3; ++r) {
       const std::string d = "v20_" + std::to_string(r);
       const std::string src = "v30_" + std::to_string(r);
-      CHECK(s.find(d + " = " + src + ";") != std::string::npos);
+      CHECK_HAS(s, d + " = " + src + ";");
     }
   }
 
@@ -346,8 +346,8 @@ int main() {
     msl::Block out;
     emitRegion(c, out, f, p, nm, [&](BlockId) { return msl::Block{}; });
     const std::string s = render(out);
-    CHECK(s.find("int off7;") != std::string::npos);
-    CHECK(s.find("int arg0;") == std::string::npos);
+    CHECK_HAS(s, "int off7;");
+    CHECK_LACKS(s, "int arg0;");
   }
 
   CASE("the shadow-drop follows the storage the hoist actually declared");
@@ -379,9 +379,9 @@ int main() {
       return body;
     });
     const std::string s = render(out);
-    CHECK(s.find("own7 = 1;") != std::string::npos); // rewritten
-    CHECK(s.find("int own7 = 1;") == std::string::npos);
-    CHECK(s.find("int borrowed = 2;") != std::string::npos); // untouched
+    CHECK_HAS(s, "own7 = 1;"); // rewritten
+    CHECK_LACKS(s, "int own7 = 1;");
+    CHECK_HAS(s, "int borrowed = 2;"); // untouched
   }
 
   return ::agpu_test::report("Region");

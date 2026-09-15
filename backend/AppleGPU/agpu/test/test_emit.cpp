@@ -17,10 +17,8 @@ namespace {
 // Rows come from the lane id's low bits, columns from its high bits.
 CoordSource twoDim() {
   CoordSource s;
-  LayoutBasis row, col;
-  row.lane = {1, 2, 0, 0, 0};
-  col.lane = {0, 0, 4, 8, 16};
-  s.dims = {row, col};
+  s.dims = {agpu_test::basis({}, {1, 2, 0, 0, 0}),
+            agpu_test::basis({}, {0, 0, 4, 8, 16})};
   return s;
 }
 
@@ -45,7 +43,7 @@ int main() {
           std::string::npos);
     CHECK(assigned.find("c2 = acc1.thread_elements()[0];") !=
           std::string::npos);
-    CHECK(assigned.find("+") == std::string::npos);
+    CHECK_LACKS(assigned, "+");
 
     msl::Block added;
     msl::SmallVec<msl::Str, 8> bases{"in0", "in1", "in2"};
@@ -78,9 +76,9 @@ int main() {
     // slot it stages to.
     const std::string out = render(body);
     CHECK(out.find("if (") == std::string::npos);
-    CHECK(out.find("pA[") != std::string::npos);
-    CHECK(out.find("= v0;") != std::string::npos);
-    CHECK(out.find("lane") != std::string::npos);
+    CHECK_HAS(out, "pA[");
+    CHECK_HAS(out, "= v0;");
+    CHECK_HAS(out, "lane");
   }
 
   CASE("a straddling register stages under exactly the terms it needs");
@@ -97,7 +95,7 @@ int main() {
     emitStage(c, body, pa, "pA", {*act}, {"v0", "v1", "v2", "v3"}, cs, f16());
     const std::string out = render(body);
     CHECK(out.find("if ((lane & 28) < 32) pA[") != std::string::npos);
-    CHECK(out.find("= v3;") != std::string::npos);
+    CHECK_HAS(out, "= v3;");
     CHECK_EQ(countOf(out, ">="), 0); // no lower bound needed
   }
 
@@ -163,7 +161,7 @@ int main() {
                          {{ROW, 64, 96}, {COL, 32, 64}}, {0, 0});
     CHECK(act.has_value());
     emitStage(c, body, panel, "pA", {*act}, {"v0"}, cs, f16());
-    CHECK(render(body).find("pA[4128 + ") != std::string::npos);
+    CHECK_HAS(render(body), "pA[4128 + ");
   }
 
   CASE("a batch slice removes the rank test entirely");
@@ -180,7 +178,7 @@ int main() {
     msl::Block body;
     emitStage(c, body, c2, "pC", {*act}, {"v0"}, cs, f16());
     // Batch 2 of a 4x16x32 tile starts at 2*16*32 = 1024.
-    CHECK(render(body).find("pC[1024") != std::string::npos);
+    CHECK_HAS(render(body), "pC[1024");
   }
 
   CASE("a batch filter, when the register spans batches, is just a window");
@@ -202,9 +200,9 @@ int main() {
     emitStage(c, body, pa, "pA", {*act}, {"v0"}, cs, f16());
     const std::string out = render(body);
     CHECK(out.find("if (") == std::string::npos);
-    CHECK(out.find("pA[") != std::string::npos);
-    CHECK(out.find("= v0;") != std::string::npos);
-    CHECK(out.find("lane") != std::string::npos);
+    CHECK_HAS(out, "pA[");
+    CHECK_HAS(out, "= v0;");
+    CHECK_HAS(out, "lane");
   }
 
   CASE("a padded pool tile addresses through the padded stride");
@@ -219,8 +217,8 @@ int main() {
     emitStage(c, body, pa, "pA", {*act}, {"v0", "v1"}, cs, f16());
     // The pad lives in the stride, so the row term scales by the padded 36.
     const std::string out = render(body);
-    CHECK(out.find("* 36") != std::string::npos);
-    CHECK(out.find("* 32") == std::string::npos);
+    CHECK_HAS(out, "* 36");
+    CHECK_LACKS(out, "* 32");
   }
 
   CASE("the staging phase reads as a script");
@@ -262,7 +260,7 @@ int main() {
 
     const std::string s =
         render(msl::Block{c.assign(c.var("out"), cs.of(c, 0, ROW))});
-    CHECK(s.find("tgpos.x") != std::string::npos);
+    CHECK_HAS(s, "tgpos.x");
 
     const CoordRange r = cs.rangeOf(0, ROW, 256);
     CHECK_EQ(r.lo, 0);
@@ -292,9 +290,9 @@ int main() {
     // 16-column f16 tile's rows are 32-byte multiples, so the slot is
     // half4-aligned.
     CHECK_EQ(countOf(out, "pA["), 1);
-    CHECK(out.find("threadgroup half4") != std::string::npos);
-    CHECK(out.find("packed_half4") == std::string::npos);
-    CHECK(out.find("half4(v0, v1, v2, v3)") != std::string::npos);
+    CHECK_HAS(out, "threadgroup half4");
+    CHECK_LACKS(out, "packed_half4");
+    CHECK_HAS(out, "half4(v0, v1, v2, v3)");
   }
 
   CASE("a guard on any register of the group blocks the merge");
@@ -377,10 +375,10 @@ int main() {
     // One pool read, through the plain vector type; the adds stay scalar,
     // one per destination register.
     CHECK_EQ(countOf(out, "pC["), 1);
-    CHECK(out.find("threadgroup float4") != std::string::npos);
-    CHECK(out.find("packed_float4") == std::string::npos);
-    CHECK(out.find("o0 = o0_w[0] + b0;") != std::string::npos);
-    CHECK(out.find("o3 = o0_w[3] + b3;") != std::string::npos);
+    CHECK_HAS(out, "threadgroup float4");
+    CHECK_LACKS(out, "packed_float4");
+    CHECK_HAS(out, "o0 = o0_w[0] + b0;");
+    CHECK_HAS(out, "o3 = o0_w[3] + b3;");
   }
 
   CASE("an integer register converts the pooled float before the base add");
@@ -395,12 +393,12 @@ int main() {
     msl::Block body;
     emitReadback(c, body, pc, "pC", {*a0}, {"o0"}, {"b0"}, cs, f32(), i32());
     const std::string out = render(body);
-    CHECK(out.find("(int)pC[") != std::string::npos);
-    CHECK(out.find("+ b0") != std::string::npos);
+    CHECK_HAS(out, "(int)pC[");
+    CHECK_HAS(out, "+ b0");
 
     msl::Block plain;
     emitReadback(c, plain, pc, "pC", {*a0}, {"o0"}, {"b0"}, cs, f32(), f32());
-    CHECK(render(plain).find("(int)") == std::string::npos);
+    CHECK_LACKS(render(plain), "(int)");
   }
 
   return ::agpu_test::report("Emit");

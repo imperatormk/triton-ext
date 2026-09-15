@@ -132,7 +132,7 @@ int main() {
                   TileView::rowMajor({32, 32}), nm, 0, {}, {});
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "if (warp =="), 0);
-    CHECK(out.find("warp") != std::string::npos);
+    CHECK_HAS(out, "warp");
   }
 
   CASE("the program says which warp a block serves, so the emitter need not "
@@ -255,8 +255,8 @@ int main() {
     int counter = 0;
     emitDirectMma(c, body, slots, gemmInputs(4, 32, 8, true), nm, counter);
     const std::string out = render(body);
-    CHECK(out.find("kv < 32") != std::string::npos);
-    CHECK(out.find("kv += 8") != std::string::npos);
+    CHECK_HAS(out, "kv < 32");
+    CHECK_HAS(out, "kv += 8");
   }
 
   CASE("the K term is the only difference between the two forms");
@@ -268,8 +268,8 @@ int main() {
     int c1 = 0, c2 = 0;
     emitDirectMma(c, rolled, slots, gemmInputs(2, 16, 8, true), nm, c1);
     emitDirectMma(c, unrolled, slots, gemmInputs(2, 16, 8, false), nm, c2);
-    CHECK(render(rolled).find("kv") != std::string::npos);
-    CHECK(render(unrolled).find("kv") == std::string::npos);
+    CHECK_HAS(render(rolled), "kv");
+    CHECK_LACKS(render(unrolled), "kv");
   }
 
   // ── accumulators and stores ────────────────────────────────────────────
@@ -293,7 +293,7 @@ int main() {
     std::vector<WarpSlot> slots = {
         {SlotCoord::fixed(1), SlotCoord::fixed(1), 0}};
     emitAccumStores(c, body, slots, TileView::rowMajor({32, 32}), nm, 0);
-    CHECK(render(body).find("pC + 264") != std::string::npos);
+    CHECK_HAS(render(body), "pC + 264");
   }
 
   CASE("an affine slot's store address keeps the warp term");
@@ -303,7 +303,7 @@ int main() {
     std::vector<WarpSlot> slots = {
         {SlotCoord::affine(2, 1), SlotCoord::fixed(0), 0}};
     emitAccumStores(c, body, slots, TileView::rowMajor({32, 32}), nm, 0);
-    CHECK(render(body).find("warp") != std::string::npos);
+    CHECK_HAS(render(body), "warp");
   }
 
   // ── the fused path is the same emitter ─────────────────────────────────
@@ -371,10 +371,10 @@ int main() {
     emitDirectMma(c, body, slots, in, nm, counter);
     const std::string out = render(body);
 
-    CHECK(out.find("pA + 512,") != std::string::npos);
-    CHECK(out.find("pB + 8,") != std::string::npos);
-    CHECK(out.find("pA + 520,") != std::string::npos);
-    CHECK(out.find("pB + 520,") != std::string::npos);
+    CHECK_HAS(out, "pA + 512,");
+    CHECK_HAS(out, "pB + 8,");
+    CHECK_HAS(out, "pA + 520,");
+    CHECK_HAS(out, "pB + 520,");
   }
 
   CASE("banding does not fold an affine row");
@@ -437,9 +437,9 @@ int main() {
     emitAccumDeviceStores(c, body, slots, t, {}, nm);
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "simdgroup_store(acc3,"), 1);
-    CHECK(out.find("rs + 8") != std::string::npos);
-    CHECK(out.find("* ldc") != std::string::npos);
-    CHECK(out.find("cs + warp * 8") != std::string::npos);
+    CHECK_HAS(out, "rs + 8");
+    CHECK_HAS(out, "* ldc");
+    CHECK_HAS(out, "cs + warp * 8");
     CHECK(out.find(", ldc)") != std::string::npos);
     CHECK_EQ(countOf(out, "pC"), 0);
   }
@@ -455,8 +455,7 @@ int main() {
     t.leadingDim = Stride::runtime("ldc");
     emitAccumDeviceStores(c, body, slots, t, {}, nm);
     const std::string out = render(body);
-    CHECK(out.find("simdgroup_store(acc0, cptr + 16, ldc)") !=
-          std::string::npos);
+    CHECK_HAS(out, "simdgroup_store(acc0, cptr + 16, ldc)");
   }
 
   // ── the drain's folded epilogue and bounds ─────────────────────────────
@@ -495,7 +494,7 @@ int main() {
     CHECK_EQ(countOf(out, "acc0.thread_elements()[1] ="), 1);
     CHECK_EQ(countOf(out, "bptr["), 2);
     CHECK_EQ(countOf(out, "simdgroup_store(acc0,"), 1);
-    CHECK(out.find("* ldc]") == std::string::npos);
+    CHECK_LACKS(out, "* ldc]");
   }
 
   CASE("a bounded store guards per fragment and falls back to scalars");
@@ -514,16 +513,16 @@ int main() {
     emitAccumDeviceStores(c, body, slots, t, {}, nm);
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "simdgroup_store(acc1,"), 1);
-    CHECK(out.find("+ 8 <= 16384") != std::string::npos);
-    CHECK(out.find("+ 8 <= 30522") != std::string::npos);
-    CHECK(out.find("else") != std::string::npos);
+    CHECK_HAS(out, "+ 8 <= 16384");
+    CHECK_HAS(out, "+ 8 <= 30522");
+    CHECK_HAS(out, "else");
     CHECK_EQ(countOf(out, "cptr["), 2);
     CHECK_EQ(countOf(out, "< 16384"), 2);
     CHECK_EQ(countOf(out, "< 30522"), 2);
     CHECK_EQ(countOf(out, "threadgroup_barrier"), 0);
-    CHECK(out.find("lane >> 1") != std::string::npos);
-    CHECK(out.find("lane >> 4") != std::string::npos);
-    CHECK(out.find("lane >> 3") != std::string::npos);
+    CHECK_HAS(out, "lane >> 1");
+    CHECK_HAS(out, "lane >> 4");
+    CHECK_HAS(out, "lane >> 3");
   }
 
   CASE("a splat scale and a residual tile fold as steps");
@@ -553,7 +552,7 @@ int main() {
     CHECK_EQ(countOf(out, "* alpha"), 2);
     CHECK_EQ(countOf(out, "rptr["), 2);
     CHECK_EQ(countOf(out, "metal::max("), 2);
-    CHECK(out.find("* ldr") != std::string::npos);
+    CHECK_HAS(out, "* ldr");
     CHECK_EQ(countOf(out, "simdgroup_store(acc0,"), 1);
   }
 
@@ -582,8 +581,8 @@ int main() {
     bias.roundBefore = true;
     emitAccumDeviceStores(c, body, slots, t, {bias}, nm);
     const std::string out = render(body);
-    CHECK(out.find("half fr0 = bptr[") != std::string::npos);
-    CHECK(out.find("float fr0") == std::string::npos);
+    CHECK_HAS(out, "half fr0 = bptr[");
+    CHECK_LACKS(out, "float fr0");
     CHECK_EQ(countOf(out, "+ fr0)"), 2);
   }
 
@@ -600,7 +599,7 @@ int main() {
     t.colBound = c.lit(100);
     emitAccumDeviceStores(c, body, slots, t, {}, nm);
     const std::string out = render(body);
-    CHECK(out.find("simdgroup_half8x8 acc0n") != std::string::npos);
+    CHECK_HAS(out, "simdgroup_half8x8 acc0n");
     CHECK_EQ(countOf(out, "acc0n.thread_elements()"), 2);
     CHECK_EQ(countOf(out, "simdgroup_store(acc0n,"), 1);
     CHECK_EQ(countOf(out, "(half)"), 4);
@@ -721,8 +720,8 @@ int main() {
     CHECK_EQ(calls, 2);
     CHECK_EQ(countOf(out, "simdgroup_store(acc0, pC,"), 1);
     CHECK_EQ(countOf(out, "pC + 128, 16"), 2);
-    CHECK(out.find("r0 =") != std::string::npos);
-    CHECK(out.find("r16 =") != std::string::npos);
+    CHECK_HAS(out, "r0 =");
+    CHECK_HAS(out, "r16 =");
     CHECK_EQ(countOf(out, "threadgroup_barrier"), 3);
   }
 

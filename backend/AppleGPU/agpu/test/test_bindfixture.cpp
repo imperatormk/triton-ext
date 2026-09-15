@@ -5,11 +5,13 @@
 #include "agpu/emit/EmitElementwise.h"
 #include "agpu/emit/EmitRange.h"
 #include "agpu/msl/Printer.h"
+#include "fixtures.h"
 #include "harness.h"
 
 #include <sstream>
 
 using namespace agpu;
+using agpu_test::laneMajor;
 
 namespace {
 
@@ -103,11 +105,6 @@ OpView op(std::string_view name, std::vector<ValueId> operands = {},
   return o;
 }
 
-LayoutBasis laneMajor() {
-  return LayoutBasis{/*reg=*/{32}, /*lane=*/{1, 2, 4, 8, 16}, /*warp=*/{},
-                     /*block=*/{}};
-}
-
 } // namespace
 
 int main() {
@@ -132,11 +129,11 @@ int main() {
     p.printBlock(body);
     const std::string msl = os.str();
 
-    CHECK(msl.find("lane & 31") != std::string::npos);
-    CHECK(msl.find("a[") != std::string::npos);
-    CHECK(msl.find("b[") != std::string::npos);
-    CHECK(msl.find("out[") != std::string::npos);
-    CHECK(msl.find(" + ") != std::string::npos);
+    CHECK_HAS(msl, "lane & 31");
+    CHECK_HAS(msl, "a[");
+    CHECK_HAS(msl, "b[");
+    CHECK_HAS(msl, "out[");
+    CHECK_HAS(msl, " + ");
 
     for (ValueId v : {1u, 2u, 3u, 4u})
       CHECK(sym.regCount(v) == 2);
@@ -190,8 +187,8 @@ int main() {
     msl::Printer p(os);
     p.printBlock(body);
     const std::string msl = os.str();
-    CHECK(msl.find("a0 * scale") != std::string::npos);
-    CHECK(msl.find("a3 * scale") != std::string::npos);
+    CHECK_HAS(msl, "a0 * scale");
+    CHECK_HAS(msl, "a3 * scale");
   }
 
   CASE("the same fixture drives a whole kernel through Emitter");
@@ -223,9 +220,9 @@ int main() {
     CHECK(r.ok());
 
     const std::string msl = os.str();
-    CHECK(msl.find("kernel void vecadd") != std::string::npos);
-    CHECK(msl.find("#include <metal_stdlib>") != std::string::npos);
-    CHECK(msl.find("out[") != std::string::npos);
+    CHECK_HAS(msl, "kernel void vecadd");
+    CHECK_HAS(msl, "#include <metal_stdlib>");
+    CHECK_HAS(msl, "out[");
   }
 
   CASE("the fixture runs through DispatchTable, the way the bridge does");
@@ -333,10 +330,10 @@ int main() {
     msl::Printer p(os);
     p.printBlock(body);
     const std::string msl = os.str();
-    CHECK(msl.find("a[") != std::string::npos);
-    CHECK(msl.find("b[") != std::string::npos);
-    CHECK(msl.find(" + ") != std::string::npos);
-    CHECK(msl.find("out[") != std::string::npos);
+    CHECK_HAS(msl, "a[");
+    CHECK_HAS(msl, "b[");
+    CHECK_HAS(msl, " + ");
+    CHECK_HAS(msl, "out[");
     CHECK(sym.isDataless(5));
   }
 

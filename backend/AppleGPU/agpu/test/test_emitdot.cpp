@@ -9,20 +9,10 @@
 
 using namespace agpu;
 using agpu_test::countOf;
+using agpu_test::gemm;
 using agpu_test::render;
 
 namespace {
-
-DotFacts gemm(int64_t M, int64_t N, int64_t K, int64_t warps = 4) {
-  DotFacts f;
-  f.M = M;
-  f.N = N;
-  f.K = K;
-  f.aElemBytes = 2;
-  f.bElemBytes = 2;
-  f.numWarps = warps;
-  return f;
-}
 
 DotInputs inputsFor() {
   DotInputs in;
@@ -473,7 +463,7 @@ int main() {
           out.find(zero) < out.find("if (warp"));
     // No store outside `warp < 2` and the one store is spelled in the warp id.
     CHECK_EQ(countOf(out, "simdgroup_store"), 1);
-    CHECK(out.find("warp % 2 * 8") != std::string::npos);
+    CHECK_HAS(out, "warp % 2 * 8");
     CHECK(countOf(out, "if (warp < 2)") > 0);
     CHECK(out.find("if (warp < 2)", out.find("THE_LOOP")) <
           out.find("simdgroup_store"));

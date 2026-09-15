@@ -102,12 +102,12 @@ int main() {
     CHECK(r.ok());
     const std::string out = render(r.fn);
     CHECK(out.find("kernel void add(") != std::string::npos);
-    CHECK(out.find("[[buffer(0)]]") != std::string::npos);
-    CHECK(out.find("[[buffer(1)]]") != std::string::npos);
-    CHECK(out.find("[[buffer(2)]]") != std::string::npos); // the arg buffer
-    CHECK(out.find("[[threadgroup_position_in_grid]]") != std::string::npos);
-    CHECK(out.find("[[thread_position_in_threadgroup]]") != std::string::npos);
-    CHECK(out.find("[[threadgroups_per_grid]]") != std::string::npos);
+    CHECK_HAS(out, "[[buffer(0)]]");
+    CHECK_HAS(out, "[[buffer(1)]]");
+    CHECK_HAS(out, "[[buffer(2)]]"); // the arg buffer
+    CHECK_HAS(out, "[[threadgroup_position_in_grid]]");
+    CHECK_HAS(out, "[[thread_position_in_threadgroup]]");
+    CHECK_HAS(out, "[[threadgroups_per_grid]]");
   }
 
   CASE("a coherent argument is declared coherent and only that one");
@@ -121,8 +121,8 @@ int main() {
     KernelResult r = emitKernel(c, f, trivialBody(1));
     CHECK(r.ok());
     const std::string out = render(r.fn);
-    CHECK(out.find("device coherent(device) float * s") != std::string::npos);
-    CHECK(out.find("device float * y") != std::string::npos);
+    CHECK_HAS(out, "device coherent(device) float * s");
+    CHECK_HAS(out, "device float * y");
     CHECK_EQ(countOf(out, "coherent"), 1);
   }
 
@@ -171,8 +171,8 @@ int main() {
     f.args = {ptr("x"), ptr("y")};
     KernelResult r = emitKernel(c, f, trivialBody(1));
     const std::string out = render(r.fn);
-    CHECK(out.find("[[buffer(2)]]") == std::string::npos);
-    CHECK(out.find("constant") == std::string::npos);
+    CHECK_LACKS(out, "[[buffer(2)]]");
+    CHECK_LACKS(out, "constant");
   }
 
   CASE("scalars are unpacked from the argument buffer at their offsets");
@@ -185,7 +185,7 @@ int main() {
     const std::string out = render(r.fn);
     CHECK(out.find("int m = *(constant int *)args;") != std::string::npos ||
           out.find("int m = *(constant int *)(args + 0)") != std::string::npos);
-    CHECK(out.find("args + 4") != std::string::npos);
+    CHECK_HAS(out, "args + 4");
   }
 
   CASE("lane and warp are derived once, from the flat thread index");
@@ -196,8 +196,8 @@ int main() {
     f.args = {ptr("x")};
     KernelResult r = emitKernel(c, f, trivialBody(1));
     const std::string out = render(r.fn);
-    CHECK(out.find("int lane = tid.x & 31;") != std::string::npos);
-    CHECK(out.find("int warp = tid.x / 32;") != std::string::npos);
+    CHECK_HAS(out, "int lane = tid.x & 31;");
+    CHECK_HAS(out, "int warp = tid.x / 32;");
     CHECK_EQ(countOf(out, "int lane ="), 1);
   }
 
@@ -231,8 +231,7 @@ int main() {
     f.numWarps = 8;
     f.poolBytes = 40000;
     KernelResult r = emitKernel(c, f, trivialBody(1));
-    CHECK(render(r.fn).find("max_total_threads_per_threadgroup(256)") !=
-          std::string::npos);
+    CHECK_HAS(render(r.fn), "max_total_threads_per_threadgroup(256)");
   }
 
   CASE("a small pool leaves it unpinned, buying the second threadgroup");
@@ -243,7 +242,7 @@ int main() {
     f.args = {ptr("x")};
     f.poolBytes = 4096;
     KernelResult r = emitKernel(c, f, trivialBody(1));
-    CHECK(render(r.fn).find("max_total_threads") == std::string::npos);
+    CHECK_LACKS(render(r.fn), "max_total_threads");
   }
 
   CASE("a small kernel is emitted once and not rolled");
@@ -355,9 +354,9 @@ int main() {
     KernelResult r = emitKernel(c, f, trivialBody(1));
     const std::string out = render(r.fn);
     CHECK(out.find("kernel void vecadd(") != std::string::npos);
-    CHECK(out.find("device float * out") != std::string::npos);
-    CHECK(out.find("constant uchar * args") != std::string::npos);
-    CHECK(out.find("uint3 tgid") != std::string::npos);
+    CHECK_HAS(out, "device float * out");
+    CHECK_HAS(out, "constant uchar * args");
+    CHECK_HAS(out, "uint3 tgid");
     CHECK(r.decision.ok());
   }
 

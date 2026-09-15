@@ -119,7 +119,7 @@ int main() {
     CHECK(p.usable());
     CHECK(!p.linearLanePerm);
     emitShuffle(c, body, p, names("v", 1), names("d", 1), elem, nm);
-    CHECK(render(body).find("lanetab[lane]") != std::string::npos);
+    CHECK_HAS(render(body), "lanetab[lane]");
   }
 
   CASE("a conversion where every lane keeps its own is a rename");

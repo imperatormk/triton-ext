@@ -239,11 +239,11 @@ int main() {
     log.printSummary(os);
     const std::string out = os.str();
 
-    CHECK(out.find("distinct rejects: 1") != std::string::npos);
-    CHECK(out.find("plan notes: 2") != std::string::npos);
+    CHECK_HAS(out, "distinct rejects: 1");
+    CHECK_HAS(out, "plan notes: 2");
     CHECK(out.find("MSL-REJECT-SITE") < out.find("MSL-PLAN-SITE"));
-    CHECK(out.find("sites=1") != std::string::npos);
-    CHECK(out.find("configs=1") != std::string::npos);
+    CHECK_HAS(out, "sites=1");
+    CHECK_HAS(out, "configs=1");
   }
 
   CASE("the summary names the sites beyond just counting them");
@@ -266,11 +266,11 @@ int main() {
     log.printSummary(os);
     const std::string out = os.str();
 
-    CHECK(out.find("sites=9") != std::string::npos);
-    CHECK(out.find("a.py:0") != std::string::npos);
-    CHECK(out.find("a.py:2") != std::string::npos);
-    CHECK(out.find("(+6 more)") != std::string::npos);
-    CHECK(out.find("a.py:8") == std::string::npos);
+    CHECK_HAS(out, "sites=9");
+    CHECK_HAS(out, "a.py:0");
+    CHECK_HAS(out, "a.py:2");
+    CHECK_HAS(out, "(+6 more)");
+    CHECK_LACKS(out, "a.py:8");
   }
 
   CASE("a decline with no site named prints no location clause");

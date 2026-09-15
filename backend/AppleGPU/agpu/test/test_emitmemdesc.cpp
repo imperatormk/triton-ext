@@ -56,7 +56,7 @@ int main() {
     msl::Context c;
     const MemDesc m = allocMemDesc("pool", {4, 6});
     const std::string s = render(memDescElemAt(c, m, {nullptr, c.var("k")}));
-    CHECK(s.find("*") == std::string::npos);
+    CHECK_LACKS(s, "*");
   }
 
   // ── the handle operations ──────────────────────────────────────────────
@@ -104,8 +104,8 @@ int main() {
     const MemDesc m = allocMultiBuffered("pool", 3, {4, 6});
     const std::string s =
         render(memDescDecl(c, m, msl::Type::scalar(msl::Scalar::F32)));
-    CHECK(s.find("threadgroup") != std::string::npos);
-    CHECK(s.find("pool[72]") != std::string::npos);
+    CHECK_HAS(s, "threadgroup");
+    CHECK_HAS(s, "pool[72]");
     CHECK_EQ(m.cosizeElems(), 72);
   }
 

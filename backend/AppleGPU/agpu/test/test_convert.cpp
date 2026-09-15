@@ -34,7 +34,7 @@ int main() {
     msl::Context c;
     msl::Block body;
     emitConvert(c, body, p, {"v0"}, {"d0"}, f32());
-    CHECK(render(body).find("(float)v0") != std::string::npos);
+    CHECK_HAS(render(body), "(float)v0");
   }
 
   CASE("an int-to-float conversion is a cast");
@@ -77,7 +77,7 @@ int main() {
     msl::Context c;
     msl::Block body;
     emitConvert(c, body, p, {"v0"}, {"d0"}, f16());
-    CHECK(render(body).find("__agpu_rtz_half(v0)") != std::string::npos);
+    CHECK_HAS(render(body), "__agpu_rtz_half(v0)");
   }
 
   CASE("rounding only matters when the conversion narrows");
@@ -135,8 +135,8 @@ int main() {
                 {"d"}, e4m3());
     emitConvert(c, b, planConvert(f32(), e5m2(), Rounding::Default), {"v"},
                 {"d"}, e5m2());
-    CHECK(render(a).find("__agpu_f32_to_e4m3") != std::string::npos);
-    CHECK(render(b).find("__agpu_f32_to_e5m2") != std::string::npos);
+    CHECK_HAS(render(a), "__agpu_f32_to_e4m3");
+    CHECK_HAS(render(b), "__agpu_f32_to_e5m2");
   }
 
   CASE("the bias variants are their own distinct encodings");
@@ -154,8 +154,8 @@ int main() {
                 {"d"}, e4b8());
     emitConvert(c, b, planConvert(e5b16(), f32(), Rounding::Default), {"v"},
                 {"d"}, f32());
-    CHECK(render(a).find("__agpu_f32_to_e4b8") != std::string::npos);
-    CHECK(render(b).find("__agpu_e5b16_to_f32") != std::string::npos);
+    CHECK_HAS(render(a), "__agpu_f32_to_e4b8");
+    CHECK_HAS(render(b), "__agpu_e5b16_to_f32");
   }
 
   CASE("each fp8 encoding pulls in its own helper and no other");
@@ -169,8 +169,8 @@ int main() {
     std::ostringstream os;
     printPrelude(os, h);
     const std::string out = os.str();
-    CHECK(out.find("__agpu_f32_to_e4b8") != std::string::npos);
-    CHECK(out.find("e4m3") == std::string::npos);
+    CHECK_HAS(out, "__agpu_f32_to_e4b8");
+    CHECK_LACKS(out, "e4m3");
 
     HelperSet h2;
     h2.require(planConvert(e5b16(), f32(), Rounding::Default));
@@ -187,11 +187,11 @@ int main() {
     std::ostringstream os;
     printPrelude(os, h);
     const std::string out = os.str();
-    CHECK(out.find("__agpu_e2m1_to_f32") != std::string::npos);
-    CHECK(out.find("6.0f") != std::string::npos);
-    CHECK(out.find("-6.0f") != std::string::npos);
-    CHECK(out.find("0.5f") != std::string::npos);
-    CHECK(out.find("nib & 0xfu") != std::string::npos);
+    CHECK_HAS(out, "__agpu_e2m1_to_f32");
+    CHECK_HAS(out, "6.0f");
+    CHECK_HAS(out, "-6.0f");
+    CHECK_HAS(out, "0.5f");
+    CHECK_HAS(out, "nib & 0xfu");
 
     HelperSet other;
     other.require(planConvert(f32(), e4m3(), Rounding::Default));
@@ -242,7 +242,7 @@ int main() {
     const std::string out = render(convertExpr(c, p, c.var("b"), bf16()));
     CHECK(out.find("__agpu_rtne_bfloat(__agpu_e4m3_to_f32(b))") !=
           std::string::npos);
-    CHECK(out.find("(bfloat)") == std::string::npos);
+    CHECK_LACKS(out, "(bfloat)");
     HelperSet h;
     h.require(p);
     CHECK(h.has(Helper::Fp8UnpackE4M3));
@@ -270,8 +270,8 @@ int main() {
     std::ostringstream os;
     printPrelude(os, h);
     const std::string out = os.str();
-    CHECK(out.find("__agpu_f32_to_e4m3") != std::string::npos);
-    CHECK(out.find("e5m2") == std::string::npos);
+    CHECK_HAS(out, "__agpu_f32_to_e4m3");
+    CHECK_LACKS(out, "e5m2");
   }
 
   CASE("half and bfloat ask for different narrowing helpers");
@@ -289,8 +289,8 @@ int main() {
     std::ostringstream os;
     printPrelude(os, hb);
     const std::string out = os.str();
-    CHECK(out.find("__agpu_rtz_bfloat") != std::string::npos);
-    CHECK(out.find("__agpu_rtz_half") == std::string::npos);
+    CHECK_HAS(out, "__agpu_rtz_bfloat");
+    CHECK_LACKS(out, "__agpu_rtz_half");
   }
 
   CASE("a cast asks for nothing");

@@ -17,16 +17,10 @@
 
 using namespace agpu::msl;
 using agpu_test::countOf;
+using agpu_test::render;
 using agpu_test::renderType;
 
 namespace {
-
-std::string render(const Block &b) {
-  std::ostringstream os;
-  Printer p(os);
-  p.printBlock(b);
-  return os.str();
-}
 
 std::string renderExpr(const Expr *e) {
   std::ostringstream os;
@@ -115,14 +109,14 @@ int main() {
     sm->cases.push_back({3, Block{c.assign(c.var("st"), c.lit(-1))}});
 
     const std::string out = render(Block{sm});
-    CHECK(out.find("int st = 2;") != std::string::npos);
-    CHECK(out.find("while (st != -1)") != std::string::npos);
-    CHECK(out.find("switch (st)") != std::string::npos);
+    CHECK_HAS(out, "int st = 2;");
+    CHECK_HAS(out, "while (st != -1)");
+    CHECK_HAS(out, "switch (st)");
     CHECK(out.find("int st = 2;") < out.find("while (st != -1)"));
     CHECK(out.find("while (st != -1)") < out.find("switch (st)"));
     CHECK_EQ(countOf(out, "case "), 2);
     CHECK_EQ(countOf(out, "break;"), 3); // two cases plus the default
-    CHECK(out.find("default: st = -1; break;") != std::string::npos);
+    CHECK_HAS(out, "default: st = -1; break;");
   }
 
   CASE("nested structures are fully traversed");
@@ -194,9 +188,9 @@ int main() {
     sm->cases.push_back({1, Block{c.assign(c.var("y"), c.lit(2))}});
     const std::string out = render(Block{sm});
 
-    CHECK(out.find("switch (state)") != std::string::npos);
-    CHECK(out.find("case 0:") != std::string::npos);
-    CHECK(out.find("case 1:") != std::string::npos);
+    CHECK_HAS(out, "switch (state)");
+    CHECK_HAS(out, "case 0:");
+    CHECK_HAS(out, "case 1:");
     CHECK_EQ(countOf(out, "break;"), 3); // one per case, plus the default
     CHECK(out.find("break;") < out.find("case 1:"));
   }
@@ -210,8 +204,8 @@ int main() {
     sm->cases.push_back({1, Block{c.assign(c.var("x"), c.lit(2))}});
     const std::string out = render(Block{sm});
 
-    CHECK(out.find("continue;\n") != std::string::npos);
-    CHECK(out.find("continue;\n    break;") == std::string::npos);
+    CHECK_HAS(out, "continue;\n");
+    CHECK_LACKS(out, "continue;\n    break;");
     CHECK_EQ(countOf(out, "break;"), 2);
   }
 
@@ -250,8 +244,8 @@ int main() {
     CHECK(out.find("simdgroup_barrier(mem_flags::mem_threadgroup);") !=
           std::string::npos);
     // A device barrier still orders threadgroup memory.
-    CHECK(out.find("threadgroup_barrier(mem_flags::mem_threadgroup | "
-                   "mem_flags::mem_device);") != std::string::npos);
+    CHECK_HAS(out, "threadgroup_barrier(mem_flags::mem_threadgroup | "
+                   "mem_flags::mem_device);");
   }
 
   CASE("a negated negative does not print as a predecrement");
@@ -284,8 +278,8 @@ int main() {
     Printer p(os);
     p.printBlock(b);
     const std::string out = os.str();
-    CHECK(out.find("threadgroup_barrier") != std::string::npos);
-    CHECK(out.find("simdgroup_barrier") == std::string::npos);
+    CHECK_HAS(out, "threadgroup_barrier");
+    CHECK_LACKS(out, "simdgroup_barrier");
   }
 
   CASE("a statement and a loop header spell the same thing the same way");
@@ -363,8 +357,8 @@ int main() {
     b.push_back(c.barrier(S::Device));
     b.push_back(c.assign(c.var("x"), c.lit(1)));
     const std::string out = render(b);
-    CHECK(out.find("simdgroup_barrier") != std::string::npos);
-    CHECK(out.find("mem_device") != std::string::npos);
+    CHECK_HAS(out, "simdgroup_barrier");
+    CHECK_HAS(out, "mem_device");
   }
 
   CASE("guardedInto splices an unguarded block flat into the parent");

@@ -3,21 +3,16 @@
 #include "agpu/plan/ShrinkPlan.h"
 #include "fixtures.h"
 #include "harness.h"
+#include "render.h"
 
 #include <sstream>
 
 using namespace agpu;
 using namespace agpu::msl;
 using agpu_test::countOf;
+using agpu_test::render;
 
 namespace {
-
-std::string render(const Block &b) {
-  std::ostringstream os;
-  Printer p(os);
-  p.printBlock(b);
-  return os.str();
-}
 
 FuncSize sized(int64_t decls, int64_t frags, int64_t branches = 0) {
   FuncSize s;
@@ -276,17 +271,17 @@ int main() {
     CHECK(!p.rollKSteps);
 
     const std::string r = budgetReport("kern", s, p, /*reemitted=*/false);
-    CHECK(r.find("EXPOSED") != std::string::npos);
-    CHECK(r.find("below frag floor") != std::string::npos);
+    CHECK_HAS(r, "EXPOSED");
+    CHECK_HAS(r, "below frag floor");
   }
 
   CASE("a healthy kernel's report carries no alarm and no excuse");
   {
     const FuncSize s = sized(12, 0);
     const std::string r = budgetReport("kern", s, planShrink(s), false);
-    CHECK(r.find("fine") != std::string::npos);
-    CHECK(r.find("EXPOSED") == std::string::npos);
-    CHECK(r.find("frag floor") == std::string::npos);
+    CHECK_HAS(r, "fine");
+    CHECK_LACKS(r, "EXPOSED");
+    CHECK_LACKS(r, "frag floor");
   }
 
   return ::agpu_test::report("FuncSize");

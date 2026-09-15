@@ -15,15 +15,9 @@ using agpu_test::render;
 
 namespace {
 
+// A panel is emitted one warp at a time.
 DotFacts gemm(int64_t M, int64_t N, int64_t K) {
-  DotFacts f;
-  f.M = M;
-  f.N = N;
-  f.K = K;
-  f.aElemBytes = 2;
-  f.bElemBytes = 2;
-  f.numWarps = 1;
-  return f;
+  return agpu_test::gemm(M, N, K, /*warps=*/1);
 }
 
 const std::string kZeroAcc = kSimdgroup8x8.zeroCtor("float");
@@ -50,8 +44,8 @@ int main() {
     msl::Block body;
     emitPanelAccumDecls(c, body, s.tiles[0], nm, planWarpProgram(g), g);
     const std::string out = render(body);
-    CHECK(out.find("simdgroup_float8x8(0.0f)") != std::string::npos);
-    CHECK(out.find("make_filled") == std::string::npos);
+    CHECK_HAS(out, "simdgroup_float8x8(0.0f)");
+    CHECK_LACKS(out, "make_filled");
     CHECK_EQ(countOf(out, "simdgroup_load"), 0);
     CHECK_EQ(countOf(out, "if ("), 0);
   }
@@ -67,7 +61,7 @@ int main() {
     emitPanelMma(c, body, s.tiles[1], nm, stagedA(s.tiles[1]),
                  {slotAt(0, 0, 0)}, false);
     const std::string out = render(body);
-    CHECK(out.find(kZeroAcc + "(0.0f)") == std::string::npos);
+    CHECK_LACKS(out, kZeroAcc + "(0.0f)");
     CHECK(out.find("simdgroup_load(acc") == std::string::npos);
     CHECK(out.find(", pC") == std::string::npos);
     CHECK(out.find("simdgroup_multiply_accumulate(acc0") != std::string::npos);
@@ -116,8 +110,8 @@ int main() {
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "simdgroup_multiply_accumulate"), 1);
     CHECK_EQ(countOf(out, "for ("), 1);
-    CHECK(out.find("kv < 32") != std::string::npos);
-    CHECK(out.find("kv += 8") != std::string::npos);
+    CHECK_HAS(out, "kv < 32");
+    CHECK_HAS(out, "kv += 8");
     CHECK_EQ(countOf(out, kZeroAcc + "(0.0f)"), 0);
     CHECK_EQ(countOf(out, "simdgroup_store"), 0);
   }
@@ -153,9 +147,9 @@ int main() {
     emitPanelMma(c, body, s.tiles[0], nm, stagedA(s.tiles[0]),
                  {slotAt(0, 0, 0)}, false);
     const std::string out = render(body);
-    CHECK(out.find("simdgroup_load(fa0, pA, 40)") != std::string::npos);
-    CHECK(out.find("simdgroup_load(fa2, pA + 8, 40)") != std::string::npos);
-    CHECK(out.find("simdgroup_load(fa4, pA + 16, 40)") != std::string::npos);
+    CHECK_HAS(out, "simdgroup_load(fa0, pA, 40)");
+    CHECK_HAS(out, "simdgroup_load(fa2, pA + 8, 40)");
+    CHECK_HAS(out, "simdgroup_load(fa4, pA + 16, 40)");
   }
 
   CASE("B steps by the row stride, because K is its row axis");
@@ -167,8 +161,8 @@ int main() {
     emitPanelMma(c, body, s.tiles[0], nm, stagedA(s.tiles[0]),
                  {slotAt(0, 0, 0)}, false);
     const std::string out = render(body);
-    CHECK(out.find("simdgroup_load(fb1, pB, 24)") != std::string::npos);
-    CHECK(out.find("simdgroup_load(fb3, pB + 192, 24)") != std::string::npos);
+    CHECK_HAS(out, "simdgroup_load(fb1, pB, 24)");
+    CHECK_HAS(out, "simdgroup_load(fb3, pB + 192, 24)");
   }
 
   CASE("a second slot addresses a different fragment");
@@ -182,9 +176,9 @@ int main() {
     emitAccumStore(c, body, s.tiles[0], nm, slotAt(1, 1, 1),
                    panelAccName(s.tiles[0], nm, 1));
     const std::string out = render(body);
-    CHECK(out.find("pA + 192") != std::string::npos);
-    CHECK(out.find("pB + 8") != std::string::npos);
-    CHECK(out.find("simdgroup_store(acc1, pC + 168, 20)") != std::string::npos);
+    CHECK_HAS(out, "pA + 192");
+    CHECK_HAS(out, "pB + 8");
+    CHECK_HAS(out, "simdgroup_store(acc1, pC + 168, 20)");
   }
 
   CASE("a ragged tile addresses its own smaller extent");
@@ -237,9 +231,9 @@ int main() {
     emitPanelTile(c, body, s.tiles[0], nm, in, pc, g, planWarpProgram(g));
     const std::string out = render(body);
 
-    CHECK(out.find("= a0") != std::string::npos);
-    CHECK(out.find("laneA") != std::string::npos);
-    CHECK(out.find("laneB") != std::string::npos);
+    CHECK_HAS(out, "= a0");
+    CHECK_HAS(out, "laneA");
+    CHECK_HAS(out, "laneB");
     const std::size_t aAt = out.find("pA[");
     const std::size_t bAt = out.find("pB[");
     CHECK(aAt != std::string::npos && bAt != std::string::npos);
@@ -330,8 +324,8 @@ int main() {
     emitReadback(c, body, s.tiles[0].cView(), nm.poolC, {*c0}, {"r0"},
                  {"base0"}, cs, f32(), f32());
     const std::string out = render(body);
-    CHECK(out.find("r0 = pC[") != std::string::npos);
-    CHECK(out.find("+ base0;") != std::string::npos);
+    CHECK_HAS(out, "r0 = pC[");
+    CHECK_HAS(out, "+ base0;");
   }
 
   CASE("readback without an incoming value is a plain load");
@@ -349,8 +343,8 @@ int main() {
     emitReadback(c, body, s.tiles[0].cView(), nm.poolC, {*c0}, {"r0"}, {""}, cs,
                  f32(), f32());
     const std::string out = render(body);
-    CHECK(out.find("r0 = pC[") != std::string::npos);
-    CHECK(out.find("] +") == std::string::npos);
+    CHECK_HAS(out, "r0 = pC[");
+    CHECK_LACKS(out, "] +");
   }
 
   CASE("readback elides the bounds it can prove");
@@ -408,8 +402,8 @@ int main() {
                  f32());
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "if ("), 1);
-    CHECK(out.find("60") != std::string::npos);
-    CHECK(out.find("< 64") == std::string::npos);
+    CHECK_HAS(out, "60");
+    CHECK_LACKS(out, "< 64");
   }
 
   CASE("an aligned tile pays nothing for the ragged path");
@@ -542,9 +536,9 @@ int main() {
     emitPanelMma(c, body, s.tiles[0], nm, stagedA(s.tiles[0]),
                  {slotAt(0, 0, 0)}, false);
     const std::string out = render(body);
-    CHECK(out.find("simdgroup_bfloat8x8") != std::string::npos);
-    CHECK(out.find("simdgroup_half8x8") == std::string::npos);
-    CHECK(out.find("simdgroup_float8x8") != std::string::npos); // the acc
+    CHECK_HAS(out, "simdgroup_bfloat8x8");
+    CHECK_LACKS(out, "simdgroup_half8x8");
+    CHECK_HAS(out, "simdgroup_float8x8"); // the acc
   }
 
   CASE("an affine slot spells the warp term into every address");
@@ -558,10 +552,8 @@ int main() {
     emitAccumStore(c, body, s.tiles[0], nm, s0,
                    panelAccName(s.tiles[0], nm, 0));
     const std::string out = render(body);
-    CHECK(out.find("simdgroup_load(fb1, pB + warp * 8, 24)") !=
-          std::string::npos);
-    CHECK(out.find("simdgroup_store(acc0, pC + warp * 8, 20)") !=
-          std::string::npos);
+    CHECK_HAS(out, "simdgroup_load(fb1, pB + warp * 8, 24)");
+    CHECK_HAS(out, "simdgroup_store(acc0, pC + warp * 8, 20)");
   }
 
   CASE("a two-axis cover: one block, warp row and column as div and mod");
@@ -579,10 +571,8 @@ int main() {
                   prog);
     const std::string out = render(body);
     CHECK(out.find("if (warp ==") == std::string::npos);
-    CHECK(out.find("simdgroup_load(fa0, pA + warp / 2 % 2 * 8 * 24, 24)") !=
-          std::string::npos);
-    CHECK(out.find("simdgroup_load(fb1, pB + warp % 2 * 8, 24)") !=
-          std::string::npos);
+    CHECK_HAS(out, "simdgroup_load(fa0, pA + warp / 2 % 2 * 8 * 24, 24)");
+    CHECK_HAS(out, "simdgroup_load(fb1, pB + warp % 2 * 8, 24)");
     CHECK(out.find("simdgroup_store(acc0, pC + (warp / 2 % 2 * 8 * 20 + "
                    "warp % 2 * 8), 20)") != std::string::npos);
   }
@@ -623,9 +613,8 @@ int main() {
     msl::Block body;
     emitPanelMma(c, body, s.tiles[1], nm, dev, {slotAt(0, 0, 0)}, false);
     const std::string out = render(body);
-    CHECK(out.find("simdgroup_load(fa_16_0_0_0, dA + 16 * ldA, ldA)") !=
-          std::string::npos);
-    CHECK(out.find("dA + (16 * ldA + 8)") != std::string::npos);
+    CHECK_HAS(out, "simdgroup_load(fa_16_0_0_0, dA + 16 * ldA, ldA)");
+    CHECK_HAS(out, "dA + (16 * ldA + 8)");
     CHECK(out.find(", pB,") != std::string::npos);
   }
 
@@ -657,7 +646,7 @@ int main() {
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "threadgroup_barrier"), 4);
     CHECK_EQ(countOf(out, "pA["), 0);
-    CHECK(out.find("simdgroup_load(fa0, dA, ldA)") != std::string::npos);
+    CHECK_HAS(out, "simdgroup_load(fa0, dA, ldA)");
   }
 
   CASE("predictPanelDotSize matches a measured emission of the panel walk");
@@ -734,11 +723,11 @@ int main() {
     msl::Block body;
     emitPanelTile(c, body, t, nm, in, PanelCoords::forAll({}), g, prog);
     const std::string out = render(body);
-    CHECK(out.find("c0 = acc0.thread_elements()[0];") != std::string::npos);
-    CHECK(out.find("c1 = acc0.thread_elements()[1];") != std::string::npos);
-    CHECK(out.find("c2 = acc1.thread_elements()[0];") != std::string::npos);
-    CHECK(out.find("simdgroup_store") == std::string::npos);
-    CHECK(out.find(nm.poolC + "[") == std::string::npos);
+    CHECK_HAS(out, "c0 = acc0.thread_elements()[0];");
+    CHECK_HAS(out, "c1 = acc0.thread_elements()[1];");
+    CHECK_HAS(out, "c2 = acc1.thread_elements()[0];");
+    CHECK_LACKS(out, "simdgroup_store");
+    CHECK_LACKS(out, nm.poolC + "[");
     CHECK_EQ(countOf(out, "threadgroup_barrier"), 1);
 
     t.renameC = false;

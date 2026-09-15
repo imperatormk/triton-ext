@@ -41,7 +41,7 @@ int main() {
                         false, msl::Block{}, {});
     CHECK(d.ok());
     const std::string out = render(body);
-    CHECK(out.find("int r0;") != std::string::npos);
+    CHECK_HAS(out, "int r0;");
     CHECK(out.find("int r0;") < out.find("if ("));
   }
 
@@ -52,9 +52,9 @@ int main() {
     emitIf(c, body, "p", one({"r0"}), msl::Block{}, one({"t0"}),
            /*hasElse=*/true, msl::Block{}, one({"e0"}));
     const std::string out = render(body);
-    CHECK(out.find("r0 = t0;") != std::string::npos);
-    CHECK(out.find("r0 = e0;") != std::string::npos);
-    CHECK(out.find("else") != std::string::npos);
+    CHECK_HAS(out, "r0 = t0;");
+    CHECK_HAS(out, "r0 = e0;");
+    CHECK_HAS(out, "else");
   }
 
   CASE("an if with no else leaves the results at their declared value");
@@ -65,7 +65,7 @@ int main() {
            msl::Block{}, {});
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "r0 ="), 1);
-    CHECK(out.find("else") == std::string::npos);
+    CHECK_LACKS(out, "else");
   }
 
   CASE("a multi-register result assigns every register");
@@ -75,8 +75,8 @@ int main() {
     emitIf(c, body, "p", one({"r0", "r1"}), msl::Block{}, one({"t0", "t1"}),
            false, msl::Block{}, {});
     const std::string out = render(body);
-    CHECK(out.find("r0 = t0;") != std::string::npos);
-    CHECK(out.find("r1 = t1;") != std::string::npos);
+    CHECK_HAS(out, "r0 = t0;");
+    CHECK_HAS(out, "r1 = t1;");
   }
 
   CASE("a yield whose arity disagrees is a failure");
@@ -111,9 +111,9 @@ int main() {
                          one({"next"}));
     CHECK(d.ok());
     const std::string out = render(body);
-    CHECK(out.find("int acc = init;") != std::string::npos);
+    CHECK_HAS(out, "int acc = init;");
     CHECK(out.find("int acc = init;") < out.find("for ("));
-    CHECK(out.find("acc = next;") != std::string::npos);
+    CHECK_HAS(out, "acc = next;");
   }
 
   CASE("the loop spells its bounds and step");
@@ -122,9 +122,9 @@ int main() {
     msl::Block body;
     emitFor(c, body, constBounds(c, "k", 0, 64, 8), {}, {}, msl::Block{}, {});
     const std::string out = render(body);
-    CHECK(out.find("int k = 0") != std::string::npos);
-    CHECK(out.find("k < 64") != std::string::npos);
-    CHECK(out.find("k += 8") != std::string::npos);
+    CHECK_HAS(out, "int k = 0");
+    CHECK_HAS(out, "k < 64");
+    CHECK_HAS(out, "k += 8");
   }
 
   CASE("the bounds are expressions, so a runtime trip count is expressible");
@@ -138,8 +138,8 @@ int main() {
     b.step = c.var("BLOCK_K");
     emitFor(c, body, b, {}, {}, msl::Block{}, {});
     const std::string out = render(body);
-    CHECK(out.find("k < K") != std::string::npos);
-    CHECK(out.find("k += BLOCK_K") != std::string::npos);
+    CHECK_HAS(out, "k < K");
+    CHECK_HAS(out, "k += BLOCK_K");
   }
 
   CASE("a wide induction variable selects the trip-count form");
@@ -153,13 +153,13 @@ int main() {
     emitFor(c, body, b, {}, {}, msl::Block{}, {});
     const std::string out = render(body);
 
-    CHECK(out.find("int i_tc = 0") != std::string::npos);
-    CHECK(out.find("i_tc += 1") != std::string::npos);
-    CHECK(out.find("long i = i_tc;") != std::string::npos);
+    CHECK_HAS(out, "int i_tc = 0");
+    CHECK_HAS(out, "i_tc += 1");
+    CHECK_HAS(out, "long i = i_tc;");
     // The exit test is inside the body: the derived value does not exist until
     // the body computes it.
-    CHECK(out.find("for (int i_tc = 0; ; i_tc += 1)") != std::string::npos);
-    CHECK(out.find("if (!(i < 8)) break;") != std::string::npos);
+    CHECK_HAS(out, "for (int i_tc = 0; ; i_tc += 1)");
+    CHECK_HAS(out, "if (!(i < 8)) break;");
     CHECK(out.find("long i =") < out.find("break;"));
   }
 
@@ -170,8 +170,8 @@ int main() {
     msl::Block body;
     emitFor(c, body, constBounds(c, "i", 0, 8), {}, {}, msl::Block{}, {});
     const std::string out = render(body);
-    CHECK(out.find("for (int i = 0; i < 8; i += 1)") != std::string::npos);
-    CHECK(out.find("_tc") == std::string::npos);
+    CHECK_HAS(out, "for (int i = 0; i < 8; i += 1)");
+    CHECK_LACKS(out, "_tc");
   }
 
   CASE("a mismatched carried arity fails");
@@ -194,9 +194,9 @@ int main() {
                   one({"res"}), one({"fwd"}), msl::Block{}, one({"next"}));
     CHECK(d.ok());
     const std::string out = render(body);
-    CHECK(out.find("while (true)") != std::string::npos);
-    CHECK(out.find("if (!cond)") != std::string::npos);
-    CHECK(out.find("break;") != std::string::npos);
+    CHECK_HAS(out, "while (true)");
+    CHECK_HAS(out, "if (!cond)");
+    CHECK_HAS(out, "break;");
   }
 
   CASE("the exit forwards the results before breaking");
@@ -221,8 +221,8 @@ int main() {
     emitWhile(c, body, one({"acc"}), one({"init"}), msl::Block{}, "cond",
               one({"res"}), one({"fwd"}), msl::Block{}, one({"next"}));
     const std::string out = render(body);
-    CHECK(out.find("int acc = init;") != std::string::npos);
-    CHECK(out.find("acc = next;") != std::string::npos);
+    CHECK_HAS(out, "int acc = init;");
+    CHECK_HAS(out, "acc = next;");
     CHECK(out.find("break;") < out.find("acc = next;"));
   }
 
@@ -234,8 +234,8 @@ int main() {
     emitWhile(c, body, one({"acc"}), one({"init"}), msl::Block{}, "cond",
               one({"res"}), one({"fwd"}), msl::Block{}, one({"next"}));
     const std::string out = render(body);
-    CHECK(out.find("int res;") != std::string::npos);
-    CHECK(out.find("int acc = init;") != std::string::npos);
+    CHECK_HAS(out, "int res;");
+    CHECK_HAS(out, "int acc = init;");
   }
 
   CASE("a carried value keeps its element type");
@@ -244,7 +244,7 @@ int main() {
     msl::Block body;
     emitFor(c, body, LoopBounds{}, one({"acc"}, f32()), one({"init"}, f32()),
             msl::Block{}, one({"next"}, f32()));
-    CHECK(render(body).find("float acc = init;") != std::string::npos);
+    CHECK_HAS(render(body), "float acc = init;");
   }
 
   return ::agpu_test::report("EmitControl");

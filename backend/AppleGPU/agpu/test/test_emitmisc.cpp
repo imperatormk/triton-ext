@@ -35,9 +35,9 @@ int main() {
     CHECK_EQ(p.zeroSteps(), 2);
     emitHistogramZero(c, body, p, nm);
     const std::string out = render(body);
-    CHECK(out.find("int zi = tid.x") != std::string::npos);
-    CHECK(out.find("zi < 256") != std::string::npos);
-    CHECK(out.find("zi += 128") != std::string::npos);
+    CHECK_HAS(out, "int zi = tid.x");
+    CHECK_HAS(out, "zi < 256");
+    CHECK_HAS(out, "zi += 128");
     CHECK(out.find("atomic_store_explicit(&bins[zi], 0") != std::string::npos);
   }
 
@@ -65,7 +65,7 @@ int main() {
                        nm);
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "atomic_fetch_add"), 2);
-    CHECK(out.find("&bins[v0]") != std::string::npos);
+    CHECK_HAS(out, "&bins[v0]");
   }
 
   CASE("a source value outside the bins is not counted");
@@ -74,7 +74,7 @@ int main() {
     msl::Block body;
     HistogramNames nm;
     emitHistogramCount(c, body, planHistogram(64, 1, 0, 0), regs({"v0"}), nm);
-    CHECK(render(body).find("v0 < 64") != std::string::npos);
+    CHECK_HAS(render(body), "v0 < 64");
   }
 
   CASE("a masked histogram counts only what the mask admits");
@@ -84,7 +84,7 @@ int main() {
     HistogramNames nm;
     emitHistogramCount(c, body, planHistogram(64, 1, 0, 0), regs({"v0"}), nm,
                        regs({"m0"}));
-    CHECK(render(body).find("m0") != std::string::npos);
+    CHECK_HAS(render(body), "m0");
   }
 
   CASE("a free lane bit elects one owner per element");
@@ -105,8 +105,8 @@ int main() {
     HistogramNames nm;
     emitHistogramCount(c, body, planHistogram(64, 1, 0, 0), regs({"v0"}), nm);
     const std::string out = render(body);
-    CHECK(out.find("lane") == std::string::npos);
-    CHECK(out.find("warp") == std::string::npos);
+    CHECK_LACKS(out, "lane");
+    CHECK_LACKS(out, "warp");
   }
 
   CASE("a program id reads its axis component and casts to int");
@@ -114,7 +114,7 @@ int main() {
     msl::Context c;
     msl::Stmt *s = emitGridQuery(c, GridQuery::ProgramId, 0, "pid");
     const std::string out = render(s);
-    CHECK(out.find("int pid = (int)tgid.x;") != std::string::npos);
+    CHECK_HAS(out, "int pid = (int)tgid.x;");
   }
 
   CASE("each axis names its own component");
@@ -149,8 +149,8 @@ int main() {
     msl::SmallVec<msl::Expr *, 8> offs{c.var("i0"), c.var("i1")};
     emitGather(c, body, "buf", offs, regs({"g0", "g1"}), f32());
     const std::string out = render(body);
-    CHECK(out.find("float g0 = buf[i0];") != std::string::npos);
-    CHECK(out.find("float g1 = buf[i1];") != std::string::npos);
+    CHECK_HAS(out, "float g0 = buf[i0];");
+    CHECK_HAS(out, "float g1 = buf[i1];");
   }
 
   CASE("gather declares each result with the element type");
@@ -160,7 +160,7 @@ int main() {
     msl::SmallVec<msl::Expr *, 8> offs{c.var("i0")};
     emitGather(c, body, "buf", offs, regs({"g0"}),
                ElemType{ElemType::Kind::Int, 32, false});
-    CHECK(render(body).find("int g0 = buf[i0];") != std::string::npos);
+    CHECK_HAS(render(body), "int g0 = buf[i0];");
   }
 
   CASE("gather reads a compound offset");

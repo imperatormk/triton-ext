@@ -1,6 +1,7 @@
 // make_range: the element IS its coordinate.
 #include "agpu/emit/EmitRange.h"
 #include "agpu/msl/Printer.h"
+#include "fixtures.h"
 #include "harness.h"
 #include "render.h"
 
@@ -11,10 +12,7 @@ using agpu_test::render;
 
 namespace {
 
-LayoutBasis laneMajor() {
-  return LayoutBasis{/*reg=*/{32, 64, 128}, /*lane=*/{1, 2, 4, 8, 16},
-                     /*warp=*/{}, /*block=*/{}};
-}
+LayoutBasis laneMajor() { return agpu_test::laneMajor({32, 64, 128}); }
 
 } // namespace
 

@@ -1,157 +1,103 @@
 // LayoutExpr tests: coordinate expressions from layout bases.
 #include "agpu/emit/LayoutExpr.h"
 #include "agpu/msl/Printer.h"
+#include "fixtures.h"
 #include "harness.h"
 #include "render.h"
 
 #include <sstream>
 
 using namespace agpu;
+using agpu_test::basis;
 using agpu_test::render;
 
+namespace {
+
+struct ExprRow {
+  const char *what;
+  LayoutBasis b;
+  int reg2Index;
+  const char *want;
+};
+
+struct RangeRow {
+  const char *what;
+  LayoutBasis b;
+  int reg2Index;
+  std::int32_t extent, lo, hi;
+};
+
+} // namespace
+
 int main() {
-  CASE("a full identity run is one mask");
+  CASE("a coordinate spells exactly the bits its bases reach");
   {
-    msl::Context c;
-    LayoutBasis b;
-    b.lane = {1, 2, 4, 8, 16};
-    CHECK_EQ(render(coordExpr(c, b, 0, "lane", "warp")),
-             std::string("lane & 31"));
+    // An identity run collapses to one mask. Anything else is an explicit
+    // bit term, and the terms xor together. The run test is
+    // basis(k) == 1<<k on the bit's own position.
+    const ExprRow rows[] = {
+        {"a full identity run is one mask", basis({}, {1, 2, 4, 8, 16}), 0,
+         "lane & 31"},
+        {"a partial identity run masks only its own bits",
+         basis({}, {0, 0, 4, 8, 16}), 0, "lane & 28"},
+        {"a non-identity basis becomes an explicit bit term",
+         basis({}, {0, 0, 0, 0, 1}), 0, "lane >> 4 & 1"},
+        {"mixed runs and singletons combine by xor", basis({}, {1, 2, 0, 0, 1}),
+         0, "lane & 3 ^ lane >> 4 & 1"},
+        {"a register-only coordinate is a bare constant", basis({8, 16}, {}), 0,
+         "0"},
+        {"register 1 of a register-only coordinate", basis({8, 16}, {}), 1,
+         "8"},
+        {"register 2 of a register-only coordinate", basis({8, 16}, {}), 2,
+         "16"},
+        {"a register past the bases keeps counting", basis({8, 16}, {}), 3,
+         "24"},
+        {"a register constant joins the runtime terms",
+         basis({32}, {1, 2, 4, 0, 0}), 1, "32 ^ lane & 7"},
+        {"register 0 contributes no constant", basis({32}, {1, 2, 4, 0, 0}), 0,
+         "lane & 7"},
+        {"lane and warp both contribute", basis({}, {1, 2, 0, 0, 0}, {1, 2}), 0,
+         "lane & 3 ^ warp & 3"},
+        {"a shifted warp mapping is not an identity run", basis({}, {}, {4, 8}),
+         0, "(warp & 1) * 4 ^ (warp >> 1 & 1) * 8"},
+        {"an empty layout is the zero coordinate", basis({}, {}), 0, "0"},
+    };
+
+    for (const ExprRow &r : rows) {
+      SUBCASE(r.what);
+      msl::Context c;
+      CHECK_EQ(render(coordExpr(c, r.b, r.reg2Index, "lane", "warp")),
+               std::string(r.want));
+    }
   }
 
-  CASE("a partial identity run masks only its own bits");
+  CASE("a range is exact when the bases are disjoint, conservative when not");
   {
-    msl::Context c;
-    LayoutBasis b;
-    b.lane = {0, 0, 4, 8, 16};
-    CHECK_EQ(render(coordExpr(c, b, 0, "lane", "warp")),
-             std::string("lane & 28"));
-  }
+    // Bases sharing a bit make the reachable set an xor lattice, which no
+    // interval describes: the range widens to the whole dimension.
+    const RangeRow rows[] = {
+        {"disjoint bases give an exact range", basis({8}, {1, 2, 4, 0, 0}), 0,
+         64, 0, 7},
+        {"the register constant shifts the exact range",
+         basis({8}, {1, 2, 4, 0, 0}), 1, 64, 8, 15},
+        {"overlapping bases fall back to the whole dimension",
+         basis({}, {1, 1}), 0, 64, 0, 63},
+        {"a register constant overlapping the runtime mask is conservative",
+         basis({1}, {1, 2, 0, 0, 0}), 1, 64, 0, 63},
+        {"a block-distributed range is wider than lane alone",
+         basis({}, {1, 2, 4, 0, 0}, {}, {8, 16, 32}), 0, 256, 0, 63},
+        {"the same layout without block bases stays narrow",
+         basis({}, {1, 2, 4, 0, 0}), 0, 256, 0, 7},
+        {"block bases join the disjointness test too",
+         basis({}, {1, 2}, {}, {2}), 0, 64, 0, 63},
+    };
 
-  CASE("a non-identity basis becomes an explicit bit term");
-  {
-    msl::Context c;
-    LayoutBasis b;
-    b.lane = {0, 0, 0, 0, 1};
-    CHECK_EQ(render(coordExpr(c, b, 0, "lane", "warp")),
-             std::string("lane >> 4 & 1"));
-  }
-
-  CASE("mixed runs and singletons combine by xor");
-  {
-    msl::Context c;
-    LayoutBasis b;
-    b.lane = {1, 2, 0, 0, 1};
-    CHECK_EQ(render(coordExpr(c, b, 0, "lane", "warp")),
-             std::string("lane & 3 ^ lane >> 4 & 1"));
-  }
-
-  CASE("a register-only coordinate is a bare constant");
-  {
-    msl::Context c;
-    LayoutBasis b;
-    b.reg = {8, 16};
-    CHECK_EQ(render(coordExpr(c, b, 0, "lane", "warp")), std::string("0"));
-    CHECK_EQ(render(coordExpr(c, b, 1, "lane", "warp")), std::string("8"));
-    CHECK_EQ(render(coordExpr(c, b, 2, "lane", "warp")), std::string("16"));
-    CHECK_EQ(render(coordExpr(c, b, 3, "lane", "warp")), std::string("24"));
-  }
-
-  CASE("a register constant joins the runtime terms");
-  {
-    msl::Context c;
-    LayoutBasis b;
-    b.reg = {32};
-    b.lane = {1, 2, 4, 0, 0};
-    CHECK_EQ(render(coordExpr(c, b, 1, "lane", "warp")),
-             std::string("32 ^ lane & 7"));
-    CHECK_EQ(render(coordExpr(c, b, 0, "lane", "warp")),
-             std::string("lane & 7"));
-  }
-
-  CASE("lane and warp both contribute");
-  {
-    msl::Context c;
-    LayoutBasis b;
-    b.lane = {1, 2, 0, 0, 0};
-    b.warp = {1, 2};
-    CHECK_EQ(render(coordExpr(c, b, 0, "lane", "warp")),
-             std::string("lane & 3 ^ warp & 3"));
-  }
-
-  CASE("a shifted warp mapping is not an identity run");
-  {
-    msl::Context c;
-    LayoutBasis b;
-    // Run test is basis(k) == 1<<k on the bit's own position.
-    b.warp = {4, 8};
-    CHECK_EQ(render(coordExpr(c, b, 0, "lane", "warp")),
-             std::string("(warp & 1) * 4 ^ (warp >> 1 & 1) * 8"));
-  }
-
-  CASE("an empty layout is the zero coordinate");
-  {
-    msl::Context c;
-    LayoutBasis b;
-    CHECK_EQ(render(coordExpr(c, b, 0, "lane", "warp")), std::string("0"));
-  }
-
-  CASE("disjoint bases give an exact range");
-  {
-    LayoutBasis b;
-    b.reg = {8};
-    b.lane = {1, 2, 4, 0, 0};
-    CoordRange r0 = b.rangeOf(0, 0, 64);
-    CHECK_EQ(r0.lo, 0);
-    CHECK_EQ(r0.hi, 7);
-    CoordRange r1 = b.rangeOf(1, 0, 64);
-    CHECK_EQ(r1.lo, 8);
-    CHECK_EQ(r1.hi, 15);
-  }
-
-  CASE("overlapping bases fall back to the whole dimension");
-  {
-    // Bases sharing a bit make the reachable set an xor lattice.
-    LayoutBasis b;
-    b.lane = {1, 1};
-    CoordRange r = b.rangeOf(0, 0, 64);
-    CHECK_EQ(r.lo, 0);
-    CHECK_EQ(r.hi, 63);
-  }
-
-  CASE("a register constant overlapping the runtime mask is conservative");
-  {
-    LayoutBasis b;
-    b.reg = {1};
-    b.lane = {1, 2, 0, 0, 0};
-    CoordRange r = b.rangeOf(1, 0, 64);
-    CHECK_EQ(r.lo, 0);
-    CHECK_EQ(r.hi, 63);
-  }
-
-  CASE("a block-distributed range is wider than lane and warp alone");
-  {
-    LayoutBasis b;
-    b.lane = {1, 2, 4, 0, 0};
-    b.block = {8, 16, 32};
-
-    const CoordRange r = b.rangeOf(0, 0, 256);
-    CHECK_EQ(r.lo, 0);
-    CHECK_EQ(r.hi, 63);
-
-    LayoutBasis noBlock = b;
-    noBlock.block = {};
-    CHECK_EQ(noBlock.rangeOf(0, 0, 256).hi, 7);
-  }
-
-  CASE("block bases join the disjointness test too");
-  {
-    LayoutBasis b;
-    b.lane = {1, 2};
-    b.block = {2};
-    const CoordRange r = b.rangeOf(0, 0, 64);
-    CHECK_EQ(r.lo, 0);
-    CHECK_EQ(r.hi, 63);
+    for (const RangeRow &r : rows) {
+      SUBCASE(r.what);
+      const CoordRange got = r.b.rangeOf(r.reg2Index, 0, r.extent);
+      CHECK_EQ(got.lo, r.lo);
+      CHECK_EQ(got.hi, r.hi);
+    }
   }
 
   CASE("a coordinate reads the block id and every threadgroup differs");
@@ -163,8 +109,8 @@ int main() {
     CHECK(b.needsBlockId());
 
     const std::string s = render(coordExpr(c, b, 0, "lane", "warp", "tgpos.x"));
-    CHECK(s.find("tgpos.x") != std::string::npos);
-    CHECK(s.find("lane & 7") != std::string::npos);
+    CHECK_HAS(s, "tgpos.x");
+    CHECK_HAS(s, "lane & 7");
   }
 
   CASE("a layout with no block bases demands no block id");

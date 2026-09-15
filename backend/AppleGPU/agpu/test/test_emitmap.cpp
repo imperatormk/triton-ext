@@ -83,8 +83,8 @@ int main() {
                 });
     CHECK(d.ok());
     const std::string out = render(body);
-    CHECK(out.find("a0") != std::string::npos);
-    CHECK(out.find("mp") == std::string::npos);
+    CHECK_HAS(out, "a0");
+    CHECK_LACKS(out, "mp");
   }
 
   CASE("a multi-block region declares a capture per result element, typed");
@@ -109,8 +109,8 @@ int main() {
     CHECK_EQ(results[1], (RegisterNames{captured[2], captured[3]}));
 
     const std::string out = render(body);
-    CHECK(out.find("float " + captured[0]) != std::string::npos);
-    CHECK(out.find("int " + captured[2]) != std::string::npos);
+    CHECK_HAS(out, "float " + captured[0]);
+    CHECK_HAS(out, "int " + captured[2]);
   }
 
   CASE("a body returning the wrong count declines");

@@ -84,8 +84,8 @@ int main() {
         copyRebind(c, body, splat(2), names("s", 1), names("d", 2), f32());
     CHECK(d.ok());
     const std::string out = render(body);
-    CHECK(out.find("float d0 = s0") != std::string::npos);
-    CHECK(out.find("float d1 = s0") != std::string::npos);
+    CHECK_HAS(out, "float d0 = s0");
+    CHECK_HAS(out, "float d1 = s0");
   }
 
   CASE("a copy with the wrong number of destinations declines");

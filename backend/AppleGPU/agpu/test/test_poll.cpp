@@ -51,8 +51,8 @@ int main() {
     msl::Block body;
     CHECK(emitPoll(c, body, p, nm).ok());
     const std::string out = render(body);
-    CHECK(out.find("atomic_load_explicit") == std::string::npos);
-    CHECK(out.find("*flagp") != std::string::npos);
+    CHECK_LACKS(out, "atomic_load_explicit");
+    CHECK_HAS(out, "*flagp");
     CHECK(out.find("while (") < out.find("*flagp"));
   }
 
@@ -81,7 +81,7 @@ int main() {
     msl::Block body;
     CHECK(emitPoll(c, body, planPoll(pollOf(32)), nm).ok());
     const std::string out = render(body);
-    CHECK(out.find("if (tid.x == 0)") != std::string::npos);
+    CHECK_HAS(out, "if (tid.x == 0)");
     CHECK(out.find("if (tid.x == 0)") < out.find("while ("));
   }
 
@@ -104,8 +104,8 @@ int main() {
     msl::Block body;
     emitPoll(c, body, planPoll(pollOf(32)), nm);
     const std::string out = render(body);
-    CHECK(out.find("memory_order_relaxed") != std::string::npos);
-    CHECK(out.find("memory_order_seq_cst") == std::string::npos);
+    CHECK_HAS(out, "memory_order_relaxed");
+    CHECK_LACKS(out, "memory_order_seq_cst");
   }
 
   CASE("the barrier after the poll is hard");
@@ -123,7 +123,7 @@ int main() {
     msl::Block body;
     emitPoll(c, body, planPoll(pollOf(32, /*timeout=*/false, /*acquire=*/true)),
              nm);
-    CHECK(render(body).find("mem_device") != std::string::npos);
+    CHECK_HAS(render(body), "mem_device");
   }
 
   CASE("a timeout poll tests once and emits no loop");
@@ -135,7 +135,7 @@ int main() {
     CHECK(emitPoll(c, body, p, nm).ok());
     const std::string out = render(body);
     CHECK(out.find("while (") == std::string::npos);
-    CHECK(out.find("ready = seen") != std::string::npos);
+    CHECK_HAS(out, "ready = seen");
   }
 
   CASE("a timeout poll publishes its answer, since only one thread tested");
@@ -144,9 +144,9 @@ int main() {
     msl::Block body;
     emitPoll(c, body, planPoll(pollOf(32, /*timeout=*/true)), nm);
     const std::string out = render(body);
-    CHECK(out.find("threadgroup bool seen;") != std::string::npos);
+    CHECK_HAS(out, "threadgroup bool seen;");
     CHECK(out.find("threadgroup bool seen;") < out.find("if (tid.x == 0)"));
-    CHECK(out.find("seen = false;") != std::string::npos);
+    CHECK_HAS(out, "seen = false;");
     CHECK(out.find("seen = false;") < out.find("threadgroup_barrier"));
     CHECK(out.find("threadgroup_barrier") < out.find("if (tid.x == 0)"));
   }
@@ -156,7 +156,7 @@ int main() {
     msl::Context c;
     msl::Block body;
     emitPoll(c, body, planPoll(pollOf(32)), nm);
-    CHECK(render(body).find("bool ready = true;") != std::string::npos);
+    CHECK_HAS(render(body), "bool ready = true;");
   }
 
   CASE("a 16-bit flag selects its half at runtime");
@@ -165,9 +165,9 @@ int main() {
     msl::Block body;
     emitPoll(c, body, planPoll(pollOf(16)), nm, "hi");
     const std::string out = render(body);
-    CHECK(out.find("hi ?") != std::string::npos);
-    CHECK(out.find(">> 16") != std::string::npos);
-    CHECK(out.find("& 65535") != std::string::npos);
+    CHECK_HAS(out, "hi ?");
+    CHECK_HAS(out, ">> 16");
+    CHECK_HAS(out, "& 65535");
   }
 
   CASE("a declined poll emits nothing");

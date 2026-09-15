@@ -81,10 +81,10 @@ int main() {
 
     CHECK_EQ(countOf(out, "if ("), 0);
     CHECK_EQ(countOf(out, "int f"), 0);
-    CHECK(out.find("sc[0] = v0;") != std::string::npos);
-    CHECK(out.find("sc[3] = v3;") != std::string::npos);
-    CHECK(out.find("o0 = sc[3];") != std::string::npos);
-    CHECK(out.find("o3 = sc[0];") != std::string::npos);
+    CHECK_HAS(out, "sc[0] = v0;");
+    CHECK_HAS(out, "sc[3] = v3;");
+    CHECK_HAS(out, "o0 = sc[3];");
+    CHECK_HAS(out, "o3 = sc[0];");
   }
 
   CASE("a fitting tile still barriers exactly twice");
@@ -139,8 +139,8 @@ int main() {
     emitBandRoundTrip(c, body, p, simpleIO(c, 8, 1, /*permute=*/true), nm);
     const std::string out = render(body);
     // Register 4 sits at flat offset 4, which is slot 0 of band 1.
-    CHECK(out.find("sc[0] = v4;") != std::string::npos);
-    CHECK(out.find("sc[3] = v7;") != std::string::npos);
+    CHECK_HAS(out, "sc[0] = v4;");
+    CHECK_HAS(out, "sc[3] = v7;");
   }
 
   CASE("a spanning register is emitted under a test, once per band");
@@ -161,8 +161,8 @@ int main() {
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "int f = idx;"), 2);
     CHECK_EQ(countOf(out, "int f = jdx;"), 2);
-    CHECK(out.find("f < 4") != std::string::npos);
-    CHECK(out.find("f >= 4") != std::string::npos);
+    CHECK_HAS(out, "f < 4");
+    CHECK_HAS(out, "f >= 4");
   }
 
   CASE("the scatter and gather halves agree on which band a register touches");
@@ -181,8 +181,8 @@ int main() {
     BandPlan p = planBand(2, 4, Capacity(Bytes(32768), Bytes(0)));
     emitBandRoundTrip(c, body, p, simpleIO(c, 2, 1, /*permute=*/true), nm);
     const std::string out = render(body);
-    CHECK(out.find("sc[0] = v0;") != std::string::npos);
-    CHECK(out.find("o0 = sc[1];") != std::string::npos);
+    CHECK_HAS(out, "sc[0] = v0;");
+    CHECK_HAS(out, "o0 = sc[1];");
     CHECK(out.find("sc[0] = v0;") < out.find("o0 = sc[1];"));
   }
 

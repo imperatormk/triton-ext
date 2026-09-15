@@ -2,20 +2,15 @@
 #include "agpu/msl/GuardSink.h"
 #include "agpu/msl/Printer.h"
 #include "harness.h"
+#include "render.h"
 
 #include <sstream>
 
 using namespace agpu;
 using namespace agpu::msl;
+using agpu_test::render;
 
 namespace {
-
-std::string render(const Block &b) {
-  std::ostringstream os;
-  Printer p(os);
-  p.printBlock(b);
-  return os.str();
-}
 
 std::size_t countOf(const std::string &s, const std::string &needle) {
   std::size_t n = 0;

@@ -9,6 +9,7 @@
 
 using namespace agpu;
 using agpu_test::countOf;
+using agpu_test::has;
 using agpu_test::render;
 
 namespace {
@@ -114,12 +115,10 @@ int main() {
     ScanPlan p = planScan(facts({{0, 1}, {1, 2}}));
     emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("if (lane & 3 >= 1)") != std::string::npos ||
-          out.find("if ((lane & 3) >= 1)") != std::string::npos);
-    CHECK(out.find("if (lane & 3 >= 2)") != std::string::npos ||
-          out.find("if ((lane & 3) >= 2)") != std::string::npos);
+    CHECK(has(out, "if (lane & 3 >= 1)") || has(out, "if ((lane & 3) >= 1)"));
+    CHECK(has(out, "if (lane & 3 >= 2)") || has(out, "if ((lane & 3) >= 2)"));
     // Never the bare lane id.
-    CHECK(out.find("if (lane >= 1)") == std::string::npos);
+    CHECK_LACKS(out, "if (lane >= 1)");
   }
 
   CASE("an axis filling the warp needs no mask");
@@ -130,8 +129,8 @@ int main() {
     ScanPlan p = planScan(facts({{0, 1}, {1, 2}, {2, 4}, {3, 8}, {4, 16}}));
     emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("if (lane >= 1)") != std::string::npos);
-    CHECK(out.find("lane & 31") == std::string::npos);
+    CHECK_HAS(out, "if (lane >= 1)");
+    CHECK_LACKS(out, "lane & 31");
   }
 
   // ── the local pass keeps every partial ─────────────────────────────────
@@ -154,7 +153,7 @@ int main() {
     ScanPlan p = planScan(facts({}, {}, 1, 3));
     auto res = emitScan(c, body, p, 1, sources(1, 3), nm, adder(c)).value[0];
     // No cross-lane phase, so register 0's accumulator keeps its seed.
-    CHECK(render(body).find("float sa0_0 = v0_0;") != std::string::npos);
+    CHECK_HAS(render(body), "float sa0_0 = v0_0;");
     CHECK_EQ(res[0], std::string("sa0_0"));
   }
 
@@ -185,8 +184,8 @@ int main() {
     const std::string out = render(body);
     // Three combines and no register keeps its seed unfolded.
     CHECK_EQ(countOf(out, "float sum"), 3);
-    CHECK(out.find("sa0_1 = sum") != std::string::npos);
-    CHECK(out.find("sa0_3 = sum") != std::string::npos);
+    CHECK_HAS(out, "sa0_1 = sum");
+    CHECK_HAS(out, "sa0_3 = sum");
   }
 
   CASE("every register gets its own result");
@@ -221,10 +220,10 @@ int main() {
     const std::string out = render(body);
 
     // A separate accumulator, seeded from the last register.
-    CHECK(out.find("float sax0 = sa0_1;") != std::string::npos);
+    CHECK_HAS(out, "float sax0 = sa0_1;");
     CHECK_EQ(countOf(out, "if ("), 2); // the ladder rung and the fold
     for (const msl::Str &r : res)
-      CHECK(out.find(r + " = ") != std::string::npos);
+      CHECK_HAS(out, r + " = ");
   }
 
   CASE("a single register needs no local combine");
@@ -245,8 +244,8 @@ int main() {
     ScanPlan p = planScan(facts(wholeWarp(), {{0, 32}}, 4));
     emitScan(c, body, p, 4, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("if (lane == 31)") != std::string::npos);
-    CHECK(out.find("scr0[warp * 32]") != std::string::npos);
+    CHECK_HAS(out, "if (lane == 31)");
+    CHECK_HAS(out, "scr0[warp * 32]");
   }
 
   CASE("the combine takes the earlier element first");
@@ -270,8 +269,8 @@ int main() {
     const std::string out = render(body);
 
     // Peer minus accumulator.
-    CHECK(out.find("sp0_0 - sax0") != std::string::npos);
-    CHECK(out.find("sax0 - sp0_0") == std::string::npos);
+    CHECK_HAS(out, "sp0_0 - sax0");
+    CHECK_LACKS(out, "sax0 - sp0_0");
   }
 
   CASE("registers across the axis are independent scans");
@@ -304,8 +303,8 @@ int main() {
     ScanPlan p = planScan(facts({{0, 1}}, {{0, 2}}, 4));
     emitScan(c, body, p, 4, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("scr0[warp * 32 + lane]") != std::string::npos);
-    CHECK(out.find("if (lane == ") == std::string::npos);
+    CHECK_HAS(out, "scr0[warp * 32 + lane]");
+    CHECK_LACKS(out, "if (lane == ");
   }
 
   CASE("each warp takes the warps before it");
@@ -341,9 +340,9 @@ int main() {
     CHECK_EQ(countOf(out, "scarry"), 2); // one declaration, one read
 
     // The peer slot is anchored to the executing warp's own subset.
-    CHECK(out.find("(warp & 2)") != std::string::npos);
+    CHECK_HAS(out, "(warp & 2)");
     // The guard compares the position within that subset.
-    CHECK(out.find("(warp & 1) > 0") != std::string::npos);
+    CHECK_HAS(out, "(warp & 1) > 0");
   }
 
   CASE("the cross-warp carry reaches the lane the prefix guard rejects");
@@ -368,8 +367,8 @@ int main() {
     // One fold, reaching every register.
     CHECK_EQ(countOf(out, "float scarry0 ="), 1);
     const std::string afterCarry = out.substr(carry);
-    CHECK(afterCarry.find("sa0_0 = ") != std::string::npos);
-    CHECK(afterCarry.find("sa0_1 = ") != std::string::npos);
+    CHECK_HAS(afterCarry, "sa0_0 = ");
+    CHECK_HAS(afterCarry, "sa0_1 = ");
   }
 
   CASE("the warp total is published exactly once");
@@ -407,10 +406,10 @@ int main() {
     CHECK_EQ(countOf(out, "float scarry4_0 ="), 1);
 
     // The anchor keeps the bit the axis does not traverse.
-    CHECK(out.find("(warp & 2)") != std::string::npos);
+    CHECK_HAS(out, "(warp & 2)");
     // Guards on the subset values {0, 1, 4}.
-    CHECK(out.find("(warp & 5) > 4") != std::string::npos);
-    CHECK(out.find("(warp & 5) > 2") == std::string::npos);
+    CHECK_HAS(out, "(warp & 5) > 4");
+    CHECK_LACKS(out, "(warp & 5) > 2");
   }
 
   // ── the scratch buffer ─────────────────────────────────────────────────
@@ -427,8 +426,8 @@ int main() {
     CHECK(p.scratch.slotsPerOperand > 0);
     emitScan(c, body, p, 4, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("threadgroup float") == std::string::npos);
-    CHECK(out.find("scr0[") != std::string::npos);
+    CHECK_LACKS(out, "threadgroup float");
+    CHECK_HAS(out, "scr0[");
   }
 
   CASE("a lane-local scan declares no buffer");
@@ -438,7 +437,7 @@ int main() {
     ScanPlan p = planScan(facts({{0, 1}}));
     CHECK(!p.crossWarp);
     emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
-    CHECK(render(body).find("threadgroup") == std::string::npos);
+    CHECK_LACKS(render(body), "threadgroup");
   }
 
   // ── multi-operand agreement ────────────────────────────────────────────
@@ -481,9 +480,9 @@ int main() {
 
     const std::string out = render(body);
     for (const msl::Str &n : res[0])
-      CHECK(out.find(n) != std::string::npos);
+      CHECK_HAS(out, n);
     for (const msl::Str &n : res[1])
-      CHECK(out.find(n) != std::string::npos);
+      CHECK_HAS(out, n);
   }
 
   // ── the element type ───────────────────────────────────────────────────
@@ -498,10 +497,10 @@ int main() {
     emitScan(c, body, p, 4, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
     // Only the emitter's own declarations: accumulator, peer, carry.
-    CHECK(out.find("int sa") != std::string::npos);
-    CHECK(out.find("int sp") != std::string::npos);
-    CHECK(out.find("float sa") == std::string::npos);
-    CHECK(out.find("float sp") == std::string::npos);
+    CHECK_HAS(out, "int sa");
+    CHECK_HAS(out, "int sp");
+    CHECK_LACKS(out, "float sa");
+    CHECK_LACKS(out, "float sp");
   }
 
   CASE("an unset element type still means f32");
@@ -511,7 +510,7 @@ int main() {
     ScanPlan p = planScan(facts({{0, 1}}));
     CHECK(p.elems.empty());
     emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
-    CHECK(render(body).find("float sa") != std::string::npos);
+    CHECK_HAS(render(body), "float sa");
   }
 
   // ── the identity fill ──────────────────────────────────────────────────
@@ -526,9 +525,8 @@ int main() {
     CHECK(p.fills());
     emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("simd_shuffle_and_fill_up(sax0, "
-                   "-metal::numeric_limits<float>::infinity(), 1u)") !=
-          std::string::npos);
+    CHECK_HAS(out, "simd_shuffle_and_fill_up(sax0, "
+                   "-metal::numeric_limits<float>::infinity(), 1u)");
     CHECK_EQ(countOf(out, "simd_shuffle_and_fill_up"), 5 + 1);
     CHECK_EQ(countOf(out, "simd_shuffle_up("), 0);
     CHECK_EQ(countOf(out, "if ("), 0);
@@ -543,10 +541,9 @@ int main() {
     ScanPlan p = planScan(f);
     emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("simd_shuffle_and_fill_up(sax0, "
-                   "metal::numeric_limits<float>::infinity(), 1u, 4)") !=
-          std::string::npos);
-    CHECK(out.find("lane & 3") == std::string::npos);
+    CHECK_HAS(out, "simd_shuffle_and_fill_up(sax0, "
+                   "metal::numeric_limits<float>::infinity(), 1u, 4)");
+    CHECK_LACKS(out, "lane & 3");
     CHECK_EQ(countOf(out, "if ("), 0);
   }
 
@@ -561,7 +558,7 @@ int main() {
     emitScan(c, body, p, 1, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "simd_shuffle_and_fill_down("), 2 + 1);
-    CHECK(out.find("<= ") == std::string::npos);
+    CHECK_LACKS(out, "<= ");
   }
 
   CASE("a column axis, a sum and a generic combine keep the guarded ladder");
@@ -583,7 +580,7 @@ int main() {
     emitScan(c, body, planScan(col), 1, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
     CHECK_EQ(countOf(out, "simd_shuffle_and_fill"), 0);
-    CHECK(out.find("(lane & 24) >= 8") != std::string::npos);
+    CHECK_HAS(out, "(lane & 24) >= 8");
   }
 
   CASE("integer combiners fill with their own limits");
@@ -600,8 +597,8 @@ int main() {
       f.elems = {i32()};
       emitScan(c, body, planScan(f), 1, sources(1, 1), nm, adder(c));
       const std::string out = render(body);
-      CHECK(out.find(std::string("simd_shuffle_and_fill_up(sax0, ") + want +
-                     ", 1u, 2)") != std::string::npos);
+      CHECK_HAS(out, std::string("simd_shuffle_and_fill_up(sax0, ") + want +
+                         ", 1u, 2)");
     }
   }
 
@@ -625,9 +622,9 @@ int main() {
 
     // Forward guards `>= delta`, reverse guards `<= top - delta`. The top is
     // the axis's, which these two bits put at 3.
-    CHECK(out.find("<= 2") != std::string::npos); // delta 1
-    CHECK(out.find("<= 1") != std::string::npos); // delta 2
-    CHECK(out.find(">= ") == std::string::npos);
+    CHECK_HAS(out, "<= 2"); // delta 1
+    CHECK_HAS(out, "<= 1"); // delta 2
+    CHECK_LACKS(out, ">= ");
   }
 
   CASE("a reverse warp scan publishes its total from lane 0");
@@ -640,8 +637,8 @@ int main() {
     ScanPlan p = planScan(f);
     emitScan(c, body, p, 4, sources(1, 1), nm, adder(c));
     const std::string out = render(body);
-    CHECK(out.find("if (lane == 0)") != std::string::npos);
-    CHECK(out.find("if (lane == 31)") == std::string::npos);
+    CHECK_HAS(out, "if (lane == 0)");
+    CHECK_LACKS(out, "if (lane == 31)");
   }
 
   CASE("a reverse scan carries from the warps after it");
@@ -713,8 +710,8 @@ int main() {
     emitScan(c, body, p, 1, sources(2, 1), nm, adder(c));
     const std::string out = render(body);
     // One accumulator per (operand, register).
-    CHECK(out.find("float sa0_0 = v0_0;") != std::string::npos);
-    CHECK(out.find("float sa1_0 = v1_0;") != std::string::npos);
+    CHECK_HAS(out, "float sa0_0 = v0_0;");
+    CHECK_HAS(out, "float sa1_0 = v1_0;");
     // One ladder rung and one prefix fold per operand.
     CHECK_EQ(countOf(out, "simd_shuffle_up"), (1 + 1) * 2);
   }

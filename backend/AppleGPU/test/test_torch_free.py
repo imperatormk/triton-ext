@@ -90,3 +90,54 @@ def test_dispatch_without_torch():
         assert 'torch' not in sys.modules
     """)
     assert "v:1.5" in out and "v:2.5" in out
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs Metal")
+@pytest.mark.skipif(
+    importlib.util.find_spec("triton_apple_backend.metal_native") is None,
+    reason="metal_native is not built")
+def test_address_table_without_torch():
+    out = _run_without_torch("""
+        import numpy as np
+        import triton
+        import triton.language as tl
+        from triton_apple_backend import metal_native
+        from triton_apple_backend.address import address_table, gpu_address
+
+        @triton.jit
+        def through(tab, out, n, BLOCK: tl.constexpr):
+            e = tl.program_id(0)
+            offs = tl.arange(0, BLOCK)
+            mask = offs < n
+            src = tl.load(tab + e).to(tl.pointer_type(tl.float32))
+            tl.store(out + e * n + offs,
+                     tl.load(src + offs, mask=mask, other=0.), mask=mask)
+
+        n, experts = 256, 4
+        data = [np.arange(i * n, (i + 1) * n, dtype=np.float32)
+                for i in range(experts)]
+        bufs = []
+        for d in data:
+            b = metal_native.alloc(n * 4, np.dtype('float32'))
+            np.frombuffer(b, dtype=np.float32)[:] = d
+            bufs.append(b)
+
+        ob = metal_native.alloc(experts * n * 4, np.dtype('float32'))
+        through[(experts,)](address_table(bufs), ob, n, BLOCK=n)
+        metal_native.synchronize()
+        assert np.array_equal(np.frombuffer(ob, dtype=np.float32),
+                              np.concatenate(data))
+
+        assert gpu_address(bufs[0]) != bufs[0].data_ptr()
+
+        try:
+            gpu_address(metal_native.wrap(data[0]))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a wrapped buffer should have no gpu address")
+
+        assert 'torch' not in sys.modules
+        print('ok')
+    """)
+    assert out.strip() == "ok"

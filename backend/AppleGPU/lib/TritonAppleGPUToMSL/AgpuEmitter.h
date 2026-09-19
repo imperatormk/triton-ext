@@ -12,13 +12,16 @@
 #include "agpu/Emitter.h"
 #include "agpu/bind/Dispatch.h"
 #include "agpu/bind/LayoutBind.h"
+#include "agpu/bind/PointerBind.h"
 #include "agpu/bind/SymbolTable.h"
 #include "agpu/core/MemDesc.h"
 #include "agpu/emit/Emit.h"
+#include "agpu/plan/AccessPlan.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
@@ -309,6 +312,17 @@ private:
 
   agpu::CoordSource coordSourceOf(RankedTensorType ty);
 
+  ModuleAxisInfoAnalysis &axisInfo() {
+    if (!axisInfo_)
+      axisInfo_ = std::make_unique<ModuleAxisInfoAnalysis>(mod_);
+    return *axisInfo_;
+  }
+  agpu::PtrDims ptrDimsOf(Value ptr, const agpu::ElemType &elem);
+  std::vector<agpu::LayoutBasis> layoutDimsOf(Value v);
+  agpu::MoveFacts moveFactsOf(Value ptr, Value laidOut,
+                              const agpu::ElemType *elem, int64_t regs,
+                              bool isStore);
+
   agpu::Decision emitLocalAlloc(const agpu::OpView &o);
   agpu::Decision emitLocalLoad(const agpu::OpView &o);
   agpu::Decision emitLocalStore(const agpu::OpView &o);
@@ -347,6 +361,7 @@ private:
   int64_t numWarps() const;
 
   ModuleOp mod_;
+  std::unique_ptr<ModuleAxisInfoAnalysis> axisInfo_;
   llvm::raw_ostream &os_;
 
   agpu::Emitter agpu_;

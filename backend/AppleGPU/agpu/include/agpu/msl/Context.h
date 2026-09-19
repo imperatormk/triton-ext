@@ -117,6 +117,12 @@ public:
     return make<If>(cond, std::move(thenBody));
   }
 
+  If *ifElse(Expr *cond, Block thenBody, Block elseBody) {
+    If *s = make<If>(cond, std::move(thenBody));
+    s->elseBody = std::move(elseBody);
+    return s;
+  }
+
   enum class GuardFold {
     Always,  // no condition, or a literal true: run unconditionally
     Never,   // a literal false: the body is unreachable

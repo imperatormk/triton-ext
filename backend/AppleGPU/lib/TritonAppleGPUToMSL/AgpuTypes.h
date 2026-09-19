@@ -47,6 +47,13 @@ inline std::optional<agpu::ElemType> elemTypeOf(Type t) {
 
   return std::nullopt;
 }
+
+// The one case where axis analysis reports divisibility in bytes.
+inline bool isTensorOfPointers(Type t) {
+  auto rt = dyn_cast<RankedTensorType>(t);
+  return rt && isa<triton::PointerType>(rt.getElementType());
+}
+
 } // namespace mlir::triton::applegpu::bridge
 
 #endif // AGPU_BRIDGE_TYPES_H

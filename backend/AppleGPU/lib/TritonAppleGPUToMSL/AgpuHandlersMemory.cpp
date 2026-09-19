@@ -9,6 +9,50 @@ namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
 
+agpu::PtrDims AgpuEmitter::ptrDimsOf(Value ptr, const agpu::ElemType &elem) {
+  agpu::PtrDims out;
+  const auto rt =
+      ptr ? dyn_cast<RankedTensorType>(ptr.getType()) : RankedTensorType();
+  if (!rt)
+    return out;
+  AxisInfo *ai = axisInfo().getAxisInfo(ptr);
+  if (!ai)
+    return out;
+  const bool bytes = isTensorOfPointers(rt);
+  for (int d = 0; d < rt.getRank(); ++d)
+    out.push_back(agpu::ptrInfoFrom(
+        agpu::AxisReport{ai->getContiguity(d), ai->getDivisibility(d), bytes},
+        elem));
+  return out;
+}
+
+// Empty for a value with no layout, which leaves every access scalar.
+std::vector<agpu::LayoutBasis> AgpuEmitter::layoutDimsOf(Value v) {
+  const auto rt =
+      v ? dyn_cast<RankedTensorType>(v.getType()) : RankedTensorType();
+  if (!rt)
+    return {};
+  const agpu::CoordSource cs = coordSourceOf(rt);
+  if ((int)cs.dims.size() != rt.getRank())
+    return {};
+  return cs.dims;
+}
+
+agpu::MoveFacts AgpuEmitter::moveFactsOf(Value ptr, Value laidOut,
+                                         const agpu::ElemType *elem,
+                                         int64_t regs, bool isStore) {
+  agpu::MoveFacts f;
+  f.regCount = regs;
+  f.isStore = isStore;
+  f.elemBits = elem ? elem->bits : 0;
+  if (elem)
+    f.ptr = ptrDimsOf(ptr, *elem);
+  const std::vector<agpu::LayoutBasis> dims = layoutDimsOf(laidOut);
+  f.bases = agpu::regBasesOf(dims);
+  f.runtime = agpu::runtimeSpanOf(dims);
+  return f;
+}
+
 PtrOffset AgpuEmitter::offsetSum(agpu::ValueId basePtr, int64_t reg,
                                  const am::Str &added) {
   const auto prior = body_.offsetOf.find({basePtr, reg});
@@ -45,8 +89,9 @@ agpu::Decision AgpuEmitter::emitLoad(const agpu::OpView &o,
     if (!addressAt(o.operands[0], r))
       return declined(o.name, "cannot build register " + std::to_string(r));
 
-  agpu::MoveFacts f;
-  f.regCount = ready.regs;
+  agpu::MoveFacts f =
+      moveFactsOf(mlirValueOf(o.operands[0]), mlirValueOf(o.results[0]),
+                  &ready.elem, ready.regs, /*isStore=*/false);
   f.hasMask = o.operands.size() > maskIndex;
   f.hasOther = hasOther;
 
@@ -68,7 +113,8 @@ agpu::Decision AgpuEmitter::emitLoad(const agpu::OpView &o,
     site.values.push_back(names.back());
   }
 
-  agpu::emitMove(agpu_.context(), *cur_, f, site, ready.elem);
+  const agpu::MovePlan p = agpu::planMove(f);
+  agpu::emitMove(agpu_.context(), *cur_, f, p, site, ready.elem);
   body_.sym.bindRegs(o.results[0], std::move(names));
   return agpu::Decision::emitted();
 }
@@ -96,9 +142,9 @@ agpu::Decision AgpuEmitter::emitStore(const agpu::OpView &o,
       return declined(o.name, "pointer has no recorded offset");
 
   const agpu::ElemType *ve = elemOf(o.operands[1]);
-  agpu::MoveFacts f;
-  f.regCount = regs;
-  f.isStore = true;
+  agpu::MoveFacts f =
+      moveFactsOf(mlirValueOf(o.operands[0]), mlirValueOf(o.operands[1]), ve,
+                  regs, /*isStore=*/true);
   f.hasMask = o.operands.size() > maskIndex;
 
   agpu::MoveSite site;
@@ -110,7 +156,8 @@ agpu::Decision AgpuEmitter::emitStore(const agpu::OpView &o,
   for (int64_t r = 0; r < regs; ++r)
     site.values.push_back(val.at(r));
 
-  agpu::emitMove(agpu_.context(), *cur_, f, site, ve ? *ve : agpu::f32());
+  const agpu::MovePlan p = agpu::planMove(f);
+  agpu::emitMove(agpu_.context(), *cur_, f, p, site, ve ? *ve : agpu::f32());
 
   if (!o.results.empty())
     body_.sym.bindDataless(o.results[0]);

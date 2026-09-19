@@ -18,8 +18,9 @@ namespace agpu {
 // `bases[b][d]` is how far register bit `b` moves along dimension `d`.
 using RegBases = std::vector<std::vector<int32_t>>;
 
-// Condition (c)'s input: the or of every runtime basis (lane, warp, block)
-// along each dimension, the bases being disjoint powers of two.
+// Condition (c)'s input: the xor of every runtime basis (lane, warp, block)
+// along each dimension. The bases are disjoint powers of two here, so the xor
+// is an or.
 using RuntimeSpan = std::vector<int32_t>;
 
 // What the pointer analysis knows about one dimension.
@@ -34,6 +35,8 @@ using PtrDims = std::vector<PtrInfo>;
 // Metal's portable vector widths stop at 4.
 inline constexpr int64_t kMaxAccessWidth = 4;
 
+// Every element here has a `packed_` vector form, so only contiguity forces a
+// demotion. 64-bit is excluded.
 enum class VecElem {
   Packable,    // a packed_* form exists, so alignment can be relaxed
   Unsupported, // no vector access worth taking
@@ -46,9 +49,10 @@ inline VecElem vecElemOf(unsigned bits) {
 }
 
 // Conditions (a) and (c). Register bit `b` must move by `2^b` along one fixed
-// dimension and by nothing along any other; a runtime basis with a low bit set
-// there interleaves other threads' elements, so the run shrinks until every
-// outside basis clears its bits. Length 1 with dim -1 means not adjacent.
+// dimension and by nothing along any other. A runtime basis with a low bit set
+// along that dimension interleaves other threads' elements, so the run shrinks
+// until every outside basis clears its bits. Length 1 with dim -1 means the
+// registers are not adjacent.
 struct RegRun {
   int64_t length = 1;
   int dim = -1;
@@ -117,6 +121,7 @@ inline WidthLimit limitFor(int64_t run, const PtrInfo &ptr, VecElem elem) {
   return lim;
 }
 
+// The whole answer for one access.
 struct AccessPlan {
   int64_t width = 1;
   int dim = -1;

@@ -316,9 +316,12 @@ struct FusedParams {
   bool stagePad = true;
 };
 
-// Zero where the operands leave no room: the drain falls back to guarded
-// scalar stores.
+// Zero where every fragment lands whole, since the scratch exists to hold a
+// partial one, and where the operands leave no room: the drain falls back to
+// guarded scalar stores.
 inline Bytes edgeScratchFor(const DotFacts &f, Bytes staged, Bytes budget) {
+  if (!f.ragged())
+    return Bytes(0);
   const Bytes want(f.numWarps * kSgFragDim * kSgFragDim * kAccBytes);
   return staged + want <= budget ? want : Bytes(0);
 }

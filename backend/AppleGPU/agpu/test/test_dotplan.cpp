@@ -347,9 +347,20 @@ int main() {
     CHECK(p.direct().bandRows < 128);
   }
 
-  CASE("a direct store with no ragged arm reserves only the edge scratch");
+  CASE("a whole-fragment direct store reserves no edge scratch");
   {
     DotFacts f = gemm(64, 64, 64);
+    f.fusedAcc = true;
+    f.cDirect = true;
+    f.cFallback = false;
+    Plan p = planDot(f, kBudget);
+    CHECK_EQ(p.edgeScratch.count(), 0);
+    CHECK(p.pool.cNeed == p.stage.ab());
+  }
+
+  CASE("a ragged direct store reserves the edge scratch");
+  {
+    DotFacts f = gemm(60, 64, 64);
     f.fusedAcc = true;
     f.cDirect = true;
     f.cFallback = false;
@@ -379,7 +390,7 @@ int main() {
     f.bInPlace = true;
     Plan p = planDot(f, kBudget);
     CHECK_EQ(p.stage.ab().count(), 0);
-    CHECK_EQ(p.pool.cNeed.count(), p.edgeScratch.count());
+    CHECK_EQ(p.edgeScratch.count(), 0);
     CHECK(p.pool.reserved() > Bytes(0));
   }
 

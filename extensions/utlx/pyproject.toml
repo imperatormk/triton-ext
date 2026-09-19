@@ -3,10 +3,16 @@ requires = ["scikit-build-core>=0.10", "cmake>=3.20", "ninja"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "utlx"
-version = "0.1.0"
+name = "triton-utlx"
+# Tracks the Triton release this plugin targets; `.postN` for a uTLX-only fix
+# against an unchanged Triton. 3.8.0 itself is taken (and yanked) on PyPI.
+version = "3.8.0.post1"
 description = "uTLX: Triton Language Extensions distributed as a Plugin"
 requires-python = ">=3.9"
+# libutlx.so is built against one Triton release line and its version check
+# enforces that. Without the bound, pip will happily pair this wheel with a
+# Triton from another line, which corrupts the heap rather than failing cleanly.
+dependencies = ["triton~=3.8.0"]
 
 [tool.triton-ext]
 status = "experimental"
@@ -18,8 +24,8 @@ cmake.build-type = "Release"
 # Keep tutorials and caches out of the wheel.
 wheel.exclude = ["**/__pycache__/**", "**/*.pyc", "tlx/tutorials/**"]
 
-# Bundle the three pure-Python packages. CMake installs libutlx.so into
-# utlx_plugin/ using `install()` (see CMakeLists.txt).
+# Bundle the three pure-Python packages. CMake `install()`s libutlx.so into
+# utlx_plugin/, plus the startup .pth pair at the wheel root (see CMakeLists.txt).
 [tool.scikit-build.wheel.packages]
 utlx_plugin = "python/utlx_plugin"
 utlx = "python/utlx"

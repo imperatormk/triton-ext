@@ -115,3 +115,11 @@ set_target_properties(${TRITON_EXT_NAME} PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 install(TARGETS ${TRITON_EXT_NAME} LIBRARY DESTINATION utlx_plugin)
+
+# These land at the site-packages root rather than inside the package: site.py
+# runs the .pth at interpreter startup, the only point early enough for a Triton
+# that reads TRITON_PLUGIN_PATHS while importing (see _utlx_autoregister.py).
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/utlx_plugin.pth"
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/_utlx_autoregister.py"
+    DESTINATION .)

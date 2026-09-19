@@ -58,6 +58,12 @@ public:
     return Type(Form::Vector, s, n, {}, AddrSpace::None);
   }
 
+  // `packed_floatN`, which aligns only to the element.
+  static Type packedVector(Scalar s, int n) {
+    Type t(Form::Vector, s, n, {}, AddrSpace::None);
+    t.packed_ = true;
+    return t;
+  }
   bool isPacked() const { return packed_; }
   static Type named(Str n) {
     return Type(Form::Named, Scalar::I32, 0, std::move(n), AddrSpace::None);
@@ -66,6 +72,14 @@ public:
     Type t = *this;
     t.pointee_ = std::make_shared<Type>(*this);
     t.form_ = Form::Pointer;
+    t.addrSpace_ = as;
+    return t;
+  }
+
+  // The address space of storage: `threadgroup float pool[1024];` is not a
+  // pointer.
+  Type inAddrSpace(AddrSpace as) const {
+    Type t = *this;
     t.addrSpace_ = as;
     return t;
   }
@@ -186,6 +200,13 @@ struct Cast : Expr {
       : Expr(ExprKind::Cast), to(std::move(t)), operand(e), style(s) {}
 };
 
+struct Call : Expr {
+  Str callee;
+  SmallVec<Expr *, 4> args;
+  Call(Str c, SmallVec<Expr *, 4> a)
+      : Expr(ExprKind::Call), callee(std::move(c)), args(std::move(a)) {}
+};
+
 struct Subscript : Expr {
   Expr *base;
   Expr *index;
@@ -204,6 +225,13 @@ struct Deref : Expr {
   explicit Deref(Expr *e) : Expr(ExprKind::Deref), operand(e) {}
 };
 
+struct AddrOf : Expr {
+  Expr *operand;
+  explicit AddrOf(Expr *e) : Expr(ExprKind::AddrOf), operand(e) {}
+};
+
+// ── statements ────────────────────────────────────────────────────────────
+
 struct Stmt {
   const StmtKind kind;
   explicit Stmt(StmtKind k) : kind(k) {}
@@ -219,12 +247,50 @@ struct Decl : Stmt {
       : Stmt(StmtKind::Decl), type(std::move(t)), name(std::move(n)), init(i) {}
 };
 
+struct ArrayDecl : Stmt {
+  Type elem;
+  Str name;
+  int64_t count = 0;
+  ArrayDecl(Type e, Str n, int64_t c)
+      : Stmt(StmtKind::ArrayDecl), elem(std::move(e)), name(std::move(n)),
+        count(c) {}
+};
+
 struct Assign : Stmt {
   Expr *target;
   Expr *value;
   bool compound = false;
   BinOp compoundOp = BinOp::Add;
   Assign(Expr *t, Expr *v) : Stmt(StmtKind::Assign), target(t), value(v) {}
+};
+
+struct Barrier : Stmt {
+  enum class Scope { Threadgroup, Device, Simdgroup };
+  Scope scope = Scope::Threadgroup;
+
+  // Must not merge with an adjacent barrier.
+  bool hard = false;
+
+  explicit Barrier(Scope s) : Stmt(StmtKind::Barrier), scope(s) {}
+
+  // Declaration order is not breadth order, so Scope values do not compare.
+  static int breadth(Scope s) {
+    switch (s) {
+    case Scope::Simdgroup:
+      return 0;
+    case Scope::Threadgroup:
+      return 1;
+    case Scope::Device:
+      return 2;
+    }
+    return 0;
+  }
+
+  // Merging must never narrow the scope.
+  static Scope widest(Scope a, Scope b) {
+    return std::max(a, b,
+                    [](Scope x, Scope y) { return breadth(x) < breadth(y); });
+  }
 };
 
 struct If : Stmt {

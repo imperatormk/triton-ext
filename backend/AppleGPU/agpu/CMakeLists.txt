@@ -16,7 +16,14 @@ target_compile_options(agpu_msl PRIVATE ${AGPU_WARNINGS})
 
 enable_testing()
 
-add_executable(test_kernelabi test/test_kernelabi.cpp)
-target_link_libraries(test_kernelabi PRIVATE agpu_msl agpu_core)
-target_compile_options(test_kernelabi PRIVATE ${AGPU_WARNINGS})
-add_test(NAME kernelabi COMMAND test_kernelabi)
+file(GLOB AGPU_TEST_SRCS CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/test/test_*.cpp")
+
+foreach(src ${AGPU_TEST_SRCS})
+  get_filename_component(name ${src} NAME_WE)
+  add_executable(${name} ${src})
+  target_link_libraries(${name} PRIVATE agpu_msl agpu_core)
+  target_include_directories(${name} PRIVATE test)
+  target_compile_options(${name} PRIVATE ${AGPU_WARNINGS})
+  add_test(NAME ${name} COMMAND ${name})
+endforeach()

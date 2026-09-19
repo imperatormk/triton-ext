@@ -13,6 +13,7 @@
 #include "agpu/bind/Dispatch.h"
 #include "agpu/bind/LayoutBind.h"
 #include "agpu/bind/SymbolTable.h"
+#include "agpu/core/MemDesc.h"
 #include "agpu/emit/Emit.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -61,6 +62,9 @@ struct BodyState {
   // addptr binds the base name and keeps the offset here: an access is
   // base[off].
   std::map<std::pair<agpu::ValueId, int64_t>, PtrOffset> offsetOf;
+
+  // Which threadgroup buffer a memdesc handle addresses.
+  std::map<agpu::ValueId, agpu::MemDesc> memDescOf;
 
   // Written only via markBasePointer/inheritBasePointer.
   std::set<agpu::ValueId> basePtrs;
@@ -304,6 +308,41 @@ private:
   agpu::BuiltBody buildKernelBody(Region &region);
 
   agpu::CoordSource coordSourceOf(RankedTensorType ty);
+
+  agpu::Decision emitLocalAlloc(const agpu::OpView &o);
+  agpu::Decision emitLocalLoad(const agpu::OpView &o);
+  agpu::Decision emitLocalStore(const agpu::OpView &o);
+  agpu::Decision emitMemDescViewOp(const agpu::OpView &o);
+  void registerMemDescHandler();
+
+  agpu::Decision emitRebindOp(const agpu::OpView &o);
+  void registerRebindHandler();
+
+  // Whether every register of `ty` has a coordinate. The part of
+  // `planTileActions` that no window can change.
+  agpu::Decision tileCoordsResolvable(RankedTensorType ty,
+                                      std::string_view where);
+
+  // `actions` gets one entry per register that reaches the window. Declines
+  // when the layout cannot be read.
+  agpu::Decision
+  planTileActions(agpu::ValueId v, RankedTensorType ty,
+                  const std::vector<agpu::CoordWindow> &windows,
+                  const agpu::TileView &dst, unsigned elemBits,
+                  agpu::msl::SmallVec<agpu::StageAction, 8> &actions,
+                  std::string_view where);
+
+  // The registers of `v` in their IR element type, narrowed where a wider
+  // evaluation width left them declared as f32.
+  agpu::msl::SmallVec<agpu::msl::Str, 8> stagedNamesOf(agpu::ValueId v,
+                                                       int64_t regs);
+
+  agpu::Decision stageWholeTensor(agpu::ValueId v, RankedTensorType ty,
+                                  const agpu::msl::Str &buffer,
+                                  const agpu::TileView &dst,
+                                  const agpu::ElemType &elem,
+                                  std::string_view where,
+                                  std::string_view what);
 
   int64_t numWarps() const;
 

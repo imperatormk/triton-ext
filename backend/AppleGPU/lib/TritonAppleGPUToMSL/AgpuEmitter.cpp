@@ -129,6 +129,8 @@ void AgpuEmitter::registerHandlers() {
   registerRangeHandler();
   registerAddPtrHandler();
   registerMemoryHandler();
+  registerMemDescHandler();
+  registerRebindHandler();
 }
 
 int64_t AgpuEmitter::numWarps() const {

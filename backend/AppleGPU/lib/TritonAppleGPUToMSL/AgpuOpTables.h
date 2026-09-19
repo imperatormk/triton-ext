@@ -18,6 +18,9 @@ inline constexpr std::string_view kLoad = "tt.load";
 inline constexpr std::string_view kGetProgramId = "tt.get_program_id";
 inline constexpr std::string_view kExpandDims = "tt.expand_dims";
 inline constexpr std::string_view kBroadcast = "tt.broadcast";
+inline constexpr std::string_view kConvertLayout = "ttg.convert_layout";
+inline constexpr std::string_view kTrans = "tt.trans";
+inline constexpr std::string_view kReshape = "tt.reshape";
 
 // ── asking a table ────────────────────────────────────────────────────────
 

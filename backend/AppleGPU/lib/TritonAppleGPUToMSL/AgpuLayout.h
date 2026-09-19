@@ -12,6 +12,7 @@
 #include "triton/Tools/LinearLayout.h"
 
 #include <optional>
+#include <set>
 #include <vector>
 
 namespace mlir::triton::applegpu::bridge {
@@ -181,6 +182,59 @@ elemThroughRebind(RankedTensorType srcTy, RankedTensorType resTy, int resReg) {
       return std::nullopt;
   return flatIndex(srcShape, srcCoord);
 }
+
+// The source element feeding a result register of a transpose. `order[d]`
+// names which source axis becomes result axis d, the `tt.trans` convention.
+inline std::optional<int64_t> elemThroughTranspose(RankedTensorType srcTy,
+                                                   RankedTensorType resTy,
+                                                   ArrayRef<int32_t> order,
+                                                   int resReg) {
+  const std::optional<std::vector<int64_t>> coord =
+      registerCoordAt(resTy, resReg);
+  if (!coord)
+    return std::nullopt;
+
+  const ArrayRef<int64_t> srcShape = srcTy.getShape();
+  if (order.size() != coord->size() || srcShape.size() != coord->size())
+    return std::nullopt;
+
+  std::vector<int64_t> srcCoord(srcShape.size(), 0);
+  for (std::size_t d = 0; d < coord->size(); ++d) {
+    const int32_t s = order[d];
+    if (s < 0 || (std::size_t)s >= srcShape.size())
+      return std::nullopt;
+    if ((*coord)[d] < 0 || (*coord)[d] >= srcShape[s])
+      return std::nullopt;
+    srcCoord[(std::size_t)s] = (*coord)[d];
+  }
+
+  return flatIndex(srcShape, srcCoord);
+}
+
+inline std::optional<int64_t>
+elemThroughReshape(RankedTensorType srcTy, RankedTensorType resTy, int resReg) {
+  int64_t srcCount = 1, resCount = 1;
+  for (int64_t d : srcTy.getShape())
+    srcCount *= d;
+  for (int64_t d : resTy.getShape())
+    resCount *= d;
+  if (srcCount != resCount)
+    return std::nullopt;
+  return flatElemAt(resTy, resReg);
+}
+
+// Which elements one warp of a layout holds, as a set of flat indices.
+std::set<int64_t> elemsOfWarp(RankedTensorType rt, int32_t warp);
+
+// Whether every warp holds the same elements under both layouts, so a
+// shuffle can move them without crossing a warp boundary.
+bool warpsAgree(RankedTensorType srcTy, RankedTensorType resTy,
+                llvm::ArrayRef<int32_t> order);
+
+// Per register, the flat element each lane holds. Costs registers x 32
+// layout applications, so callers that ask repeatedly go through
+// AgpuEmitter::elemsPerLaneOf, which memoises it.
+std::vector<std::vector<int64_t>> elemsPerLane(RankedTensorType rt);
 
 } // namespace mlir::triton::applegpu::bridge
 

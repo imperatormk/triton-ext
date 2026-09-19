@@ -15,6 +15,7 @@
 #include "agpu/bind/SymbolTable.h"
 #include "agpu/core/MemDesc.h"
 #include "agpu/emit/Emit.h"
+#include "agpu/plan/ShufflePlan.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -54,6 +55,13 @@ struct BodyState {
   // Distinguishes the temporaries `offsetSum` mints: what it guarantees is
   // distinctness within a body.
   int64_t tempSeq = 0;
+
+  // Every op-site threadgroup buffer this body declares, summed against the
+  // hardware limit.
+  int64_t threadgroupBytes = 0;
+
+  // Distinguishes one shuffle's declared names from the next.
+  int64_t shuffleSeq = 0;
 
   agpu::msl::Str scope;
 
@@ -316,6 +324,16 @@ private:
   void registerMemDescHandler();
 
   agpu::Decision emitRebindOp(const agpu::OpView &o);
+  agpu::Decision emitRedistribute(const agpu::OpView &o, RankedTensorType srcTy,
+                                  RankedTensorType resTy,
+                                  llvm::ArrayRef<int32_t> order);
+  agpu::ShufflePlan shuffleFor(RankedTensorType srcTy, RankedTensorType resTy,
+                               llvm::ArrayRef<int32_t> order);
+  agpu::Decision emitShuffled(const agpu::OpView &o, RankedTensorType srcTy,
+                              RankedTensorType resTy,
+                              const agpu::ShufflePlan &sp, agpu::ElemType elem);
+  const std::vector<std::vector<int64_t>> &elemsPerLaneOf(RankedTensorType rt);
+  std::map<const void *, std::vector<std::vector<int64_t>>> elemsPerLane_;
   void registerRebindHandler();
 
   // Whether every register of `ty` has a coordinate. The part of

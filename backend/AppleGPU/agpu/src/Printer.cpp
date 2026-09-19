@@ -522,7 +522,17 @@ void Printer::printStmt(const Stmt *s) {
     auto *d = static_cast<const ArrayDecl *>(s);
     indent();
     printType(d->elem);
-    os_ << " " << d->name << "[" << d->count << "];\n";
+    os_ << " " << d->name << "[" << d->count << "]";
+    if (!d->init.empty()) {
+      printWrapped(
+          " = {",
+          [&] {
+            printList(d->init,
+                      [&](const Expr *e, std::size_t) { printExpr(e); });
+          },
+          "}");
+    }
+    os_ << ";\n";
     return;
   }
   case StmtKind::Barrier:

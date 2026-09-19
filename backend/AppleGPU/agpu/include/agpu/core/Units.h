@@ -49,6 +49,9 @@ private:
 
 // ── the hardware budget ───────────────────────────────────────────────────
 
+// What one threadgroup may declare.
+inline constexpr int64_t kTGResidentBudgetBytes = 32768;
+
 // What a core hands out across concurrently resident threadgroups.
 inline constexpr int64_t kTGCoreBudgetBytes = 65536;
 

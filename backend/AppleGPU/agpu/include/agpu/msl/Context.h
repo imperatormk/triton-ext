@@ -79,6 +79,9 @@ public:
   Expr *cast(Type to, Expr *e, Cast::Style s) {
     return make<Cast>(std::move(to), e, s);
   }
+  Expr *bitcast(Type to, Expr *e) {
+    return make<Cast>(std::move(to), e, Cast::Style::Bits);
+  }
   Expr *subscript(Expr *b, Expr *i) { return make<Subscript>(b, i); }
   Expr *member(Expr *b, std::string f) { return make<Member>(b, std::move(f)); }
   Expr *deref(Expr *e) { return make<Deref>(e); }
@@ -96,6 +99,12 @@ public:
 
   Decl *declStmt(Type t, std::string n, Expr *init = nullptr) {
     return make<Decl>(std::move(t), std::move(n), init);
+  }
+  ArrayDecl *arrayDecl(Type elem, std::string n, SmallVec<Expr *, 4> init) {
+    auto *d =
+        make<ArrayDecl>(std::move(elem), std::move(n), (int64_t)init.size());
+    d->init = std::move(init);
+    return d;
   }
   ArrayDecl *arrayDecl(Type elem, std::string n, int64_t count) {
     return make<ArrayDecl>(std::move(elem), std::move(n), count);

@@ -251,6 +251,7 @@ struct ArrayDecl : Stmt {
   Type elem;
   Str name;
   int64_t count = 0;
+  SmallVec<Expr *, 4> init;
   ArrayDecl(Type e, Str n, int64_t c)
       : Stmt(StmtKind::ArrayDecl), elem(std::move(e)), name(std::move(n)),
         count(c) {}

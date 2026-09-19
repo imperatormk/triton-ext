@@ -35,6 +35,10 @@ inline const char *of(int axis) {
 }
 } // namespace comp
 
+namespace simd {
+inline constexpr const char *Shuffle = "simd_shuffle";
+} // namespace simd
+
 } // namespace agpu::msl::builtin
 
 #endif // AGPU_MSL_BUILTINS_H

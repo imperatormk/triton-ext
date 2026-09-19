@@ -315,6 +315,9 @@ private:
   agpu::Decision emitMemDescViewOp(const agpu::OpView &o);
   void registerMemDescHandler();
 
+  agpu::Decision emitRebindOp(const agpu::OpView &o);
+  void registerRebindHandler();
+
   // Whether every register of `ty` has a coordinate. The part of
   // `planTileActions` that no window can change.
   agpu::Decision tileCoordsResolvable(RankedTensorType ty,

@@ -38,6 +38,10 @@ static id<MTLDevice> get_device(void) {
   return g_device;
 }
 
+// The watchdog aborts asynchronously, so a reaped failure is held for the
+// next synchronize to raise.
+static NSError *g_reapError = nil;
+
 // GIL held.
 static void reapInflight(void) {
   while (!g_inflight.empty()) {
@@ -45,6 +49,8 @@ static void reapInflight(void) {
     if (st != MTLCommandBufferStatusCompleted &&
         st != MTLCommandBufferStatusError)
       break;
+    if (st == MTLCommandBufferStatusError && !g_reapError)
+      g_reapError = g_inflight.front().cb.error;
     for (PyObject *o : g_inflight.front().held)
       Py_DECREF(o);
     g_inflight.pop_front();
@@ -62,9 +68,11 @@ static bool sync_gpu(void) {
   [cb waitUntilCompleted];
   Py_END_ALLOW_THREADS;
   reapInflight();
-  if (cb.error) {
+  NSError *failed = cb.error ? cb.error : g_reapError;
+  if (failed) {
     PyErr_Format(PyExc_RuntimeError, "Metal command buffer failed: %s",
-                 cb.error.localizedDescription.UTF8String);
+                 failed.localizedDescription.UTF8String);
+    g_reapError = nil;
     return false;
   }
   return true;

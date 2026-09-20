@@ -45,9 +45,9 @@ static std::optional<agpu::TileView> paddedView(gpu::PaddedSharedEncodingAttr p,
   return v;
 }
 
-// Whether `v` reproduces the encoding's own offset map, over the whole range
-// rather than a sample: an encoding whose addressing this does not model would
-// otherwise silently address the wrong element.
+// Whether `v` reproduces the encoding's own offset map, checked over the whole
+// range: an encoding whose addressing this does not model would otherwise
+// silently address the wrong element.
 static bool viewMatchesLayout(const agpu::TileView &v, gpu::MemDescType mt) {
   MLIRContext *ctx = mt.getContext();
   const LinearLayout ll = gpu::toLinearLayout(mt);

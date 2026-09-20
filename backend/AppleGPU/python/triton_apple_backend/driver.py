@@ -100,7 +100,7 @@ class _NativeRuntime:
 
     def empty_cache(self):
         import numpy as np
-        return self.metal.alloc(256 * 1024 * 1024, np.dtype('int32'))
+        return self.metal.alloc(32 * 1024 * 1024, np.dtype('int32'))
 
     def clear_cache(self, cache):
         import numpy as np

@@ -344,6 +344,10 @@ class MetalBackend(BaseBackend):
 
     def add_stages(self, stages, options, language):
         if language == Language.GLUON:
+            # `compile` indexes the stage list by the source's own extension,
+            # so a Gluon module needs a stage under its name before the one
+            # that lowers it.
+            stages["glir"] = lambda src, meta: src
             stages["ttgir"] = lambda src, meta: self.gluon_to_ttgir(
                 src, meta, options)
         else:

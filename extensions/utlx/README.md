@@ -3,6 +3,32 @@
 This package provides most of the function that Meta's [TLX] does, but without
 any changes to a fork of Triton.
 
+## Install against the Triton that ships with PyTorch
+
+µTLX runs on the stock `triton` wheel PyTorch depends on, with no Triton build
+of your own:
+
+```bash
+pip install torch            # torch 2.14 pulls triton ~=3.8.0
+pip install triton-utlx      # matching the Triton release line
+```
+
+Then import it like any other package, in any order:
+
+```python
+import triton
+import utlx_plugin as tlx
+```
+
+That Triton registers plugins from `TRITON_PLUGIN_PATHS` while `libtriton` is
+imported, rather than from `extend_with`, so the wheel installs a `.pth` that
+sets the variable at interpreter startup. Set `UTLX_NO_AUTOREGISTER=1` to
+disable that and set `TRITON_PLUGIN_PATHS` yourself. It also predates two
+`TritonSemantic` helpers µTLX calls, which `utlx_plugin/_compat.py` supplies.
+
+Build from source, as below, if you need an unreleased Triton or are changing
+the plugin itself.
+
 ## Create a Project Root Directory
 
 ```bash

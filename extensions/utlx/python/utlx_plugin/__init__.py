@@ -97,6 +97,10 @@ __all__ = [
     "vote_ballot_sync",
 ]
 
+# Imported first, ahead of anything that pulls in triton: importing it is the
+# last chance to set TRITON_PLUGIN_PATHS for a pre-`extend_with` Triton, which
+# reads the variable only while its own libtriton is being imported.
+from . import _compat
 from .async_task_utils import async_task, async_tasks
 from .barrier import (
     alloc_barriers,
@@ -186,10 +190,8 @@ from .utility import (
 # Register this module as triton.language.extra.tlx so that
 # `import triton.language.extra.tlx` works without a filesystem symlink.
 # This must happen before importing mxfp8_utils which does that import.
-from pathlib import Path
 import sys as _sys
 import triton.language.extra as _extra
-import triton._C.libtriton as _libtriton
 
 _sys.modules['triton.language.extra.tlx'] = _sys.modules[__name__]
 _extra.tlx = _sys.modules[__name__]
@@ -225,7 +227,7 @@ def _make_tlx_op_builder():
     that exist only on ``gluon_ir.GluonOpBuilder``. A plain ``@triton.jit``
     kernel compiles with ``ir.builder`` (``TritonOpBuilder``), which lacks
     those ops. ``GluonOpBuilder`` subclasses ``TritonOpBuilder`` and also
-    inherits the ``create_utlx_*`` plugin ops, but it *overrides* a number of
+    inherits the ``utlx_*`` plugin ops, but it *overrides* a number of
     shared ops (``create_broadcast``, ``create_cat``, ``create_split``, ...)
     with gluon-specific signatures that are incompatible with the standard
     ``TritonSemantic`` used for regular kernels.
@@ -233,7 +235,7 @@ def _make_tlx_op_builder():
     We therefore derive a class from ``GluonOpBuilder`` that restores the base
     ``TritonOpBuilder`` implementation for every op the gluon builder overrides.
     The result speaks the regular Triton op ABI (so ``TritonSemantic`` and the
-    ``create_utlx_*`` plugin ops work) while still exposing the gluon-exclusive
+    ``utlx_*`` plugin ops work) while still exposing the gluon-exclusive
     ops that tlx needs.
     """
     from triton._C.libtriton import ir as _ir
@@ -321,9 +323,7 @@ def _patch_gluon_builder():
 
 _patch_gluon_builder()
 
-# Register the uTLX plugin library with Triton.
-PLUGIN_DIR = Path(__file__).resolve().parent
-PLUGIN_LIBRARY = PLUGIN_DIR / "libutlx.so"
-_libtriton.passes.plugin.extend_with(str(PLUGIN_LIBRARY))  # adds passes
-_libtriton.ir.extend_dialects_with(str(PLUGIN_LIBRARY))  # adds dialects
-_libtriton.ir.builder.extend_with(str(PLUGIN_LIBRARY))  # adds ops
+PLUGIN_DIR = _compat.PLUGIN_DIR
+PLUGIN_LIBRARY = _compat.PLUGIN_LIBRARY
+_compat.register_plugin(PLUGIN_LIBRARY)
+_compat.install_semantic_helpers()

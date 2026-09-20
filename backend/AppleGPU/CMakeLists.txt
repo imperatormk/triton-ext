@@ -112,13 +112,28 @@ target_compile_options(TritonAppleGPUBackend PRIVATE
 set_source_files_properties(lib/Dialect/TritonAppleGPU/IR/Dialect.cpp
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter")
 
+# The plugin resolves its MLIR and LLVM symbols from the already-loaded
+# libtriton, so it needs no search path of its own. Linking against LLVM's
+# targets would otherwise bake this machine's LLVM directory into the binary,
+# which no other machine has.
 set_target_properties(TritonAppleGPUBackend PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     OUTPUT_NAME "applegpu_backend"
-    CXX_STANDARD 17)
+    CXX_STANDARD 17
+    SKIP_BUILD_RPATH TRUE
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "")
 
 install(TARGETS TritonAppleGPUBackend
         LIBRARY DESTINATION triton_apple_backend)
+
+# These land at the site-packages root rather than inside the package: site.py
+# runs the .pth at interpreter startup, the only point early enough for a
+# Triton that reads TRITON_PLUGIN_PATHS while importing.
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/applegpu_backend.pth"
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/_applegpu_autoregister.py"
+    DESTINATION .)
 
 if(APPLE)
     # The plugin's MLIR symbols are resolved at load from libtriton. This

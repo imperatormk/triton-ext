@@ -1,7 +1,8 @@
-// Atomic handlers: read-modify-write, compare-and-swap, poll.
+// Atomic handlers: read-modify-write, compare-and-swap, poll, load, store.
 #include "AgpuEmitter.h"
 #include "AgpuEnums.h"
 
+#include "agpu/emit/EmitAtomicAccess.h"
 #include "agpu/emit/EmitCas.h"
 #include "agpu/emit/EmitPoll.h"
 
@@ -26,6 +27,34 @@ bool AgpuEmitter::declarePacked16Word(am::Expr *addr, const am::Str &wordName,
                              c.binary(am::BinOp::Ne,
                                       c.binary(am::BinOp::And, asInt, c.lit(2)),
                                       c.lit(0))));
+  cur_->push_back(c.declStmt(
+      wordPtr, wordName,
+      c.cast(wordPtr, c.binary(am::BinOp::And, asInt, c.lit(~(int64_t)3)))));
+  return true;
+}
+
+// A byte or half is reached through its containing word: mask the pointer to
+// the word and shift by the offset the address had within it.
+bool AgpuEmitter::declareSubWord(am::Expr *addr, agpu::SubWord sub,
+                                 const am::Str &wordName,
+                                 const am::Str &shiftName) {
+  if (!addr)
+    return false;
+  am::Context &c = agpu_.context();
+
+  const am::Type sizeT = am::Type::scalar(am::Scalar::U64);
+  const am::Type wordPtr = am::Type::named(am::builtin::atomic::Uint)
+                               .pointerTo(am::AddrSpace::Device);
+
+  am::Expr *asInt = c.cast(sizeT, c.addrOf(addr));
+  const int64_t within = sub == agpu::SubWord::Byte ? 3 : 2;
+
+  cur_->push_back(c.declStmt(
+      am::Type::scalar(am::Scalar::U32), shiftName,
+      c.binary(am::BinOp::Shl,
+               c.cast(am::Type::scalar(am::Scalar::U32),
+                      c.binary(am::BinOp::And, asInt, c.lit(within))),
+               c.lit(3))));
   cur_->push_back(c.declStmt(
       wordPtr, wordName,
       c.cast(wordPtr, c.binary(am::BinOp::And, asInt, c.lit(~(int64_t)3)))));
@@ -312,10 +341,111 @@ agpu::Decision AgpuEmitter::emitAtomicRmwOp(const agpu::OpView &o) {
   return agpu::Decision::emitted();
 }
 
+agpu::Decision AgpuEmitter::emitAtomicAccessOp(const agpu::OpView &o,
+                                               agpu::AtomicAccess kind) {
+  am::Context &mc = agpu_.context();
+  const bool isLoad = kind == agpu::AtomicAccess::Load;
+  const char *what = isLoad ? "tt.atomic_load" : "tt.atomic_store";
+
+  const agpu::ValueId elemOwner = isLoad ? o.results[0] : o.operands[1];
+  const agpu::ElemType *elemP = elemOf(elemOwner);
+  if (!elemP)
+    return declined(what, "the value type was never recorded");
+
+  agpu::AtomicAccessFacts f;
+  f.kind = kind;
+  f.elem = *elemP;
+
+  const agpu::AtomicAccessPlan plan =
+      agpu::planAtomicAccess(f, memOrderOf((triton::MemSemantic)o.intAt(0)));
+  if (!plan.usable)
+    return agpu::atomicAccessDecision(plan);
+
+  const Value ptrV = mlirValueOf(o.operands[0]);
+  auto ptrTy =
+      ptrV ? dyn_cast<RankedTensorType>(ptrV.getType()) : RankedTensorType();
+  const int64_t regs = ptrTy ? registerCount(ptrTy) : 1;
+
+  const std::size_t maskIndex = isLoad ? 1 : 2;
+  Ready ready;
+  if (!isLoad) {
+    ready = readyForCounted(o, 1, 2, regs, "the value has no register names");
+    if (!ready.ok())
+      return ready.why;
+  }
+
+  agpu::AtomicAccessNames nm;
+  const std::string tag =
+      std::to_string(isLoad ? o.results[0] : o.operands[0]) + body_.scope;
+  nm.result = (isLoad ? "atl" : "ats") + tag;
+
+  const am::Type ptrTypeOfPlan = agpu::atomicAccessPtrType(plan);
+  agpu::ValueNames names;
+
+  agpu::emitAtomicAccessFenceBefore(mc, *cur_, plan);
+
+  for (int64_t r = 0; r < regs; ++r) {
+    am::Expr *addr = addressAt(o.operands[0], r);
+    if (!addr)
+      return declined(what, "pointer has no recorded offset");
+
+    const am::Str pn = nm.result + "_p" + std::to_string(r);
+    agpu::AtomicAccessNames rn = nm;
+    rn.result = nm.result + "_" + std::to_string(r);
+    rn.shift = nm.result + "_sh" + std::to_string(r);
+
+    if (plan.sub != agpu::SubWord::None) {
+      if (!declareSubWord(addr, plan.sub, pn, rn.shift))
+        return declined(what, "pointer has no recorded offset");
+    } else {
+      cur_->push_back(mc.declStmt(ptrTypeOfPlan, pn,
+                                  mc.cast(ptrTypeOfPlan, mc.addrOf(addr))));
+    }
+
+    am::Expr *guard = maskAt(o, maskIndex, r);
+    if (isLoad) {
+      cur_->push_back(
+          mc.declStmt(agpu::mslTypeOf(*elemP), rn.result, mc.lit(0)));
+      am::Block body;
+      body.push_back(mc.assign(mc.var(rn.result),
+                               agpu::atomicLoadValue(mc, plan, pn, rn)));
+      mc.guardedInto(*cur_, guard, std::move(body));
+      names.push_back(rn.result);
+      continue;
+    }
+
+    am::Block body;
+    agpu::emitAtomicStoreValue(mc, body, plan, pn, ready.ops[1].at(r), rn);
+    mc.guardedInto(*cur_, guard, std::move(body));
+  }
+
+  agpu::emitAtomicAccessFenceAfter(mc, *cur_, plan);
+
+  if (!isLoad)
+    return agpu::Decision::emitted();
+
+  if (!ptrTy) {
+    body_.sym.bindScalar(o.results[0], names[0]);
+    return agpu::Decision::emitted();
+  }
+  body_.sym.bindRegs(o.results[0], std::move(names));
+  return agpu::Decision::emitted();
+}
+
 void AgpuEmitter::registerAtomicHandlers() {
   table_.add("atomic",
              agpu::forOps({"tt.atomic_rmw"}, [this](const agpu::OpView &o) {
                return emitAtomicRmwOp(o);
+             }));
+
+  table_.add("atomic_access",
+             agpu::forOps({"tt.atomic_load"}, [this](const agpu::OpView &o) {
+               return emitAtomicAccessOp(o, agpu::AtomicAccess::Load);
+             }));
+
+  table_.add("atomic_access_store",
+             agpu::forOps({"tt.atomic_store"}, [this](const agpu::OpView &o) {
+               return emitAtomicAccessOp(o, agpu::AtomicAccess::Store);
              }));
 
   table_.add("cas",

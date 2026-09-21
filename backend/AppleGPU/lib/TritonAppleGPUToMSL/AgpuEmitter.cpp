@@ -221,6 +221,10 @@ agpu::OpView AgpuEmitter::opViewOf(Operation *op) {
     view.ints.push_back((int64_t)rmw.getAtomicRmwOp());
     view.ints.push_back((int64_t)rmw.getSem());
   }
+  if (auto ld = dyn_cast<triton::AtomicLoadOp>(op))
+    view.ints.push_back((int64_t)ld.getSem());
+  if (auto st = dyn_cast<triton::AtomicStoreOp>(op))
+    view.ints.push_back((int64_t)st.getSem());
   if (auto pid = dyn_cast<triton::GetProgramIdOp>(op))
     view.ints.push_back((int64_t)pid.getAxisAsInt());
   if (auto np = dyn_cast<triton::GetNumProgramsOp>(op))

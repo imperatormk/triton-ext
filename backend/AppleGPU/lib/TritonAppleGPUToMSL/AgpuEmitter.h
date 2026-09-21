@@ -29,6 +29,7 @@
 #include "agpu/emit/EmitScan.h"
 #include "agpu/emit/EmitShuffle.h"
 #include "agpu/plan/AccessPlan.h"
+#include "agpu/plan/AtomicAccessPlan.h"
 #include "agpu/plan/BandPlan.h"
 #include "agpu/plan/Coherence.h"
 #include "agpu/plan/LaunchPlan.h"
@@ -607,6 +608,10 @@ private:
                            const agpu::msl::Str &wordName,
                            const agpu::msl::Str &highName);
 
+  bool declareSubWord(agpu::msl::Expr *addr, agpu::SubWord sub,
+                      const agpu::msl::Str &wordName,
+                      const agpu::msl::Str &shiftName);
+
   agpu::msl::Expr *maskAt(const agpu::OpView &o, std::size_t maskIndex,
                           int64_t reg);
   // An i1 conjunction arrives as its conjuncts, for the peel to dedup per term.
@@ -628,6 +633,8 @@ private:
   agpu::Decision emitAtomicRmwOp(const agpu::OpView &o);
   agpu::Decision emitAtomicCasOp(const agpu::OpView &o);
   agpu::Decision emitAtomicPollOp(const agpu::OpView &o);
+  agpu::Decision emitAtomicAccessOp(const agpu::OpView &o,
+                                    agpu::AtomicAccess kind);
 
   agpu::Decision emitGridQueryOp(const agpu::OpView &o);
   agpu::Decision emitSplatOp(const agpu::OpView &o);

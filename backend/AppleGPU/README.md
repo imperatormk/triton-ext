@@ -2,7 +2,7 @@
 
 Out-of-tree Apple GPU backend for the Triton compiler, built as a triton-ext
 plugin. Codegen lowers TTGIR straight to Metal Shading Language (MSL) text,
-which is compiled to a `.metallib` in-process via the Metal framework.
+which `xcrun metal` and `xcrun metallib` compile to a `.metallib`.
 
 ## Architecture
 
@@ -27,6 +27,16 @@ triton-ext/backend/AppleGPU/
 macOS 14+ with Xcode, for the Metal framework and clang. Everything else (LLVM,
 Triton, cmake, ninja) is the repo-wide setup in the
 [top-level README](../../README.md).
+
+The Metal toolchain (`xcrun metal`, `xcrun metallib`) must be installed, since
+that is what produces the `.metallib`. On Xcode 16 and later it is a separate
+download: `xcodebuild -downloadComponent MetalToolchain`. Building the library
+in-process instead fails to load on macOS 26.
+
+On Xcode 27, `xcrun metal` reports
+`cannot execute tool 'metal' due to missing Metal Toolchain` even once the
+component is installed, because the default toolchain does not delegate to the
+mounted one. Set `TOOLCHAINS=Metal` to pick it up.
 
 ### Metal version and hardware
 
@@ -102,6 +112,16 @@ assert (out - (x + y)).abs().max().item() == 0.0
 print("vecadd ok")
 ```
 
+### Embedding the runtime
+
+Two things a host driving the runtime itself has to match, both of which
+otherwise fail quietly:
+
+- Scalar arguments are packed into one buffer, not a slot each, so an adapter
+  that binds them per slot reads zeros. See `_pack_scalars` in `driver.py`.
+- `metal_native` dispatches on the command queue it owns, so a host sharing
+  buffers has to order its own queue against that one first.
+
 ## What's included
 
 ### C++ MLIR Passes
@@ -153,7 +173,9 @@ that `llvm.intr.assume` and `ub.poison` are both handled: the first becomes a
 
 - `float64` - Metal has no double, so an f64 kernel silently computes in f32.
   The narrowing carries a decline note; see `narrowsSilently` in
-  `agpu/include/agpu/plan/ElemType.h`.
+  `agpu/include/agpu/plan/ElemType.h`. An f64 scalar argument is passed whole
+  and narrowed on the device from its two words, so its value is the one the
+  caller gave, rounded once to f32.
 - `float8` (e4m3, e5m2) - kernels compile and run when fp8 crosses the boundary
   as uint8 storage plus `triton.reinterpret`, which is what Triton's own fp8
   tests do. A native `torch.float8_*` device tensor is not possible: torch MPS

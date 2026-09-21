@@ -316,6 +316,17 @@ int main() {
     CHECK(!plain.has(Helper::Erf));
   }
 
+  CASE("an f64 argument is narrowed from its two words, never loaded as one");
+  {
+    const std::string body = helperSource(Helper::NarrowF64);
+    CHECK_HAS(body, "uint hi");
+    CHECK_HAS(body, "uint lo");
+    CHECK_LACKS(body, "double");
+    // 1023 - 127 is the whole of the conversion: re-bias, then round.
+    CHECK_HAS(body, "1023");
+    CHECK_HAS(body, "127");
+  }
+
   CASE("an f32 fma pulls in the soft path it falls back to");
   {
     HelperSet hs;

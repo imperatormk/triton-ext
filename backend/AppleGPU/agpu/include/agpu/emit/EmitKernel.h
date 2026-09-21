@@ -67,11 +67,25 @@ inline void emitArgUnpack(msl::Context &c, msl::Block &body,
     if (abi.placements[i].slot != ArgSlot::ArgBuffer)
       continue;
     const msl::Type ty = mslTypeOf(args[i].elem);
-    msl::Expr *addr = c.binary(msl::BinOp::Add, c.var(nm.argBuffer),
-                               c.lit(abi.placements[i].offset));
+    const auto at = [&](int64_t extra) {
+      return c.binary(msl::BinOp::Add, c.var(nm.argBuffer),
+                      c.lit(abi.placements[i].offset + extra));
+    };
+    // The host writes eight bytes for an f64 and Metal has no type to read
+    // them back as, so the two words are narrowed to f32 instead.
+    const ElemType &e = args[i].elem;
+    if (e.kind == ElemType::Kind::Float && e.bits == 64) {
+      const msl::Type ptr = msl::Type::scalar(msl::Scalar::U32)
+                                .pointerTo(msl::AddrSpace::Constant);
+      body.push_back(c.declStmt(
+          ty, args[i].name,
+          c.call(msl::builtin::helper::NarrowF64,
+                 {c.deref(c.cast(ptr, at(4))), c.deref(c.cast(ptr, at(0)))})));
+      continue;
+    }
     body.push_back(c.declStmt(
         ty, args[i].name,
-        c.deref(c.cast(ty.pointerTo(msl::AddrSpace::Constant), addr))));
+        c.deref(c.cast(ty.pointerTo(msl::AddrSpace::Constant), at(0)))));
   }
 }
 

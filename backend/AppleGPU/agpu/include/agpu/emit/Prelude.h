@@ -397,6 +397,121 @@ inline msl::Function *recordAppender(msl::Context &c, const char *name,
   return fn;
 }
 
+// An f64 argument, narrowed to f32. Metal has no double, so the value never
+// exists as a float: it arrives as its two words and the result is built from
+// the bit pattern, rounded nearest-even.
+inline msl::Function *narrowF64(msl::Context &c) {
+  const msl::Type f32 = msl::Type::scalar(msl::Scalar::F32);
+  const msl::Type u32 = msl::Type::scalar(msl::Scalar::U32);
+  const msl::Type i32 = msl::Type::scalar(msl::Scalar::I32);
+  const msl::Type u64 = msl::Type::scalar(msl::Scalar::U64);
+
+  msl::Function *fn = helperFn(c, hn::NarrowF64, f32);
+  fn->params.push_back({u32, "hi", {}});
+  fn->params.push_back({u32, "lo", {}});
+
+  msl::Expr *const hi = c.var("hi");
+  msl::Expr *const E = c.var("E");
+  msl::Expr *const q = c.var("q");
+  msl::Expr *const sig = c.var("sig");
+  const auto u64lit = [&](uint64_t v) {
+    return c.cast(u64, c.lit((int64_t)v));
+  };
+  const auto shlOne = [&](msl::Expr *by) {
+    return c.binary(msl::BinOp::Shl, u64lit(1), by);
+  };
+  const auto signBit = [&] {
+    return c.binary(msl::BinOp::And, hi, c.litHex(0x80000000));
+  };
+
+  fn->body.push_back(c.declStmt(
+      u32, "ex",
+      c.binary(msl::BinOp::And, c.binary(msl::BinOp::Shr, hi, c.lit(20)),
+               c.litHex(0x7ff))));
+  fn->body.push_back(
+      c.declStmt(u64, "mant",
+                 c.binary(msl::BinOp::Or,
+                          c.binary(msl::BinOp::Shl,
+                                   c.cast(u64, c.binary(msl::BinOp::And, hi,
+                                                        c.litHex(0xfffff))),
+                                   c.lit(32)),
+                          c.cast(u64, c.var("lo")))));
+
+  fn->body.push_back(c.ifStmt(
+      c.binary(msl::BinOp::Eq, c.var("ex"), c.litHex(0x7ff)),
+      {c.returnStmt(c.bitcast(
+          f32,
+          c.binary(msl::BinOp::Or, signBit(),
+                   c.ternary(c.binary(msl::BinOp::Ne, c.var("mant"), u64lit(0)),
+                             c.litHex(0x7fc00000), c.litHex(0x7f800000)))))}));
+  // A subnormal f64 is far below the smallest f32, so it joins zero here.
+  fn->body.push_back(
+      c.ifStmt(c.binary(msl::BinOp::Eq, c.var("ex"), c.lit(0, u32)),
+               {c.returnStmt(c.bitcast(f32, signBit()))}));
+
+  fn->body.push_back(c.declStmt(
+      i32, "E",
+      c.binary(msl::BinOp::Sub, c.cast(i32, c.var("ex")), c.lit(1023))));
+  fn->body.push_back(
+      c.ifStmt(c.binary(msl::BinOp::Gt, E, c.lit(127)),
+               {c.returnStmt(c.bitcast(f32, c.binary(msl::BinOp::Or, signBit(),
+                                                     c.litHex(0x7f800000))))}));
+
+  fn->body.push_back(c.declStmt(
+      u64, "sig", c.binary(msl::BinOp::Or, shlOne(c.lit(52)), c.var("mant"))));
+  // 29 = 52 - 23: the mantissa keeps 24 bits, and widens below the normal
+  // range where the quantum is fixed at 2^-149.
+  fn->body.push_back(c.declStmt(
+      i32, "shift",
+      c.ternary(c.binary(msl::BinOp::Ge, E, c.lit(-126)), c.lit(29),
+                c.binary(msl::BinOp::Add, c.lit(29),
+                         c.binary(msl::BinOp::Sub, c.lit(-126), E)))));
+  fn->body.push_back(
+      c.ifStmt(c.binary(msl::BinOp::Gt, c.var("shift"), c.lit(54)),
+               {c.returnStmt(c.bitcast(f32, signBit()))}));
+
+  fn->body.push_back(
+      c.declStmt(u64, "q", c.binary(msl::BinOp::Shr, sig, c.var("shift"))));
+  fn->body.push_back(c.declStmt(
+      u64, "rem",
+      c.binary(msl::BinOp::And, sig,
+               c.binary(msl::BinOp::Sub, shlOne(c.var("shift")), u64lit(1)))));
+  fn->body.push_back(c.declStmt(
+      u64, "hb", shlOne(c.binary(msl::BinOp::Sub, c.var("shift"), c.lit(1)))));
+  fn->body.push_back(c.ifStmt(
+      c.binary(msl::BinOp::LOr,
+               c.binary(msl::BinOp::Gt, c.var("rem"), c.var("hb")),
+               c.binary(msl::BinOp::LAnd,
+                        c.binary(msl::BinOp::Eq, c.var("rem"), c.var("hb")),
+                        c.binary(msl::BinOp::And, q, u64lit(1)))),
+      {c.assign(q, c.binary(msl::BinOp::Add, q, u64lit(1)))}));
+
+  msl::Block normal;
+  normal.push_back(c.ifStmt(
+      c.binary(msl::BinOp::Ge, q, shlOne(c.lit(24))),
+      {c.assign(q, c.binary(msl::BinOp::Shr, q, c.lit(1))),
+       c.assign(E, c.binary(msl::BinOp::Add, E, c.lit(1))),
+       c.ifStmt(
+           c.binary(msl::BinOp::Gt, E, c.lit(127)),
+           {c.returnStmt(c.bitcast(f32, c.binary(msl::BinOp::Or, signBit(),
+                                                 c.litHex(0x7f800000))))})}));
+  normal.push_back(c.returnStmt(c.bitcast(
+      f32, c.binary(msl::BinOp::Or,
+                    c.binary(msl::BinOp::Or, signBit(),
+                             c.binary(msl::BinOp::Shl,
+                                      c.cast(u32, c.binary(msl::BinOp::Add, E,
+                                                           c.lit(127))),
+                                      c.lit(23))),
+                    c.binary(msl::BinOp::And, c.cast(u32, q),
+                             c.litHex(0x7fffff))))));
+
+  fn->body.push_back(c.ifElse(
+      c.binary(msl::BinOp::Eq, c.var("shift"), c.lit(29)), std::move(normal),
+      {c.returnStmt(c.bitcast(
+          f32, c.binary(msl::BinOp::Or, signBit(), c.cast(u32, q))))}));
+  return fn;
+}
+
 // Rounds sign * sig * 2^exp to f32, nearest-even. `sig` is nonzero and below
 // 2^63; bit 0 of it carries the sticky bit of everything already shifted out.
 inline msl::Function *softFmaPacker(msl::Context &c) {
@@ -1310,6 +1425,10 @@ inline std::string helperSource(Helper h) {
         {"site", "pid", "tid"},
         {assertFieldWord(AssertField::Site), assertFieldWord(AssertField::Pid),
          assertFieldWord(AssertField::Tid)}));
+  }
+  case Helper::NarrowF64: {
+    msl::Context c;
+    return renderHelper(narrowF64(c));
   }
   case Helper::SoftFma: {
     msl::Context c;

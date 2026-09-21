@@ -129,6 +129,9 @@ LogicalResult AgpuEmitter::bindArgs(triton::FuncOp func,
       return failure();
     }
     ka.elem = *elem;
+    if (!ka.isPointer && elem->kind == agpu::ElemType::Kind::Float &&
+        elem->bits == 64)
+      agpu_.helpers.add(agpu::Helper::NarrowF64);
     args.push_back(ka);
 
     body_.sym.bindScalar(idOf(arg), ka.name);

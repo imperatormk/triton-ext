@@ -26,6 +26,7 @@ HELPER(Fp8UnpackE5B16)
 HELPER(Fp4Unpack)
 HELPER(PrintAppend)
 HELPER(AssertRecord)
+HELPER(NarrowF64)
 HELPER(SoftFma)
 HELPER(Fma)
 

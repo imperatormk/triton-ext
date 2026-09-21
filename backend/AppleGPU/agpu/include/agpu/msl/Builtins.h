@@ -163,8 +163,8 @@ inline constexpr const char *Fp8UnpackE5B16 = "__agpu_e5b16_to_f32";
 inline constexpr const char *Fp4Unpack = "__agpu_e2m1_to_f32";
 inline constexpr const char *PrintAppend = "__agpu_print_append";
 inline constexpr const char *AssertRecord = "__agpu_assert_record";
+inline constexpr const char *NarrowF64 = "__agpu_f64_to_f32";
 inline constexpr const char *SoftFma = "__agpu_soft_fma";
-// Defined inside SoftFma's body, which is its only caller.
 inline constexpr const char *SoftFmaPack = "__agpu_soft_fma_pack";
 inline constexpr const char *Fma = "__agpu_fma";
 } // namespace helper

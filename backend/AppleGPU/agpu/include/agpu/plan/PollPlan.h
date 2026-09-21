@@ -21,11 +21,10 @@ namespace agpu {
 struct PollFacts {
   unsigned bits = 32;   // width of the flag
   bool acquire = false; // the poll carries acquire semantics
-  // A timeout poll tests once and reports; a plain one spins.
+  // A timeout poll tests once and reports; a plain one spins. Apple GPUs
+  // expose no in-shader clock, so the budget itself is never measured: the
+  // op asks for one load even at zero, which is what a spent budget gets.
   bool hasTimeout = false;
-  // A budget the IR asks to be measured. Apple GPUs expose no in-shader
-  // clock, so only a zero budget can be honoured.
-  bool timedBudget = false;
 };
 
 // Metal's atomic loads are 32-bit only. AtomicWord is
@@ -46,8 +45,6 @@ struct PollPlan {
   // Acquire ordering on the barrier, when the IR asked for it.
   bool acquire = false;
 
-  bool timed = false;
-
   bool usable = false;
 };
 
@@ -55,10 +52,6 @@ inline PollPlan planPoll(const PollFacts &f) {
   PollPlan p;
   p.acquire = f.acquire;
   p.spins = !f.hasTimeout;
-  if (f.timedBudget) {
-    p.timed = true;
-    return p;
-  }
 
   // A poll only loads, so unlike the CAS path it can read a 64-bit word.
   switch (accessFor(f.bits)) {
@@ -84,9 +77,6 @@ inline PollPlan planPoll(const PollFacts &f) {
 inline Decision pollDecision(const PollPlan &p) {
   if (p.usable)
     return Decision::emitted();
-  if (p.timed)
-    return Decision::declined("emitAtomicPoll",
-                              "no in-shader clock to measure a timeout");
   return Decision::declined("emitAtomicPoll", "no flag load at this width");
 }
 

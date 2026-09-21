@@ -144,6 +144,14 @@ int main() {
     CHECK_HAS(render(body), "mem_device");
   }
 
+  CASE("a timeout poll is planned whatever the budget, since one load is the "
+       "floor the op asks for");
+  {
+    PollPlan p = planPoll(pollOf(32, /*timeout=*/true));
+    CHECK(p.usable);
+    CHECK(!p.spins);
+  }
+
   CASE("a timeout poll tests once and emits no loop");
   {
     msl::Context c;

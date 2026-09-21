@@ -79,12 +79,6 @@ agpu::Decision AgpuEmitter::emitAtomicPollOp(const agpu::OpView &o) {
   f.bits = want->bits;
   f.acquire = poll.getSem() == triton::MemSemantic::ACQUIRE;
   f.hasTimeout = poll.getTimeout() ? true : false;
-  // A zero budget is a single load, which needs no clock. Any other budget
-  // has to be measured, and nothing on the device can measure it.
-  if (Value timeout = poll.getTimeout()) {
-    APInt ns;
-    f.timedBudget = !matchPattern(timeout, m_ConstantInt(&ns)) || !ns.isZero();
-  }
 
   const agpu::PollPlan plan = agpu::planPoll(f);
   if (!plan.usable)

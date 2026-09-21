@@ -182,11 +182,17 @@ class MetalBackend(BaseBackend):
             st = PLUGIN_LIBRARY.stat()
             h.update(
                 f"{PLUGIN_LIBRARY}:{st.st_size}:{st.st_mtime_ns}".encode())
-        h.update(__file__.encode())
-        try:
-            h.update(str(os.stat(__file__).st_mtime_ns).encode())
-        except OSError:
-            pass
+        # The whole package, since a libdevice stub is inlined into the kernel
+        # and a cached entry would otherwise outlive the source it came from.
+        for name in sorted(os.listdir(os.path.dirname(__file__))):
+            if not name.endswith('.py'):
+                continue
+            path = os.path.join(os.path.dirname(__file__), name)
+            h.update(name.encode())
+            try:
+                h.update(str(os.stat(path).st_mtime_ns).encode())
+            except OSError:
+                pass
         return f"msl-v0.1-{h.hexdigest()[:16]}"
 
     def make_ttir(self, mod, metadata, options):

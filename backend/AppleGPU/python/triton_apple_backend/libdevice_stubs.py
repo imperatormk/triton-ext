@@ -610,14 +610,20 @@ def _nextafter(x, y):
 
 @triton.jit
 def _ilogb(x):
-    # Read the exponent field directly. A subnormal carries a zero field, so it
-    # is scaled into the normal range first and the shift taken back off.
-    ax = tl.abs(x)
-    sub = (ax < 1.1754943508222875e-38) & (ax > 0.0)
-    scaled = tl.where(sub, ax * 16777216.0, ax)
-    bits = scaled.to(tl.float32, bitcast=True).to(tl.int32, bitcast=True)
-    e = ((bits >> 23) & 0xFF) - 127
-    return tl.where(sub, e - 24, e).to(tl.int32)
+    # The ALU reads a subnormal operand as zero, so every test here is on the
+    # bit pattern: comparing or scaling the value would classify one as zero.
+    mag = x.to(tl.float32).to(tl.int32, bitcast=True) & 0x7FFFFFFF
+    e = (mag >> 23) - 127
+    # A subnormal's exponent is the position of its highest set bit.
+    lead = 0
+    m = mag
+    for shift in tl.static_range(4, -1, -1):
+        step = 1 << shift
+        wide = m >= (1 << step)
+        lead += tl.where(wide, step, 0)
+        m = tl.where(wide, m >> step, m)
+    sub = tl.where(mag == 0, -2147483648, lead - 149)
+    return tl.where(mag < 0x00800000, sub, e).to(tl.int32)
 
 
 @triton.jit

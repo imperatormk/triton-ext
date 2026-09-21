@@ -49,23 +49,41 @@ agpu::Decision AgpuEmitter::emitAtomicPollOp(const agpu::OpView &o) {
   agpu::PollFacts f;
   f.bits = want->bits;
   f.acquire = poll.getSem() == triton::MemSemantic::ACQUIRE;
-  // Presence only: a timeout poll tests once and reports what it saw. The
-  // duration is not honoured.
   f.hasTimeout = poll.getTimeout() ? true : false;
+  // A zero budget is a single load, which needs no clock. Any other budget
+  // has to be measured, and nothing on the device can measure it.
+  if (Value timeout = poll.getTimeout()) {
+    APInt ns;
+    f.timedBudget = !matchPattern(timeout, m_ConstantInt(&ns)) || !ns.isZero();
+  }
 
   const agpu::PollPlan plan = agpu::planPoll(f);
   if (!plan.usable)
     return pollDecision(plan);
 
+  const Value ptrV = mlirValueOf(o.operands[0]);
+  auto ptrTy =
+      ptrV ? dyn_cast<RankedTensorType>(ptrV.getType()) : RankedTensorType();
+  const int64_t regs = ptrTy ? registerCount(ptrTy) : 1;
+
   const Ready ready =
-      readyForCounted(o, 0, 2, 1, "an operand has no register name");
+      readyForCounted(o, 0, 2, regs, "an operand has no register name");
   if (!ready.ok())
     return ready.why;
   const Operand &expected = ready.ops[1];
 
-  am::Expr *addr = addressAt(o.operands[0], 0);
-  if (!addr)
-    return declined("tt.atomic_poll", "pointer has no recorded offset");
+  agpu::ReplicaMap replicas;
+  if (ptrTy)
+    replicas.regFree = freeBitsOf(gpu::toLinearLayout(ptrTy),
+                                  ptrTy.getContext(), lldim::Register);
+
+  // A poll only loads, so replicated threads can read their own element
+  // instead of waiting on an elected one. Only a uniform pointer, whose
+  // answer has to cross warps, still elects.
+  agpu::AddressSpread spread = spreadOf(ptrV);
+  spread.laneFree = 0;
+  spread.warpFree = 0;
+  const agpu::ThreadElection election = agpu::electFor(spread);
 
   agpu::PollNames nm;
   const std::string tag = std::to_string(o.results[0]) + body_.scope;
@@ -74,29 +92,54 @@ agpu::Decision AgpuEmitter::emitAtomicPollOp(const agpu::OpView &o) {
   nm.result = "ready" + tag;
   nm.flag = "seen" + tag;
 
-  // Empty at every width but 16-bit; emitPoll reads empty as "flag
-  // occupies the whole word".
-  am::Str isHigh;
-  if (plan.load == agpu::PollLoad::PackedHalf) {
-    isHigh = "hi" + tag;
-    if (!declarePacked16Word(addr, nm.ptr, isHigh))
+  const am::Type wantTy = agpu::mslTypeOf(*want);
+  am::SmallVec<am::Str, 8> ptrs, expecteds, highs;
+  for (int64_t r = 0; r < regs; ++r) {
+    if (replicas.isReplica((int)r)) {
+      ptrs.push_back({});
+      expecteds.push_back({});
+      highs.push_back({});
+      continue;
+    }
+    am::Expr *addr = addressAt(o.operands[0], r);
+    if (!addr)
       return declined("tt.atomic_poll", "pointer has no recorded offset");
-  } else {
-    const am::Type wordPtr = agpu::pollPtrType(plan);
-    cur_->push_back(
-        mc.declStmt(wordPtr, nm.ptr, mc.cast(wordPtr, mc.addrOf(addr))));
+
+    const am::Str pn = nm.ptr + "_" + std::to_string(r);
+    am::Str isHigh;
+    if (plan.load == agpu::PollLoad::PackedHalf) {
+      isHigh = "hi" + tag + "_" + std::to_string(r);
+      if (!declarePacked16Word(addr, pn, isHigh))
+        return declined("tt.atomic_poll", "pointer has no recorded offset");
+    } else {
+      const am::Type wordPtr = agpu::pollPtrType(plan);
+      cur_->push_back(
+          mc.declStmt(wordPtr, pn, mc.cast(wordPtr, mc.addrOf(addr))));
+    }
+
+    const am::Str en = nm.expected + "_" + std::to_string(r);
+    cur_->push_back(mc.declStmt(wantTy, en, mc.var(expected.at(r))));
+
+    ptrs.push_back(pn);
+    expecteds.push_back(en);
+    highs.push_back(isHigh);
   }
 
-  cur_->push_back(
-      mc.declStmt(agpu::mslTypeOf(*want), nm.expected, mc.var(expected.at(0))));
+  const am::SmallVec<am::Str, 8> outs = agpu::emitPollTensor(
+      mc, *cur_, plan, nm, ptrs, expecteds, replicas, election, highs,
+      [&](int64_t) { return agpu::electionExpr(mc, election, nm); });
+  if (outs.size() != (std::size_t)regs)
+    return declined("tt.atomic_poll", "the emitter refused the plan");
 
-  const agpu::Decision d = agpu::emitPoll(mc, *cur_, plan, nm, isHigh);
-  if (!d.ok())
-    return d;
+  if (!ptrTy) {
+    body_.sym.bindScalar(o.results[0], outs[0]);
+    return agpu::Decision::emitted();
+  }
 
-  // Scalar bool regardless of pointer layout: the poll runs once per
-  // threadgroup.
-  body_.sym.bindScalar(o.results[0], nm.result);
+  agpu::ValueNames names;
+  for (int64_t r = 0; r < regs; ++r)
+    names.push_back(outs[(std::size_t)r]);
+  body_.sym.bindRegs(o.results[0], std::move(names));
   return agpu::Decision::emitted();
 }
 

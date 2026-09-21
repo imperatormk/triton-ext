@@ -145,12 +145,22 @@ inline msl::Expr *mathExpr(msl::Context &c, MathFn3 fn, msl::Expr *a,
   return c.call(mathNameOf(fn), {a, b, d});
 }
 
+// `metal::fma` flushes a subnormal operand or result to zero, so f32 goes
+// through the helper that falls back to integer arithmetic there.
+inline msl::Expr *mathExpr(msl::Context &c, MathFn3 fn, ElemType elem,
+                           msl::Expr *a, msl::Expr *b, msl::Expr *d) {
+  if (fn == MathFn3::Fma && elem.kind == ElemType::Kind::Float &&
+      elem.bits == 32)
+    return c.call(msl::builtin::helper::Fma, {a, b, d});
+  return mathExpr(c, fn, a, b, d);
+}
+
 // `metal::clamp` drops NaN like min/max do. Under `propagateNan` the tested
 // value is returned instead; it is a name, since it is mentioned twice.
 inline msl::Expr *clampExpr(msl::Context &c, MathFn3 fn, ElemType elem,
                             const msl::Str &v, msl::Expr *lo, msl::Expr *hi,
                             bool propagateNan) {
-  msl::Expr *call = mathExpr(c, fn, c.var(v), lo, hi);
+  msl::Expr *call = mathExpr(c, fn, elem, c.var(v), lo, hi);
   if (!math3PropagatesNan(fn, elem, propagateNan))
     return call;
   return c.ternary(isNanExpr(c, c.var(v)), c.var(v), call);

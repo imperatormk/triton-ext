@@ -222,6 +222,7 @@ agpu::Decision AgpuEmitter::emitMath3Op(const agpu::OpView &o) {
   const agpu::Decision d = agpu::checkMath3(m->fn, ready.elem);
   if (!d.ok())
     return d;
+  agpu_.helpers.require(m->fn, ready.elem);
 
   const Operand &v0 = ready[0];
   const Operand &v1 = ready[1];

@@ -316,5 +316,46 @@ int main() {
     CHECK(!plain.has(Helper::Erf));
   }
 
+  CASE("an f32 fma pulls in the soft path it falls back to");
+  {
+    HelperSet hs;
+    hs.require(MathFn3::Fma, f32());
+    CHECK(hs.has(Helper::Fma));
+    CHECK(hs.has(Helper::SoftFma));
+
+    HelperSet other;
+    other.require(MathFn3::Clamp, f32());
+    CHECK(!other.has(Helper::Fma));
+    other.require(MathFn3::Fma, f16());
+    CHECK(!other.has(Helper::Fma));
+  }
+
+  CASE("the soft path is defined before the fma that calls it");
+  {
+    CHECK((unsigned)Helper::SoftFma < (unsigned)Helper::Fma);
+  }
+
+  CASE("a subnormal operand or result leaves the hardware fma");
+  {
+    const std::string body = helperSource(Helper::Fma);
+    CHECK_HAS(body, "metal::fma");
+    CHECK_HAS(body, helperName(Helper::SoftFma));
+    // Operands and result each get their own test: a flushed operand can
+    // leave a result that looks perfectly normal.
+    std::size_t tests = 0;
+    for (std::size_t at = body.find("0x7f800000u) == 0u");
+         at != std::string::npos; at = body.find("0x7f800000u) == 0u", at + 1))
+      ++tests;
+    CHECK_EQ(tests, 4u);
+  }
+
+  CASE("the soft path never reaches the hardware fma");
+  {
+    const std::string body = helperSource(Helper::SoftFma);
+    CHECK_LACKS(body, "metal::fma");
+    CHECK_HAS(body, "ulong");
+    CHECK_HAS(body, "metal::clz");
+  }
+
   return ::agpu_test::report("Prelude");
 }

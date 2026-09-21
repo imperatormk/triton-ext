@@ -129,6 +129,14 @@ public:
       add(h);
   }
 
+  void require(MathFn3 fn, ElemType elem) {
+    if (fn != MathFn3::Fma || elem.kind != ElemType::Kind::Float ||
+        elem.bits != 32)
+      return;
+    add(Helper::Fma);
+    add(Helper::SoftFma);
+  }
+
   void require(const ConvertPlan &p) {
     Helper h;
     if (!convertHelper(p, h))
@@ -386,6 +394,368 @@ inline msl::Function *recordAppender(msl::Context &c, const char *name,
     fn->body.push_back(
         c.exprStmt(c.call(at::Store, {c.add(c.var("rec"), c.lit(offsets[i])),
                                       c.var(fields[i]), relaxed})));
+  return fn;
+}
+
+// Rounds sign * sig * 2^exp to f32, nearest-even. `sig` is nonzero and below
+// 2^63; bit 0 of it carries the sticky bit of everything already shifted out.
+inline msl::Function *softFmaPacker(msl::Context &c) {
+  const msl::Type f32 = msl::Type::scalar(msl::Scalar::F32);
+  const msl::Type u32 = msl::Type::scalar(msl::Scalar::U32);
+  const msl::Type i32 = msl::Type::scalar(msl::Scalar::I32);
+  const msl::Type u64 = msl::Type::scalar(msl::Scalar::U64);
+
+  msl::Function *fn = helperFn(c, hn::SoftFmaPack, f32);
+  fn->params.push_back({u32, "sign", {}});
+  fn->params.push_back({i32, "exp", {}});
+  fn->params.push_back({u64, "sig", {}});
+
+  msl::Expr *const sign = c.var("sign");
+  msl::Expr *const exp = c.var("exp");
+  msl::Expr *const sig = c.var("sig");
+  msl::Expr *const E = c.var("E");
+  msl::Expr *const shift = c.var("shift");
+  msl::Expr *const q = c.var("q");
+
+  const auto u64lit = [&](uint64_t v) {
+    return c.cast(u64, c.lit((int64_t)v));
+  };
+  const auto one64 = [&] { return u64lit(1); };
+  const auto shlOne = [&](msl::Expr *by) {
+    return c.binary(msl::BinOp::Shl, one64(), by);
+  };
+  const auto signBit = [&] {
+    return c.binary(msl::BinOp::Shl, sign, c.lit(31));
+  };
+
+  fn->body.push_back(c.declStmt(
+      u32, "lz", c.cast(u32, c.call(msl::builtin::math::Clz, {sig}))));
+  fn->body.push_back(
+      c.assign(sig, c.binary(msl::BinOp::Shl, sig, c.var("lz"))));
+  fn->body.push_back(
+      c.assign(exp, c.binary(msl::BinOp::Sub, exp, c.cast(i32, c.var("lz")))));
+  fn->body.push_back(
+      c.declStmt(i32, "E", c.binary(msl::BinOp::Add, exp, c.lit(63))));
+
+  // 40 = 63 - 23: the leading bit sits at 63 and the mantissa keeps 24 bits.
+  // Below the normal range the quantum is fixed at 2^-149, so the shift widens
+  // by however far the exponent falls short.
+  fn->body.push_back(c.declStmt(
+      i32, "shift",
+      c.ternary(c.binary(msl::BinOp::Ge, E, c.lit(-126)), c.lit(40),
+                c.binary(msl::BinOp::Add, c.lit(40),
+                         c.binary(msl::BinOp::Sub, c.lit(-126), E)))));
+  fn->body.push_back(c.ifStmt(c.binary(msl::BinOp::Gt, shift, c.lit(64)),
+                              {c.returnStmt(c.bitcast(f32, signBit()))}));
+
+  fn->body.push_back(c.declStmt(u64, "q"));
+  fn->body.push_back(c.declStmt(u64, "rem"));
+  fn->body.push_back(c.declStmt(u64, "hb"));
+  fn->body.push_back(c.ifElse(
+      c.binary(msl::BinOp::Eq, shift, c.lit(64)),
+      {c.assign(q, u64lit(0)), c.assign(c.var("rem"), sig),
+       c.assign(c.var("hb"), shlOne(c.lit(63)))},
+      {c.assign(q, c.binary(msl::BinOp::Shr, sig, shift)),
+       c.assign(c.var("rem"),
+                c.binary(msl::BinOp::And, sig,
+                         c.binary(msl::BinOp::Sub, shlOne(shift), one64()))),
+       c.assign(c.var("hb"),
+                shlOne(c.binary(msl::BinOp::Sub, shift, c.lit(1))))}));
+
+  fn->body.push_back(c.ifStmt(
+      c.binary(msl::BinOp::LOr,
+               c.binary(msl::BinOp::Gt, c.var("rem"), c.var("hb")),
+               c.binary(msl::BinOp::LAnd,
+                        c.binary(msl::BinOp::Eq, c.var("rem"), c.var("hb")),
+                        c.binary(msl::BinOp::And, q, one64()))),
+      {c.assign(q, c.binary(msl::BinOp::Add, q, one64()))}));
+
+  msl::Block normal;
+  normal.push_back(
+      c.ifStmt(c.binary(msl::BinOp::Ge, q, shlOne(c.lit(24))),
+               {c.assign(q, c.binary(msl::BinOp::Shr, q, c.lit(1))),
+                c.assign(E, c.binary(msl::BinOp::Add, E, c.lit(1)))}));
+  normal.push_back(
+      c.declStmt(i32, "be", c.binary(msl::BinOp::Add, E, c.lit(127))));
+  normal.push_back(
+      c.ifStmt(c.binary(msl::BinOp::Ge, c.var("be"), c.lit(255)),
+               {c.returnStmt(c.bitcast(f32, c.binary(msl::BinOp::Or, signBit(),
+                                                     c.litHex(0x7f800000))))}));
+  normal.push_back(c.returnStmt(c.bitcast(
+      f32, c.binary(msl::BinOp::Or,
+                    c.binary(msl::BinOp::Or, signBit(),
+                             c.binary(msl::BinOp::Shl, c.cast(u32, c.var("be")),
+                                      c.lit(23))),
+                    c.binary(msl::BinOp::And, c.cast(u32, q),
+                             c.litHex(0x7fffff))))));
+
+  // A subnormal target already has the quantum built in, so the rounded
+  // integer is the whole field and a carry lands in the exponent by itself.
+  fn->body.push_back(
+      c.ifElse(c.binary(msl::BinOp::Eq, shift, c.lit(40)), std::move(normal),
+               {c.returnStmt(c.bitcast(f32, c.binary(msl::BinOp::Or, signBit(),
+                                                     c.cast(u32, q))))}));
+  return fn;
+}
+
+// fma with every step in integer arithmetic. The ALU flushes subnormals in
+// and out, so a operand or result in that range has to avoid it entirely:
+// the 24x24 product is exact in 64 bits, the addend is aligned into the same
+// frame, and the single rounding happens on the integer significand.
+inline msl::Function *softFma(msl::Context &c) {
+  const msl::Type f32 = msl::Type::scalar(msl::Scalar::F32);
+  const msl::Type u32 = msl::Type::scalar(msl::Scalar::U32);
+  const msl::Type i32 = msl::Type::scalar(msl::Scalar::I32);
+  const msl::Type u64 = msl::Type::scalar(msl::Scalar::U64);
+  const msl::Type b = msl::Type::scalar(msl::Scalar::Bool);
+
+  msl::Function *fn = helperFn(c, hn::SoftFma, f32);
+  fn->params.push_back({f32, "a", {}});
+  fn->params.push_back({f32, "b", {}});
+  fn->params.push_back({f32, "c", {}});
+
+  const auto u64lit = [&](uint64_t v) {
+    return c.cast(u64, c.lit((int64_t)v));
+  };
+  const auto bitsOf = [&](const char *v) { return c.bitcast(u32, c.var(v)); };
+  const auto magOf = [&](const char *v) {
+    return c.binary(msl::BinOp::And, bitsOf(v), c.litHex(0x7fffffff));
+  };
+  const auto expField = [&](const char *v) {
+    return c.binary(msl::BinOp::And,
+                    c.binary(msl::BinOp::Shr, bitsOf(v), c.lit(23)),
+                    c.litHex(0xff));
+  };
+  const auto isNan = [&](const char *v) {
+    return c.binary(msl::BinOp::Gt, magOf(v), c.litHex(0x7f800000));
+  };
+  const auto isZero = [&](const char *v) {
+    return c.binary(msl::BinOp::Eq, magOf(v), c.lit(0, u32));
+  };
+  const auto quietNan = [&] { return c.bitcast(f32, c.litHex(0x7fc00000)); };
+
+  // sign, exponent and integer significand of each operand.
+  for (const char *v : {"a", "b", "c"}) {
+    const std::string s = std::string("s") + v;
+    const std::string e = std::string("e") + v;
+    const std::string m = std::string("m") + v;
+    fn->body.push_back(
+        c.declStmt(u32, s, c.binary(msl::BinOp::Shr, bitsOf(v), c.lit(31))));
+    fn->body.push_back(c.declStmt(u32, e + "f", expField(v)));
+    fn->body.push_back(
+        c.declStmt(u32, m + "f",
+                   c.binary(msl::BinOp::And, bitsOf(v), c.litHex(0x7fffff))));
+    fn->body.push_back(c.declStmt(
+        i32, e,
+        c.ternary(c.binary(msl::BinOp::Eq, c.var(e + "f"), c.lit(0, u32)),
+                  c.lit(-149),
+                  c.binary(msl::BinOp::Sub, c.cast(i32, c.var(e + "f")),
+                           c.lit(150)))));
+    fn->body.push_back(c.declStmt(
+        u32, m,
+        c.ternary(
+            c.binary(msl::BinOp::Eq, c.var(e + "f"), c.lit(0, u32)),
+            c.var(m + "f"),
+            c.binary(msl::BinOp::Or, c.var(m + "f"), c.litHex(0x800000)))));
+  }
+
+  // Inf and NaN never reach the hardware fma: it would read a subnormal
+  // operand as zero and turn inf*subnormal into a NaN.
+  msl::Block spec;
+  spec.push_back(c.ifStmt(
+      c.binary(msl::BinOp::LOr,
+               c.binary(msl::BinOp::LOr, isNan("a"), isNan("b")), isNan("c")),
+      {c.returnStmt(quietNan())}));
+  spec.push_back(c.declStmt(
+      u32, "ps", c.binary(msl::BinOp::Xor, c.var("sa"), c.var("sb"))));
+  spec.push_back(c.declStmt(
+      b, "ainf", c.binary(msl::BinOp::Eq, c.var("eaf"), c.litHex(0xff))));
+  spec.push_back(c.declStmt(
+      b, "binf", c.binary(msl::BinOp::Eq, c.var("ebf"), c.litHex(0xff))));
+  spec.push_back(c.declStmt(
+      b, "cinf", c.binary(msl::BinOp::Eq, c.var("ecf"), c.litHex(0xff))));
+  spec.push_back(
+      c.ifStmt(c.binary(msl::BinOp::LOr,
+                        c.binary(msl::BinOp::LAnd, c.var("ainf"), isZero("b")),
+                        c.binary(msl::BinOp::LAnd, c.var("binf"), isZero("a"))),
+               {c.returnStmt(quietNan())}));
+  spec.push_back(c.ifStmt(
+      c.binary(msl::BinOp::LOr, c.var("ainf"), c.var("binf")),
+      {c.ifStmt(c.binary(msl::BinOp::LAnd, c.var("cinf"),
+                         c.binary(msl::BinOp::Ne, c.var("sc"), c.var("ps"))),
+                {c.returnStmt(quietNan())}),
+       c.returnStmt(c.bitcast(
+           f32, c.binary(msl::BinOp::Or,
+                         c.binary(msl::BinOp::Shl, c.var("ps"), c.lit(31)),
+                         c.litHex(0x7f800000))))}));
+  spec.push_back(c.returnStmt(c.var("c")));
+
+  fn->body.push_back(c.ifStmt(
+      c.binary(msl::BinOp::LOr,
+               c.binary(msl::BinOp::LOr,
+                        c.binary(msl::BinOp::Eq, c.var("eaf"), c.litHex(0xff)),
+                        c.binary(msl::BinOp::Eq, c.var("ebf"), c.litHex(0xff))),
+               c.binary(msl::BinOp::Eq, c.var("ecf"), c.litHex(0xff))),
+      std::move(spec)));
+
+  fn->body.push_back(c.declStmt(
+      u32, "ps", c.binary(msl::BinOp::Xor, c.var("sa"), c.var("sb"))));
+  fn->body.push_back(
+      c.declStmt(u64, "pm",
+                 c.binary(msl::BinOp::Mul, c.cast(u64, c.var("ma")),
+                          c.cast(u64, c.var("mb")))));
+  fn->body.push_back(c.declStmt(
+      i32, "pe", c.binary(msl::BinOp::Add, c.var("ea"), c.var("eb"))));
+  fn->body.push_back(c.declStmt(u64, "cm", c.cast(u64, c.var("mc"))));
+
+  fn->body.push_back(
+      c.ifStmt(c.binary(msl::BinOp::Eq, c.var("pm"), u64lit(0)),
+               {c.ifStmt(c.binary(msl::BinOp::Eq, c.var("cm"), u64lit(0)),
+                         {c.returnStmt(c.bitcast(
+                             f32, c.binary(msl::BinOp::Shl,
+                                           c.binary(msl::BinOp::And,
+                                                    c.var("ps"), c.var("sc")),
+                                           c.lit(31))))}),
+                c.returnStmt(c.var("c"))}));
+  fn->body.push_back(c.ifStmt(
+      c.binary(msl::BinOp::Eq, c.var("cm"), u64lit(0)),
+      {c.returnStmt(
+          c.call(hn::SoftFmaPack, {c.var("ps"), c.var("pe"), c.var("pm")}))}));
+
+  // Both terms move into one frame. Bit 0 is left free so everything shifted
+  // out of it can be OR'd back as a sticky bit for the rounding decision.
+  fn->body.push_back(c.declStmt(
+      i32, "E0",
+      c.binary(msl::BinOp::Sub,
+               c.call(msl::builtin::math::Min, {c.var("pe"), c.var("ec")}),
+               c.lit(1))));
+  fn->body.push_back(c.declStmt(
+      i32, "spm", c.binary(msl::BinOp::Sub, c.var("pe"), c.var("E0"))));
+  fn->body.push_back(c.declStmt(
+      i32, "scm", c.binary(msl::BinOp::Sub, c.var("ec"), c.var("E0"))));
+  fn->body.push_back(
+      c.declStmt(i32, "over",
+                 c.call(msl::builtin::math::Max,
+                        {c.binary(msl::BinOp::Sub, c.var("spm"), c.lit(14)),
+                         c.binary(msl::BinOp::Sub, c.var("scm"), c.lit(38))})));
+  fn->body.push_back(c.ifStmt(
+      c.binary(msl::BinOp::Gt, c.var("over"), c.lit(0)),
+      {c.assign(c.var("E0"),
+                c.binary(msl::BinOp::Add, c.var("E0"), c.var("over"))),
+       c.assign(c.var("spm"),
+                c.binary(msl::BinOp::Sub, c.var("spm"), c.var("over"))),
+       c.assign(c.var("scm"),
+                c.binary(msl::BinOp::Sub, c.var("scm"), c.var("over")))}));
+
+  fn->body.push_back(c.declStmt(b, "sticky", c.litBool(false)));
+  const auto alignInto = [&](const char *dst, const char *src, const char *by) {
+    msl::Block down;
+    down.push_back(c.declStmt(i32, std::string(by) + "n",
+                              c.unary(msl::UnOp::Neg, c.var(by))));
+    msl::Block wide;
+    wide.push_back(
+        c.assign(c.var("sticky"),
+                 c.binary(msl::BinOp::LOr, c.var("sticky"),
+                          c.binary(msl::BinOp::Ne, c.var(src), u64lit(0)))));
+    wide.push_back(c.assign(c.var(dst), u64lit(0)));
+    msl::Block part;
+    part.push_back(c.assign(
+        c.var("sticky"),
+        c.binary(
+            msl::BinOp::LOr, c.var("sticky"),
+            c.binary(msl::BinOp::Ne,
+                     c.binary(msl::BinOp::And, c.var(src),
+                              c.binary(msl::BinOp::Sub,
+                                       c.binary(msl::BinOp::Shl, u64lit(1),
+                                                c.var(std::string(by) + "n")),
+                                       u64lit(1))),
+                     u64lit(0)))));
+    part.push_back(
+        c.assign(c.var(dst), c.binary(msl::BinOp::Shr, c.var(src),
+                                      c.var(std::string(by) + "n"))));
+    down.push_back(c.ifElse(
+        c.binary(msl::BinOp::Ge, c.var(std::string(by) + "n"), c.lit(64)),
+        std::move(wide), std::move(part)));
+    return c.ifElse(c.binary(msl::BinOp::Ge, c.var(by), c.lit(0)),
+                    {c.assign(c.var(dst), c.binary(msl::BinOp::Shl, c.var(src),
+                                                   c.var(by)))},
+                    std::move(down));
+  };
+  fn->body.push_back(c.declStmt(u64, "P"));
+  fn->body.push_back(c.declStmt(u64, "Q"));
+  fn->body.push_back(alignInto("P", "pm", "spm"));
+  fn->body.push_back(alignInto("Q", "cm", "scm"));
+
+  fn->body.push_back(c.declStmt(u64, "sig"));
+  fn->body.push_back(c.declStmt(u32, "sign"));
+  const auto carrySticky = [&](const char *v) {
+    return c.ifStmt(
+        c.var("sticky"),
+        {c.assign(c.var(v), c.binary(msl::BinOp::Sub, c.var(v), u64lit(1))),
+         c.assign(c.var(v), c.binary(msl::BinOp::Or, c.var(v), u64lit(1)))});
+  };
+  msl::Block same;
+  same.push_back(c.assign(c.var("sig"),
+                          c.binary(msl::BinOp::Add, c.var("P"), c.var("Q"))));
+  same.push_back(c.assign(c.var("sign"), c.var("ps")));
+  same.push_back(
+      c.ifStmt(c.var("sticky"),
+               {c.assign(c.var("sig"),
+                         c.binary(msl::BinOp::Or, c.var("sig"), u64lit(1)))}));
+  msl::Block diff;
+  diff.push_back(
+      c.ifElse(c.binary(msl::BinOp::Ge, c.var("P"), c.var("Q")),
+               {c.assign(c.var("sig"),
+                         c.binary(msl::BinOp::Sub, c.var("P"), c.var("Q"))),
+                c.assign(c.var("sign"), c.var("ps")), carrySticky("sig")},
+               {c.assign(c.var("sig"),
+                         c.binary(msl::BinOp::Sub, c.var("Q"), c.var("P"))),
+                c.assign(c.var("sign"), c.var("sc")), carrySticky("sig")}));
+  fn->body.push_back(
+      c.ifElse(c.binary(msl::BinOp::Eq, c.var("ps"), c.var("sc")),
+               std::move(same), std::move(diff)));
+
+  fn->body.push_back(c.ifStmt(c.binary(msl::BinOp::Eq, c.var("sig"), u64lit(0)),
+                              {c.returnStmt(c.bitcast(f32, c.lit(0, u32)))}));
+  fn->body.push_back(c.returnStmt(
+      c.call(hn::SoftFmaPack, {c.var("sign"), c.var("E0"), c.var("sig")})));
+  return fn;
+}
+
+// The hardware fma, except where a subnormal could reach it. Checking the
+// result alone is not enough: a subnormal operand is read as zero, so a
+// vanished product leaves a normal-looking answer that no result test catches.
+inline msl::Function *guardedFma(msl::Context &c) {
+  const msl::Type f32 = msl::Type::scalar(msl::Scalar::F32);
+  const msl::Type u32 = msl::Type::scalar(msl::Scalar::U32);
+  const msl::Type b = msl::Type::scalar(msl::Scalar::Bool);
+
+  msl::Function *fn = helperFn(c, hn::Fma, f32);
+  fn->params.push_back({f32, "a", {}});
+  fn->params.push_back({f32, "b", {}});
+  fn->params.push_back({f32, "c", {}});
+
+  const auto expOf = [&](const char *v) {
+    return c.binary(msl::BinOp::And, c.bitcast(u32, c.var(v)),
+                    c.litHex(0x7f800000));
+  };
+  const auto flushed = [&](const char *v) {
+    return c.binary(msl::BinOp::Eq, expOf(v), c.lit(0, u32));
+  };
+
+  fn->body.push_back(c.declStmt(
+      f32, "r",
+      c.call(msl::builtin::math::Fma, {c.var("a"), c.var("b"), c.var("c")})));
+  fn->body.push_back(c.declStmt(
+      b, "bad",
+      c.binary(msl::BinOp::LOr,
+               c.binary(msl::BinOp::LOr,
+                        c.binary(msl::BinOp::LOr, flushed("a"), flushed("b")),
+                        flushed("c")),
+               flushed("r"))));
+  fn->body.push_back(c.returnStmt(c.ternary(
+      c.var("bad"), c.call(hn::SoftFma, {c.var("a"), c.var("b"), c.var("c")}),
+      c.var("r"))));
   return fn;
 }
 
@@ -940,6 +1310,14 @@ inline std::string helperSource(Helper h) {
         {"site", "pid", "tid"},
         {assertFieldWord(AssertField::Site), assertFieldWord(AssertField::Pid),
          assertFieldWord(AssertField::Tid)}));
+  }
+  case Helper::SoftFma: {
+    msl::Context c;
+    return renderHelper(softFmaPacker(c)) + "\n" + renderHelper(softFma(c));
+  }
+  case Helper::Fma: {
+    msl::Context c;
+    return renderHelper(guardedFma(c));
   }
   case Helper::Count:
     break;

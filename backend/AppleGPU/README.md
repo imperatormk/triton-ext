@@ -126,11 +126,12 @@ otherwise fail quietly:
 
 ### C++ MLIR Passes
 
-| Pass                       | Purpose                                                 |
-| -------------------------- | ------------------------------------------------------- |
-| `add_accelerate_matmul`    | Rewrite tt.dot → AppleMmaEncoding (simdgroup MMA)       |
-| `add_store_shuffle_layout` | Re-lay MMA epilogue stores as within-simdgroup shuffles |
-| `add_emit_msl`             | Emit MSL text from TTGIR (terminal codegen)             |
+| Pass                        | Purpose                                                 |
+| --------------------------- | ------------------------------------------------------- |
+| `add_accelerate_matmul`     | Rewrite tt.dot → AppleMmaEncoding (simdgroup MMA)       |
+| `add_store_shuffle_layout`  | Re-lay MMA epilogue stores as within-simdgroup shuffles |
+| `add_mask_select_arm_loads` | Mask loads feeding one select arm with its condition    |
+| `add_emit_msl`              | Emit MSL text from TTGIR (terminal codegen)             |
 
 ### TritonAppleGPU Dialect
 

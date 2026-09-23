@@ -15,6 +15,10 @@ static void addStoreShuffleLayout(mlir::PassManager *pm,
                                   const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createStoreShuffleLayoutPass());
 }
+static void addMaskSelectArmLoads(mlir::PassManager *pm,
+                                  const std::vector<std::string> &) {
+  pm->addPass(mlir::triton::applegpu::createMaskSelectArmLoadsPass());
+}
 static void addEmitMSL(mlir::PassManager *pm,
                        const std::vector<std::string> &args) {
   pm->addPass(mlir::triton::applegpu::createEmitMSLPass(
@@ -29,6 +33,11 @@ static void registerAccelerateMatmul() {
 static void registerStoreShuffleLayout() {
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return mlir::triton::applegpu::createStoreShuffleLayoutPass();
+  });
+}
+static void registerMaskSelectArmLoads() {
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::triton::applegpu::createMaskSelectArmLoadsPass();
   });
 }
 static void registerEmitMSL() {
@@ -49,6 +58,8 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
        registerAccelerateMatmul},
       {"store_shuffle_layout", "0.1.0", addStoreShuffleLayout,
        registerStoreShuffleLayout},
+      {"mask_select_arm_loads", "0.1.0", addMaskSelectArmLoads,
+       registerMaskSelectArmLoads},
       {"emit_msl", "0.1.0", addEmitMSL, registerEmitMSL},
   };
 

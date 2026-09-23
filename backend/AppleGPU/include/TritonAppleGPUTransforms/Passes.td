@@ -38,6 +38,22 @@ def StoreShuffleLayout : Pass<"triton-apple-store-shuffle-layout", "mlir::Module
   ];
 }
 
+def MaskSelectArmLoads : Pass<"triton-apple-mask-select-arm-loads", "mlir::ModuleOp"> {
+  let summary = "Mask loads that only feed one arm of a select with its condition";
+
+  let description = [{
+    Inductor lowers select_backward, stack and similar ops to a sum of
+    `where(c_i, f_i(load_i), 0)`, loading every input for every element. A
+    load whose value only reaches one arm of a select gets that arm's
+    condition in its mask, so lanes that discard the arm skip the access.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
 def EmitMSL : Pass<"triton-apple-emit-msl", "mlir::ModuleOp"> {
   let summary = "Emit Metal Shading Language from TTGIR";
 

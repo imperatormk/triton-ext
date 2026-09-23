@@ -8,6 +8,7 @@ namespace mlir::triton::applegpu {
 
 std::unique_ptr<mlir::Pass> createAccelerateAppleMatmulPass();
 std::unique_ptr<mlir::Pass> createStoreShuffleLayoutPass();
+std::unique_ptr<mlir::Pass> createMaskSelectArmLoadsPass();
 
 } // namespace mlir::triton::applegpu
 

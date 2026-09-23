@@ -209,6 +209,8 @@ class MetalBackend(BaseBackend):
         passes.common.add_licm(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
+        _plugin.add_mask_select_arm_loads(pm)
+        passes.common.add_cse(pm)
         pm.run(mod, 'make_ttir')
         if options.enable_reflect_ftz:
             mod.set_attr(_REFLECT_FTZ_ATTR,

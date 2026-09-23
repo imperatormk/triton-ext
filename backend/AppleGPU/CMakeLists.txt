@@ -88,6 +88,7 @@ add_mlir_library(TritonAppleGPUBackend
     ${TO_MSL}/AgpuHandlersValue.cpp
     ${TO_MSL}/AgpuLayout.cpp
     ${TO_MSL}/AgpuPool.cpp
+    ${TO_MSL}/AgpuPredicate.cpp
     ${TO_MSL}/AgpuRegions.cpp
     ${TO_MSL}/AgpuValues.cpp
 

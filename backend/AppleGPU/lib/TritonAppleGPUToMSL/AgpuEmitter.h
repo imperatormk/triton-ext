@@ -208,6 +208,14 @@ private:
 
   agpu::Decision walkOp(Operation *op);
   agpu::OpView opViewOf(Operation *op);
+
+  struct PredicatedArms {
+    std::array<std::vector<Operation *>, 2> cones;
+  };
+  llvm::DenseMap<Operation *, PredicatedArms> predicated_;
+  llvm::DenseSet<Operation *> deferred_;
+  void planPredicatedArms(Block &block);
+  agpu::Decision emitPredicatedSelect(Operation *sel);
   void traceOp(Operation *op, const agpu::OpView &view);
 
   RegionSources regionSourcesOf(ValueRange srcs, ResultRange results,

@@ -291,12 +291,15 @@ agpu::Decision AgpuEmitter::walkBlock(Block &block, am::Block &out) {
   // Coordinates respelled inside this block are not visible outside it.
   const llvm::scope_exit epochs(
       [this, depth = body_.hoist.depth()] { body_.hoist.popTo(depth); });
+  planPredicatedArms(block);
   for (Operation &op : block) {
     // By name: `hasTrait` compares a TypeID the plugin and the host generate
     // separately, so it answers false wherever they do not share one.
-    if (agpu::isTerminator(opName(&op)))
+    if (agpu::isTerminator(opName(&op)) || deferred_.count(&op))
       continue;
-    if (const agpu::Decision d = walkOp(&op); !d.ok())
+    const agpu::Decision d =
+        predicated_.count(&op) ? emitPredicatedSelect(&op) : walkOp(&op);
+    if (!d.ok())
       return d;
   }
   return agpu::Decision::emitted();

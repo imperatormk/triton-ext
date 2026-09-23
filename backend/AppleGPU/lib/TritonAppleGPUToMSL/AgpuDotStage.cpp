@@ -36,11 +36,15 @@ void AgpuEmitter::tagDotNames(agpu::DotInputs &in) {
 }
 
 agpu::Decision AgpuEmitter::namePoolRegions(const agpu::Plan &plan,
+                                            Operation *dot,
                                             agpu::DotInputs &in) {
   // B and C are regions of the threadgroup buffer carved by `walkOp`; this
   // handler only names them.
   const agpu::MmaNames mnm;
-  const am::Str bBuf = body_.pool.use(mnm.poolB);
+  const auto resident = body_.residentBuf.find({dot, 1});
+  const am::Str bBuf = resident != body_.residentBuf.end()
+                           ? resident->second
+                           : body_.pool.use(mnm.poolB);
   const bool cThroughPool = plan.cThroughPool();
   const am::Str cBuf = cThroughPool ? body_.pool.use(mnm.poolC) : am::Str();
   if (bBuf.empty() || (cThroughPool && cBuf.empty()))
@@ -89,12 +93,15 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
       return d;
   } else {
     const agpu::MmaNames mnm;
-    const am::Str aBuf = body_.pool.use(mnm.poolA);
+    const auto resident = body_.residentBuf.find({ops.op, 0});
+    const bool aResident = resident != body_.residentBuf.end();
+    const am::Str aBuf =
+        aResident ? resident->second : body_.pool.use(mnm.poolA);
     if (aBuf.empty())
       return declined("tt.dot",
                       "a pool region this dot stages through was never carved");
     in.direct.poolA = in.panel.poolA = aBuf;
-    if (!stagesPerTile) {
+    if (!stagesPerTile && !aResident) {
       // `aStaged` is the plan's staged view; its row stride carries the bank
       // pad that simdgroup_load reads at.
       if (const agpu::Decision d =
@@ -110,11 +117,12 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
   }
 
   if (!stagesPerTile) {
-    if (const agpu::Decision d =
-            stageWholeTensor(ops.bStage, ops.bStageTy, in.panel.poolB, bStaged,
-                             stagedBElem, "tt.dot", "a B");
-        !d.ok())
-      return d;
+    if (!body_.residentBuf.count({ops.op, 1}))
+      if (const agpu::Decision d =
+              stageWholeTensor(ops.bStage, ops.bStageTy, in.panel.poolB,
+                               bStaged, stagedBElem, "tt.dot", "a B");
+          !d.ok())
+        return d;
     cur_->push_back(agpu_.context().barrier());
   }
 
@@ -134,7 +142,7 @@ agpu::Decision AgpuEmitter::stageDotOperands(const DotOperands &ops,
   declareAccumulatorRegisters(ops, plan);
   tagDotNames(in);
 
-  if (const agpu::Decision d = namePoolRegions(plan, in); !d.ok())
+  if (const agpu::Decision d = namePoolRegions(plan, ops.op, in); !d.ok())
     return d;
 
   const agpu::ElemType stagedAElem = stagedElemOf(plan, ops.shape.aElem);

@@ -78,15 +78,14 @@ int main() {
 
   CASE("a pool that only costs occupancy is not refused");
   {
-    // The core budget is twice the per-threadgroup cap.
     FunctionPool p = planFunctionPool({req("dot", kTGResidentBudgetBytes)});
     CHECK(poolDecision(p).ok());
-    CHECK_EQ(tgResidency(p.total().count()), 2);
+    CHECK_EQ(tgResidency(p.total().count()), 1);
 
     FunctionPool tight = planFunctionPool({req("dot", 20000)}, Bytes(12000));
     CHECK(poolDecision(tight).ok());
     CHECK(tight.total() == Bytes(32000));
-    CHECK_EQ(tgResidency(tight.total().count()), 2);
+    CHECK_EQ(tgResidency(tight.total().count()), 1);
   }
 
   CASE("the limit reflects the hardware itself");

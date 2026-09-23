@@ -175,6 +175,7 @@ struct DotShape {
 
 struct DotOperands {
   DotShape shape;
+  Operation *op = nullptr;
 
   // Not the operand itself when a `convert_layout` fronts it: staging
   // addresses by element index, so that round trip is one the scatter undoes.

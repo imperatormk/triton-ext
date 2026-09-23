@@ -337,6 +337,32 @@ int main() {
     CHECK_EQ(actions.back().width, 4);
   }
 
+  CASE("registers clear of the lane bits store off one shared base");
+  {
+    msl::Context c;
+    CoordSource cs = twoDim();
+    cs.dims[0].reg = {4, 8};
+    TileView pa = TileView::rowMajor({16, 32});
+    msl::SmallVec<StageAction, 8> actions;
+    msl::SmallVec<msl::Str, 8> names;
+    for (int r = 0; r < 4; ++r) {
+      names.push_back("v" + std::to_string(r));
+      actions.push_back(*planStage(r, {{ROW, 0, 15}, {COL, 0, 31}},
+                                   {{ROW, 0, 16}, {COL, 0, 32}}, {4 * r, 0}));
+    }
+    msl::Block body;
+    emitStage(c, body, pa, "pA", actions, names, cs, f16());
+    const std::string out = render(body);
+    CHECK_HAS(out, ")[0] = v0;");
+    CHECK_HAS(out, ")[128] = v1;");
+    CHECK_HAS(out, ")[384] = v3;");
+
+    cs.dims[0].reg = {1, 4};
+    msl::Block overlapping;
+    emitStage(c, overlapping, pa, "pA", actions, names, cs, f16());
+    CHECK_EQ(countOf(render(overlapping), ")["), 0);
+  }
+
   CASE("a strided destination dimension refuses the merge");
   {
     // The registers walk rows: adjacent in the tensor, 16 slots apart in

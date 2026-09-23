@@ -75,6 +75,17 @@ struct LiveBuffer {
   agpu::msl::Str decl;
 };
 
+struct ResidentOperand {
+  Operation *dot = nullptr;
+  int which = 0;
+  Value source;
+  scf::ForOp loop;
+  agpu::ElemType elem;
+  agpu::TileView view;
+  int64_t bytes = 0;
+  int buffer = 0;
+};
+
 struct BodyState {
   BodyState() = default;
   BodyState(const agpu::SymbolTable &afterArgs,
@@ -104,6 +115,8 @@ struct BodyState {
   std::set<agpu::ValueId> absorbedInto;
   std::set<Operation *> absorbedOps;
   std::vector<FusedDot> fusedDots;
+
+  std::map<std::pair<Operation *, int>, agpu::msl::Str> residentBuf;
 
   agpu::SymbolTable sym;
 
@@ -252,6 +265,9 @@ private:
   // Pre-pass facts only: clamp targets and live buffer bytes. Pool
   // scratch is sized from what the built bodies used.
   void scanPool(triton::FuncOp func);
+
+  void planResidentOperands(triton::FuncOp func);
+  void stageResidentOperands(scf::ForOp loop);
 
   agpu::DebugBinding printBindingOf(triton::FuncOp func);
 
@@ -559,7 +575,8 @@ private:
 
   void tagDotNames(agpu::DotInputs &in);
 
-  agpu::Decision namePoolRegions(const agpu::Plan &plan, agpu::DotInputs &in);
+  agpu::Decision namePoolRegions(const agpu::Plan &plan, Operation *dot,
+                                 agpu::DotInputs &in);
 
   static agpu::ElemType stagedElemOf(const agpu::Plan &plan,
                                      const agpu::ElemType &operand);
@@ -808,6 +825,8 @@ private:
   llvm::DenseSet<Value> clampPoison_;
 
   llvm::DenseMap<Operation *, bool> cDirectOf_;
+
+  std::vector<ResidentOperand> residents_;
 
   std::map<agpu::ValueId, std::vector<ConstantValue>> constantFor_;
 

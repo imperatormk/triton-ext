@@ -366,6 +366,7 @@ LogicalResult AgpuEmitter::emit() {
   clampOf_.clear();
   clampPoison_.clear();
   cDirectOf_.clear();
+  residents_.clear();
   for (auto func : mod_.getOps<triton::FuncOp>())
     scanPool(func);
 

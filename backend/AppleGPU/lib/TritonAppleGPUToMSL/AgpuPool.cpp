@@ -132,9 +132,9 @@ PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
     // Otherwise the plan's numbers: staged operands with bank pad and fragment
     // alignment, and C's reservation, a whole tile when it fits and a band when
     // it does not.
-    if (plan.stage.a > agpu::Bytes(0))
+    if (plan.stage.a > agpu::Bytes(0) && !body_.residentBuf.count({dot, 0}))
       need.add(mnm.poolA, aElem, plan.stage.a.count());
-    if (plan.stage.b > agpu::Bytes(0))
+    if (plan.stage.b > agpu::Bytes(0) && !body_.residentBuf.count({dot, 1}))
       need.add(mnm.poolB, bElem, plan.stage.b.count());
     // Size and placement both come from the plan: a fused C overlays the
     // operands at the pool's base.
@@ -274,6 +274,164 @@ void AgpuEmitter::scanPool(triton::FuncOp func) {
     if (e && agpu::electFor(spreadOf(rmw.getPtr())).crossesWarp())
       agpu_.pool.live(agpu::Bytes(agpu::byteWidthOf(*e)));
   });
+
+  planResidentOperands(func);
+}
+
+void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
+  if (!func.isPublic())
+    return;
+  std::vector<ResidentOperand> found;
+  int buffers = 0;
+  func.walk([&](triton::DotOp dot) {
+    auto loop = dot->getParentOfType<scf::ForOp>();
+    if (!loop)
+      return;
+    const DotShape shape = dotShapeOf(dot);
+    if (!shape.aTy)
+      return;
+    // The planner may turn a device-direct A back into a staged one.
+    const agpu::Plan plan = agpu_.planFor(dotFactsOf(shape));
+    const agpu::DotFacts &f = plan.facts;
+    if (plan.kind == agpu::Plan::Kind::Panel)
+      return;
+    const bool pad = plan.padStagedC();
+    for (int which = 0; which < 2; ++which) {
+      if (which == 0 && f.aDirect)
+        continue;
+      const agpu::Bytes stage = which == 0 ? plan.stage.a : plan.stage.b;
+      const Value source = throughLayoutChange(dot->getOperand(which));
+      if (stage <= agpu::Bytes(0) || !isa<RankedTensorType>(source.getType()) ||
+          !loop.isDefinedOutsideOfLoop(source))
+        continue;
+
+      ResidentOperand r;
+      r.dot = dot;
+      r.which = which;
+      r.source = source;
+      r.loop = loop;
+      r.elem = stagedElemOf(plan, which == 0 ? shape.aElem : shape.bElem);
+      r.view =
+          which == 0
+              ? agpu::stagedOperandView(f, f.M, f.K, f.aElemBytes, pad)
+              : agpu::stagedOperandView(f, f.K, agpu::fragAlignedExtent(f.N),
+                                        f.bElemBytes, pad);
+      r.bytes = stage.count();
+      r.buffer = -1;
+      for (const ResidentOperand &o : found)
+        if (o.source == r.source && o.loop == r.loop && o.elem == r.elem &&
+            o.view == r.view && o.bytes == r.bytes) {
+          r.buffer = o.buffer;
+          break;
+        }
+      if (r.buffer < 0)
+        r.buffer = buffers++;
+      found.push_back(r);
+    }
+  });
+
+  const auto peakWith = [&](const std::vector<ResidentOperand> &cands,
+                            int keep) {
+    for (const ResidentOperand &r : cands)
+      if (r.buffer < keep)
+        body_.residentBuf[{r.dot, r.which}] = "";
+    int64_t peak = 0;
+    func.walk([&](Operation *op) {
+      if (op == func.getOperation())
+        return;
+      int64_t seq = 0, base = 0;
+      for (const PoolNeed::Region &r : poolNeedOf(op).regions)
+        if (r.atBase)
+          base = std::max(base, r.alignedBytes());
+        else
+          seq += r.alignedBytes();
+      peak = std::max({peak, seq, base});
+    });
+    body_.residentBuf.clear();
+    std::map<int, int64_t> bytes;
+    for (const ResidentOperand &r : cands)
+      if (r.buffer < keep)
+        bytes[r.buffer] = r.bytes;
+    for (const auto &[b, n] : bytes)
+      peak += n;
+    return peak;
+  };
+
+  const int64_t live = agpu_.pool.plan().live.count();
+  const auto fit = [&](std::vector<ResidentOperand> cands) {
+    std::map<int, int> ids;
+    for (ResidentOperand &r : cands)
+      r.buffer = ids.try_emplace(r.buffer, (int)ids.size()).first->second;
+    int keep = (int)ids.size();
+    while (keep > 0 &&
+           peakWith(cands, keep) > agpu::kTGResidentBudgetBytes - live)
+      --keep;
+    llvm::erase_if(cands,
+                   [&](const ResidentOperand &r) { return r.buffer >= keep; });
+    return cands;
+  };
+
+  // One invariant operand per loop does not spill; only more is worth a
+  // resident threadgroup.
+  std::map<Operation *, std::set<int>> perLoop;
+  for (ResidentOperand r : found)
+    perLoop[r.loop.getOperation()].insert(r.buffer);
+  std::vector<ResidentOperand> chosen = fit(found);
+  if (agpu::tgResidency(peakWith(chosen, buffers) + live) <
+      agpu::tgResidency(peakWith(found, 0) + live)) {
+    llvm::erase_if(found, [&](ResidentOperand r) {
+      return perLoop[r.loop.getOperation()].size() < 2;
+    });
+    chosen = fit(found);
+  }
+
+  std::set<int> reserved;
+  for (const ResidentOperand &r : chosen) {
+    if (reserved.insert(r.buffer).second)
+      agpu_.pool.live(agpu::Bytes(r.bytes));
+    residents_.push_back(r);
+  }
+}
+
+void AgpuEmitter::stageResidentOperands(scf::ForOp loop) {
+  if (!body_.declaresThreadgroup)
+    return;
+  am::Context &mc = agpu_.context();
+  std::map<int, am::Str> staged;
+  std::set<int> failed;
+  am::Block writes;
+  {
+    const CurBlock into(*this, writes);
+    for (const ResidentOperand &r : residents_) {
+      if (r.loop != loop || failed.count(r.buffer))
+        continue;
+      if (!staged.count(r.buffer)) {
+        auto ty = cast<RankedTensorType>(r.source.getType());
+        const agpu::ValueId id = idOf(r.source);
+        const am::Str name = "res" + std::to_string(r.buffer);
+        if (!body_.sym.regAt(id, 0) ||
+            !stageWholeTensor(id, ty, name, r.view, r.elem, "tt.dot",
+                              "a resident")
+                 .ok()) {
+          failed.insert(r.buffer);
+          continue;
+        }
+        body_.liveDecls.push_back(mc.arrayDecl(
+            agpu::mslTypeOf(r.elem).inAddrSpace(am::AddrSpace::Threadgroup),
+            name, r.bytes / agpu::byteWidthOf(r.elem)));
+        staged[r.buffer] = name;
+      }
+      body_.residentBuf[{r.dot, r.which}] = staged[r.buffer];
+    }
+  }
+  if (staged.empty())
+    return;
+  // Before: a loop re-entered from an outer one overwrites what the last
+  // entry's dots may still be reading. After: the first dot reads it.
+  cur_->push_back(mc.barrier());
+  for (am::Stmt *s : writes)
+    cur_->push_back(s);
+  cur_->push_back(mc.barrier());
 }
 
 // `threadgroup T *name = (threadgroup T *)(pool + off);` per used region.

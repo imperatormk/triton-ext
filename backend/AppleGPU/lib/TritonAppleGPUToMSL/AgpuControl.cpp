@@ -56,6 +56,8 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
   b.hi = agpu_.context().var(*hi);
   b.step = agpu_.context().var(*st);
 
+  stageResidentOperands(forOp);
+
   // Saved/restored around the body walk so a nested loop's fused dot is hosted
   // by the nested loop.
   agpu::Carried yieldValues;

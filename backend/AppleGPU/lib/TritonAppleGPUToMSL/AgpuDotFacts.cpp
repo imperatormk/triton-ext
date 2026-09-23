@@ -24,6 +24,9 @@ DotOperands AgpuEmitter::dotOperandsOf(const agpu::OpView &o) {
     return d;
   }
 
+  if (const Value res = mlirValueOf(o.results[0]))
+    d.op = res.getDefiningOp();
+
   const agpu::ValueId ids[3] = {o.operands[0], o.operands[1], o.results[0]};
   RankedTensorType *tys[3] = {&d.shape.aTy, &d.shape.bTy, &d.shape.cTy};
   agpu::ElemType *elems[3] = {&d.shape.aElem, &d.shape.bElem, &d.shape.cElem};

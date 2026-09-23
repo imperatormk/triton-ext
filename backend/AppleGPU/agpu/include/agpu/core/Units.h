@@ -38,12 +38,12 @@ inline Bytes maxBytes(Bytes a, Bytes b) { return std::max(a, b); }
 
 inline constexpr int64_t kTGResidentBudgetBytes = 32768;
 
-// Twice the per-threadgroup cap: what a core hands out across concurrently
-// resident threadgroups.
-inline constexpr int64_t kTGCoreBudgetBytes = 65536;
+// What a core hands out across concurrently resident threadgroups. Measured
+// on M1 Pro: a 20480-byte pool keeps three resident, 20736 bytes two.
+inline constexpr int64_t kTGCoreBudgetBytes = 61440;
 
 // Threadgroups that stay resident when a pool of `bytes` is declared. A step
-// function: 16 KB gives four, 22 KB gives two.
+// function: 15 KB gives four, 22 KB gives two.
 inline constexpr int64_t tgResidency(int64_t bytes) {
   return bytes > 0 ? kTGCoreBudgetBytes / bytes : kTGCoreBudgetBytes;
 }

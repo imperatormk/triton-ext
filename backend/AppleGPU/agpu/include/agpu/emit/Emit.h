@@ -119,14 +119,43 @@ inline msl::Expr *offsetExprOf(msl::Context &c, const TileView &v, int reg,
   return padded;
 }
 
+// Per-register addresses get hoisted out of loops and spilled by the Metal
+// compiler; one base plus literal deltas does not.
+template <class Actions>
+inline int sharedBaseRegOf(const TileView &v, const Actions &actions,
+                           const CoordSource &src) {
+  if (actions.size() < 2 || v.swizzle().permutes() || v.padding().pads() ||
+      (int)src.dims.size() < v.rank())
+    return -1;
+  for (const StageAction &a : actions)
+    for (int d = 0; d < v.rank(); ++d)
+      if (!src.dims[d].registerDeltasAreAffine(a.reg))
+        return -1;
+  return actions.front().reg;
+}
+
+inline msl::Expr *slotExprOf(msl::Context &c, const TileView &v,
+                             const msl::Str &buf, int reg,
+                             const CoordSource &src, int baseReg) {
+  if (baseReg < 0)
+    return c.subscript(c.var(buf), offsetExprOf(c, v, reg, src));
+  int64_t delta = 0;
+  for (int d = 0; d < v.rank(); ++d)
+    delta += v.strideAt(d) * (src.dims[d].registerConstant(reg) -
+                              src.dims[d].registerConstant(baseReg));
+  return c.subscript(
+      c.binary(msl::BinOp::Add, c.var(buf), offsetExprOf(c, v, baseReg, src)),
+      c.lit(delta));
+}
+
 // The address is a runtime expression: the slot depends on the lane holding
 // the register.
 inline msl::Stmt *stageStore(msl::Context &c, const TileView &dst,
                              const msl::Str &buf, const msl::Str &srcName,
-                             const StageAction &a, const CoordSource &src) {
+                             const StageAction &a, const CoordSource &src,
+                             int baseReg = -1) {
   msl::Stmt *store =
-      c.assign(c.subscript(c.var(buf), offsetExprOf(c, dst, a.reg, src)),
-               c.var(srcName));
+      c.assign(slotExprOf(c, dst, buf, a.reg, src, baseReg), c.var(srcName));
   return c.guarded(guardExpr(c, a.guard, a.reg, src), store);
 }
 
@@ -137,11 +166,11 @@ inline msl::Stmt *stageStoreWide(msl::Context &c, const TileView &dst,
                                  const msl::Str &buf,
                                  const msl::SmallVec<msl::Str, 8> &srcNames,
                                  const StageAction &a, const CoordSource &src,
-                                 ElemType elem) {
+                                 ElemType elem, int baseReg = -1) {
   msl::SmallVec<msl::Expr *, 4> lanes;
   for (int i = 0; i < a.width; ++i)
     lanes.push_back(c.var(srcNames[(std::size_t)(a.reg + i)]));
-  msl::Expr *slot = c.subscript(c.var(buf), offsetExprOf(c, dst, a.reg, src));
+  msl::Expr *slot = slotExprOf(c, dst, buf, a.reg, src, baseReg);
   msl::Stmt *store = c.assign(
       wideLValue(c, slot, elem, a.width, a.packed, msl::AddrSpace::Threadgroup),
       c.call(vecCtorName(elem, a.width), lanes));
@@ -154,10 +183,12 @@ inline void emitStage(msl::Context &c, msl::Block &body, const TileView &dst,
                       const msl::SmallVec<StageAction, 8> &actions,
                       const msl::SmallVec<msl::Str, 8> &srcNames,
                       const CoordSource &src, ElemType elem) {
+  const int baseReg = sharedBaseRegOf(dst, actions, src);
   for (const StageAction &a : actions) {
-    msl::Stmt *s = a.width > 1
-                       ? stageStoreWide(c, dst, buf, srcNames, a, src, elem)
-                       : stageStore(c, dst, buf, srcNames[a.reg], a, src);
+    msl::Stmt *s =
+        a.width > 1
+            ? stageStoreWide(c, dst, buf, srcNames, a, src, elem, baseReg)
+            : stageStore(c, dst, buf, srcNames[a.reg], a, src, baseReg);
     if (s)
       body.push_back(s);
   }
@@ -177,10 +208,9 @@ inline msl::Stmt *readbackLoad(msl::Context &c, const TileView &src,
                                const msl::Str &buf, const msl::Str &dstName,
                                const msl::Str &baseName, const StageAction &a,
                                const CoordSource &coords, ElemType poolElem,
-                               ElemType regElem) {
+                               ElemType regElem, int baseReg = -1) {
   msl::Expr *slot = readbackValueExpr(
-      c, c.subscript(c.var(buf), offsetExprOf(c, src, a.reg, coords)), poolElem,
-      regElem);
+      c, slotExprOf(c, src, buf, a.reg, coords, baseReg), poolElem, regElem);
   msl::Expr *value = baseName.empty()
                          ? slot
                          : c.binary(msl::BinOp::Add, slot, c.var(baseName));
@@ -195,9 +225,9 @@ inline void readbackLoadWide(msl::Context &c, msl::Block &body,
                              const msl::SmallVec<msl::Str, 8> &dstNames,
                              const msl::SmallVec<msl::Str, 8> &baseNames,
                              const StageAction &a, const CoordSource &coords,
-                             ElemType elem, ElemType regElem) {
-  msl::Expr *slot =
-      c.subscript(c.var(buf), offsetExprOf(c, src, a.reg, coords));
+                             ElemType elem, ElemType regElem,
+                             int baseReg = -1) {
+  msl::Expr *slot = slotExprOf(c, src, buf, a.reg, coords, baseReg);
   const msl::Str v = dstNames[(std::size_t)a.reg] + "_w";
   msl::Block inner;
   inner.push_back(c.declStmt(vectorTypeOf(elem, a.width, a.packed), v,
@@ -226,16 +256,17 @@ inline void emitReadback(msl::Context &c, msl::Block &body, const TileView &src,
                          const msl::SmallVec<msl::Str, 8> &baseNames,
                          const CoordSource &coords, ElemType elem,
                          ElemType regElem) {
+  const int baseReg = sharedBaseRegOf(src, actions, coords);
   for (const StageAction &a : actions) {
     if (a.width > 1) {
       readbackLoadWide(c, body, src, buf, dstNames, baseNames, a, coords, elem,
-                       regElem);
+                       regElem, baseReg);
       continue;
     }
     const msl::Str base =
         a.reg < (int)baseNames.size() ? baseNames[a.reg] : msl::Str{};
     if (msl::Stmt *s = readbackLoad(c, src, buf, dstNames[a.reg], base, a,
-                                    coords, elem, regElem))
+                                    coords, elem, regElem, baseReg))
       body.push_back(s);
   }
 }

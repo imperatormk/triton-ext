@@ -35,10 +35,11 @@ int main() {
 
   CASE("residency is a step function of the declared pool");
   {
-    CHECK_EQ(tgResidency(16384), 4);
-    CHECK_EQ(tgResidency(22000), 2);
-    CHECK_EQ(tgResidency(32768), 2);
-    CHECK_EQ(tgResidency(8192), 8);
+    CHECK_EQ(tgResidency(15360), 4);
+    CHECK_EQ(tgResidency(20480), 3);
+    CHECK_EQ(tgResidency(20736), 2);
+    CHECK_EQ(tgResidency(30720), 2);
+    CHECK_EQ(tgResidency(7680), 8);
   }
 
   // ── strategy selection ─────────────────────────────────────────────────
@@ -152,13 +153,13 @@ int main() {
 
   CASE("a fused pad that costs a residency class is dropped");
   {
-    DotFacts f = gemm(64, 64, 64);
+    DotFacts f = gemm(64, 80, 64);
     f.fusedAcc = true;
-    const Bytes padded(stagedTileBytes(64, fragAlignedExtent(64), kAccBytes));
+    const Bytes padded(stagedTileBytes(64, fragAlignedExtent(80), kAccBytes));
     const Bytes plain(
-        stagedTileBytes(64, fragAlignedExtent(64), kAccBytes, false));
+        stagedTileBytes(64, fragAlignedExtent(80), kAccBytes, false));
     CHECK(padded <= kBudget);
-    CHECK_EQ(plain.count(), kTGCoreBudgetBytes / 4);
+    CHECK_EQ(plain.count(), kTGCoreBudgetBytes / 3);
     CHECK(tgResidency(padded.count()) < tgResidency(plain.count()));
     CHECK(!planDot(f, kBudget).padStagedC());
 

@@ -354,10 +354,19 @@ int main() {
     // Operands and result each get their own test: a flushed operand can
     // leave a result that looks perfectly normal.
     std::size_t tests = 0;
-    for (std::size_t at = body.find("0x7f800000u) == 0u");
-         at != std::string::npos; at = body.find("0x7f800000u) == 0u", at + 1))
+    for (std::size_t at = body.find("- 1u < 0x7fffffu");
+         at != std::string::npos; at = body.find("- 1u < 0x7fffffu", at + 1))
       ++tests;
-    CHECK_EQ(tests, 4u);
+    CHECK_EQ(tests, 3u);
+    CHECK_HAS(body, "mr < 0x800000u");
+  }
+
+  CASE("a zero operand keeps the hardware fma, which is exact there");
+  {
+    const std::string body = helperSource(Helper::Fma);
+    CHECK_LACKS(body, "0x7f800000u) == 0u");
+    CHECK_HAS(body, "< 174u");
+    CHECK_HAS(body, "metal::min(ma, mb) != 0u");
   }
 
   CASE("the soft path never reaches the hardware fma");

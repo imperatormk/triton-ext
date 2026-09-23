@@ -211,6 +211,9 @@ struct FusedDot {
   // The loop result the accumulators carry.
   agpu::ValueId result = 0;
 
+  std::vector<agpu::msl::Str> initFrom;
+  bool continued = false;
+
   // Whether this dot's fragments carry `v` across the loop. If so, the loop
   // must not also carry it in variables.
   bool carries(agpu::ValueId v) const { return v == result; }

@@ -134,11 +134,17 @@ inline void emitDirectMma(msl::Context &c, msl::Block &body,
 
 inline void emitAccumDecls(msl::Context &c, msl::Block &body,
                            const std::vector<WarpSlot> &slots,
-                           const DirectNames &nm) {
-  for (const WarpSlot &s : slots)
-    body.push_back(c.declStmt(
-        kSimdgroup8x8.mslTypeNode(nm.accElem), nm.acc + std::to_string(s.acc),
-        c.call(kSimdgroup8x8.zeroCtor(nm.accElem), {c.litF(0.0)})));
+                           const DirectNames &nm,
+                           const std::vector<msl::Str> &initFrom = {}) {
+  for (std::size_t i = 0; i < slots.size(); ++i) {
+    msl::Expr *init =
+        i < initFrom.size()
+            ? static_cast<msl::Expr *>(c.var(initFrom[i]))
+            : static_cast<msl::Expr *>(
+                  c.call(kSimdgroup8x8.zeroCtor(nm.accElem), {c.litF(0.0)}));
+    body.push_back(c.declStmt(kSimdgroup8x8.mslTypeNode(nm.accElem),
+                              nm.acc + std::to_string(slots[i].acc), init));
+  }
 }
 
 // Store each accumulator into the C pool at its slot's position, relative to

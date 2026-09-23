@@ -277,7 +277,7 @@ int main() {
     DirectNames nm;
     const Decision d =
         emitFusedLoop(c, body, p, nm, readbackFor, cs, {}, {}, [&]() {
-          body.push_back(c.exprStmt(c.var("THE_LOOP")));
+          body.push_back(c.exprStmt(c.var("loop_body")));
           return Decision::emitted();
         });
     CHECK(d.ok());
@@ -294,7 +294,7 @@ int main() {
     // after it, each phase once.
     const std::size_t decl = out.find("float out0 = 0.0f");
     const std::size_t frag = out.find(zero);
-    const std::size_t loop = out.find("THE_LOOP");
+    const std::size_t loop = out.find("loop_body");
     const std::size_t store = out.find("simdgroup_store");
     const std::size_t read = out.find("out0 =", loop);
     CHECK(decl != std::string::npos && decl < loop);
@@ -312,6 +312,61 @@ int main() {
     const std::size_t b2 = out.find("threadgroup_barrier", b1 + 1);
     CHECK(loop < b1 && b1 < store);
     CHECK(store < b2 && b2 < read);
+  }
+
+  CASE("a continued fused loop drains nothing and its successor copies the "
+       "fragments instead of zeroing them");
+  {
+    DotFacts f = gemm(64, 64, 64);
+    f.fusedAcc = true;
+    const Plan p = planDot(f, kBudget);
+    CHECK(p.kind == Plan::Kind::Fused);
+
+    auto readbackFor = [](const Range &rows) {
+      ReadbackInputs back;
+      back.actions.push_back(
+          StageAction{0, 1, false, {rows.lo, 0}, CoordGuard::unguarded()});
+      back.names.push_back("out0");
+      back.bases.push_back("");
+      return Result<ReadbackInputs>::of(back);
+    };
+    CoordSource cs;
+    LayoutBasis row, col;
+    row.lane = {1, 2, 4, 8, 16};
+    cs.dims = {row, col};
+
+    msl::Context c;
+    const auto emit = [&](msl::Block &body, const std::vector<msl::Str> &from,
+                          bool continued) {
+      return emitFusedLoop(
+          c, body, p, DirectNames{}, readbackFor, cs, {}, {},
+          [&]() {
+            body.push_back(c.exprStmt(c.var("loop_body")));
+            return Decision::emitted();
+          },
+          from, continued);
+    };
+
+    msl::Block first;
+    CHECK(emit(first, {}, true).ok());
+    const std::string handed = render(first);
+    CHECK_EQ(countOf(handed, "loop_body"), 1);
+    CHECK_EQ(countOf(handed, "out0"), 0);
+    CHECK_EQ(countOf(handed, "simdgroup_store"), 0);
+    CHECK_EQ(countOf(handed, "threadgroup_barrier"), 0);
+
+    std::vector<msl::Str> prev;
+    for (int i = 0; i < 16; ++i)
+      prev.push_back("prev" + std::to_string(i));
+    msl::Block second;
+    CHECK(emit(second, prev, false).ok());
+    const std::string cont = render(second);
+    CHECK_EQ(countOf(cont, kSimdgroup8x8.zeroCtor("float") + "(0.0f)"), 0);
+    for (int i = 0; i < 16; ++i)
+      CHECK_EQ(countOf(cont, "simdgroup_float8x8 acc" + std::to_string(i) +
+                                 " = prev" + std::to_string(i) + ";"),
+               1);
+    CHECK(countOf(cont, "simdgroup_store") > 0);
   }
 
   CASE("a fused plan's own emission neither declares nor drains");
@@ -355,7 +410,7 @@ int main() {
 
     DirectNames nm;
     const Decision d = emitFusedLoop(c, body, p, nm, {}, {}, t, {}, [&]() {
-      body.push_back(c.exprStmt(c.var("THE_LOOP")));
+      body.push_back(c.exprStmt(c.var("loop_body")));
       return Decision::emitted();
     });
     CHECK(d.ok());
@@ -375,11 +430,49 @@ int main() {
     for (int i = 0; i < 16; ++i)
       CHECK_EQ(countOf(out, "simdgroup_store(acc" + std::to_string(i) + ","),
                1);
-    CHECK(out.find("THE_LOOP") < out.find("simdgroup_store"));
+    CHECK(out.find("loop_body") < out.find("simdgroup_store"));
     // The fragments are still declared before the loop, once each.
     const std::string zero = " = " + kSimdgroup8x8.zeroCtor("float") + "(0.0f)";
     CHECK_EQ(countOf(out, zero), 16);
-    CHECK(out.find(zero) < out.find("THE_LOOP"));
+    CHECK(out.find(zero) < out.find("loop_body"));
+  }
+
+  CASE("a direct drain continuing earlier fragments stores what it copied");
+  {
+    msl::Context c;
+    msl::Block body;
+    DotFacts f = gemm(64, 64, 64);
+    f.fusedAcc = true;
+    f.cDirect = true;
+    const Plan p = planDot(f, kBudget);
+    CHECK(p.storesCDirect());
+
+    DeviceStoreTarget t;
+    t.base = "cptr";
+    t.leadingDim = Stride::runtime("ldc");
+    t.rowStart = c.var("rs");
+    t.colStart = c.var("cs");
+
+    std::vector<msl::Str> prev;
+    for (int i = 0; i < 16; ++i)
+      prev.push_back("prev" + std::to_string(i));
+    const Decision d = emitFusedLoop(
+        c, body, p, DirectNames{}, {}, {}, t, {},
+        [&]() {
+          body.push_back(c.exprStmt(c.var("loop_body")));
+          return Decision::emitted();
+        },
+        prev);
+    CHECK(d.ok());
+    const std::string out = render(body);
+    CHECK_EQ(countOf(out, kSimdgroup8x8.zeroCtor("float") + "(0.0f)"), 0);
+    for (int i = 0; i < 16; ++i)
+      CHECK_EQ(countOf(out, "simdgroup_float8x8 acc" + std::to_string(i) +
+                                " = prev" + std::to_string(i) + ";"),
+               1);
+    CHECK_EQ(countOf(out, "simdgroup_store"), 16);
+    CHECK(out.find("= prev0;") < out.find("loop_body"));
+    CHECK(out.find("loop_body") < out.find("simdgroup_store"));
   }
 
   CASE("a direct drain without its window asserts as a caller bug");
@@ -449,7 +542,7 @@ int main() {
 
     const Decision d =
         emitFusedLoop(c, body, p, DirectNames{}, {}, {}, t, {}, [&]() {
-          body.push_back(c.exprStmt(c.var("THE_LOOP")));
+          body.push_back(c.exprStmt(c.var("loop_body")));
           return Decision::emitted();
         });
     CHECK(d.ok());
@@ -458,14 +551,14 @@ int main() {
     // One declaration per accumulator index, before the loop, unguarded: the
     // parameterised block's single slot serves both warps.
     CHECK_EQ(countOf(out, zero), 1);
-    CHECK(out.find(zero) < out.find("THE_LOOP"));
+    CHECK(out.find(zero) < out.find("loop_body"));
     CHECK(out.find("if (warp") == std::string::npos ||
           out.find(zero) < out.find("if (warp"));
     // No store outside `warp < 2` and the one store is spelled in the warp id.
     CHECK_EQ(countOf(out, "simdgroup_store"), 1);
     CHECK_HAS(out, "warp % 2 * 8");
     CHECK(countOf(out, "if (warp < 2)") > 0);
-    CHECK(out.find("if (warp < 2)", out.find("THE_LOOP")) <
+    CHECK(out.find("if (warp < 2)", out.find("loop_body")) <
           out.find("simdgroup_store"));
   }
 

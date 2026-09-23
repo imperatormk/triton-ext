@@ -78,15 +78,17 @@ inline std::vector<msl::Str> fusedAccNames(const Plan &p,
 //
 // The warp program is planned once here and shared by the loop body's MMAs
 // and the stores, so they refer to the same fragments.
-inline Decision emitFusedLoop(msl::Context &c, msl::Block &body, const Plan &p,
-                              const DirectNames &nm,
-                              const ReadbackFn &readbackFor,
-                              const CoordSource &cCoords,
-                              const DeviceStoreTarget &cStore,
-                              const std::vector<DrainStep> &cSteps,
-                              const std::function<Decision()> &emitLoop) {
+//
+// With `initFrom` (an earlier loop's fragments) the readback's bases must be
+// empty; a `continued` loop leaves its fragments to the next one.
+inline Decision emitFusedLoop(
+    msl::Context &c, msl::Block &body, const Plan &p, const DirectNames &nm,
+    const ReadbackFn &readbackFor, const CoordSource &cCoords,
+    const DeviceStoreTarget &cStore, const std::vector<DrainStep> &cSteps,
+    const std::function<Decision()> &emitLoop,
+    const std::vector<msl::Str> &initFrom = {}, bool continued = false) {
   const bool direct = p.storesCDirect();
-  if (direct ? !cStore.ok() : !readbackFor)
+  if (!continued && (direct ? !cStore.ok() : !readbackFor))
     return Decision::failed();
 
   const TileView cv = p.cStagedView();
@@ -95,7 +97,7 @@ inline Decision emitFusedLoop(msl::Context &c, msl::Block &body, const Plan &p,
 
   // A direct drain needs no result registers: the fragments are the result.
   ReadbackInputs back;
-  if (!direct) {
+  if (!direct && !continued) {
     const Result<ReadbackInputs> rb = readbackFor(Range{0, cv.extentAt(0)});
     if (!rb.ok())
       return rb.why;
@@ -120,10 +122,10 @@ inline Decision emitFusedLoop(msl::Context &c, msl::Block &body, const Plan &p,
         if (std::none_of(decls.begin(), decls.end(),
                          [&](const WarpSlot &d) { return d.acc == s.acc; }))
           decls.push_back(s);
-    emitAccumDecls(c, body, decls, nm);
+    emitAccumDecls(c, body, decls, nm, initFrom);
   }
 
-  if (const Decision d = emitLoop(); !d.ok())
+  if (const Decision d = emitLoop(); !d.ok() || continued)
     return d;
 
   // Fragments straight to the device tensor. A barrier is needed only when

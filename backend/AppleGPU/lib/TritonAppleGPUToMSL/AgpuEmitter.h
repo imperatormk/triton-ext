@@ -118,6 +118,17 @@ struct BodyState {
 
   std::map<std::pair<Operation *, int>, agpu::msl::Str> residentBuf;
   std::set<int> residentDeclared;
+  // What a slot holds and the block of the loop that staged it: a later loop
+  // of that block finds it staged already.
+  struct ResidentHeld {
+    agpu::ValueId source;
+    agpu::ElemType elem;
+    agpu::TileView view;
+    Block *block;
+  };
+  std::map<int, ResidentHeld> residentHeld;
+
+  std::map<agpu::ValueId, std::vector<agpu::msl::Str>> continuedFrom;
 
   // Accumulators of the last fused dot, until the next staging anchors them.
   std::vector<agpu::msl::Str> anchorAccs;
@@ -250,6 +261,7 @@ private:
                             const llvm::function_ref<agpu::Decision()> &atEnd);
 
   agpu::Decision emitForOp(scf::ForOp forOp);
+  bool continuesInto(scf::ForOp forOp, const FusedDot &fd);
 
   agpu::Decision emitIfOp(scf::IfOp ifOp);
 

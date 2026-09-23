@@ -433,7 +433,7 @@ void AgpuEmitter::stageResidentOperands(scf::ForOp loop) {
     return;
   am::Context &mc = agpu_.context();
   std::map<int, am::Str> staged;
-  std::set<int> failed;
+  std::set<int> failed, written;
   am::Block writes;
   {
     const CurBlock into(*this, writes);
@@ -444,6 +444,15 @@ void AgpuEmitter::stageResidentOperands(scf::ForOp loop) {
         auto ty = cast<RankedTensorType>(r.source.getType());
         const agpu::ValueId id = idOf(r.source);
         const am::Str name = "res" + std::to_string(r.buffer);
+        const auto held = body_.residentHeld.find(r.buffer);
+        if (held != body_.residentHeld.end() && held->second.source == id &&
+            held->second.elem == r.elem && held->second.view == r.view &&
+            held->second.block == loop->getBlock()) {
+          staged[r.buffer] = name;
+          body_.residentBuf[{r.dot, r.which}] = name;
+          continue;
+        }
+        body_.residentHeld.erase(r.buffer);
         if (!body_.sym.regAt(id, 0) ||
             !stageWholeTensor(id, ty, name, r.view, r.elem, "tt.dot",
                               "a resident")
@@ -456,11 +465,13 @@ void AgpuEmitter::stageResidentOperands(scf::ForOp loop) {
               agpu::mslTypeOf(r.elem).inAddrSpace(am::AddrSpace::Threadgroup),
               name, r.bytes / agpu::byteWidthOf(r.elem)));
         staged[r.buffer] = name;
+        written.insert(r.buffer);
+        body_.residentHeld[r.buffer] = {id, r.elem, r.view, loop->getBlock()};
       }
       body_.residentBuf[{r.dot, r.which}] = staged[r.buffer];
     }
   }
-  if (staged.empty())
+  if (written.empty())
     return;
   // Before: a loop re-entered from an outer one overwrites what the last
   // entry's dots may still be reading. After: the first dot reads it.

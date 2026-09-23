@@ -146,15 +146,66 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
     return d;
   };
 
+  for (FusedDot &fd : fused) {
+    if (const auto it = body_.continuedFrom.find(fd.result);
+        it != body_.continuedFrom.end())
+      fd.initFrom = it->second;
+    fd.continued = continuesInto(forOp, fd);
+  }
+
   // Each bracket wraps the loop the previous ones built.
   std::function<agpu::Decision()> bracketed = loop;
   for (const FusedDot &fd : fused)
     bracketed = [&fd, inner = bracketed, this]() {
+      agpu::ReadbackFn readback = fd.readbackFor;
+      // The handed-over fragments already hold the earlier result, so the
+      // readback assigns rather than adds it.
+      if (!fd.initFrom.empty() && readback)
+        readback = [rb = fd.readbackFor](const agpu::Range &rows) {
+          agpu::Result<agpu::ReadbackInputs> got = rb(rows);
+          if (got.ok())
+            for (am::Str &base : got.value.bases)
+              base = {};
+          return got;
+        };
       return agpu::emitFusedLoop(agpu_.context(), *cur_, fd.plan, fd.names,
-                                 fd.readbackFor, fd.cCoords, fd.cStore,
-                                 fd.cSteps, inner);
+                                 readback, fd.cCoords, fd.cStore, fd.cSteps,
+                                 inner, fd.initFrom, fd.continued);
     };
   return bracketed();
+}
+
+// When this loop's result is only the next loop's matching accumulator input,
+// the next loop continues the fragments and nothing drains in between.
+bool AgpuEmitter::continuesInto(scf::ForOp forOp, const FusedDot &fd) {
+  Value res;
+  for (Value r : forOp.getResults())
+    if (idOf(r) == fd.result)
+      res = r;
+  if (!res || !res.hasOneUse())
+    return false;
+  OpOperand &use = *res.getUses().begin();
+  auto next = dyn_cast<scf::ForOp>(use.getOwner());
+  if (!next || use.getOperandNumber() < next.getNumControlOperands())
+    return false;
+  const unsigned i = use.getOperandNumber() - next.getNumControlOperands();
+  for (triton::DotOp dot : next.getBody()->getOps<triton::DotOp>()) {
+    if (dot.getC() != next.getRegionIterArg(i))
+      continue;
+    const DotShape shape = dotShapeOf(dot);
+    if (!shape.aTy)
+      return false;
+    const agpu::Plan plan = agpu_.planFor(dotFactsOf(shape));
+    const agpu::WarpGrid a = agpu::gridOf(fd.plan), b = agpu::gridOf(plan);
+    const std::vector<am::Str> accs = agpu::fusedAccNames(fd.plan, fd.names);
+    if (!plan.accumulatorsOutlivePass() || a.mT != b.mT || a.nT != b.nT ||
+        a.numWarps != b.numWarps ||
+        agpu::fusedAccNames(plan, agpu::DirectNames{}).size() != accs.size())
+      return false;
+    body_.continuedFrom[idOf(next.getResult(i))] = accs;
+    return true;
+  }
+  return false;
 }
 
 agpu::Decision AgpuEmitter::emitIfOp(scf::IfOp ifOp) {

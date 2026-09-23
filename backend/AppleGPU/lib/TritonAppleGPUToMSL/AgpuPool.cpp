@@ -14,11 +14,11 @@ namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
 
-void PoolLedger::carve(const PoolNeed &need) {
+void PoolLedger::carve(const PoolNeed &need, int64_t floor) {
   current_.clear();
-  int64_t at = 0;
+  int64_t at = floor;
   for (const PoolNeed::Region &r : need.regions) {
-    const int64_t offset = r.atBase ? 0 : at;
+    const int64_t offset = r.atBase ? floor : at;
     std::size_t found = regions_.size();
     bool nameTaken = false;
     for (std::size_t i = 0; i < regions_.size(); ++i) {
@@ -372,15 +372,8 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
         body_.residentBuf[{r.dot, r.which}] = "";
     int64_t peak = 0;
     func.walk([&](Operation *op) {
-      if (op == func.getOperation())
-        return;
-      int64_t seq = 0, base = 0;
-      for (const PoolNeed::Region &r : poolNeedOf(op).regions)
-        if (r.atBase)
-          base = std::max(base, r.alignedBytes());
-        else
-          seq += r.alignedBytes();
-      peak = std::max({peak, seq, base});
+      if (op != func.getOperation())
+        peak = std::max(peak, poolNeedOf(op).bytes());
     });
     body_.residentBuf.clear();
     std::map<int, int64_t> bytes;

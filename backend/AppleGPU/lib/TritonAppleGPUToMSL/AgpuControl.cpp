@@ -77,6 +77,7 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
 
   stageResidentOperands(forOp);
   body_.anchorAccs.clear();
+  const int64_t poolFloor = body_.poolFloor;
 
   // Saved/restored around the body walk so a nested loop's fused dot is hosted
   // by the nested loop.
@@ -110,6 +111,7 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
   fused.swap(body_.fusedDots);
   body_.fusedDots.swap(enclosing);
   body_.anchorAccs.clear();
+  body_.poolFloor = poolFloor;
   if (!bodyDone.ok())
     return bodyDone;
 
@@ -173,6 +175,36 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
                                  inner, fd.initFrom, fd.continued);
     };
   return bracketed();
+}
+
+// Metal sinks a fused dot's MMAs to the loop latch; a later staging written
+// over its operands would pin their fragment loads above it. Carving the rest
+// of the body above them avoids that when it fits without costing a resident
+// threadgroup.
+bool AgpuEmitter::keepsOperandsApart(Operation *dot) {
+  int64_t end = body_.poolFloor;
+  for (const PoolNeed::Region &r : poolNeedOf(dot).regions)
+    if (!r.atBase)
+      end += r.alignedBytes();
+  int64_t after = 0;
+  for (Operation *n = dot->getNextNode(); n; n = n->getNextNode())
+    n->walk(
+        [&](Operation *o) { after = std::max(after, poolNeedOf(o).bytes()); });
+  if (after == 0)
+    return true;
+  auto func = dot->getParentOfType<triton::FuncOp>();
+  int64_t planned = 0;
+  func.walk([&](Operation *o) {
+    if (o != func.getOperation())
+      planned = std::max(planned, poolNeedOf(o).bytes());
+  });
+  const int64_t live = agpu_.pool.plan().live.count();
+  const int64_t apart = end + after + live;
+  if (apart > agpu::kTGResidentBudgetBytes ||
+      agpu::tgResidency(apart) < agpu::tgResidency(planned + live))
+    return false;
+  body_.poolFloor = end;
+  return true;
 }
 
 // When this loop's result is only the next loop's matching accumulator input,

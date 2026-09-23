@@ -182,7 +182,7 @@ agpu::Decision AgpuEmitter::walkOp(Operation *op) {
     return emitted(emitWhileOp(typed), op, "scf.while");
 
   if (isa<triton::ReduceOp, triton::ScanOp>(op)) {
-    body_.pool.carve(poolNeedOf(op));
+    body_.pool.carve(poolNeedOf(op), body_.poolFloor);
     auto red = dyn_cast<triton::ReduceOp>(op);
     const agpu::Decision d =
         red ? emitReduceOp(red) : emitScanOp(cast<triton::ScanOp>(op));
@@ -193,7 +193,7 @@ agpu::Decision AgpuEmitter::walkOp(Operation *op) {
     return emitted(emitMapOp(map), op, "tt.map_elementwise");
 
   const agpu::OpView view = opViewOf(op);
-  body_.pool.carve(poolNeedOf(op));
+  body_.pool.carve(poolNeedOf(op), body_.poolFloor);
 
   if (agpu_.gates.on(agpu::Gate::TraceOps))
     traceOp(op, view);

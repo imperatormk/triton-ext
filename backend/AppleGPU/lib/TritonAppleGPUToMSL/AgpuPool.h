@@ -58,6 +58,17 @@ struct PoolNeed {
     regions.push_back({std::move(name), elem, bytes, atBase});
   }
   bool empty() const { return regions.empty(); }
+
+  // The extent a carve of these regions reaches.
+  int64_t bytes() const {
+    int64_t seq = 0, base = 0;
+    for (const Region &r : regions)
+      if (r.atBase)
+        base = std::max(base, r.alignedBytes());
+      else
+        seq += r.alignedBytes();
+    return std::max(seq, base);
+  }
 };
 
 // The body's pool bookkeeping: which regions were carved, at what offsets,
@@ -66,11 +77,11 @@ class PoolLedger {
 public:
   PoolLedger() = default;
 
-  // Lay out one op's regions in the threadgroup buffer, from zero: regions
+  // Lay out one op's regions in the threadgroup buffer, from `floor`: regions
   // of different ops do not coexist. A layout matching an existing region
   // shares its declaration; a conflicting one gets its own suffixed
   // declaration at its own offset.
-  void carve(const PoolNeed &need);
+  void carve(const PoolNeed &need, int64_t floor = 0);
 
   // Separate from carve because a handler may decide not to use the pool after
   // carving, e.g. a convert_layout that turns out to be a rename. Empty means

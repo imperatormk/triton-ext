@@ -133,6 +133,9 @@ struct BodyState {
   // Accumulators of the last fused dot, until the next staging anchors them.
   std::vector<agpu::msl::Str> anchorAccs;
 
+  // Where the current op's pool regions start.
+  int64_t poolFloor = 0;
+
   agpu::SymbolTable sym;
 
   // addptr binds the base name and keeps the offset here: an access is
@@ -262,6 +265,7 @@ private:
 
   agpu::Decision emitForOp(scf::ForOp forOp);
   bool continuesInto(scf::ForOp forOp, const FusedDot &fd);
+  bool keepsOperandsApart(Operation *dot);
 
   agpu::Decision emitIfOp(scf::IfOp ifOp);
 

@@ -65,7 +65,8 @@ agpu::Decision AgpuEmitter::emitDotOp(const agpu::OpView &o) {
     body_.fusedDots.push_back(FusedDot{plan, in.direct, in.coords.c,
                                        in.readbackFor, in.cStore, in.cSteps,
                                        idOf(ops.shape.cCarried)});
-    body_.anchorAccs = agpu::fusedAccNames(plan, in.direct);
+    if (!keepsOperandsApart(ops.op))
+      body_.anchorAccs = agpu::fusedAccNames(plan, in.direct);
     // The store and its feeding chain must not also emit on their own.
     if (plan.storesCDirect()) {
       body_.absorbedOps.insert(ops.shape.cStore);

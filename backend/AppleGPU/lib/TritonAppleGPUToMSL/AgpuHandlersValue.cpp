@@ -82,6 +82,9 @@ agpu::Decision AgpuEmitter::emitSplatOp(const agpu::OpView &o) {
     inheritOffset(o.operands[0], 0, o.results[0], r);
 
   inheritBasePointer(o.operands[0], o.results[0]);
+  if (const Value res = mlirValueOf(o.results[0]))
+    if (auto rt = dyn_cast<RankedTensorType>(res.getType()))
+      body_.affine[o.results[0]] = agpu::uniformFamily((int)rt.getRank());
   return agpu::Decision::emitted();
 }
 

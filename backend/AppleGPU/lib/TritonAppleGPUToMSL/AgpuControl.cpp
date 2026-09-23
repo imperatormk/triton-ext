@@ -57,6 +57,7 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
   b.step = agpu_.context().var(*st);
 
   stageResidentOperands(forOp);
+  body_.anchorAccs.clear();
 
   // Saved/restored around the body walk so a nested loop's fused dot is hosted
   // by the nested loop.
@@ -89,6 +90,7 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
   std::vector<FusedDot> fused;
   fused.swap(body_.fusedDots);
   body_.fusedDots.swap(enclosing);
+  body_.anchorAccs.clear();
   if (!bodyDone.ok())
     return bodyDone;
 

@@ -376,6 +376,29 @@ AgpuEmitter::stageWholeTensor(agpu::ValueId v, RankedTensorType ty,
     if (names[(std::size_t)r].empty())
       return declined(where, std::string(what) + " register has no name");
 
+  // Metal sinks a fused dot's MMAs to the loop latch while this staging pins
+  // their fragment loads above it. A never-taken select reading every
+  // accumulator keeps the MMAs before this store.
+  const std::optional<agpu::ElemType> regElem = elemTypeOf(ty.getElementType());
+  if (!body_.anchorAccs.empty() && regElem &&
+      regElem->kind == agpu::ElemType::Kind::Float && !actions.empty()) {
+    am::Context &mc = agpu_.context();
+    am::Expr *sum = nullptr;
+    for (const am::Str &a : body_.anchorAccs) {
+      am::Expr *e = agpu::fragElemExpr(mc, a, 0);
+      sum = sum ? mc.binary(am::BinOp::Add, sum, e) : e;
+    }
+    const am::Str &x = names[(std::size_t)actions.front().reg];
+    am::Expr *never = mc.binary(
+        am::BinOp::Eq,
+        mc.member(mc.var(agpu::KernelNames{}.gridSize), am::builtin::comp::X),
+        mc.lit(0));
+    cur_->push_back(mc.assign(
+        mc.var(x),
+        mc.ternary(never, mc.cast(agpu::mslTypeOf(*regElem), sum), mc.var(x))));
+    body_.anchorAccs.clear();
+  }
+
   agpu::emitStage(agpu_.context(), *cur_, dst, buffer, actions, names,
                   coordSourceOf(ty), elem);
   return agpu::Decision::emitted();

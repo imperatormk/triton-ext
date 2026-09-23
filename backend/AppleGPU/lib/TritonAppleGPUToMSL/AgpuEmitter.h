@@ -118,6 +118,9 @@ struct BodyState {
 
   std::map<std::pair<Operation *, int>, agpu::msl::Str> residentBuf;
 
+  // Accumulators of the last fused dot, until the next staging anchors them.
+  std::vector<agpu::msl::Str> anchorAccs;
+
   agpu::SymbolTable sym;
 
   // addptr binds the base name and keeps the offset here: an access is

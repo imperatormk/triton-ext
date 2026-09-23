@@ -57,6 +57,21 @@ inline WarpGrid gridOf(const Plan &p) {
   return g;
 }
 
+inline std::vector<msl::Str> fusedAccNames(const Plan &p,
+                                           const DirectNames &nm) {
+  const WarpGrid grid = gridOf(p);
+  const WarpProgram prog = planWarpProgram(grid);
+  std::vector<int64_t> accs;
+  for (int64_t w = 0; w < prog.blockCount(grid.numWarps); ++w)
+    for (const WarpSlot &s : prog.slots(w, grid.mT, grid.nT, grid.numWarps))
+      if (std::find(accs.begin(), accs.end(), s.acc) == accs.end())
+        accs.push_back(s.acc);
+  std::vector<msl::Str> names;
+  for (int64_t a : accs)
+    names.push_back(directAccName(nm)(a));
+  return names;
+}
+
 // A loop whose body accumulates into simdgroup fragments it does not own.
 // Drained once after the loop: through the pool and a readback, or straight
 // to the device tensor when the plan set `storesCDirect`.

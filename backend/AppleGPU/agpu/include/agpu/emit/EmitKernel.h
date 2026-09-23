@@ -126,6 +126,11 @@ inline void addParams(msl::Function *fn, const std::vector<KernelArg> &args,
       u3, nm.threadId, A::builtin(A::Kind::ThreadPositionInThreadgroup)});
   fn->params.push_back(msl::Function::Param{
       u3, nm.gridSize, A::builtin(A::Kind::ThreadgroupsPerGrid)});
+  const msl::Type u16 = msl::Type::scalar(msl::Scalar::U16);
+  fn->params.push_back(msl::Function::Param{
+      u16, nm.simdLaneId, A::builtin(A::Kind::ThreadIndexInSimdgroup)});
+  fn->params.push_back(msl::Function::Param{
+      u16, nm.simdGroupId, A::builtin(A::Kind::SimdgroupIndexInThreadgroup)});
 }
 
 // Declared as bytes and cast at each use: the pool holds tiles of several

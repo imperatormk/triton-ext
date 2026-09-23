@@ -6,6 +6,8 @@
 #include "agpu/msl/Printer.h"
 #include "agpu/plan/Vestigial.h"
 
+#include "llvm/ADT/ScopeExit.h"
+
 #include <sstream>
 
 namespace mlir::triton::applegpu::bridge {
@@ -286,6 +288,9 @@ agpu::Decision AgpuEmitter::declineOp(Operation *op, const agpu::Decision &d,
 
 agpu::Decision AgpuEmitter::walkBlock(Block &block, am::Block &out) {
   const CurBlock here(*this, out);
+  // Coordinates respelled inside this block are not visible outside it.
+  const llvm::scope_exit epochs(
+      [this, depth = body_.hoist.depth()] { body_.hoist.popTo(depth); });
   for (Operation &op : block) {
     // By name: `hasTrait` compares a TypeID the plugin and the host generate
     // separately, so it answers false wherever they do not share one.

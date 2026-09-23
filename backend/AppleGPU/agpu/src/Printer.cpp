@@ -605,6 +605,12 @@ static void printAttribute(std::ostream &os, const Attribute &a) {
   case K::ThreadIndexInThreadgroup:
     os << "[[thread_index_in_threadgroup]]";
     return;
+  case K::ThreadIndexInSimdgroup:
+    os << "[[thread_index_in_simdgroup]]";
+    return;
+  case K::SimdgroupIndexInThreadgroup:
+    os << "[[simdgroup_index_in_threadgroup]]";
+    return;
   }
 }
 

@@ -431,6 +431,8 @@ public:
     ThreadPositionInThreadgroup,
     ThreadgroupsPerGrid,
     ThreadIndexInThreadgroup,
+    ThreadIndexInSimdgroup,
+    SimdgroupIndexInThreadgroup,
   };
 
   Attribute() = default;

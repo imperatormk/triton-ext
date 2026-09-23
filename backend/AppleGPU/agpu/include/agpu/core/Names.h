@@ -37,6 +37,8 @@ struct ThreadNames {
   // threadgroup_position_in_grid. The `.x` is part of the name because the
   // grid is one-dimensional here.
   msl::Str blockId = "tgpos.x";
+  msl::Str simdLaneId = "slane";
+  msl::Str simdGroupId = "sgroup";
 };
 
 // Names of pool regions. Metal admits threadgroup declarations only in a

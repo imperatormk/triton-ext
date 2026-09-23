@@ -5,6 +5,25 @@ namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
 
+static bool isLoop(Operation *op) { return isa<scf::ForOp, scf::WhileOp>(op); }
+
+static bool nestedInLoop(Operation *op) {
+  for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
+    if (isLoop(p))
+      return true;
+  return false;
+}
+
+static bool laterLoopInBlock(Operation *op) {
+  for (Operation *n = op->getNextNode(); n; n = n->getNextNode()) {
+    bool found = false;
+    n->walk([&](Operation *inner) { found = found || isLoop(inner); });
+    if (found)
+      return true;
+  }
+  return false;
+}
+
 agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
   // Loop-carried names are minted from the result id and bound to init, body
   // arg and yield, so all three use the same MSL variable.
@@ -113,8 +132,18 @@ agpu::Decision AgpuEmitter::emitForOp(scf::ForOp forOp) {
   }
 
   const auto loop = [&]() -> agpu::Decision {
-    return agpu::emitFor(agpu_.context(), *cur_, b, carried, inits,
-                         std::move(body), yielded);
+    const agpu::Decision d = agpu::emitFor(agpu_.context(), *cur_, b, carried,
+                                           inits, std::move(body), yielded);
+    // Only after a block's last loop: a respelling between two loops was
+    // measured to cost more than it saved.
+    if (d.ok() && body_.declaresThreadgroup && !nestedInLoop(forOp) &&
+        !laterLoopInBlock(forOp)) {
+      am::Context &mc = agpu_.context();
+      const agpu::KernelNames nm;
+      body_.hoist.rebase(mc, *cur_, mc.var(nm.simdLaneId),
+                         mc.var(nm.simdGroupId));
+    }
+    return d;
   };
 
   // Each bracket wraps the loop the previous ones built.

@@ -875,22 +875,15 @@ inline msl::Function *guardedFma(msl::Context &c) {
           c.binary(msl::BinOp::LOr,
                    c.binary(msl::BinOp::LOr, subnormal("a"), subnormal("b")),
                    subnormal("c")),
-          c.binary(msl::BinOp::LAnd,
-                   c.binary(msl::BinOp::Lt, mag("r"), c.litHex(0x800000)),
-                   c.binary(msl::BinOp::LOr,
-                            c.binary(msl::BinOp::LAnd,
-                                     c.binary(msl::BinOp::Lt,
-                                              c.binary(msl::BinOp::Add,
-                                                       expOf("a"), expOf("b")),
-                                              c.lit(174, u32)),
-                                     c.binary(msl::BinOp::Ne,
-                                              c.call(msl::builtin::math::Min,
-                                                     {mag("a"), mag("b")}),
-                                              c.lit(0, u32))),
-                            c.binary(msl::BinOp::Lt,
-                                     c.binary(msl::BinOp::Sub, mag("c"),
-                                              c.lit(1, u32)),
-                                     c.litHex(0xbffffff)))))));
+          c.binary(
+              msl::BinOp::LAnd,
+              c.binary(msl::BinOp::Lt, mag("r"), c.litHex(0x800000)),
+              c.binary(
+                  msl::BinOp::LOr,
+                  c.binary(msl::BinOp::Lt,
+                           c.binary(msl::BinOp::Add, expOf("a"), expOf("b")),
+                           c.lit(174, u32)),
+                  c.binary(msl::BinOp::Lt, expOf("c"), c.lit(24, u32)))))));
   fn->body.push_back(c.returnStmt(c.ternary(
       c.var("bad"), c.call(hn::SoftFma, {c.var("a"), c.var("b"), c.var("c")}),
       c.var("r"))));

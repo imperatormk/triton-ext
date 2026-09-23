@@ -366,7 +366,7 @@ int main() {
     const std::string body = helperSource(Helper::Fma);
     CHECK_LACKS(body, "0x7f800000u) == 0u");
     CHECK_HAS(body, "< 174u");
-    CHECK_HAS(body, "metal::min(ma, mb) != 0u");
+    CHECK_HAS(body, "mc >> 23 < 24u");
   }
 
   CASE("the soft path never reaches the hardware fma");

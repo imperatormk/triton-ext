@@ -650,6 +650,7 @@ private:
   agpu::Decision emitMath1Op(const agpu::OpView &o);
   agpu::Decision emitMath2Op(const agpu::OpView &o);
   agpu::Decision emitMath3Op(const agpu::OpView &o);
+  agpu::Decision emitLibdeviceFmaOp(const agpu::OpView &o);
   agpu::Decision emitCastOp(const agpu::OpView &o);
   agpu::Decision emitReinterpretCast(const agpu::OpView &o, const Ready &ready,
                                      const Operand &a, agpu::ElemType from,

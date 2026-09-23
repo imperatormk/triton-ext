@@ -239,6 +239,8 @@ agpu::OpView AgpuEmitter::opViewOf(Operation *op) {
     view.ints.push_back(cl.getPropagateNan() == triton::PropagateNan::ALL);
   if (auto call = dyn_cast<triton::CallOp>(op))
     view.text = call.getCallee();
+  if (auto asmOp = dyn_cast<triton::ElementwiseInlineAsmOp>(op))
+    view.text = asmOp.getAsmString();
   std::vector<ConstantValue> konst;
   if (auto k = dyn_cast<arith::ConstantOp>(op))
     konst = constantsOf(k);

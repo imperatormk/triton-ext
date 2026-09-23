@@ -10,6 +10,9 @@ namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
 
+static constexpr std::string_view kLibdeviceFmaAsm = "agpu.fma.ftz";
+static constexpr llvm::StringLiteral kReflectFtzAttr = "applegpu.reflect_ftz";
+
 am::Str AgpuEmitter::castTo(const agpu::ElemType &from,
                             const agpu::ElemType &to, const am::Str &src) {
   am::Context &mc = agpu_.context();
@@ -234,6 +237,38 @@ agpu::Decision AgpuEmitter::emitMath3Op(const agpu::OpView &o) {
     RegValue v;
     v.value = agpu::clampExpr(mc, m->fn, ready.elem, v0.at(r), mc.var(v1.at(r)),
                               mc.var(v2.at(r)), propagateNan);
+    return v;
+  });
+}
+
+agpu::Decision AgpuEmitter::emitLibdeviceFmaOp(const agpu::OpView &o) {
+  am::Context &mc = agpu_.context();
+  if (o.text != kLibdeviceFmaAsm)
+    return declined(o.name, "inline assembly has no MSL lowering");
+  const Ready ready = readyFor(o, 3);
+  if (!ready.ok())
+    return ready.why;
+  const agpu::Decision d = agpu::checkMath3(agpu::MathFn3::Fma, ready.elem);
+  if (!d.ok())
+    return d;
+
+  const Value res = mlirValueOf(o.results[0]);
+  auto mod =
+      res ? res.getDefiningOp()->getParentOfType<ModuleOp>() : ModuleOp();
+  const bool ftz = mod && mod->hasAttr(kReflectFtzAttr);
+  if (!ftz)
+    agpu_.helpers.require(agpu::MathFn3::Fma, ready.elem);
+
+  const Operand &v0 = ready[0];
+  const Operand &v1 = ready[1];
+  const Operand &v2 = ready[2];
+  return emitPerRegister(o, ready.regs, ready.elem, 'm', [&](int64_t r) {
+    RegValue v;
+    v.value = ftz ? agpu::mathExpr(mc, agpu::MathFn3::Fma, mc.var(v0.at(r)),
+                                   mc.var(v1.at(r)), mc.var(v2.at(r)))
+                  : agpu::mathExpr(mc, agpu::MathFn3::Fma, ready.elem,
+                                   mc.var(v0.at(r)), mc.var(v1.at(r)),
+                                   mc.var(v2.at(r)));
     return v;
   });
 }
@@ -573,6 +608,11 @@ void AgpuEmitter::registerArithHandlers() {
              agpu::forOps(math3OpNames(), [this](const agpu::OpView &o) {
                return emitMath3Op(o);
              }));
+
+  table_.add("libdevice_fma", agpu::forOps({"tt.elementwise_inline_asm"},
+                                           [this](const agpu::OpView &o) {
+                                             return emitLibdeviceFmaOp(o);
+                                           }));
 
   // planConvert picks static_cast vs rounding helper vs fp8 pack from the two
   // element types. Reinterpreting ops are handled below instead.

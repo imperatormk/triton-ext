@@ -59,6 +59,15 @@ def _cbrt(x):
 
 
 @triton.jit
+def _fma(a, b, c):
+    return tl.inline_asm_elementwise("agpu.fma.ftz",
+                                     "=r,r,r,r", [a, b, c],
+                                     dtype=tl.float32,
+                                     is_pure=True,
+                                     pack=1)
+
+
+@triton.jit
 def _round_to_int(y):
     # Round-half-away-from-zero to the nearest integral float value.
     return tl.where(y >= 0.0, tl.floor(y + 0.5), tl.ceil(y - 0.5))
@@ -71,7 +80,7 @@ def _pow_mag(ax, y):
     # then 2**t = 2**ki * 2**frac to keep the exp2 argument small.
     lg = tl.log2(ax)
     hi = y * lg
-    e = tl.math.fma(y, lg, -hi)
+    e = _fma(y, lg, -hi)
     t = hi + e
     ki = _round_to_int(t)
     tf = (hi - ki) + e
@@ -247,9 +256,9 @@ def _erfc(x):
     p = p * q + -1.396211e-01
     p = p * q + 2.3299512e-01
     s = t * t
-    r = tl.math.fma(t, t, -s)
+    r = _fma(t, t, -s)
     e = tl.exp(-s)
-    e = tl.math.fma(-e, r, e)
+    e = _fma(-e, r, e)
     tail = (1.0 + p) / (2.0 * t + 1.0) * e
     near = 1.0 - tl.math.erf(x)
     big = tl.where(x >= 0.0, tail, 2.0 - tail)

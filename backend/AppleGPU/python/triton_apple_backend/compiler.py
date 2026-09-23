@@ -28,6 +28,7 @@ _GRID_RESIDENCY_ATTR = 'applegpu.grid_coresident'
 # Also spelled in agpu/plan/PoolPlan.h.
 _POOL_NEEDED_ATTR = 'applegpu.pool_needed_bytes'
 _POOL_LIMIT_ATTR = 'applegpu.pool_limit_bytes'
+_REFLECT_FTZ_ATTR = 'applegpu.reflect_ftz'
 
 _MSL_PREAMBLE_END = 'using namespace metal;\n'
 
@@ -95,6 +96,7 @@ class MetalOptions:
 
     debug: bool = False
     enable_fp_fusion: bool = True
+    enable_reflect_ftz: bool = True
     launch_cooperative_grid: bool = _inert(False)
     instrumentation_mode: str = "none"
     fpsan_homomorphic_casts: bool = _inert(False)
@@ -208,6 +210,9 @@ class MetalBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod, 'make_ttir')
+        if options.enable_reflect_ftz:
+            mod.set_attr(_REFLECT_FTZ_ATTR,
+                         ir.builder(mod.context).get_unit_attr())
         return mod
 
     def make_ttgir(self, mod, metadata, options):

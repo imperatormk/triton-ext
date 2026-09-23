@@ -21,7 +21,8 @@ inline constexpr const char *Copysign = "metal::copysign";
 inline constexpr const char *Clamp = "metal::clamp";
 inline constexpr const char *Sign = "metal::sign";
 inline constexpr const char *Mulhi = "metal::mulhi";
-inline constexpr const char *Clz = "metal::clz";
+inline constexpr const char *Min3 = "metal::min3";
+inline constexpr const char *Expect = "__builtin_expect";
 
 // `round` rounds half away from zero; `rint` rounds half to even. Distinct
 // MLIR ops: math.round and math.roundeven.
@@ -165,7 +166,6 @@ inline constexpr const char *PrintAppend = "__agpu_print_append";
 inline constexpr const char *AssertRecord = "__agpu_assert_record";
 inline constexpr const char *NarrowF64 = "__agpu_f64_to_f32";
 inline constexpr const char *SoftFma = "__agpu_soft_fma";
-inline constexpr const char *SoftFmaPack = "__agpu_soft_fma_pack";
 inline constexpr const char *Fma = "__agpu_fma";
 } // namespace helper
 

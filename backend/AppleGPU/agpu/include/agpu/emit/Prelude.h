@@ -512,116 +512,16 @@ inline msl::Function *narrowF64(msl::Context &c) {
   return fn;
 }
 
-// Rounds sign * sig * 2^exp to f32, nearest-even. `sig` is nonzero and below
-// 2^63; bit 0 of it carries the sticky bit of everything already shifted out.
-inline msl::Function *softFmaPacker(msl::Context &c) {
-  const msl::Type f32 = msl::Type::scalar(msl::Scalar::F32);
-  const msl::Type u32 = msl::Type::scalar(msl::Scalar::U32);
-  const msl::Type i32 = msl::Type::scalar(msl::Scalar::I32);
-  const msl::Type u64 = msl::Type::scalar(msl::Scalar::U64);
-
-  msl::Function *fn = helperFn(c, hn::SoftFmaPack, f32);
-  fn->params.push_back({u32, "sign", {}});
-  fn->params.push_back({i32, "exp", {}});
-  fn->params.push_back({u64, "sig", {}});
-
-  msl::Expr *const sign = c.var("sign");
-  msl::Expr *const exp = c.var("exp");
-  msl::Expr *const sig = c.var("sig");
-  msl::Expr *const E = c.var("E");
-  msl::Expr *const shift = c.var("shift");
-  msl::Expr *const q = c.var("q");
-
-  const auto u64lit = [&](uint64_t v) {
-    return c.cast(u64, c.lit((int64_t)v));
-  };
-  const auto one64 = [&] { return u64lit(1); };
-  const auto shlOne = [&](msl::Expr *by) {
-    return c.binary(msl::BinOp::Shl, one64(), by);
-  };
-  const auto signBit = [&] {
-    return c.binary(msl::BinOp::Shl, sign, c.lit(31));
-  };
-
-  fn->body.push_back(c.declStmt(
-      u32, "lz", c.cast(u32, c.call(msl::builtin::math::Clz, {sig}))));
-  fn->body.push_back(
-      c.assign(sig, c.binary(msl::BinOp::Shl, sig, c.var("lz"))));
-  fn->body.push_back(
-      c.assign(exp, c.binary(msl::BinOp::Sub, exp, c.cast(i32, c.var("lz")))));
-  fn->body.push_back(
-      c.declStmt(i32, "E", c.binary(msl::BinOp::Add, exp, c.lit(63))));
-
-  // 40 = 63 - 23: the leading bit sits at 63 and the mantissa keeps 24 bits.
-  // Below the normal range the quantum is fixed at 2^-149, so the shift widens
-  // by however far the exponent falls short.
-  fn->body.push_back(c.declStmt(
-      i32, "shift",
-      c.ternary(c.binary(msl::BinOp::Ge, E, c.lit(-126)), c.lit(40),
-                c.binary(msl::BinOp::Add, c.lit(40),
-                         c.binary(msl::BinOp::Sub, c.lit(-126), E)))));
-  fn->body.push_back(c.ifStmt(c.binary(msl::BinOp::Gt, shift, c.lit(64)),
-                              {c.returnStmt(c.bitcast(f32, signBit()))}));
-
-  fn->body.push_back(c.declStmt(u64, "q"));
-  fn->body.push_back(c.declStmt(u64, "rem"));
-  fn->body.push_back(c.declStmt(u64, "hb"));
-  fn->body.push_back(c.ifElse(
-      c.binary(msl::BinOp::Eq, shift, c.lit(64)),
-      {c.assign(q, u64lit(0)), c.assign(c.var("rem"), sig),
-       c.assign(c.var("hb"), shlOne(c.lit(63)))},
-      {c.assign(q, c.binary(msl::BinOp::Shr, sig, shift)),
-       c.assign(c.var("rem"),
-                c.binary(msl::BinOp::And, sig,
-                         c.binary(msl::BinOp::Sub, shlOne(shift), one64()))),
-       c.assign(c.var("hb"),
-                shlOne(c.binary(msl::BinOp::Sub, shift, c.lit(1))))}));
-
-  fn->body.push_back(c.ifStmt(
-      c.binary(msl::BinOp::LOr,
-               c.binary(msl::BinOp::Gt, c.var("rem"), c.var("hb")),
-               c.binary(msl::BinOp::LAnd,
-                        c.binary(msl::BinOp::Eq, c.var("rem"), c.var("hb")),
-                        c.binary(msl::BinOp::And, q, one64()))),
-      {c.assign(q, c.binary(msl::BinOp::Add, q, one64()))}));
-
-  msl::Block normal;
-  normal.push_back(
-      c.ifStmt(c.binary(msl::BinOp::Ge, q, shlOne(c.lit(24))),
-               {c.assign(q, c.binary(msl::BinOp::Shr, q, c.lit(1))),
-                c.assign(E, c.binary(msl::BinOp::Add, E, c.lit(1)))}));
-  normal.push_back(
-      c.declStmt(i32, "be", c.binary(msl::BinOp::Add, E, c.lit(127))));
-  normal.push_back(
-      c.ifStmt(c.binary(msl::BinOp::Ge, c.var("be"), c.lit(255)),
-               {c.returnStmt(c.bitcast(f32, c.binary(msl::BinOp::Or, signBit(),
-                                                     c.litHex(0x7f800000))))}));
-  normal.push_back(c.returnStmt(c.bitcast(
-      f32, c.binary(msl::BinOp::Or,
-                    c.binary(msl::BinOp::Or, signBit(),
-                             c.binary(msl::BinOp::Shl, c.cast(u32, c.var("be")),
-                                      c.lit(23))),
-                    c.binary(msl::BinOp::And, c.cast(u32, q),
-                             c.litHex(0x7fffff))))));
-
-  // A subnormal target already has the quantum built in, so the rounded
-  // integer is the whole field and a carry lands in the exponent by itself.
-  fn->body.push_back(
-      c.ifElse(c.binary(msl::BinOp::Eq, shift, c.lit(40)), std::move(normal),
-               {c.returnStmt(c.bitcast(f32, c.binary(msl::BinOp::Or, signBit(),
-                                                     c.cast(u32, q))))}));
-  return fn;
-}
-
-// fma with every step in integer arithmetic. The ALU flushes subnormals in
-// and out, so a operand or result in that range has to avoid it entirely:
-// the 24x24 product is exact in 64 bits, the addend is aligned into the same
-// frame, and the single rounding happens on the integer significand.
+// fma where the ALU would flush a subnormal. Each operand is split from its
+// bits into a [1, 2) significand and an exponent, so the hardware fma runs
+// where nothing is subnormal and rounds exactly; the result is then narrowed
+// to its subnormal width. That second rounding is only wrong on a midpoint,
+// where the sign of the first rounding's error (Boldo-Muller) breaks the tie.
 inline msl::Function *softFma(msl::Context &c) {
+  using B = msl::BinOp;
   const msl::Type f32 = msl::Type::scalar(msl::Scalar::F32);
   const msl::Type u32 = msl::Type::scalar(msl::Scalar::U32);
   const msl::Type i32 = msl::Type::scalar(msl::Scalar::I32);
-  const msl::Type u64 = msl::Type::scalar(msl::Scalar::U64);
   const msl::Type b = msl::Type::scalar(msl::Scalar::Bool);
 
   msl::Function *fn = helperFn(c, hn::SoftFma, f32);
@@ -629,211 +529,167 @@ inline msl::Function *softFma(msl::Context &c) {
   fn->params.push_back({f32, "b", {}});
   fn->params.push_back({f32, "c", {}});
 
-  const auto u64lit = [&](uint64_t v) {
-    return c.cast(u64, c.lit((int64_t)v));
+  const auto v = [&](const std::string &n) { return c.var(n); };
+  const auto bin = [&](B op, msl::Expr *x, msl::Expr *y) {
+    return c.binary(op, x, y);
   };
-  const auto bitsOf = [&](const char *v) { return c.bitcast(u32, c.var(v)); };
-  const auto magOf = [&](const char *v) {
-    return c.binary(msl::BinOp::And, bitsOf(v), c.litHex(0x7fffffff));
+  const auto hex = [&](int64_t x) { return c.litHex(x); };
+  const auto asF = [&](msl::Expr *e) { return c.bitcast(f32, e); };
+  const auto nan = [&] { return c.returnStmt(asF(hex(0x7fc00000))); };
+  const auto inf = [&](msl::Expr *sign) {
+    return c.returnStmt(asF(bin(B::Or, sign, hex(0x7f800000))));
   };
-  const auto expField = [&](const char *v) {
-    return c.binary(msl::BinOp::And,
-                    c.binary(msl::BinOp::Shr, bitsOf(v), c.lit(23)),
-                    c.litHex(0xff));
-  };
-  const auto isNan = [&](const char *v) {
-    return c.binary(msl::BinOp::Gt, magOf(v), c.litHex(0x7f800000));
-  };
-  const auto isZero = [&](const char *v) {
-    return c.binary(msl::BinOp::Eq, magOf(v), c.lit(0, u32));
-  };
-  const auto quietNan = [&] { return c.bitcast(f32, c.litHex(0x7fc00000)); };
+  msl::Block &body = fn->body;
 
-  // sign, exponent and integer significand of each operand.
-  for (const char *v : {"a", "b", "c"}) {
-    const std::string s = std::string("s") + v;
-    const std::string e = std::string("e") + v;
-    const std::string m = std::string("m") + v;
-    fn->body.push_back(
-        c.declStmt(u32, s, c.binary(msl::BinOp::Shr, bitsOf(v), c.lit(31))));
-    fn->body.push_back(c.declStmt(u32, e + "f", expField(v)));
-    fn->body.push_back(
-        c.declStmt(u32, m + "f",
-                   c.binary(msl::BinOp::And, bitsOf(v), c.litHex(0x7fffff))));
-    fn->body.push_back(c.declStmt(
-        i32, e,
-        c.ternary(c.binary(msl::BinOp::Eq, c.var(e + "f"), c.lit(0, u32)),
-                  c.lit(-149),
-                  c.binary(msl::BinOp::Sub, c.cast(i32, c.var(e + "f")),
-                           c.lit(150)))));
-    fn->body.push_back(c.declStmt(
-        u32, m,
-        c.ternary(
-            c.binary(msl::BinOp::Eq, c.var(e + "f"), c.lit(0, u32)),
-            c.var(m + "f"),
-            c.binary(msl::BinOp::Or, c.var(m + "f"), c.litHex(0x800000)))));
+  for (const char *x : {"a", "b", "c"}) {
+    const std::string s(x);
+    body.push_back(c.declStmt(u32, "u" + s, c.bitcast(u32, v(s))));
+    body.push_back(
+        c.declStmt(u32, "m" + s, bin(B::And, v("u" + s), hex(0x7fffffff))));
+  }
+  body.push_back(c.declStmt(
+      u32, "ps", bin(B::And, bin(B::Xor, v("ua"), v("ub")), hex(0x80000000))));
+
+  body.push_back(c.ifStmt(bin(B::LOr,
+                              bin(B::LOr, bin(B::Gt, v("ma"), hex(0x7f800000)),
+                                  bin(B::Gt, v("mb"), hex(0x7f800000))),
+                              bin(B::Gt, v("mc"), hex(0x7f800000))),
+                          {nan()}));
+  body.push_back(c.ifStmt(
+      bin(B::LOr, bin(B::Eq, v("ma"), hex(0x7f800000)),
+          bin(B::Eq, v("mb"), hex(0x7f800000))),
+      {c.ifStmt(bin(B::LOr, bin(B::Eq, v("ma"), c.lit(0, u32)),
+                    bin(B::Eq, v("mb"), c.lit(0, u32))),
+                {nan()}),
+       c.ifStmt(bin(B::LAnd, bin(B::Eq, v("mc"), hex(0x7f800000)),
+                    bin(B::Ne, bin(B::And, v("uc"), hex(0x80000000)), v("ps"))),
+                {nan()}),
+       inf(v("ps"))}));
+  body.push_back(
+      c.ifStmt(bin(B::Eq, v("mc"), hex(0x7f800000)), {c.returnStmt(v("c"))}));
+  body.push_back(c.ifStmt(
+      bin(B::LOr, bin(B::Eq, v("ma"), c.lit(0, u32)),
+          bin(B::Eq, v("mb"), c.lit(0, u32))),
+      {c.ifStmt(bin(B::Ne, v("mc"), c.lit(0, u32)), {c.returnStmt(v("c"))}),
+       c.returnStmt(asF(bin(B::And, v("ps"), v("uc"))))}));
+
+  for (const char *x : {"a", "b", "c"}) {
+    const std::string s(x);
+    const std::string u = "u" + s, k = "k" + s, z = "z" + s;
+    body.push_back(c.declStmt(
+        b, z,
+        bin(B::Eq, bin(B::And, bin(B::Shr, v(u), c.lit(23)), hex(0xff)),
+            c.lit(0, u32))));
+    body.push_back(c.declStmt(
+        u32, k,
+        c.ternary(v(z),
+                  c.bitcast(u32, c.cast(f32, bin(B::And, v(u), hex(0x7fffff)))),
+                  v(u))));
+    body.push_back(c.declStmt(
+        i32, "e" + s,
+        bin(B::Sub,
+            c.cast(i32, bin(B::And, bin(B::Shr, v(k), c.lit(23)), hex(0xff))),
+            c.ternary(v(z), c.lit(276), c.lit(127)))));
+    body.push_back(c.declStmt(
+        f32, "f" + s,
+        asF(bin(B::Or,
+                bin(B::Or, bin(B::And, v(k), hex(0x7fffff)), hex(0x3f800000)),
+                bin(B::And, v(u), hex(0x80000000))))));
   }
 
-  // Inf and NaN never reach the hardware fma: it would read a subnormal
-  // operand as zero and turn inf*subnormal into a NaN.
-  msl::Block spec;
-  spec.push_back(c.ifStmt(
-      c.binary(msl::BinOp::LOr,
-               c.binary(msl::BinOp::LOr, isNan("a"), isNan("b")), isNan("c")),
-      {c.returnStmt(quietNan())}));
-  spec.push_back(c.declStmt(
-      u32, "ps", c.binary(msl::BinOp::Xor, c.var("sa"), c.var("sb"))));
-  spec.push_back(c.declStmt(
-      b, "ainf", c.binary(msl::BinOp::Eq, c.var("eaf"), c.litHex(0xff))));
-  spec.push_back(c.declStmt(
-      b, "binf", c.binary(msl::BinOp::Eq, c.var("ebf"), c.litHex(0xff))));
-  spec.push_back(c.declStmt(
-      b, "cinf", c.binary(msl::BinOp::Eq, c.var("ecf"), c.litHex(0xff))));
-  spec.push_back(
-      c.ifStmt(c.binary(msl::BinOp::LOr,
-                        c.binary(msl::BinOp::LAnd, c.var("ainf"), isZero("b")),
-                        c.binary(msl::BinOp::LAnd, c.var("binf"), isZero("a"))),
-               {c.returnStmt(quietNan())}));
-  spec.push_back(c.ifStmt(
-      c.binary(msl::BinOp::LOr, c.var("ainf"), c.var("binf")),
-      {c.ifStmt(c.binary(msl::BinOp::LAnd, c.var("cinf"),
-                         c.binary(msl::BinOp::Ne, c.var("sc"), c.var("ps"))),
-                {c.returnStmt(quietNan())}),
-       c.returnStmt(c.bitcast(
-           f32, c.binary(msl::BinOp::Or,
-                         c.binary(msl::BinOp::Shl, c.var("ps"), c.lit(31)),
-                         c.litHex(0x7f800000))))}));
-  spec.push_back(c.returnStmt(c.var("c")));
+  msl::Expr *const tiny = asF(hex(0x21800000));
+  body.push_back(c.declStmt(i32, "S", bin(B::Add, v("ea"), v("eb"))));
+  body.push_back(c.declStmt(f32, "g", c.litF(0.0)));
+  body.push_back(c.ifStmt(
+      bin(B::Ne, v("mc"), c.lit(0, u32)),
+      {c.declStmt(i32, "d", bin(B::Sub, v("ec"), v("S"))),
+       c.ifElse(
+           bin(B::Gt, v("d"), c.lit(60)),
+           {c.assign(v("fa"), bin(B::Mul, v("fa"), tiny)),
+            c.assign(v("g"), v("fc")), c.assign(v("S"), v("ec"))},
+           {c.ifElse(
+               bin(B::Lt, v("d"), c.lit(-60)),
+               {c.assign(v("g"),
+                         asF(bin(B::Or, bin(B::And, v("uc"), hex(0x80000000)),
+                                 hex(0x21800000))))},
+               {c.assign(v("g"), asF(bin(B::Add, c.bitcast(u32, v("fc")),
+                                         bin(B::Shl, c.cast(u32, v("d")),
+                                             c.lit(23)))))})})}));
 
-  fn->body.push_back(c.ifStmt(
-      c.binary(msl::BinOp::LOr,
-               c.binary(msl::BinOp::LOr,
-                        c.binary(msl::BinOp::Eq, c.var("eaf"), c.litHex(0xff)),
-                        c.binary(msl::BinOp::Eq, c.var("ebf"), c.litHex(0xff))),
-               c.binary(msl::BinOp::Eq, c.var("ecf"), c.litHex(0xff))),
-      std::move(spec)));
-
-  fn->body.push_back(c.declStmt(
-      u32, "ps", c.binary(msl::BinOp::Xor, c.var("sa"), c.var("sb"))));
-  fn->body.push_back(
-      c.declStmt(u64, "pm",
-                 c.binary(msl::BinOp::Mul, c.cast(u64, c.var("ma")),
-                          c.cast(u64, c.var("mb")))));
-  fn->body.push_back(c.declStmt(
-      i32, "pe", c.binary(msl::BinOp::Add, c.var("ea"), c.var("eb"))));
-  fn->body.push_back(c.declStmt(u64, "cm", c.cast(u64, c.var("mc"))));
-
-  fn->body.push_back(
-      c.ifStmt(c.binary(msl::BinOp::Eq, c.var("pm"), u64lit(0)),
-               {c.ifStmt(c.binary(msl::BinOp::Eq, c.var("cm"), u64lit(0)),
-                         {c.returnStmt(c.bitcast(
-                             f32, c.binary(msl::BinOp::Shl,
-                                           c.binary(msl::BinOp::And,
-                                                    c.var("ps"), c.var("sc")),
-                                           c.lit(31))))}),
-                c.returnStmt(c.var("c"))}));
-  fn->body.push_back(c.ifStmt(
-      c.binary(msl::BinOp::Eq, c.var("cm"), u64lit(0)),
+  body.push_back(c.declStmt(
+      f32, "y", c.call(msl::builtin::math::Fma, {v("fa"), v("fb"), v("g")})));
+  body.push_back(c.declStmt(u32, "uy", c.bitcast(u32, v("y"))));
+  body.push_back(
+      c.ifStmt(bin(B::Eq, bin(B::And, v("uy"), hex(0x7fffffff)), c.lit(0, u32)),
+               {c.returnStmt(c.litF(0.0))}));
+  body.push_back(c.declStmt(
+      i32, "E",
+      bin(B::Add,
+          bin(B::Sub,
+              c.cast(i32,
+                     bin(B::And, bin(B::Shr, v("uy"), c.lit(23)), hex(0xff))),
+              c.lit(127)),
+          v("S"))));
+  body.push_back(c.declStmt(u32, "sg", bin(B::And, v("uy"), hex(0x80000000))));
+  body.push_back(c.ifStmt(bin(B::Gt, v("E"), c.lit(127)), {inf(v("sg"))}));
+  body.push_back(c.ifStmt(
+      bin(B::Ge, v("E"), c.lit(-126)),
       {c.returnStmt(
-          c.call(hn::SoftFmaPack, {c.var("ps"), c.var("pe"), c.var("pm")}))}));
+          asF(bin(B::Or,
+                  bin(B::Or, v("sg"),
+                      bin(B::Shl, c.cast(u32, bin(B::Add, v("E"), c.lit(127))),
+                          c.lit(23))),
+                  bin(B::And, v("uy"), hex(0x7fffff)))))}));
 
-  // Both terms move into one frame. Bit 0 is left free so everything shifted
-  // out of it can be OR'd back as a sticky bit for the rounding decision.
-  fn->body.push_back(c.declStmt(
-      i32, "E0",
-      c.binary(msl::BinOp::Sub,
-               c.call(msl::builtin::math::Min, {c.var("pe"), c.var("ec")}),
-               c.lit(1))));
-  fn->body.push_back(c.declStmt(
-      i32, "spm", c.binary(msl::BinOp::Sub, c.var("pe"), c.var("E0"))));
-  fn->body.push_back(c.declStmt(
-      i32, "scm", c.binary(msl::BinOp::Sub, c.var("ec"), c.var("E0"))));
-  fn->body.push_back(
-      c.declStmt(i32, "over",
-                 c.call(msl::builtin::math::Max,
-                        {c.binary(msl::BinOp::Sub, c.var("spm"), c.lit(14)),
-                         c.binary(msl::BinOp::Sub, c.var("scm"), c.lit(38))})));
-  fn->body.push_back(c.ifStmt(
-      c.binary(msl::BinOp::Gt, c.var("over"), c.lit(0)),
-      {c.assign(c.var("E0"),
-                c.binary(msl::BinOp::Add, c.var("E0"), c.var("over"))),
-       c.assign(c.var("spm"),
-                c.binary(msl::BinOp::Sub, c.var("spm"), c.var("over"))),
-       c.assign(c.var("scm"),
-                c.binary(msl::BinOp::Sub, c.var("scm"), c.var("over")))}));
+  body.push_back(c.declStmt(i32, "sh", bin(B::Sub, c.lit(-126), v("E"))));
+  body.push_back(
+      c.ifStmt(bin(B::Gt, v("sh"), c.lit(25)), {c.returnStmt(asF(v("sg")))}));
+  body.push_back(c.declStmt(
+      u32, "M",
+      bin(B::Or, bin(B::And, v("uy"), hex(0x7fffff)), hex(0x800000))));
+  body.push_back(c.declStmt(
+      u32, "rem",
+      bin(B::And, v("M"),
+          bin(B::Sub, bin(B::Shl, c.lit(1, u32), v("sh")), c.lit(1, u32)))));
+  body.push_back(c.declStmt(
+      u32, "hb", bin(B::Shl, c.lit(1, u32), bin(B::Sub, v("sh"), c.lit(1)))));
+  body.push_back(c.declStmt(u32, "q", bin(B::Shr, v("M"), v("sh"))));
 
-  fn->body.push_back(c.declStmt(b, "sticky", c.litBool(false)));
-  const auto alignInto = [&](const char *dst, const char *src, const char *by) {
-    msl::Block down;
-    down.push_back(c.declStmt(i32, std::string(by) + "n",
-                              c.unary(msl::UnOp::Neg, c.var(by))));
-    msl::Block wide;
-    wide.push_back(
-        c.assign(c.var("sticky"),
-                 c.binary(msl::BinOp::LOr, c.var("sticky"),
-                          c.binary(msl::BinOp::Ne, c.var(src), u64lit(0)))));
-    wide.push_back(c.assign(c.var(dst), u64lit(0)));
-    msl::Block part;
-    part.push_back(c.assign(
-        c.var("sticky"),
-        c.binary(
-            msl::BinOp::LOr, c.var("sticky"),
-            c.binary(msl::BinOp::Ne,
-                     c.binary(msl::BinOp::And, c.var(src),
-                              c.binary(msl::BinOp::Sub,
-                                       c.binary(msl::BinOp::Shl, u64lit(1),
-                                                c.var(std::string(by) + "n")),
-                                       u64lit(1))),
-                     u64lit(0)))));
-    part.push_back(
-        c.assign(c.var(dst), c.binary(msl::BinOp::Shr, c.var(src),
-                                      c.var(std::string(by) + "n"))));
-    down.push_back(c.ifElse(
-        c.binary(msl::BinOp::Ge, c.var(std::string(by) + "n"), c.lit(64)),
-        std::move(wide), std::move(part)));
-    return c.ifElse(c.binary(msl::BinOp::Ge, c.var(by), c.lit(0)),
-                    {c.assign(c.var(dst), c.binary(msl::BinOp::Shl, c.var(src),
-                                                   c.var(by)))},
-                    std::move(down));
+  const auto twoSum = [&](const std::string &s, const std::string &e,
+                          const std::string &t, const std::string &x,
+                          const std::string &y, msl::Block &into) {
+    into.push_back(c.declStmt(f32, s, bin(B::Add, v(x), v(y))));
+    into.push_back(c.declStmt(f32, t, bin(B::Sub, v(s), v(x))));
+    into.push_back(
+        c.declStmt(f32, e,
+                   bin(B::Add, bin(B::Sub, v(x), bin(B::Sub, v(s), v(t))),
+                       bin(B::Sub, v(y), v(t)))));
   };
-  fn->body.push_back(c.declStmt(u64, "P"));
-  fn->body.push_back(c.declStmt(u64, "Q"));
-  fn->body.push_back(alignInto("P", "pm", "spm"));
-  fn->body.push_back(alignInto("Q", "cm", "scm"));
-
-  fn->body.push_back(c.declStmt(u64, "sig"));
-  fn->body.push_back(c.declStmt(u32, "sign"));
-  const auto carrySticky = [&](const char *v) {
-    return c.ifStmt(
-        c.var("sticky"),
-        {c.assign(c.var(v), c.binary(msl::BinOp::Sub, c.var(v), u64lit(1))),
-         c.assign(c.var(v), c.binary(msl::BinOp::Or, c.var(v), u64lit(1)))});
-  };
-  msl::Block same;
-  same.push_back(c.assign(c.var("sig"),
-                          c.binary(msl::BinOp::Add, c.var("P"), c.var("Q"))));
-  same.push_back(c.assign(c.var("sign"), c.var("ps")));
-  same.push_back(
-      c.ifStmt(c.var("sticky"),
-               {c.assign(c.var("sig"),
-                         c.binary(msl::BinOp::Or, c.var("sig"), u64lit(1)))}));
-  msl::Block diff;
-  diff.push_back(
-      c.ifElse(c.binary(msl::BinOp::Ge, c.var("P"), c.var("Q")),
-               {c.assign(c.var("sig"),
-                         c.binary(msl::BinOp::Sub, c.var("P"), c.var("Q"))),
-                c.assign(c.var("sign"), c.var("ps")), carrySticky("sig")},
-               {c.assign(c.var("sig"),
-                         c.binary(msl::BinOp::Sub, c.var("Q"), c.var("P"))),
-                c.assign(c.var("sign"), c.var("sc")), carrySticky("sig")}));
-  fn->body.push_back(
-      c.ifElse(c.binary(msl::BinOp::Eq, c.var("ps"), c.var("sc")),
-               std::move(same), std::move(diff)));
-
-  fn->body.push_back(c.ifStmt(c.binary(msl::BinOp::Eq, c.var("sig"), u64lit(0)),
-                              {c.returnStmt(c.bitcast(f32, c.lit(0, u32)))}));
-  fn->body.push_back(c.returnStmt(
-      c.call(hn::SoftFmaPack, {c.var("sign"), c.var("E0"), c.var("sig")})));
+  msl::Block tie;
+  tie.push_back(c.declStmt(f32, "u1", bin(B::Mul, v("fa"), v("fb"))));
+  tie.push_back(
+      c.declStmt(f32, "u2",
+                 c.call(msl::builtin::math::Fma,
+                        {v("fa"), v("fb"), c.unary(msl::UnOp::Neg, v("u1"))})));
+  twoSum("a1", "zz", "t1", "g", "u2", tie);
+  twoSum("b1", "b2", "t2", "u1", "a1", tie);
+  tie.push_back(
+      c.declStmt(f32, "r2",
+                 bin(B::Add, bin(B::Add, bin(B::Sub, v("b1"), v("y")), v("b2")),
+                     v("zz"))));
+  tie.push_back(c.ifElse(
+      bin(B::Eq, v("r2"), c.litF(0.0)),
+      {c.assign(v("q"),
+                bin(B::Add, v("q"), bin(B::And, v("q"), c.lit(1, u32))))},
+      {c.ifStmt(bin(B::Eq,
+                    bin(B::And, c.bitcast(u32, v("r2")), hex(0x80000000)),
+                    v("sg")),
+                {c.assign(v("q"), bin(B::Add, v("q"), c.lit(1, u32)))})}));
+  body.push_back(
+      c.ifElse(bin(B::Gt, v("rem"), v("hb")),
+               {c.assign(v("q"), bin(B::Add, v("q"), c.lit(1, u32)))},
+               {c.ifStmt(bin(B::Eq, v("rem"), v("hb")), std::move(tie))}));
+  body.push_back(c.returnStmt(asF(bin(B::Or, v("sg"), v("q")))));
   return fn;
 }
 
@@ -860,10 +716,22 @@ inline msl::Function *guardedFma(msl::Context &c) {
                     c.litHex(0x7fffff));
   };
 
+  msl::Expr *const rZero = c.binary(msl::BinOp::Eq, c.var("r"), c.litF(0.0));
   fn->body.push_back(c.declStmt(
       f32, "r",
       c.call(msl::builtin::math::Fma, {c.var("a"), c.var("b"), c.var("c")})));
-  for (const char *v : {"a", "b", "c", "r"})
+  fn->body.push_back(c.declStmt(
+      b, "near",
+      c.binary(
+          msl::BinOp::LOr,
+          c.binary(msl::BinOp::Lt,
+                   c.call(msl::builtin::math::Min3,
+                          {c.call(msl::builtin::math::Fabs, {c.var("a")}),
+                           c.call(msl::builtin::math::Fabs, {c.var("b")}),
+                           c.call(msl::builtin::math::Fabs, {c.var("c")})}),
+                   c.bitcast(f32, c.litHex(0x800000))),
+          rZero)));
+  for (const char *v : {"a", "b", "c"})
     fn->body.push_back(
         c.declStmt(u32, std::string("m") + v,
                    c.binary(msl::BinOp::And, c.bitcast(u32, c.var(v)),
@@ -871,22 +739,26 @@ inline msl::Function *guardedFma(msl::Context &c) {
   fn->body.push_back(c.declStmt(
       b, "bad",
       c.binary(
-          msl::BinOp::LOr,
+          msl::BinOp::LAnd, c.var("near"),
           c.binary(msl::BinOp::LOr,
-                   c.binary(msl::BinOp::LOr, subnormal("a"), subnormal("b")),
-                   subnormal("c")),
-          c.binary(
-              msl::BinOp::LAnd,
-              c.binary(msl::BinOp::Lt, mag("r"), c.litHex(0x800000)),
-              c.binary(
-                  msl::BinOp::LOr,
-                  c.binary(msl::BinOp::Lt,
-                           c.binary(msl::BinOp::Add, expOf("a"), expOf("b")),
-                           c.lit(174, u32)),
-                  c.binary(msl::BinOp::Lt, expOf("c"), c.lit(24, u32)))))));
-  fn->body.push_back(c.returnStmt(c.ternary(
-      c.var("bad"), c.call(hn::SoftFma, {c.var("a"), c.var("b"), c.var("c")}),
-      c.var("r"))));
+                   c.binary(msl::BinOp::LOr,
+                            c.binary(msl::BinOp::LOr, subnormal("a"),
+                                     subnormal("b")),
+                            subnormal("c")),
+                   c.binary(msl::BinOp::LAnd,
+                            c.binary(msl::BinOp::Eq, c.var("r"), c.litF(0.0)),
+                            c.binary(msl::BinOp::LOr,
+                                     c.binary(msl::BinOp::Lt,
+                                              c.binary(msl::BinOp::Add,
+                                                       expOf("a"), expOf("b")),
+                                              c.lit(174, u32)),
+                                     c.binary(msl::BinOp::Lt, expOf("c"),
+                                              c.lit(24, u32))))))));
+  fn->body.push_back(
+      c.ifStmt(c.call(msl::builtin::math::Expect, {c.var("bad"), c.lit(0)}),
+               {c.returnStmt(c.call(hn::SoftFma,
+                                    {c.var("a"), c.var("b"), c.var("c")}))}));
+  fn->body.push_back(c.returnStmt(c.var("r")));
   return fn;
 }
 
@@ -1448,7 +1320,7 @@ inline std::string helperSource(Helper h) {
   }
   case Helper::SoftFma: {
     msl::Context c;
-    return renderHelper(softFmaPacker(c)) + "\n" + renderHelper(softFma(c));
+    return renderHelper(softFma(c));
   }
   case Helper::Fma: {
     msl::Context c;

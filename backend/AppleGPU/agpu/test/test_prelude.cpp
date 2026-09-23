@@ -358,7 +358,8 @@ int main() {
          at != std::string::npos; at = body.find("- 1u < 0x7fffffu", at + 1))
       ++tests;
     CHECK_EQ(tests, 3u);
-    CHECK_HAS(body, "mr < 0x800000u");
+    CHECK_HAS(body, "r == 0.0f");
+    CHECK_HAS(body, "__builtin_expect(bad, 0)");
   }
 
   CASE("a zero operand keeps the hardware fma, which is exact there");
@@ -369,12 +370,12 @@ int main() {
     CHECK_HAS(body, "mc >> 23 < 24u");
   }
 
-  CASE("the soft path never reaches the hardware fma");
+  CASE("the soft path runs the hardware fma only where nothing is subnormal");
   {
     const std::string body = helperSource(Helper::SoftFma);
-    CHECK_LACKS(body, "metal::fma");
-    CHECK_HAS(body, "ulong");
-    CHECK_HAS(body, "metal::clz");
+    CHECK_HAS(body, "metal::fma(fa, fb, g)");
+    CHECK_HAS(body, "0x3f800000u");
+    CHECK_LACKS(body, "ulong");
   }
 
   return ::agpu_test::report("Prelude");

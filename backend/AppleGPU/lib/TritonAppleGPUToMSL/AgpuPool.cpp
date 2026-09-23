@@ -330,6 +330,41 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
     }
   });
 
+  // Loops that run one after another reuse the same slots; a nested loop
+  // stacks its slots above its ancestors'.
+  std::map<Operation *, std::vector<int>> perLoopBuffers;
+  for (ResidentOperand r : found) {
+    std::vector<int> &v = perLoopBuffers[r.loop.getOperation()];
+    if (!llvm::is_contained(v, r.buffer))
+      v.push_back(r.buffer);
+  }
+  struct Slot {
+    int index;
+    agpu::ElemType elem;
+    int64_t bytes;
+  };
+  std::vector<Slot> slots;
+  for (ResidentOperand &r : found) {
+    Operation *loopOp = r.loop.getOperation();
+    int index = 0;
+    for (Operation *p = loopOp->getParentOp(); p; p = p->getParentOp())
+      if (const auto it = perLoopBuffers.find(p); it != perLoopBuffers.end())
+        index += (int)it->second.size();
+    const std::vector<int> &own = perLoopBuffers[loopOp];
+    index += (int)(llvm::find(own, r.buffer) - own.begin());
+    int id = 0;
+    while (id < (int)slots.size() &&
+           !(slots[id].index == index && slots[id].elem == r.elem))
+      ++id;
+    if (id == (int)slots.size())
+      slots.push_back({index, r.elem, 0});
+    slots[id].bytes = std::max(slots[id].bytes, r.bytes);
+    r.buffer = id;
+  }
+  for (ResidentOperand &r : found)
+    r.bytes = slots[r.buffer].bytes;
+  buffers = (int)slots.size();
+
   const auto peakWith = [&](const std::vector<ResidentOperand> &cands,
                             int keep) {
     for (const ResidentOperand &r : cands)
@@ -416,9 +451,10 @@ void AgpuEmitter::stageResidentOperands(scf::ForOp loop) {
           failed.insert(r.buffer);
           continue;
         }
-        body_.liveDecls.push_back(mc.arrayDecl(
-            agpu::mslTypeOf(r.elem).inAddrSpace(am::AddrSpace::Threadgroup),
-            name, r.bytes / agpu::byteWidthOf(r.elem)));
+        if (body_.residentDeclared.insert(r.buffer).second)
+          body_.liveDecls.push_back(mc.arrayDecl(
+              agpu::mslTypeOf(r.elem).inAddrSpace(am::AddrSpace::Threadgroup),
+              name, r.bytes / agpu::byteWidthOf(r.elem)));
         staged[r.buffer] = name;
       }
       body_.residentBuf[{r.dot, r.which}] = staged[r.buffer];

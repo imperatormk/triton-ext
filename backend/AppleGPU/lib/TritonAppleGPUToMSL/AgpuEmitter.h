@@ -117,6 +117,7 @@ struct BodyState {
   std::vector<FusedDot> fusedDots;
 
   std::map<std::pair<Operation *, int>, agpu::msl::Str> residentBuf;
+  std::set<int> residentDeclared;
 
   // Accumulators of the last fused dot, until the next staging anchors them.
   std::vector<agpu::msl::Str> anchorAccs;

@@ -780,6 +780,20 @@ int main() {
     CHECK_EQ(p.cBandRows(), 64);
   }
 
+  CASE("a C that skips the pool does not cost the operands their pad");
+  {
+    DotFacts f = gemm(64, 64, 64);
+    f.aElemBytes = f.bElemBytes = 4;
+    f.aDirect = true;
+    f.cDirect = true;
+    Plan p = planDot(f, kBudget);
+    CHECK_EQ(kindOf(p), kDirect);
+    CHECK(p.facts.cCostsPoolNothing());
+    CHECK(p.direct().stagePad);
+    CHECK(p.pool.reserved() <= kBudget);
+    CHECK(p.stage.b.count() > 64 * 64 * 4);
+  }
+
   CASE("the cover follows the layout while the extra loads fit the round trip");
   {
     DotFacts f = gemm(64, 64, 64);

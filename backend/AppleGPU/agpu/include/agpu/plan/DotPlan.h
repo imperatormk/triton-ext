@@ -867,11 +867,13 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
     // Keep the pad if the padded pitch fits whole. Drop it if unpadded fits
     // whole where padded bands, or if the padded pitch does not fit at all,
     // which would put the reservation over the budget it was admitted under.
-    // A shape that bands at both pitches keeps the pad.
-    const Bytes cPadded = cTileBytes(f, true);
+    // A shape that bands at both pitches keeps the pad. A C that never reaches
+    // the pool weighs nothing here, as in `CReserve`.
+    const bool cFree = f.cRename || f.cCostsPoolNothing();
+    const Bytes cPadded = cFree ? Bytes(0) : cTileBytes(f, true);
     if (p.stage.ab() + cPadded > budget) {
       const StageBytes plain = planStageBytes(f, /*pad=*/false);
-      const Bytes cPlain = cTileBytes(f, false);
+      const Bytes cPlain = cFree ? Bytes(0) : cTileBytes(f, false);
       if (plain.ab() + cPlain <= budget || !fitsPadded) {
         dp.stagePad = false;
         p.stage = plain;

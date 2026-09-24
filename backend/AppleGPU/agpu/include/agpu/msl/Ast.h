@@ -376,8 +376,6 @@ struct If : Stmt {
   bool hasElse() const { return !elseBody.empty(); }
 };
 
-inline constexpr int64_t kUnrollCount = 8;
-
 struct For : Stmt {
   Stmt *init;
   Expr *cond;

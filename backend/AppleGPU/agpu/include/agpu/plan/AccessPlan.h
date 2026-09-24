@@ -4,6 +4,7 @@
 
 #include "agpu/core/CoordGuard.h"
 #include "agpu/core/Decline.h"
+#include "agpu/cost/CodeSize.h"
 #include "agpu/plan/AccessWidth.h"
 #include "agpu/plan/LayoutBasis.h"
 
@@ -11,8 +12,6 @@
 #include <vector>
 
 namespace agpu {
-
-inline constexpr int64_t kMaskFastPathMinRegs = 4;
 
 // A mask read as `coordinate < limit`, with the layout that builds it
 struct MaskBound {
@@ -119,7 +118,7 @@ inline bool runIsDead(const MaskGuards &g, int64_t base, int64_t width) {
 inline bool peelsFastPath(const MoveFacts &f, const MaskGuards &g) {
   if (!g.empty())
     return false;
-  return f.hasMask && f.regCount >= kMaskFastPathMinRegs;
+  return f.hasMask && f.regCount >= cost::kMaskFastPathMinRegs;
 }
 
 // A masked load must leave something defined in every register; the mask is a

@@ -7,6 +7,7 @@
 #ifndef AGPU_SHRINK_PLAN_H
 #define AGPU_SHRINK_PLAN_H
 
+#include "agpu/cost/CodeSize.h"
 #include "agpu/msl/Analysis.h"
 
 #include <string>
@@ -15,13 +16,6 @@
 namespace agpu {
 
 using msl::FuncSize;
-
-// Not derived from anything; a guess biased toward rolling too early.
-inline constexpr int64_t kDeclBudget = 10000;
-
-inline constexpr int64_t kRollFragFloor = 1024;
-
-inline constexpr int64_t kRollMmaFloor = 128;
 
 // A pre-emission forecast of what rolling the K steps would save. The deltas
 // cover only the statements `rollK` changes, so the unrolled size can be
@@ -46,9 +40,9 @@ struct ShrinkPlan {
 inline ShrinkPlan planShrink(const FuncSize &s) {
   ShrinkPlan p;
   p.fuseGuards = s.branches > 0;
-  p.rollKSteps =
-      (s.optimiserLoad() > kDeclBudget && s.fragDecls >= kRollFragFloor) ||
-      s.mma > kRollMmaFloor;
+  p.rollKSteps = (s.optimiserLoad() > cost::kDeclBudget &&
+                  s.fragDecls >= cost::kRollFragFloor) ||
+                 s.mma > cost::kRollMmaFloor;
   return p;
 }
 
@@ -67,7 +61,7 @@ inline FuncSize unrolledFrom(const FuncSize &rolled, const RollPrediction &p) {
 }
 
 inline bool withinBudget(const FuncSize &s) {
-  return s.optimiserLoad() <= kDeclBudget;
+  return s.optimiserLoad() <= cost::kDeclBudget;
 }
 
 enum class SizeVerdict {
@@ -103,15 +97,15 @@ inline std::string budgetReport(std::string_view fn, const FuncSize &s,
   out += " ";
   out += name(v);
   out += " decls=" + std::to_string(s.decls);
-  out += "/" + std::to_string(kDeclBudget);
+  out += "/" + std::to_string(cost::kDeclBudget);
   out += " frags=" + std::to_string(s.fragDecls);
   out += " stmts=" + std::to_string(s.stmts);
   out += " mma=" + std::to_string(s.mma);
   out += " rolled=" + std::string(reemitted ? "yes" : "no");
   out += " fused=" + std::string(plan.fuseGuards ? "yes" : "no");
   if (v == SizeVerdict::Exposed && !plan.rollKSteps &&
-      s.fragDecls < kRollFragFloor)
-    out += " (below frag floor " + std::to_string(kRollFragFloor) +
+      s.fragDecls < cost::kRollFragFloor)
+    out += " (below frag floor " + std::to_string(cost::kRollFragFloor) +
            ": rolling would not pay)";
   return out;
 }

@@ -45,21 +45,25 @@ int main() {
 
   CASE("rolling needs both an over-budget function and enough fragments");
   {
-    CHECK(planShrink(sized(kDeclBudget + 1, kRollFragFloor)).rollKSteps);
-    CHECK(!planShrink(sized(kDeclBudget + 1, kRollFragFloor - 1)).rollKSteps);
-    CHECK(!planShrink(sized(kDeclBudget, kRollFragFloor * 10)).rollKSteps);
+    CHECK(planShrink(sized(cost::kDeclBudget + 1, cost::kRollFragFloor))
+              .rollKSteps);
+    CHECK(!planShrink(sized(cost::kDeclBudget + 1, cost::kRollFragFloor - 1))
+               .rollKSteps);
+    CHECK(!planShrink(sized(cost::kDeclBudget, cost::kRollFragFloor * 10))
+               .rollKSteps);
   }
 
   CASE("a function inside the budget needs no roll");
   {
-    CHECK(withinBudget(sized(kDeclBudget, 0)));
-    CHECK(!withinBudget(sized(kDeclBudget + 1, 0)));
+    CHECK(withinBudget(sized(cost::kDeclBudget, 0)));
+    CHECK(!withinBudget(sized(cost::kDeclBudget + 1, 0)));
     CHECK(!planShrink(sized(100, 100)).rollKSteps);
   }
 
   CASE("only rolling forces a re-emit");
   {
-    ShrinkPlan roll = planShrink(sized(kDeclBudget + 1, kRollFragFloor));
+    ShrinkPlan roll =
+        planShrink(sized(cost::kDeclBudget + 1, cost::kRollFragFloor));
     CHECK(roll.needsReemit());
     ShrinkPlan fuse = planShrink(sized(10, 0, 1));
     CHECK(fuse.any());
@@ -254,8 +258,8 @@ int main() {
 
   CASE("a mitigated kernel and an unfixable one do not read alike");
   {
-    const FuncSize under = sized(kDeclBudget - 1, 0);
-    const FuncSize over = sized(kDeclBudget + 1, 0);
+    const FuncSize under = sized(cost::kDeclBudget - 1, 0);
+    const FuncSize over = sized(cost::kDeclBudget + 1, 0);
 
     CHECK(verdictOf(under, /*reemitted=*/false) == SizeVerdict::Fine);
     CHECK(verdictOf(under, /*reemitted=*/true) == SizeVerdict::Shrunk);
@@ -266,7 +270,7 @@ int main() {
 
   CASE("the report says why an over-budget kernel was left alone");
   {
-    const FuncSize s = sized(kDeclBudget + 500, kRollFragFloor - 1);
+    const FuncSize s = sized(cost::kDeclBudget + 500, cost::kRollFragFloor - 1);
     const ShrinkPlan p = planShrink(s);
     CHECK(!p.rollKSteps);
 

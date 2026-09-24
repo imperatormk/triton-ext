@@ -226,6 +226,7 @@ class MetalBackend(BaseBackend):
                                            options.warp_size, options.num_ctas)
 
         passes.ttgpuir.add_coalesce(pm)
+        _plugin.add_atomic_lane_layout(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         _plugin.add_accelerate_matmul(pm)

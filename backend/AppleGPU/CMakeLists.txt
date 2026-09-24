@@ -63,6 +63,7 @@ add_mlir_library(TritonAppleGPUBackend
     lib/Dialect/TritonAppleGPU/IR/LinearLayoutConversions.cpp
 
     lib/TritonAppleGPUTransforms/AccelerateAppleMatmul.cpp
+    lib/TritonAppleGPUTransforms/AtomicLaneLayout.cpp
     lib/TritonAppleGPUTransforms/EmitMSL.cpp
     lib/TritonAppleGPUTransforms/MaskSelectArmLoads.cpp
     lib/TritonAppleGPUTransforms/StoreShuffleLayout.cpp

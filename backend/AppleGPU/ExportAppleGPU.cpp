@@ -19,6 +19,10 @@ static void addMaskSelectArmLoads(mlir::PassManager *pm,
                                   const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createMaskSelectArmLoadsPass());
 }
+static void addAtomicLaneLayout(mlir::PassManager *pm,
+                                const std::vector<std::string> &) {
+  pm->addPass(mlir::triton::applegpu::createAtomicLaneLayoutPass());
+}
 static void addEmitMSL(mlir::PassManager *pm,
                        const std::vector<std::string> &args) {
   pm->addPass(mlir::triton::applegpu::createEmitMSLPass(
@@ -38,6 +42,11 @@ static void registerStoreShuffleLayout() {
 static void registerMaskSelectArmLoads() {
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return mlir::triton::applegpu::createMaskSelectArmLoadsPass();
+  });
+}
+static void registerAtomicLaneLayout() {
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::triton::applegpu::createAtomicLaneLayoutPass();
   });
 }
 static void registerEmitMSL() {
@@ -60,6 +69,8 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
        registerStoreShuffleLayout},
       {"mask_select_arm_loads", "0.1.0", addMaskSelectArmLoads,
        registerMaskSelectArmLoads},
+      {"atomic_lane_layout", "0.1.0", addAtomicLaneLayout,
+       registerAtomicLaneLayout},
       {"emit_msl", "0.1.0", addEmitMSL, registerEmitMSL},
   };
 

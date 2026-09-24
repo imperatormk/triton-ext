@@ -38,6 +38,22 @@ def StoreShuffleLayout : Pass<"triton-apple-store-shuffle-layout", "mlir::Module
   ];
 }
 
+def AtomicLaneLayout : Pass<"triton-apple-atomic-lane-layout", "mlir::ModuleOp"> {
+  let summary = "Give each lane one element of a tensor atomic's fastest axis";
+
+  let description = [{
+    Coalesce sizes a thread's elements for vector memory ops. Metal has no
+    vector atomics, so with several elements per thread one atomic
+    instruction strides across cache lines. Converts in and out let
+    remove_layout_conversions push the lane layout onto the producers.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
 def MaskSelectArmLoads : Pass<"triton-apple-mask-select-arm-loads", "mlir::ModuleOp"> {
   let summary = "Mask loads that only feed one arm of a select with its condition";
 

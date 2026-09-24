@@ -277,10 +277,10 @@ bool multipleOf(Value v, int64_t blk) {
 
 // Whether a bound can never cut through the tile: limit and start both
 // multiples of the extent make it all-in or all-out and the exact grid never
-// launches an all-out tile.
+// launches an all-out tile. A null start is a window at zero.
 bool neverRagged(const AxisBound &b, Value start, int64_t extent) {
   return !b.limit && extent > 0 && b.constant % extent == 0 &&
-         multipleOf(start, extent);
+         (!start || multipleOf(start, extent));
 }
 
 // One conjunct of a mask: `idx < limit` (or `limit > idx`), with `idx` the

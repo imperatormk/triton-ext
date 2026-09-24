@@ -130,7 +130,7 @@ struct DotShape {
 
   // A's type behind any layout change, which a layout-preserving value shares.
   RankedTensorType aRegsTy;
-  bool aSeedIdle = false;
+  bool aSeedGranted = false;
 
   // A is loop-invariant but the loop keeps no resident copy, so staging it
   // would repeat the same scatter every trip.

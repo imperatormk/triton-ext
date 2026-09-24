@@ -241,6 +241,8 @@ PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
 }
 
 void AgpuEmitter::scanPool(triton::FuncOp func) {
+  // The scan plans the unrolled build; a rolled rebuild replans its own dots.
+  rollK_ = false;
   // Recorded in the pre-pass because the scalar's definition is emitted before
   // the walk reaches the dot.
   func.walk([&](triton::DotOp dot) {
@@ -285,7 +287,7 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
   if (!func.isPublic())
     return;
   directInvariantA_.clear();
-  idleSeedA_.clear();
+  planSeedGrants(func);
   std::vector<ResidentOperand> found;
   int buffers = 0;
   func.walk([&](triton::DotOp dot) {
@@ -470,32 +472,69 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
     if (agpu::tgResidency(peak()) <= staged)
       directInvariantA_.erase(r.dot);
   }
+}
 
-  // A seed unrolls a rolled K, which pays only where the A it keeps out of
-  // the pool buys a resident threadgroup.
+// Before residency, so resident operands are planned against the pool the
+// seeds leave. Priced as a rolled build prices it, where no seed is free: a
+// grant is kept only where it is needed for the certain residency all of them
+// together reach.
+void AgpuEmitter::planSeedGrants(triton::FuncOp func) {
+  aSeedGranted_.clear();
+  struct Grant {
+    Operation *dot;
+    int64_t need;
+  };
   std::vector<std::pair<Operation *, int64_t>> needs;
+  std::vector<Grant> offers;
   func.walk([&](Operation *op) {
-    if (op != func.getOperation())
-      needs.push_back({op, poolNeedOf(op).bytes()});
-  });
-  for (const auto &[op, seededNeed] : needs) {
+    if (op == func.getOperation())
+      return;
     auto dot = dyn_cast<triton::DotOp>(op);
-    if (!dot)
-      continue;
+    if (!dot) {
+      needs.push_back({op, poolNeedOf(op).bytes()});
+      return;
+    }
     const DotShape shape = dotShapeOf(dot);
-    agpu::DotFacts staged = dotFactsOf(shape);
-    if (!staged.aFromRegs)
-      continue;
-    staged.aFromRegs = false;
-    int64_t others = 0;
-    for (const auto &[o, n] : needs)
-      if (o != op)
-        others = std::max(others, n);
-    const int64_t stagedNeed = dotPoolNeed(dot, shape, staged).bytes();
-    if (agpu::tgResidency(std::max(others, stagedNeed) + held) >=
-        agpu::tgResidency(std::max(others, seededNeed) + held))
-      idleSeedA_.insert(dot);
+    agpu::DotFacts f = dotFactsOf(shape);
+    f.rollK = true;
+    const int64_t staged = dotPoolNeed(dot, shape, f).bytes();
+    needs.push_back({op, staged});
+    f.aSeedGranted = true;
+    if (!agpu_.planFor(f).facts.aFromRegs)
+      return;
+    const int64_t seeded = dotPoolNeed(dot, shape, f).bytes();
+    if (seeded < staged)
+      offers.push_back({op, seeded});
+  });
+  if (offers.empty())
+    return;
+
+  const int64_t live = agpu_.pool.plan().live.count();
+  const int64_t threads = agpu::threadsFor(numWarps());
+  std::set<Operation *> granted;
+  const auto residency = [&] {
+    int64_t peak = 0;
+    for (const auto &[op, need] : needs) {
+      int64_t n = need;
+      for (const Grant &g : offers)
+        if (g.dot == op && granted.count(op))
+          n = g.need;
+      peak = std::max(peak, n);
+    }
+    return agpu::certainResidency(peak + live, threads);
+  };
+  const int64_t without = residency();
+  for (const Grant &g : offers)
+    granted.insert(g.dot);
+  const int64_t target = residency();
+  if (target <= without)
+    return;
+  for (const Grant &g : offers) {
+    granted.erase(g.dot);
+    if (residency() < target)
+      granted.insert(g.dot);
   }
+  aSeedGranted_ = std::move(granted);
 }
 
 void AgpuEmitter::stageResidentOperands(scf::ForOp loop) {

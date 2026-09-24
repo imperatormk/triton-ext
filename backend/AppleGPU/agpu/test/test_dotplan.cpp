@@ -20,6 +20,24 @@ const int kDirect = static_cast<int>(Plan::Kind::Direct);
 const int kFused = static_cast<int>(Plan::Kind::Fused);
 const int kUnsupported = static_cast<int>(Plan::Kind::Unsupported);
 
+// A held in registers under `apple_mma` with warpsPerCTA [gM, gN].
+void holdAIn(DotFacts &f, int64_t gM, int64_t gN) {
+  DotFacts a = gemm(f.M, f.K, f.K, f.numWarps);
+  landIn(a, gM, gN);
+  f.aDims = a.cDims;
+  f.aRegs = a.cRegs;
+}
+
+DotFacts pv(bool fused) {
+  DotFacts f = gemm(32, 64, 32);
+  f.aElemBytes = f.bElemBytes = 4;
+  f.fusedAcc = f.carriedAcc = fused;
+  if (!fused)
+    landIn(f, 4, 1);
+  holdAIn(f, 4, 1);
+  return f;
+}
+
 } // namespace
 
 int main() {
@@ -1026,6 +1044,53 @@ int main() {
     const Plan starved = planDot(f, Bytes{1024});
     CHECK(!starved.fit.operandsAndBand);
     CHECK(starved.kind == Plan::Kind::Panel);
+  }
+
+  CASE("an A holding its fragments' lanes fills them under the staged cover");
+  {
+    const DotFacts f = pv(/*fused=*/false);
+    Plan p = planDot(f, kBudget);
+    CHECK(p.facts.aFromRegs);
+    CHECK(p.aSeed.ok());
+    CHECK_EQ(p.stage.a.count(), 0);
+    CHECK(p.readsBackByRename());
+  }
+
+  CASE("a seed that moves the cover stays staged unless the kernel grants it");
+  {
+    DotFacts f = pv(/*fused=*/true);
+    CHECK(!planDot(f, kBudget).facts.aFromRegs);
+    f.aSeedGranted = true;
+    Plan p = planDot(f, kBudget);
+    CHECK(p.facts.aFromRegs);
+    CHECK_EQ(p.stage.a.count(), 0);
+  }
+
+  CASE("a rolled K takes no free seed");
+  {
+    DotFacts f = pv(/*fused=*/false);
+    f.rollK = true;
+    CHECK(!planDot(f, kBudget).facts.aFromRegs);
+    f.aSeedGranted = true;
+    CHECK(planDot(f, kBudget).facts.aFromRegs);
+  }
+
+  CASE("an A whose warps split K is never seeded");
+  {
+    DotFacts f = pv(/*fused=*/true);
+    holdAIn(f, 2, 2);
+    f.aSeedGranted = true;
+    CHECK(!planDot(f, kBudget).facts.aFromRegs);
+  }
+
+  CASE("an A readable in place is read there, not seeded");
+  {
+    DotFacts f = pv(/*fused=*/true);
+    f.aDirect = true;
+    f.aSeedGranted = true;
+    Plan p = planDot(f, kBudget);
+    CHECK(p.facts.aDirect);
+    CHECK(!p.facts.aFromRegs);
   }
 
   return ::agpu_test::report("DotPlan");

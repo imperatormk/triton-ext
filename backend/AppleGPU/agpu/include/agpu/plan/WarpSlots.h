@@ -176,7 +176,9 @@ struct WarpCover {
 // The grid a warp program covers: fragment counts and warp count.
 struct WarpGrid {
   int64_t mT = 0, nT = 0, numWarps = 1;
-  bool aDirect = false; // A read from device memory: warps want M bands
+  // A read per warp, from device memory or its own registers: warps want M
+  // bands.
+  bool aDirect = false;
 
   WarpCover cover;
 

@@ -40,9 +40,14 @@ struct DotFacts {
   bool cDirect = false;           // C stores straight to device
   bool cFallback = false;         // ... but keeps a pool arm for ragged tiles
   bool cRename = false;           // C's consumers read the fragment's own lanes
+  bool aSeedGranted = false; // the kernel lets A's seed move the warp cover
+  bool rollK = false;        // this build rolls K loops
 
   std::vector<LayoutBasis> cDims;
   int64_t cRegs = 0;
+  // A's layout and register count, when A is held in registers.
+  std::vector<LayoutBasis> aDims;
+  int64_t aRegs = 0;
 
   // Fragment grid, rounded up: there is no MMA smaller than 8x8. The readback
   // guards against storing a partial fragment past the edge.
@@ -371,6 +376,7 @@ struct Plan {
   StrategyParams params;
   ReadbackPlan readback;
   WarpCover cover;
+  ASeedPlan aSeed; // set with `facts.aFromRegs`
 
   Bytes edgeScratch;
 
@@ -574,8 +580,16 @@ inline WarpGrid warpGridFor(const DotFacts &f, bool bandedC) {
   g.nT = f.nT();
   g.numWarps = warpsFor(f);
   g.hwWarps = f.numWarps;
-  g.aDirect = f.aDirect;
+  g.aDirect = f.aDirect || f.aFromRegs;
   g.bandedC = bandedC;
+  return g;
+}
+
+// Read off the plan.
+inline WarpGrid gridOf(const Plan &p) {
+  WarpGrid g =
+      warpGridFor(p.facts, p.cBandRows() < p.cStagedView().extentAt(0));
+  g.cover = p.cover;
   return g;
 }
 
@@ -724,7 +738,7 @@ inline Decision dotDecision(const Plan &p) {
 
 // Staging is decided before anything asks whether it fits, so a shape cannot
 // be judged to fit unpadded and then overflow once staged.
-inline Plan planDot(const DotFacts &facts, Bytes budget) {
+inline Plan planDotAs(const DotFacts &facts, Bytes budget) {
   Plan p;
   DotFacts f = facts;
 
@@ -901,6 +915,35 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   return p;
 }
 
+// An A whose registers already hold its fragments' lanes skips staging, but
+// only under a cover where each warp multiplies the rows it holds. Free when
+// the staged dot takes that cover anyway, keeps C's rename and leaves K
+// unrolled; otherwise only where the kernel grants it the residency it buys.
+inline Plan planDot(const DotFacts &facts, Bytes budget) {
+  Plan staged = planDotAs(facts, budget);
+  if (facts.aDims.empty() || facts.aRegs <= 0 || facts.aDirect ||
+      staged.intThroughFloat)
+    return staged;
+  DotFacts sf = facts;
+  sf.aFromRegs = true;
+  Plan seeded = planDotAs(sf, budget);
+  if ((seeded.kind != Plan::Kind::Direct && seeded.kind != Plan::Kind::Fused) ||
+      seeded.cBandRows() < seeded.cStagedView().extentAt(0))
+    return staged;
+  const WarpGrid g = gridOf(seeded);
+  const WarpProgram prog = planWarpProgram(g);
+  seeded.aSeed = planASeed(prog, g.mT, g.nT, sf.kT(), g.numWarps, facts.aDims,
+                           facts.aRegs);
+  if (!seeded.aSeed.ok())
+    return staged;
+  const bool free =
+      !facts.rollK &&
+      (staged.kind == Plan::Kind::Direct || staged.kind == Plan::Kind::Fused) &&
+      prog.sameCover(planWarpProgram(gridOf(staged))) &&
+      (seeded.facts.cRename || !staged.facts.cRename);
+  return free || facts.aSeedGranted ? seeded : staged;
+}
+
 // The whole table's verdict, for MSL_DOT_PLAN_DEBUG. Takes facts and fit,
 // since the chosen kind alone cannot say which of two Panel rows fired.
 inline std::string dotPlanReport(const DotFacts &f, const DotFit &fit) {
@@ -923,6 +966,8 @@ inline std::string dotPlanReport(const DotFacts &f, const DotFit &fit) {
   out += " batched=" + std::string(f.batched() ? "y" : "n");
   out += " intAcc=" + std::string(f.intAcc ? "y" : "n");
   out += " carriedAcc=" + std::string(f.carriedAcc ? "y" : "n");
+  out += " aDirect=" + std::string(f.aDirect ? "y" : "n");
+  out += " aFromRegs=" + std::string(f.aFromRegs ? "y" : "n");
   out += " cDirect=" + std::string(f.cDirect ? "y" : "n") + "]";
   return out;
 }

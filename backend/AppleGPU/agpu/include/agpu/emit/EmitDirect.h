@@ -32,7 +32,6 @@ struct DirectInputs {
   // A filled from its registers rather than loaded.
   const ASeedPlan *aSeed = nullptr;
   const msl::SmallVec<msl::Str, 8> *aRegs = nullptr;
-  const FragCache *aFrags = nullptr;
 };
 
 // How C comes back out of the pool, in the caller's layout. Produced per band
@@ -61,7 +60,7 @@ inline void emitDirectMma(msl::Context &c, msl::Block &body,
                           const DirectInputs &in, const DirectNames &nm,
                           int &counter, FragShare share = {}) {
   const bool shared = share.active() && !in.rollK;
-  FragCache localA = in.aFrags ? *in.aFrags : FragCache{}, localB;
+  FragCache localA, localB;
   FragCache &aCache = shared ? *share.a : localA;
   FragCache &bCache = shared ? *share.b : localB;
 
@@ -98,11 +97,31 @@ inline void emitDirectMma(msl::Context &c, msl::Block &body,
         p = SlotCoord::fixed(p.constant);
     }
   };
-  if (!in.aFrags)
+  if (!in.aSeed)
     rebase(ind.a, true);
   rebase(ind.b, false);
   const DirectInputs &inr = ind;
   const std::vector<WarpSlot> &rslots = lslots;
+
+  // Seeded at the K step that reads it, where its load would have been.
+  const auto seedFrag = [&](msl::Block &into, SlotCoord row, int64_t kIndex) {
+    if (msl::Str hit = aCache.lookup(row, kIndex); !hit.empty())
+      return hit;
+    const ASeedPlan &seed = *in.aSeed;
+    msl::Str name;
+    for (std::size_t i = 0; i < seed.slots.size() && name.empty(); ++i) {
+      if (!(seed.slots[i].mi == row) || seed.slots[i].ni.constant != kIndex)
+        continue;
+      name = nm.frag + "s" + std::to_string(i);
+      into.push_back(c.declStmt(kSimdgroup8x8.mslTypeNode(nm.opElem), name));
+      for (std::size_t r = 0; r < seed.plan.regs.size(); ++r)
+        if (seed.plan.regs[r].acc == static_cast<int64_t>(i))
+          into.push_back(c.assign(fragElemExpr(c, name, seed.plan.regs[r].elem),
+                                  c.var((*in.aRegs)[r])));
+    }
+    aCache.put(row, kIndex, name);
+    return name;
+  };
 
   auto accumulate = [&](msl::Block &into, KStep k, int64_t kIndex) {
     msl::Block &decls = shared ? *share.decls : into;
@@ -110,10 +129,12 @@ inline void emitDirectMma(msl::Context &c, msl::Block &body,
     // pass hits the cache the first filled.
     const auto frags = [&](const WarpSlot &s) {
       msl::Expr *kFrags = kTermExpr(c, k.kOffset(1), nm.kVar);
-      return std::pair(loadFrag(c, into, decls, aCache, inr.a, s.mi, kIndex,
-                                inr.a.kOffsetOf(c, kFrags), nm, counter),
-                       loadFrag(c, into, decls, bCache, inr.b, s.ni, kIndex,
-                                inr.b.kOffsetOf(c, kFrags), nm, counter));
+      const msl::Str fa =
+          in.aSeed ? seedFrag(into, s.mi, kIndex)
+                   : loadFrag(c, into, decls, aCache, inr.a, s.mi, kIndex,
+                              inr.a.kOffsetOf(c, kFrags), nm, counter);
+      return std::pair(fa, loadFrag(c, into, decls, bCache, inr.b, s.ni, kIndex,
+                                    inr.b.kOffsetOf(c, kFrags), nm, counter));
     };
     for (const WarpSlot &s : rslots)
       frags(s);
@@ -584,23 +605,7 @@ inline Decision emitDirectDot(msl::Context &c, msl::Block &body,
             auto &fc = bandCaches[prog.guardWarp(w).value_or(-1)];
             share = {&body, &fc.first, &fc.second, &counter};
           }
-          if (!in.aSeed) {
-            emitDirectMma(c, inner, slots, in, nm, counter, share);
-          } else {
-            const auto seedName = [&](int64_t a) {
-              return nm.frag + "s" + std::to_string(a);
-            };
-            FragCache seeded;
-            for (const WarpSlot &s : in.aSeed->slots) {
-              inner.push_back(c.declStmt(kSimdgroup8x8.mslTypeNode(nm.opElem),
-                                         seedName(s.acc)));
-              seeded.put(s.mi, s.ni.constant, seedName(s.acc));
-            }
-            emitFragmentSeed(c, inner, in.aSeed->plan, *in.aRegs, seedName);
-            DirectInputs fromRegs = in;
-            fromRegs.aFrags = &seeded;
-            emitDirectMma(c, inner, slots, fromRegs, nm, counter, share);
-          }
+          emitDirectMma(c, inner, slots, in, nm, counter, share);
           if (sched.drain == DotPassSchedule::Drain::Pool)
             emitAccumStores(c, inner, slots, cv, nm, band.lo / kSgFragDim);
           else if (renaming)

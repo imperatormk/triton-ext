@@ -581,7 +581,7 @@ private:
   DotOperands dotOperandsOf(const agpu::OpView &o);
 
   agpu::DotFacts dotFactsOf(const DotShape &shape);
-  bool aFromRegsOf(agpu::DotFacts f, const DotShape &shape);
+  void planSeedGrants(triton::FuncOp func);
 
   // The single-use convert_layout a non-fused dot's readback lands in instead
   // of the result, when its layout resolves and, if the readback adds C, is
@@ -863,8 +863,9 @@ private:
   std::vector<ResidentOperand> residents_;
   // Dots whose loop-invariant A residency planning turned away.
   std::set<Operation *> directInvariantA_;
-  // Dots whose A, filled from registers, frees no resident threadgroup.
-  std::set<Operation *> idleSeedA_;
+  // Dots whose A may fill from registers under a cover staging would not
+  // take, for the residency that buys.
+  std::set<Operation *> aSeedGranted_;
 
   std::map<agpu::ValueId, std::vector<ConstantValue>> constantFor_;
 

@@ -25,8 +25,7 @@ struct DotInputs {
   // Where A and B are read from on the direct path.
   OperandSource a, b;
 
-  // A's layout and registers, when the plan fills A from them.
-  std::vector<LayoutBasis> aDims;
+  // A's registers, when the plan fills A from them.
   msl::SmallVec<msl::Str, 8> aRegs;
 
   // Per-tile staging and readback, for the panel path.
@@ -52,14 +51,6 @@ struct DotInputs {
   // `emitKernel` decides this from the size budget and passes it down.
   bool rollK = false;
 };
-
-// Read off the plan.
-inline WarpGrid gridOf(const Plan &p) {
-  WarpGrid g =
-      warpGridFor(p.facts, p.cBandRows() < p.cStagedView().extentAt(0));
-  g.cover = p.cover;
-  return g;
-}
 
 inline std::vector<msl::Str> fusedAccNames(const Plan &p,
                                            const DirectNames &nm) {
@@ -210,11 +201,8 @@ inline Decision emitDot(msl::Context &c, msl::Block &body, const Plan &p,
     di.b = in.b;
     di.kT = p.facts.kT();
     di.rollK = in.rollK && !p.facts.aFromRegs;
-    ASeedPlan seed;
     if (p.facts.aFromRegs) {
-      seed = planASeed(prog, grid.mT, grid.nT, di.kT, grid.numWarps, in.aDims,
-                       static_cast<int64_t>(in.aRegs.size()));
-      di.aSeed = &seed;
+      di.aSeed = &p.aSeed;
       di.aRegs = &in.aRegs;
     }
 

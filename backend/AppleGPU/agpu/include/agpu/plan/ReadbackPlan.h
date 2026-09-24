@@ -7,6 +7,7 @@
 #include "agpu/plan/LayoutBasis.h"
 #include "agpu/plan/WarpSlots.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -155,6 +156,44 @@ inline ReadbackPlan planReadback(const std::vector<LayoutBasis> &dims,
   p.kind = ReadbackPlan::Kind::Rename;
   p.regs = std::move(out);
   return p;
+}
+
+// A's fragments filled from A's registers: one slot per row band and K step.
+// Parameterised programs only, where one block of slots serves every warp.
+struct ASeedPlan {
+  std::vector<WarpSlot> slots;
+  ReadbackPlan plan;
+
+  bool ok() const { return plan.rename(); }
+};
+
+inline ASeedPlan planASeed(const WarpProgram &prog, int64_t mT, int64_t nT,
+                           int64_t kT, int64_t numWarps,
+                           const std::vector<LayoutBasis> &aDims,
+                           int64_t aRegs) {
+  ASeedPlan s;
+  if (prog.form != WarpForm::Parameterised)
+    return s;
+  std::vector<SlotCoord> rows;
+  for (const WarpSlot &w : prog.slots(0, mT, nT, numWarps))
+    if (std::find(rows.begin(), rows.end(), w.mi) == rows.end())
+      rows.push_back(w.mi);
+  for (const SlotCoord &r : rows)
+    for (int64_t k = 0; k < kT; ++k)
+      s.slots.push_back(
+          WarpSlot{r, SlotCoord::fixed(k), static_cast<int>(s.slots.size())});
+  // Every fragment element is written, once: a readback tolerates holes.
+  if (aRegs != 2 * static_cast<int64_t>(s.slots.size()))
+    return s;
+  s.plan = planReadback(aDims, s.slots, aRegs, numWarps);
+  std::vector<bool> seen(static_cast<std::size_t>(aRegs), false);
+  for (const ReadbackPlan::Elem &e : s.plan.regs) {
+    const std::size_t i = static_cast<std::size_t>(2 * e.acc + e.elem);
+    if (e.acc < 0 || seen[i])
+      return ASeedPlan{};
+    seen[i] = true;
+  }
+  return s;
 }
 
 } // namespace agpu

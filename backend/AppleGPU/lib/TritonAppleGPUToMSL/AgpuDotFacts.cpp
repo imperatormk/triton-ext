@@ -52,7 +52,10 @@ DotOperands AgpuEmitter::dotOperandsOf(const agpu::OpView &o) {
   }
 
   d.shape.aDevice = deviceTileOf(mlirValueOf(o.operands[0]));
+  d.shape.aRegsTy = dyn_cast<RankedTensorType>(
+      throughLayoutChange(mlirValueOf(o.operands[0])).getType());
   d.shape.aRestagedEachTrip = directInvariantA_.count(d.op) != 0;
+  d.shape.aSeedIdle = idleSeedA_.count(d.op) != 0;
 
   const agpu::ValueId ops[2] = {o.operands[0], o.operands[1]};
   agpu::ValueId *stage[2] = {&d.aStage, &d.bStage};
@@ -157,7 +160,10 @@ DotShape AgpuEmitter::dotShapeOf(triton::DotOp dot) const {
   d.bElem = *bE;
   d.cElem = *cE;
   d.aDevice = deviceTileOf(dot.getA());
+  d.aRegsTy =
+      dyn_cast<RankedTensorType>(throughLayoutChange(dot.getA()).getType());
   d.aRestagedEachTrip = directInvariantA_.count(dot.getOperation()) != 0;
+  d.aSeedIdle = idleSeedA_.count(dot.getOperation()) != 0;
   fillAccumulatorCarry(d, dot.getC(), dot.getResult());
   return d;
 }
@@ -287,13 +293,28 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
   // false at the dot.
   const bool direct =
       shape.cStore && cStored && cDrainSpelled && !f.raggedM() && !f.raggedN();
-  if (!shape.cStore) {
-    f.cDirect = false;
-    return f;
-  }
-  f.cDirect = cDirectOf_.try_emplace(shape.cStore, direct).first->second;
-
+  f.cDirect = shape.cStore &&
+              cDirectOf_.try_emplace(shape.cStore, direct).first->second;
+  f.aFromRegs = aFromRegsOf(f, shape);
   return f;
+}
+
+// Planned with the fact set, so the pool it sizes and the dot it emits agree.
+bool AgpuEmitter::aFromRegsOf(agpu::DotFacts f, const DotShape &shape) {
+  if ((rollK_ && shape.aSeedIdle) || f.aDirect || !shape.aRegsTy ||
+      !(shape.aElem == agpu::f32()) || !(shape.bElem == agpu::f32()))
+    return false;
+  f.aFromRegs = true;
+  const agpu::Plan p = agpu_.planFor(f);
+  if ((p.kind != agpu::Plan::Kind::Direct &&
+       p.kind != agpu::Plan::Kind::Fused) ||
+      p.cBandRows() < p.cStagedView().extentAt(0))
+    return false;
+  const agpu::WarpGrid grid = agpu::gridOf(p);
+  return agpu::planASeed(agpu::planWarpProgram(grid), grid.mT, grid.nT, f.kT(),
+                         grid.numWarps, coordSourceOf(shape.aRegsTy).dims,
+                         registerCount(shape.aRegsTy))
+      .ok();
 }
 
 } // namespace mlir::triton::applegpu::bridge

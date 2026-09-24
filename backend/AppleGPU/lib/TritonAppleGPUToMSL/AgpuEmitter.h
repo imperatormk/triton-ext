@@ -310,6 +310,8 @@ private:
   agpu::Decision emitAssumeOp(LLVM::AssumeOp as);
 
   PoolNeed poolNeedOf(Operation *op);
+  PoolNeed dotPoolNeed(Operation *dot, const DotShape &shape,
+                       const agpu::DotFacts &f);
 
   agpu::msl::Str liveBuffer(const agpu::msl::Str &name, agpu::ElemType elem);
 
@@ -579,6 +581,7 @@ private:
   DotOperands dotOperandsOf(const agpu::OpView &o);
 
   agpu::DotFacts dotFactsOf(const DotShape &shape);
+  bool aFromRegsOf(agpu::DotFacts f, const DotShape &shape);
 
   // The single-use convert_layout a non-fused dot's readback lands in instead
   // of the result, when its layout resolves and, if the readback adds C, is
@@ -860,6 +863,8 @@ private:
   std::vector<ResidentOperand> residents_;
   // Dots whose loop-invariant A residency planning turned away.
   std::set<Operation *> directInvariantA_;
+  // Dots whose A, filled from registers, frees no resident threadgroup.
+  std::set<Operation *> idleSeedA_;
 
   std::map<agpu::ValueId, std::vector<ConstantValue>> constantFor_;
 

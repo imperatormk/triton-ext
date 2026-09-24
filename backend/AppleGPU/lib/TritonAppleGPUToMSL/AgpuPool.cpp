@@ -94,6 +94,50 @@ static llvm::ArrayRef<int32_t> transposeOrderOf(Operation *op) {
   return {};
 }
 
+PoolNeed AgpuEmitter::dotPoolNeed(Operation *dot, const DotShape &shape,
+                                  const agpu::DotFacts &f) {
+  PoolNeed need;
+  // Through the emitter's own planFor, so the carve and the handler plan
+  // against one budget.
+  const agpu::Plan plan = agpu_.planFor(f);
+  const agpu::MmaNames mnm;
+
+  // The regions hold the operands' own elements, or f32 for the lifted
+  // integer dot.
+  const agpu::ElemType aElem = plan.intThroughFloat ? agpu::f32() : shape.aElem;
+  const agpu::ElemType bElem = plan.intThroughFloat ? agpu::f32() : shape.bElem;
+
+  // A panelled dot addresses one panel of each operand.
+  if (plan.kind == agpu::Plan::Kind::Panel) {
+    const agpu::Panel &p = plan.panel().panel;
+    if (!plan.facts.aDirect)
+      need.add(mnm.poolA, aElem, p.aBytes.count());
+    need.add(mnm.poolB, bElem, p.bBytes.count());
+    const agpu::Plan::CPoolRegion panelC = plan.cPoolRegion();
+    if (panelC.bytes > 0)
+      need.add(mnm.poolC, plan.cPoolElem(), panelC.bytes,
+               panelC.overlaysOperands);
+    return need;
+  }
+
+  // Otherwise the plan's numbers: staged operands with bank pad and fragment
+  // alignment, and C's reservation, a whole tile when it fits and a band when
+  // it does not.
+  if (plan.stage.a > agpu::Bytes(0) && !body_.residentBuf.count({dot, 0}))
+    need.add(mnm.poolA, aElem, plan.stage.a.count());
+  if (plan.stage.b > agpu::Bytes(0) && !body_.residentBuf.count({dot, 1}))
+    need.add(mnm.poolB, bElem, plan.stage.b.count());
+  // Size and placement both come from the plan: a fused C overlays the
+  // operands at the pool's base.
+  const agpu::Plan::CPoolRegion cRegion = plan.cPoolRegion();
+  if (cRegion.bytes > 0)
+    need.add(mnm.poolC, plan.cPoolElem(), cRegion.bytes,
+             cRegion.overlaysOperands);
+  if (plan.edgeScratch > agpu::Bytes(0))
+    need.add(mnm.poolE, agpu::f32(), plan.edgeScratch.count());
+  return need;
+}
+
 PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
   PoolNeed need;
 
@@ -103,48 +147,7 @@ PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
     const DotShape shape = dotShapeOf(dot);
     if (!shape.aTy)
       return need;
-    const agpu::DotFacts f = dotFactsOf(shape);
-    // Through the emitter's own planFor, so the carve and the handler plan
-    // against one budget.
-    const agpu::Plan plan = agpu_.planFor(f);
-    const agpu::MmaNames mnm;
-
-    // The regions hold the operands' own elements, or f32 for the lifted
-    // integer dot.
-    const agpu::ElemType aElem =
-        plan.intThroughFloat ? agpu::f32() : shape.aElem;
-    const agpu::ElemType bElem =
-        plan.intThroughFloat ? agpu::f32() : shape.bElem;
-
-    // A panelled dot addresses one panel of each operand.
-    if (plan.kind == agpu::Plan::Kind::Panel) {
-      const agpu::Panel &p = plan.panel().panel;
-      if (!plan.facts.aDirect)
-        need.add(mnm.poolA, aElem, p.aBytes.count());
-      need.add(mnm.poolB, bElem, p.bBytes.count());
-      const agpu::Plan::CPoolRegion panelC = plan.cPoolRegion();
-      if (panelC.bytes > 0)
-        need.add(mnm.poolC, plan.cPoolElem(), panelC.bytes,
-                 panelC.overlaysOperands);
-      return need;
-    }
-
-    // Otherwise the plan's numbers: staged operands with bank pad and fragment
-    // alignment, and C's reservation, a whole tile when it fits and a band when
-    // it does not.
-    if (plan.stage.a > agpu::Bytes(0) && !body_.residentBuf.count({dot, 0}))
-      need.add(mnm.poolA, aElem, plan.stage.a.count());
-    if (plan.stage.b > agpu::Bytes(0) && !body_.residentBuf.count({dot, 1}))
-      need.add(mnm.poolB, bElem, plan.stage.b.count());
-    // Size and placement both come from the plan: a fused C overlays the
-    // operands at the pool's base.
-    const agpu::Plan::CPoolRegion cRegion = plan.cPoolRegion();
-    if (cRegion.bytes > 0)
-      need.add(mnm.poolC, plan.cPoolElem(), cRegion.bytes,
-               cRegion.overlaysOperands);
-    if (plan.edgeScratch > agpu::Bytes(0))
-      need.add(mnm.poolE, agpu::f32(), plan.edgeScratch.count());
-    return need;
+    return dotPoolNeed(dot, shape, dotFactsOf(shape));
   }
 
   // A histogram's bins live in threadgroup memory for the whole op: one
@@ -282,6 +285,7 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
   if (!func.isPublic())
     return;
   directInvariantA_.clear();
+  idleSeedA_.clear();
   std::vector<ResidentOperand> found;
   int buffers = 0;
   func.walk([&](triton::DotOp dot) {
@@ -407,12 +411,32 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
   for (ResidentOperand r : found)
     perLoop[r.loop.getOperation()].insert(r.buffer);
   std::vector<ResidentOperand> chosen = fit(found);
-  if (agpu::tgResidency(peakWith(chosen, buffers) + live) <
+  if (agpu::tgResidency(peakWith(chosen, buffers) + live) <=
       agpu::tgResidency(peakWith(found, 0) + live)) {
     llvm::erase_if(found, [&](ResidentOperand r) {
       return perLoop[r.loop.getOperation()].size() < 2;
     });
     chosen = fit(found);
+  }
+
+  // A resident A that could be read in place gives its buffer up where that
+  // buys a resident threadgroup.
+  for (const ResidentOperand &r : std::vector<ResidentOperand>(chosen)) {
+    if (r.which != 0 || !dotShapeOf(cast<triton::DotOp>(r.dot)).aDevice.base ||
+        llvm::count_if(chosen, [&](const ResidentOperand &c) {
+          return c.buffer == r.buffer;
+        }) > 1)
+      continue;
+    std::vector<ResidentOperand> without = chosen;
+    llvm::erase_if(without, [&](const ResidentOperand &c) {
+      return c.dot == r.dot && c.which == 0;
+    });
+    const int64_t kept = agpu::tgResidency(peakWith(chosen, buffers) + live);
+    directInvariantA_.insert(r.dot);
+    if (agpu::tgResidency(peakWith(without, buffers) + live) > kept)
+      chosen = std::move(without);
+    else
+      directInvariantA_.erase(r.dot);
   }
 
   std::set<int> reserved;
@@ -435,7 +459,8 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
     return p + held;
   };
   for (const ResidentOperand &r : candidates) {
-    if (r.which != 0 || !dotShapeOf(cast<triton::DotOp>(r.dot)).aDevice.base ||
+    if (r.which != 0 || directInvariantA_.count(r.dot) ||
+        !dotShapeOf(cast<triton::DotOp>(r.dot)).aDevice.base ||
         llvm::any_of(chosen, [&](const ResidentOperand &c) {
           return c.dot == r.dot && c.which == 0;
         }))
@@ -444,6 +469,32 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
     directInvariantA_.insert(r.dot);
     if (agpu::tgResidency(peak()) <= staged)
       directInvariantA_.erase(r.dot);
+  }
+
+  // A seed unrolls a rolled K, which pays only where the A it keeps out of
+  // the pool buys a resident threadgroup.
+  std::vector<std::pair<Operation *, int64_t>> needs;
+  func.walk([&](Operation *op) {
+    if (op != func.getOperation())
+      needs.push_back({op, poolNeedOf(op).bytes()});
+  });
+  for (const auto &[op, seededNeed] : needs) {
+    auto dot = dyn_cast<triton::DotOp>(op);
+    if (!dot)
+      continue;
+    const DotShape shape = dotShapeOf(dot);
+    agpu::DotFacts staged = dotFactsOf(shape);
+    if (!staged.aFromRegs)
+      continue;
+    staged.aFromRegs = false;
+    int64_t others = 0;
+    for (const auto &[o, n] : needs)
+      if (o != op)
+        others = std::max(others, n);
+    const int64_t stagedNeed = dotPoolNeed(dot, shape, staged).bytes();
+    if (agpu::tgResidency(std::max(others, stagedNeed) + held) >=
+        agpu::tgResidency(std::max(others, seededNeed) + held))
+      idleSeedA_.insert(dot);
   }
 }
 

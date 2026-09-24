@@ -91,6 +91,17 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
     const agpu::Decision d = readADirect(ops, in);
     if (!d.ok())
       return d;
+  } else if (pf.aFromRegs) {
+    if (ops.aStageTy != ops.shape.aRegsTy)
+      return agpu::Decision::failed("tt.dot", "A's registers were never bound");
+    in.aDims = coordSourceOf(ops.aStageTy).dims;
+    for (int64_t r = 0, n = registerCount(ops.aStageTy); r < n; ++r) {
+      const am::Str *name = body_.sym.regAt(ops.aStage, (std::size_t)r);
+      if (!name)
+        return agpu::Decision::failed("tt.dot",
+                                      "A's registers were never bound");
+      in.aRegs.push_back(*name);
+    }
   } else {
     const agpu::MmaNames mnm;
     const auto resident = body_.residentBuf.find({ops.op, 0});

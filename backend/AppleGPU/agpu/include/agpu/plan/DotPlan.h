@@ -32,6 +32,7 @@ struct DotFacts {
   bool aInPlace = false; // A already resident in a threadgroup buffer
   bool bInPlace = false;
   bool aDirect = false;    // A readable straight from device memory
+  bool aFromRegs = false;  // A's registers are its fragments' own lanes
   bool carriedAcc = false; // C is loop-carried: this dot runs per iteration
   bool aRestagedEachTrip = false; // loop-invariant A the loop keeps no copy of
   bool fusedAcc = false;          // C lives in registers across a K loop
@@ -128,7 +129,7 @@ inline Bytes stagedOperandBytes(const DotFacts &f, int64_t rows, int64_t cols,
 
 inline StageBytes planStageBytes(const DotFacts &f, bool pad = true) {
   StageBytes s;
-  if (!f.aInPlace && !f.aDirect)
+  if (!f.aInPlace && !f.aDirect && !f.aFromRegs)
     s.a = stagedOperandBytes(f, f.M, f.K, f.aElemBytes, pad);
   if (!f.bInPlace)
     s.b = stagedOperandBytes(f, f.K, fragAlignedExtent(f.N), f.bElemBytes, pad);

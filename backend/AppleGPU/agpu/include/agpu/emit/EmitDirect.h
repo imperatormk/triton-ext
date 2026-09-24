@@ -28,6 +28,11 @@ struct DirectInputs {
   OperandSource a, b;
   int64_t kT = 1;     // fragments along K
   bool rollK = false; // emit a K loop, leaving it rolled
+
+  // A filled from its registers rather than loaded.
+  const ASeedPlan *aSeed = nullptr;
+  const msl::SmallVec<msl::Str, 8> *aRegs = nullptr;
+  const FragCache *aFrags = nullptr;
 };
 
 // How C comes back out of the pool, in the caller's layout. Produced per band
@@ -56,7 +61,7 @@ inline void emitDirectMma(msl::Context &c, msl::Block &body,
                           const DirectInputs &in, const DirectNames &nm,
                           int &counter, FragShare share = {}) {
   const bool shared = share.active() && !in.rollK;
-  FragCache localA, localB;
+  FragCache localA = in.aFrags ? *in.aFrags : FragCache{}, localB;
   FragCache &aCache = shared ? *share.a : localA;
   FragCache &bCache = shared ? *share.b : localB;
 
@@ -93,7 +98,8 @@ inline void emitDirectMma(msl::Context &c, msl::Block &body,
         p = SlotCoord::fixed(p.constant);
     }
   };
-  rebase(ind.a, true);
+  if (!in.aFrags)
+    rebase(ind.a, true);
   rebase(ind.b, false);
   const DirectInputs &inr = ind;
   const std::vector<WarpSlot> &rslots = lslots;
@@ -532,6 +538,8 @@ inline Decision emitDirectDot(msl::Context &c, msl::Block &body,
   int counter = 0;
   std::map<int64_t, std::pair<FragCache, FragCache>> bandCaches;
   const bool acrossBands = bandRows < rows;
+  if (in.aSeed && (acrossBands || in.rollK || !in.aRegs || !in.aSeed->ok()))
+    return Decision::failed("dot", "A from registers needs one unrolled band");
   for (int64_t r0 = 0; r0 < rows; r0 += bandRows) {
     const Range band{r0, std::min(r0 + bandRows, rows)};
     const bool whole = band.lo == 0 && band.hi == rows;
@@ -576,7 +584,23 @@ inline Decision emitDirectDot(msl::Context &c, msl::Block &body,
             auto &fc = bandCaches[prog.guardWarp(w).value_or(-1)];
             share = {&body, &fc.first, &fc.second, &counter};
           }
-          emitDirectMma(c, inner, slots, in, nm, counter, share);
+          if (!in.aSeed) {
+            emitDirectMma(c, inner, slots, in, nm, counter, share);
+          } else {
+            const auto seedName = [&](int64_t a) {
+              return nm.frag + "s" + std::to_string(a);
+            };
+            FragCache seeded;
+            for (const WarpSlot &s : in.aSeed->slots) {
+              inner.push_back(c.declStmt(kSimdgroup8x8.mslTypeNode(nm.opElem),
+                                         seedName(s.acc)));
+              seeded.put(s.mi, s.ni.constant, seedName(s.acc));
+            }
+            emitFragmentSeed(c, inner, in.aSeed->plan, *in.aRegs, seedName);
+            DirectInputs fromRegs = in;
+            fromRegs.aFrags = &seeded;
+            emitDirectMma(c, inner, slots, fromRegs, nm, counter, share);
+          }
           if (sched.drain == DotPassSchedule::Drain::Pool)
             emitAccumStores(c, inner, slots, cv, nm, band.lo / kSgFragDim);
           else if (renaming)

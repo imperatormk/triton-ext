@@ -138,5 +138,35 @@ int main() {
     CHECK_EQ(other.regs[0].acc, -1);
   }
 
+  CASE("an A in the fragment layout seeds every K fragment of its row band");
+  {
+    WarpProgram prog = planWarpProgram(WarpGrid{4, 8, 4, /*aDirect=*/true});
+    CHECK_EQ(prog.miCount, 1);
+    const ASeedPlan s = planASeed(prog, 4, 8, 4, 4, mmaDims(0, 2), 8);
+    CHECK(s.ok());
+    CHECK_EQ((int64_t)s.slots.size(), 4);
+    for (int64_t r = 0; r < 8; ++r) {
+      CHECK_EQ(s.plan.regs[(std::size_t)r].acc, r / 2);
+      CHECK_EQ(s.plan.regs[(std::size_t)r].elem, r % 2);
+      CHECK_EQ(s.slots[(std::size_t)(r / 2)].ni.constant, r / 2);
+    }
+  }
+
+  CASE("a cover whose warps span more rows than A's registers hold is refused");
+  {
+    WarpProgram prog = planWarpProgram(WarpGrid{8, 8, 4});
+    CHECK(prog.miCount > 1);
+    CHECK(!planASeed(prog, 8, 8, 4, 4, mmaDims(1, 2), 16).ok());
+  }
+
+  CASE("a warp holding half of K leaves fragments unwritten");
+  {
+    std::vector<LayoutBasis> dims = mmaDims(0, 1);
+    dims[0].warp = {8, 0};
+    dims[1].warp = {0, 16};
+    WarpProgram prog = planWarpProgram(WarpGrid{4, 8, 4, /*aDirect=*/true});
+    CHECK(!planASeed(prog, 4, 8, 4, 4, dims, 4).ok());
+  }
+
   return ::agpu_test::report("ReadbackPlan");
 }

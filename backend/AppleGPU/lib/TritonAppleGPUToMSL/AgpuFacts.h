@@ -128,6 +128,10 @@ struct DotShape {
   // the MMA reads fragments in place and never stages them into the pool.
   DeviceTile aDevice;
 
+  // A's type behind any layout change, which a layout-preserving value shares.
+  RankedTensorType aRegsTy;
+  bool aSeedIdle = false;
+
   // A is loop-invariant but the loop keeps no resident copy, so staging it
   // would repeat the same scatter every trip.
   bool aRestagedEachTrip = false;

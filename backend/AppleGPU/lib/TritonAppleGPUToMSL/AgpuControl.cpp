@@ -232,6 +232,7 @@ bool AgpuEmitter::continuesInto(scf::ForOp forOp, const FusedDot &fd) {
     const std::vector<am::Str> accs = agpu::fusedAccNames(fd.plan, fd.names);
     if (!plan.accumulatorsOutlivePass() || a.mT != b.mT || a.nT != b.nT ||
         a.numWarps != b.numWarps ||
+        !agpu::planWarpProgram(a).sameCover(agpu::planWarpProgram(b)) ||
         agpu::fusedAccNames(plan, agpu::DirectNames{}).size() != accs.size())
       return false;
     body_.continuedFrom[idOf(next.getResult(i))] = accs;

@@ -160,6 +160,11 @@ struct WarpProgram {
       return std::nullopt;
     return block;
   }
+
+  // Over one grid, whether every warp owns the same fragments under both.
+  bool sameCover(const WarpProgram &o) const {
+    return form == o.form && miCount == o.miCount && niCount == o.niCount;
+  }
 };
 
 struct WarpCover {

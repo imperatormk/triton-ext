@@ -558,6 +558,9 @@ inline Decision emitDirectDot(msl::Context &c, msl::Block &body,
         return rb.why;
       renamed = rb.value;
     }
+    const bool seeded = renaming && sched.declareAccums &&
+                        seedsFromBases(renamed.plan, renamed.bases,
+                                       renamed.regElem, nm.accElem);
 
     emitWarpBlocks(
         c, body, prog, grid, nm.warpId,
@@ -565,6 +568,9 @@ inline Decision emitDirectDot(msl::Context &c, msl::Block &body,
           const std::vector<WarpSlot> slots = inBand(all);
           if (sched.declareAccums)
             emitAccumDecls(c, inner, slots, nm);
+          if (seeded)
+            emitFragmentSeed(c, inner, renamed.plan, renamed.bases,
+                             directAccName(nm));
           FragShare share;
           if (acrossBands) {
             auto &fc = bandCaches[prog.guardWarp(w).value_or(-1)];
@@ -575,8 +581,9 @@ inline Decision emitDirectDot(msl::Context &c, msl::Block &body,
             emitAccumStores(c, inner, slots, cv, nm, band.lo / kSgFragDim);
           else if (renaming)
             emitFragmentReadback(c, inner, renamed.plan, renamed.names,
-                                 renamed.bases, renamed.regElem,
-                                 directAccName(nm));
+                                 seeded ? msl::SmallVec<msl::Str, 8>{}
+                                        : renamed.bases,
+                                 renamed.regElem, directAccName(nm));
         });
 
     // No drain: fragments stay live for the caller. Such a pass is one band.

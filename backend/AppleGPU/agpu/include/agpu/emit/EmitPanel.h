@@ -362,6 +362,34 @@ emitFragmentReadback(msl::Context &c, msl::Block &body,
   }
 }
 
+// The reverse of the readback's add: a C that arrives in registers seeds the
+// fragment elements it would have been added to, so the MMAs accumulate onto it
+// and it is not held live beside them.
+inline void emitFragmentSeed(msl::Context &c, msl::Block &body,
+                             const ReadbackPlan &plan,
+                             const msl::SmallVec<msl::Str, 8> &bases,
+                             const std::function<msl::Str(int64_t)> &accName) {
+  for (std::size_t r = 0; r < plan.regs.size() && r < bases.size(); ++r) {
+    if (plan.regs[r].acc < 0 || bases[r].empty())
+      continue;
+    body.push_back(
+        c.assign(fragElemExpr(c, accName(plan.regs[r].acc), plan.regs[r].elem),
+                 c.var(bases[r])));
+  }
+}
+
+// Every read-back register has an f32 base, as float fragments hold.
+inline bool seedsFromBases(const ReadbackPlan &plan,
+                           const msl::SmallVec<msl::Str, 8> &bases,
+                           ElemType regElem, const msl::Str &accElem) {
+  if (!(regElem == f32()) || accElem != "float" || bases.empty())
+    return false;
+  for (std::size_t r = 0; r < plan.regs.size(); ++r)
+    if (plan.regs[r].acc >= 0 && (r >= bases.size() || bases[r].empty()))
+      return false;
+  return true;
+}
+
 inline std::function<msl::Str(int64_t)> directAccName(const MmaNames &nm) {
   return [acc = nm.acc](int64_t a) { return acc + std::to_string(a); };
 }

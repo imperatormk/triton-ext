@@ -66,24 +66,30 @@ def _body(k):
     return k.asm["msl"].split("kernel void")[-1]
 
 
+def _predicated(k):
+    return re.search(r"if \(!?c\d+_\d+( \|\||\) \{)", _body(k)) is not None
+
+
+# 512 elements over 16 warps is one per lane, so `i % 64 < 32` is the same in
+# every lane of a simdgroup.
+def test_a_simdgroup_uniform_condition_predicates():
+    x = torch.randn(2048, device="mps")
+    out = torch.empty_like(x)
+    k = nested_kernel[(4, )](x, out, BLOCK=512, num_warps=16)
+    j = torch.arange(2048, device="mps") % 64
+    ref = torch.where(j < 32, x.sin(), torch.where(j < 48, x.cos(), x.exp()))
+    torch.testing.assert_close(out, ref)
+    assert _predicated(k)
+
+
 @pytest.mark.parametrize("num_warps", [1, 4])
-def test_a_lane_varying_condition_still_picks_per_element(num_warps):
+def test_a_lane_varying_condition_stays_branch_free(num_warps):
     x = torch.randn(4096, device="mps")
     out = torch.empty_like(x)
     k = alternate_kernel[(4, )](x, out, BLOCK=1024, num_warps=num_warps)
     even = torch.arange(4096, device="mps") % 2 == 0
     torch.testing.assert_close(out, torch.where(even, x.sin(), x.cos()))
-    assert "if (" in _body(k)
-
-
-def test_nested_selects_predicate_the_outer_arms():
-    x = torch.randn(4096, device="mps")
-    out = torch.empty_like(x)
-    k = nested_kernel[(4, )](x, out, BLOCK=1024)
-    j = torch.arange(4096, device="mps") % 64
-    ref = torch.where(j < 32, x.sin(), torch.where(j < 48, x.cos(), x.exp()))
-    torch.testing.assert_close(out, ref)
-    assert "if (" in _body(k)
+    assert not _predicated(k)
 
 
 def test_a_2d_select_predicates_per_thread():
@@ -103,20 +109,20 @@ def test_an_arm_load_stays_ahead_of_a_later_store():
     torch.testing.assert_close(out, torch.where(j < 32, x0.sin(), 1.0))
 
 
-def test_an_arm_beside_a_dot_stays_branch_free():
+def test_a_select_on_a_dot_result_stays_branch_free():
     a = torch.randn(32, 32, device="mps") * 0.1
     out = torch.empty_like(a)
     k = dot_arm_kernel[(1, )](a, out, N=32)
     ref = torch.where(
         torch.arange(32, device="mps")[:, None] < 16, (a @ a).exp(), 0.0)
     torch.testing.assert_close(out, ref)
-    assert not re.search(r"if \(!?c\d+_\d+( \|\||\) \{)", _body(k))
+    assert not _predicated(k)
 
 
 def test_cheap_arms_stay_branch_free():
-    x = torch.randn(4096, device="mps")
+    x = torch.randn(2048, device="mps")
     out = torch.empty_like(x)
-    k = cheap_kernel[(4, )](x, out, BLOCK=1024)
-    j = torch.arange(4096, device="mps") % 64
+    k = cheap_kernel[(4, )](x, out, BLOCK=512, num_warps=16)
+    j = torch.arange(2048, device="mps") % 64
     torch.testing.assert_close(out, torch.where(j < 32, x * 2 + 1, x - 3))
-    assert "if (" not in _body(k)
+    assert not _predicated(k)

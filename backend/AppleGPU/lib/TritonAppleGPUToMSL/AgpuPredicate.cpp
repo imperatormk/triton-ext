@@ -79,19 +79,37 @@ std::vector<Operation *> armCone(Operation *sel, unsigned arm,
   return out;
 }
 
+// A simdgroup covers sizePerThread * threadsPerWarp elements of each dim, so a
+// condition constant over aligned runs that long is the same in every lane.
+// Only then does a branch skip work; a lane-varying one runs both arms.
+bool isSimdgroupUniform(ModuleAxisInfoAnalysis &axis, Value cond) {
+  auto ty = dyn_cast<RankedTensorType>(cond.getType());
+  if (!ty)
+    return true;
+  auto blk =
+      dyn_cast_or_null<triton::gpu::BlockedEncodingAttr>(ty.getEncoding());
+  AxisInfo *ai = axis.getAxisInfo(cond);
+  if (!blk || !ai)
+    return false;
+  for (int d = 0; d < ty.getRank(); ++d) {
+    const int64_t span = std::min<int64_t>((int64_t)blk.getSizePerThread()[d] *
+                                               blk.getThreadsPerWarp()[d],
+                                           ty.getShape()[d]);
+    if (ai->getConstancy(d) < span)
+      return false;
+  }
+  return true;
+}
+
 } // namespace
 
 // Latest select first, so a select inside an earlier-planned arm stays part of
-// that arm. Not beside a dot: the branch splits the MMA schedule, and a
-// masked attention tile diverges per lane anyway (dkdv_mask nw4 +12%).
+// that arm.
 void AgpuEmitter::planPredicatedArms(Block &block) {
-  if (llvm::any_of(block,
-                   [](Operation &op) { return nameOf(&op) == "tt.dot"; }))
-    return;
   llvm::DenseSet<Operation *> claimed;
   for (Operation &op : llvm::reverse(block)) {
     if (nameOf(&op) != "arith.select" || claimed.count(&op) ||
-        !isa<RankedTensorType>(op.getOperand(0).getType()))
+        !isSimdgroupUniform(axisInfo(), op.getOperand(0)))
       continue;
     PredicatedArms p;
     for (unsigned arm : {1u, 2u})

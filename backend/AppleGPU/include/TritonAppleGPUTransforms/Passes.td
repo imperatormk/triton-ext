@@ -54,6 +54,22 @@ def AtomicLaneLayout : Pass<"triton-apple-atomic-lane-layout", "mlir::ModuleOp">
   ];
 }
 
+def ReduceThroughLayoutChange : Pass<"triton-apple-reduce-through-layout-change", "mlir::ModuleOp"> {
+  let summary = "Reduce to scalars from the layout a convert_layout starts from";
+
+  let description = [{
+    A `tt.reduce` whose results are scalars has no result layout, so any
+    `convert_layout` feeding it only moves data. Across warps that move is a
+    threadgroup round trip; reading the convert's source instead lets the
+    reduction combine warps itself.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
 def MaskSelectArmLoads : Pass<"triton-apple-mask-select-arm-loads", "mlir::ModuleOp"> {
   let summary = "Mask loads that only feed one arm of a select with its condition";
 

@@ -10,6 +10,7 @@ std::unique_ptr<mlir::Pass> createAccelerateAppleMatmulPass();
 std::unique_ptr<mlir::Pass> createStoreShuffleLayoutPass();
 std::unique_ptr<mlir::Pass> createMaskSelectArmLoadsPass();
 std::unique_ptr<mlir::Pass> createAtomicLaneLayoutPass();
+std::unique_ptr<mlir::Pass> createReduceThroughLayoutChangePass();
 
 } // namespace mlir::triton::applegpu
 

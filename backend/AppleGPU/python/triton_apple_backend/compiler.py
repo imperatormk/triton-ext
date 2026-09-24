@@ -239,6 +239,7 @@ class MetalBackend(BaseBackend):
         # Must run after the final remove_layout_conversions or it gets
         # reverted.
         _plugin.add_store_shuffle_layout(pm)
+        _plugin.add_reduce_through_layout_change(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
 

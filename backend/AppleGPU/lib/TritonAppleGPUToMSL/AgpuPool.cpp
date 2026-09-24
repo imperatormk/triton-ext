@@ -7,6 +7,7 @@
 #include "AgpuEmitter.h"
 
 #include "agpu/core/Names.h"
+#include "agpu/cost/Occupancy.h"
 #include "agpu/emit/EmitBand.h"
 #include "agpu/emit/EmitHistogram.h"
 
@@ -373,27 +374,45 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
   buffers = (int)slots.size();
   const std::vector<ResidentOperand> candidates = found;
 
-  const auto peakWith = [&](const std::vector<ResidentOperand> &cands,
-                            int keep) {
-    for (const ResidentOperand &r : cands)
-      if (r.buffer < keep)
-        body_.residentBuf[{r.dot, r.which}] = "";
+  // The pool's peak with `residents` held and the dots in `inPlace` reading
+  // their A in place, plus the residents' own bytes.
+  const auto peakWhere = [&](const std::vector<ResidentOperand> &residents,
+                             const std::set<Operation *> &inPlace) {
+    for (const ResidentOperand &r : residents)
+      body_.residentBuf[{r.dot, r.which}] = "";
     int64_t peak = 0;
     func.walk([&](Operation *op) {
-      if (op != func.getOperation())
-        peak = std::max(peak, poolNeedOf(op).bytes());
+      if (op == func.getOperation())
+        return;
+      auto dot = dyn_cast<triton::DotOp>(op);
+      if (dot && inPlace.count(op)) {
+        DotShape shape = dotShapeOf(dot);
+        shape.aRestagedEachTrip = true;
+        peak =
+            std::max(peak, dotPoolNeed(op, shape, dotFactsOf(shape)).bytes());
+        return;
+      }
+      peak = std::max(peak, poolNeedOf(op).bytes());
     });
     body_.residentBuf.clear();
     std::map<int, int64_t> bytes;
-    for (const ResidentOperand &r : cands)
-      if (r.buffer < keep)
-        bytes[r.buffer] = r.bytes;
+    for (const ResidentOperand &r : residents)
+      bytes[r.buffer] = r.bytes;
     for (const auto &[b, n] : bytes)
       peak += n;
     return peak;
   };
+  const auto peakWith = [&](const std::vector<ResidentOperand> &cands,
+                            int keep) {
+    std::vector<ResidentOperand> kept;
+    for (const ResidentOperand &r : cands)
+      if (r.buffer < keep)
+        kept.push_back(r);
+    return peakWhere(kept, {});
+  };
 
   const int64_t live = agpu_.pool.plan().live.count();
+  const int64_t threads = agpu::threadsFor(numWarps());
   const auto fit = [&](std::vector<ResidentOperand> cands) {
     std::map<int, int> ids;
     for (ResidentOperand &r : cands)
@@ -413,8 +432,8 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
   for (ResidentOperand r : found)
     perLoop[r.loop.getOperation()].insert(r.buffer);
   std::vector<ResidentOperand> chosen = fit(found);
-  if (agpu::tgResidency(peakWith(chosen, buffers) + live) <=
-      agpu::tgResidency(peakWith(found, 0) + live)) {
+  if (!agpu::cost::gainsResidency(peakWith(found, 0) + live,
+                                  peakWith(chosen, buffers) + live, threads)) {
     llvm::erase_if(found, [&](ResidentOperand r) {
       return perLoop[r.loop.getOperation()].size() < 2;
     });
@@ -433,33 +452,17 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
     llvm::erase_if(without, [&](const ResidentOperand &c) {
       return c.dot == r.dot && c.which == 0;
     });
-    const int64_t kept = agpu::tgResidency(peakWith(chosen, buffers) + live);
-    directInvariantA_.insert(r.dot);
-    if (agpu::tgResidency(peakWith(without, buffers) + live) > kept)
+    if (agpu::cost::gainsResidency(peakWhere(chosen, {}) + live,
+                                   peakWhere(without, {r.dot}) + live,
+                                   threads)) {
       chosen = std::move(without);
-    else
-      directInvariantA_.erase(r.dot);
-  }
-
-  std::set<int> reserved;
-  for (const ResidentOperand &r : chosen) {
-    if (reserved.insert(r.buffer).second)
-      agpu_.pool.live(agpu::Bytes(r.bytes));
-    residents_.push_back(r);
+      directInvariantA_.insert(r.dot);
+    }
   }
 
   // An A turned away here is restaged every trip. Read it in place instead,
   // but only where the pool bytes that frees buy a resident threadgroup:
   // otherwise staged fragments are the faster read.
-  const int64_t held = agpu_.pool.plan().live.count();
-  const auto peak = [&] {
-    int64_t p = 0;
-    func.walk([&](Operation *op) {
-      if (op != func.getOperation())
-        p = std::max(p, poolNeedOf(op).bytes());
-    });
-    return p + held;
-  };
   for (const ResidentOperand &r : candidates) {
     if (r.which != 0 || directInvariantA_.count(r.dot) ||
         !dotShapeOf(cast<triton::DotOp>(r.dot)).aDevice.base ||
@@ -467,10 +470,16 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
           return c.dot == r.dot && c.which == 0;
         }))
       continue;
-    const int64_t staged = agpu::tgResidency(peak());
-    directInvariantA_.insert(r.dot);
-    if (agpu::tgResidency(peak()) <= staged)
-      directInvariantA_.erase(r.dot);
+    if (agpu::cost::gainsResidency(peakWhere(chosen, {}) + live,
+                                   peakWhere(chosen, {r.dot}) + live, threads))
+      directInvariantA_.insert(r.dot);
+  }
+
+  std::set<int> reserved;
+  for (const ResidentOperand &r : chosen) {
+    if (reserved.insert(r.buffer).second)
+      agpu_.pool.live(agpu::Bytes(r.bytes));
+    residents_.push_back(r);
   }
 }
 
@@ -521,7 +530,7 @@ void AgpuEmitter::planSeedGrants(triton::FuncOp func) {
           n = g.need;
       peak = std::max(peak, n);
     }
-    return agpu::certainResidency(peak + live, threads);
+    return agpu::cost::certainResidency(peak + live, threads);
   };
   const int64_t without = residency();
   for (const Grant &g : offers)

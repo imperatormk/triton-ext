@@ -6,6 +6,7 @@
 #include "agpu/core/Decline.h"
 #include "agpu/core/Names.h"
 #include "agpu/core/Units.h"
+#include "agpu/cost/Occupancy.h"
 #include "agpu/plan/Elementwise.h"
 
 #include <cstdint>
@@ -139,7 +140,8 @@ inline Decision abiDecision(const KernelAbi &abi) {
 // OutOfResources.
 inline bool shouldPinThreadgroupSize(int64_t poolBytes, int64_t coreBudget,
                                      int64_t launchThreads) {
-  return launchThreads > kAlwaysAdmittedThreads || poolBytes * 2 > coreBudget;
+  return launchThreads > cost::kAlwaysAdmittedThreads ||
+         poolBytes * 2 > coreBudget;
 }
 
 } // namespace agpu

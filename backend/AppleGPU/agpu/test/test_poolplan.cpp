@@ -1,4 +1,5 @@
 // Whole-function pool accounting and the budget gate.
+#include "agpu/cost/Occupancy.h"
 #include "agpu/plan/PoolPlan.h"
 #include "harness.h"
 
@@ -80,12 +81,12 @@ int main() {
   {
     FunctionPool p = planFunctionPool({req("dot", kTGResidentBudgetBytes)});
     CHECK(poolDecision(p).ok());
-    CHECK_EQ(tgResidency(p.total().count()), 1);
+    CHECK_EQ(cost::tgResidency(p.total().count()), 1);
 
     FunctionPool tight = planFunctionPool({req("dot", 20000)}, Bytes(12000));
     CHECK(poolDecision(tight).ok());
     CHECK(tight.total() == Bytes(32000));
-    CHECK_EQ(tgResidency(tight.total().count()), 1);
+    CHECK_EQ(cost::tgResidency(tight.total().count()), 1);
   }
 
   CASE("the limit reflects the hardware itself");

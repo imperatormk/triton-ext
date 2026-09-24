@@ -56,7 +56,7 @@ inline FunctionPool planFunctionPool(const std::vector<PoolRequest> &requests,
 }
 
 // Tested against the hardware limit. Occupancy is the residency question
-// (`tgResidency`).
+// (cost/Occupancy.h).
 inline Decision
 poolDecision(const FunctionPool &p,
              Bytes hardwareLimit = Bytes(kTGResidentBudgetBytes)) {

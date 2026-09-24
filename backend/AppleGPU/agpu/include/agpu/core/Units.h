@@ -39,49 +39,6 @@ inline Bytes maxBytes(Bytes a, Bytes b) { return std::max(a, b); }
 // Metal's maxThreadgroupMemoryLength: the most one threadgroup may declare.
 inline constexpr int64_t kTGResidentBudgetBytes = 32768;
 
-// What a core hands out across concurrently resident threadgroups. Measured
-// on M1 Pro: a 20480-byte pool keeps three resident, 20736 bytes two.
-inline constexpr int64_t kTGCoreBudgetBytes = 61440;
-
-// Threadgroups that stay resident when a pool of `bytes` is declared. A step
-// function: 15 KB gives four, 22 KB gives two.
-inline constexpr int64_t tgResidency(int64_t bytes) {
-  return bytes > 0 ? kTGCoreBudgetBytes / bytes : kTGCoreBudgetBytes;
-}
-
-// The register file, in 32-bit registers per core, and the most one thread may
-// hold. A pipeline's maxTotalThreadsPerThreadgroup is the threads the file
-// holds at the kernel's register count, allocated four at a time, in steps of
-// 64 threads. `test_occupancy` holds the M1 Pro kernels this was fitted to.
-inline constexpr int64_t kRegisterFileWords = 53248;
-inline constexpr int64_t kMaxRegsPerThread = 128;
-inline constexpr int64_t kRegisterGranule = 4;
-inline constexpr int64_t kThreadStep = 64;
-
-inline constexpr int64_t threadsForRegs(int64_t regs) {
-  const int64_t alloc =
-      (regs + kRegisterGranule - 1) / kRegisterGranule * kRegisterGranule;
-  return kRegisterFileWords / alloc / kThreadStep * kThreadStep;
-}
-
-// Resident threadgroups past which threadgroup memory stops binding occupancy.
-// Registers and warp slots bind first above this line.
-inline constexpr int64_t kTGResidencyFloor = 6;
-
-// Widest launch Metal admits regardless of register appetite: a kernel holding
-// every register it may compiles to this, and a wider launch is then rejected
-// at dispatch as OutOfResources.
-inline constexpr int64_t kAlwaysAdmittedThreads =
-    threadsForRegs(kMaxRegsPerThread);
-
-// Threadgroups of `threadsPerTG` a core keeps resident with a pool of `bytes`
-// however many registers the kernel turns out to hold. A launch wider than a
-// full-register kernel admits is pinned, so the compiler fits one.
-inline constexpr int64_t certainResidency(int64_t bytes, int64_t threadsPerTG) {
-  return std::min(tgResidency(bytes),
-                  std::max<int64_t>(1, kAlwaysAdmittedThreads / threadsPerTG));
-}
-
 // Alignment of a threadgroup pool's base address (Metal's widest vector
 // access). `kPadBytes` is a whole multiple of it.
 inline constexpr int64_t kTGPoolAlignBytes = 16;

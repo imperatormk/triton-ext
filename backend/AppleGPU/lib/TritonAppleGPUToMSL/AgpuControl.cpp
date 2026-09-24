@@ -1,6 +1,8 @@
 // scf.for, scf.if and scf.while lowered to MSL loops and variables.
 #include "AgpuEmitter.h"
 
+#include "agpu/cost/Occupancy.h"
+
 namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
@@ -201,7 +203,8 @@ bool AgpuEmitter::keepsOperandsApart(Operation *dot) {
   const int64_t live = agpu_.pool.plan().live.count();
   const int64_t apart = end + after + live;
   if (apart > agpu::kTGResidentBudgetBytes ||
-      agpu::tgResidency(apart) < agpu::tgResidency(planned + live))
+      agpu::cost::losesResidency(planned + live, apart,
+                                 agpu::threadsFor(numWarps())))
     return false;
   body_.poolFloor = end;
   return true;

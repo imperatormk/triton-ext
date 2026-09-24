@@ -6,6 +6,7 @@
 #include "agpu/core/Padding.h"
 #include "agpu/core/TileView.h"
 #include "agpu/core/Units.h"
+#include "agpu/cost/Occupancy.h"
 #include "agpu/plan/Elementwise.h"
 #include "agpu/plan/ReadbackPlan.h"
 #include "agpu/plan/WarpSlots.h"
@@ -231,16 +232,16 @@ inline int64_t panelTiles(int64_t M, int64_t N, int64_t K, const Panel &p) {
 }
 
 // Whether a fused dot's staged operands carry the bank pad. Dropped when only
-// the plain pitch fits the overlay, or when the pad costs a residency step
-// below `kTGResidencyFloor`. Where neither pitch fits, answers padded, which
-// is what the strategy was sized against.
-inline bool fusedPadWorthCarrying(Bytes padded, Bytes plain, Bytes budget) {
+// the plain pitch fits the overlay, or when the pad costs resident
+// threadgroups. Where neither pitch fits, answers padded, which is what the
+// strategy was sized against.
+inline bool fusedPadWorthCarrying(Bytes padded, Bytes plain, Bytes budget,
+                                  int64_t threadsPerTG) {
   if (padded > budget)
     return !(plain <= budget);
   if (plain > budget)
     return true;
-  const int64_t padRes = tgResidency(padded.count());
-  return padRes >= tgResidency(plain.count()) || padRes >= kTGResidencyFloor;
+  return !cost::losesResidency(plain.count(), padded.count(), threadsPerTG);
 }
 
 // The pad, unless it costs whole tiles: an extra tile is a full restage plus
@@ -351,7 +352,7 @@ struct PoolPlan {
   Bytes reserved() const { return cNeed; }
   // C's own reservation beyond the operands, saturating.
   Bytes cReserve() const { return maxBytes(cNeed - stagedAB, Bytes(0)); }
-  int64_t residency() const { return tgResidency(reserved().count()); }
+  int64_t residency() const { return cost::tgResidency(reserved().count()); }
 };
 
 // A readback that emits a threadgroup C pointer needs something to name: a
@@ -870,7 +871,8 @@ inline Plan planDotAs(const DotFacts &facts, Bytes budget) {
     FusedParams fp;
     fp.fragsPerWarp = fragsPerWarpFor(f);
     fp.cDirect = f.cDirect;
-    if (!fusedPadWorthCarrying(wholeCBytes(true), wholeCBytes(false), budget)) {
+    if (!fusedPadWorthCarrying(wholeCBytes(true), wholeCBytes(false), budget,
+                               threadsFor(f.numWarps))) {
       fp.stagePad = false;
       p.stage = planStageBytes(f, false);
     }

@@ -34,7 +34,7 @@ struct KernelFacts {
   std::vector<KernelArg> args;
   int64_t numWarps = 1;
   int64_t poolBytes = 0;
-  int64_t coreBudget = kTGCoreBudgetBytes;
+  int64_t coreBudget = cost::kTGCoreBudgetBytes;
   DebugChannels debug;
   RollPrediction predictedRoll;
 };

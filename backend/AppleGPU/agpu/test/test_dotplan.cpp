@@ -51,15 +51,6 @@ int main() {
     CHECK(maxBytes(Bytes(10), Bytes(20)) == Bytes(20));
   }
 
-  CASE("residency is a step function of the declared pool");
-  {
-    CHECK_EQ(tgResidency(15360), 4);
-    CHECK_EQ(tgResidency(20480), 3);
-    CHECK_EQ(tgResidency(20736), 2);
-    CHECK_EQ(tgResidency(30720), 2);
-    CHECK_EQ(tgResidency(7680), 8);
-  }
-
   // ── strategy selection ─────────────────────────────────────────────────
 
   CASE("an integer accumulator takes the scalar path");
@@ -177,11 +168,12 @@ int main() {
     const Bytes plain(
         stagedTileBytes(64, fragAlignedExtent(80), kAccBytes, false));
     CHECK(padded <= kBudget);
-    CHECK_EQ(plain.count(), kTGCoreBudgetBytes / 3);
-    CHECK(tgResidency(padded.count()) < tgResidency(plain.count()));
+    CHECK_EQ(plain.count(), cost::kTGCoreBudgetBytes / 3);
+    CHECK(cost::tgResidency(padded.count()) < cost::tgResidency(plain.count()));
     CHECK(!planDot(f, kBudget).padStagedC());
 
-    CHECK(fusedPadWorthCarrying(Bytes(4336), Bytes(4000), kBudget));
+    CHECK(fusedPadWorthCarrying(Bytes(4336), Bytes(4000), kBudget, 128));
+    CHECK(!fusedPadWorthCarrying(Bytes(9216), Bytes(8192), kBudget, 32));
   }
 
   CASE("a fused C that fits only unpadded drops the pad but keeps the fusion");

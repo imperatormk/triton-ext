@@ -359,6 +359,7 @@ agpu::BuiltBody AgpuEmitter::buildKernelBody(Region &region) {
   // A convert_layout absorbed by a later dot leaves its scatter-barrier-gather
   // emitted but unread. Metal drops the dead registers but not the barriers.
   agpu::pruneDead(out);
+  agpu::pruneRedundantBarriers(out);
   return agpu::BuiltBody{std::move(out), body_.pool.usedBytes()};
 }
 

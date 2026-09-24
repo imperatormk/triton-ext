@@ -39,6 +39,10 @@ struct ThreadNames {
   msl::Str blockId = "tgpos.x";
   msl::Str simdLaneId = "slane";
   msl::Str simdGroupId = "sgroup";
+  // Where a lane's two elements sit in an 8x8 fragment: their row and the
+  // first of their two columns.
+  msl::Str fragRow = "fragRow";
+  msl::Str fragCol = "fragCol";
 };
 
 // Names of pool regions. Metal admits threadgroup declarations only in a

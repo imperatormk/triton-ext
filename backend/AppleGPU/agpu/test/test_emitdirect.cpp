@@ -17,6 +17,11 @@ namespace {
 
 const std::string kZeroAcc = kSimdgroup8x8.zeroCtor("float") + "(0.0f)";
 
+// Fragments read, whichever way `loadFrag` spelled the read.
+int fragLoads(const std::string &out) {
+  return countOf(out, "simdgroup_load") + countOf(out, agpu_test::kLaneLoad);
+}
+
 OperandSource operandFrom(msl::Str buffer, int64_t leadingDim,
                           OperandSource::FragAxis axis, int64_t bandFrags = 0) {
   OperandSource s;
@@ -192,7 +197,7 @@ int main() {
     int counter = 0;
     emitDirectMma(c, body, slots, gemmInputs(1, 8, 24), nm, counter);
     const std::string out = render(body);
-    CHECK_EQ(countOf(out, "simdgroup_load"), 2 + 3);
+    CHECK_EQ(fragLoads(out), 2 + 3);
     CHECK_EQ(countOf(out, "simdgroup_multiply_accumulate"), 6);
   }
 
@@ -207,7 +212,7 @@ int main() {
     };
     int counter = 0;
     emitDirectMma(c, body, slots, gemmInputs(1, 8, 16), nm, counter);
-    CHECK_EQ(countOf(render(body), "simdgroup_load"), 3);
+    CHECK_EQ(fragLoads(render(body)), 3);
   }
 
   CASE("distinct K steps do not share a fragment");
@@ -219,7 +224,7 @@ int main() {
     int counter = 0;
     emitDirectMma(c, body, slots, gemmInputs(4, 32, 8), nm, counter);
     const std::string out = render(body);
-    CHECK_EQ(countOf(out, "simdgroup_load"), 8);
+    CHECK_EQ(fragLoads(out), 8);
     CHECK_EQ(countOf(out, "simdgroup_multiply_accumulate"), 4);
   }
 
@@ -357,7 +362,7 @@ int main() {
     in.kT = 1;
     int counter = 0;
     emitDirectMma(c, body, slots, in, nm, counter);
-    CHECK_EQ(countOf(render(body), "simdgroup_load"), 3);
+    CHECK_EQ(fragLoads(render(body)), 3);
   }
 
   CASE("the two operands index different axes");
@@ -371,10 +376,10 @@ int main() {
     emitDirectMma(c, body, slots, in, nm, counter);
     const std::string out = render(body);
 
-    CHECK_HAS(out, "pA + 512,");
-    CHECK_HAS(out, "pB + 8,");
-    CHECK_HAS(out, "pA + 520,");
-    CHECK_HAS(out, "pB + 520,");
+    CHECK_HAS(out, "(pA + 512 + (fragRow");
+    CHECK_HAS(out, "(pB + 8 + (fragRow");
+    CHECK_HAS(out, "(pA + 520 + (fragRow");
+    CHECK_HAS(out, "(pB + 520 + (fragRow");
   }
 
   CASE("banding does not fold an affine row");

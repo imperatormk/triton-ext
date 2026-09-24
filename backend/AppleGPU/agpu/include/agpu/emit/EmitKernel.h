@@ -3,6 +3,8 @@
 #define AGPU_EMIT_KERNEL_H
 
 #include "agpu/emit/KernelAbi.h"
+#include "agpu/emit/primitives/FragLane.h"
+#include "agpu/msl/Analysis.h"
 #include "agpu/msl/Context.h"
 #include "agpu/msl/GuardFuse.h"
 #include "agpu/msl/GuardSink.h"
@@ -51,13 +53,21 @@ struct KernelResult {
 };
 
 inline void emitLaneWarpPrologue(msl::Context &c, msl::Block &body,
-                                 const KernelNames &nm) {
+                                 const KernelNames &nm,
+                                 const msl::Block &built) {
   msl::Expr *flat = c.member(c.var(nm.threadId), msl::builtin::comp::X);
   body.push_back(
       c.declStmt(msl::Context::i32(), nm.laneId,
                  c.binary(msl::BinOp::And, flat, c.lit(kWarpSize - 1))));
   body.push_back(c.declStmt(msl::Context::i32(), nm.warpId,
                             c.binary(msl::BinOp::Div, flat, c.lit(kWarpSize))));
+  const msl::PtrSet<msl::Str> reads = msl::collectReads(built);
+  if (reads.count(nm.fragRow))
+    body.push_back(c.declStmt(msl::Context::i32(), nm.fragRow,
+                              fragLaneRowExpr(c, nm.laneId)));
+  if (reads.count(nm.fragCol))
+    body.push_back(c.declStmt(msl::Context::i32(), nm.fragCol,
+                              fragLaneColExpr(c, nm.laneId, 0)));
 }
 
 inline void emitArgUnpack(msl::Context &c, msl::Block &body,
@@ -157,7 +167,7 @@ inline KernelResult emitKernel(msl::Context &c, const KernelFacts &f,
     BuiltBody built = buildBody(c, rollK);
     msl::Block body;
     emitArgUnpack(c, body, f.args, abi, nm);
-    emitLaneWarpPrologue(c, body, nm);
+    emitLaneWarpPrologue(c, body, nm, built.stmts);
     for (msl::Stmt *s : built.stmts)
       body.push_back(s);
     built.stmts = std::move(body);

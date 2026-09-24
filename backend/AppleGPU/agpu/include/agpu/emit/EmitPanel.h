@@ -132,6 +132,16 @@ private:
   int counter_ = 0;
 };
 
+// A fragment of threadgroup memory read as the two elements each lane holds:
+// `simdgroup_load` rebuilds the lane's address on every call and never folds a
+// constant offset into the load. With an even leading dimension every lane's
+// pair starts at an even element, so it reads as one aligned 2-vector.
+inline bool loadsByLane(const OperandSource &src, const msl::Str &opElem) {
+  return src.space == msl::AddrSpace::Threadgroup && src.leadingDim.isConst() &&
+         src.leadingDim.constant() % 2 == 0 &&
+         (opElem == "float" || opElem == "half");
+}
+
 inline msl::Str loadFrag(msl::Context &c, msl::Block &into, msl::Block &decls,
                          FragCache &cache, const OperandSource &src,
                          SlotCoord pos, int64_t kIndex, msl::Expr *kTerm,
@@ -142,13 +152,32 @@ inline msl::Str loadFrag(msl::Context &c, msl::Block &into, msl::Block &decls,
 
   const msl::Str name = nm.frag + std::to_string(counter++);
   decls.push_back(c.declStmt(kSimdgroup8x8.mslTypeNode(nm.opElem), name));
-  msl::Expr *off = src.fragOffsetOf(c, row, nm.warpId);
-  if (kTerm)
-    off = c.binary(msl::BinOp::Add, off, kTerm);
-  into.push_back(c.exprStmt(
-      c.call(msl::builtin::sg::Load,
-             {c.var(name), c.binary(msl::BinOp::Add, c.var(src.buffer), off),
-              src.leadingDim.expr(c)})));
+  const auto fragAt = [&] {
+    msl::Expr *off = src.fragOffsetOf(c, row, nm.warpId);
+    if (kTerm)
+      off = c.binary(msl::BinOp::Add, off, kTerm);
+    return c.binary(msl::BinOp::Add, c.var(src.buffer), off);
+  };
+  if (loadsByLane(src, nm.opElem)) {
+    const msl::Type pair = msl::Type::vector(
+        nm.opElem == "half" ? msl::Scalar::F16 : msl::Scalar::F32, 2);
+    // One read per element keeps the declaration count `predictPanelDotSize`
+    // forecasts; the two reads of one address merge into a single load.
+    const auto pairAt = [&] {
+      msl::Expr *lane = c.binary(msl::BinOp::Add,
+                                 c.binary(msl::BinOp::Mul, c.var(nm.fragRow),
+                                          c.lit(src.leadingDim.constant())),
+                                 c.var(nm.fragCol));
+      return c.deref(c.cast(pair.pointerTo(msl::AddrSpace::Threadgroup),
+                            c.binary(msl::BinOp::Add, fragAt(), lane)));
+    };
+    into.push_back(c.assign(fragElemExpr(c, name, 0), c.member(pairAt(), "x")));
+    into.push_back(c.assign(fragElemExpr(c, name, 1), c.member(pairAt(), "y")));
+  } else {
+    into.push_back(
+        c.exprStmt(c.call(msl::builtin::sg::Load,
+                          {c.var(name), fragAt(), src.leadingDim.expr(c)})));
+  }
   cache.put(row, kIndex, name);
   return name;
 }

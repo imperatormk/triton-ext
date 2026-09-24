@@ -11,6 +11,7 @@
 
 using namespace agpu;
 using agpu_test::countOf;
+using agpu_test::laneLoad;
 using agpu_test::render;
 
 namespace {
@@ -147,9 +148,9 @@ int main() {
     emitPanelMma(c, body, s.tiles[0], nm, stagedA(s.tiles[0]),
                  {slotAt(0, 0, 0)}, false);
     const std::string out = render(body);
-    CHECK_HAS(out, "simdgroup_load(fa0, pA, 40)");
-    CHECK_HAS(out, "simdgroup_load(fa2, pA + 8, 40)");
-    CHECK_HAS(out, "simdgroup_load(fa4, pA + 16, 40)");
+    CHECK_HAS(out, laneLoad("fa0", "pA", 40));
+    CHECK_HAS(out, laneLoad("fa2", "pA + 8", 40));
+    CHECK_HAS(out, laneLoad("fa4", "pA + 16", 40));
   }
 
   CASE("B steps by the row stride, because K is its row axis");
@@ -161,8 +162,8 @@ int main() {
     emitPanelMma(c, body, s.tiles[0], nm, stagedA(s.tiles[0]),
                  {slotAt(0, 0, 0)}, false);
     const std::string out = render(body);
-    CHECK_HAS(out, "simdgroup_load(fb1, pB, 24)");
-    CHECK_HAS(out, "simdgroup_load(fb3, pB + 192, 24)");
+    CHECK_HAS(out, laneLoad("fb1", "pB", 24));
+    CHECK_HAS(out, laneLoad("fb3", "pB + 192", 24));
   }
 
   CASE("a second slot addresses a different fragment");
@@ -552,7 +553,7 @@ int main() {
     emitAccumStore(c, body, s.tiles[0], nm, s0,
                    panelAccName(s.tiles[0], nm, 0));
     const std::string out = render(body);
-    CHECK_HAS(out, "simdgroup_load(fb1, pB + warp * 8, 24)");
+    CHECK_HAS(out, laneLoad("fb1", "pB + warp * 8", 24));
     CHECK_HAS(out, "simdgroup_store(acc0, pC + warp * 8, 20)");
   }
 
@@ -571,8 +572,8 @@ int main() {
                   prog);
     const std::string out = render(body);
     CHECK(out.find("if (warp ==") == std::string::npos);
-    CHECK_HAS(out, "simdgroup_load(fa0, pA + warp / 2 % 2 * 8 * 24, 24)");
-    CHECK_HAS(out, "simdgroup_load(fb1, pB + warp % 2 * 8, 24)");
+    CHECK_HAS(out, laneLoad("fa0", "pA + warp / 2 % 2 * 8 * 24", 24));
+    CHECK_HAS(out, laneLoad("fb1", "pB + warp % 2 * 8", 24));
     CHECK(out.find("simdgroup_store(acc0, pC + (warp / 2 % 2 * 8 * 20 + "
                    "warp % 2 * 8), 20)") != std::string::npos);
   }
@@ -615,7 +616,7 @@ int main() {
     const std::string out = render(body);
     CHECK_HAS(out, "simdgroup_load(fa_16_0_0_0, dA + 16 * ldA, ldA)");
     CHECK_HAS(out, "dA + (16 * ldA + 8)");
-    CHECK(out.find(", pB,") != std::string::npos);
+    CHECK_HAS(out, "(pB + (fragRow * ");
   }
 
   CASE("a device-A tile has no StageA phase and loses its barrier");

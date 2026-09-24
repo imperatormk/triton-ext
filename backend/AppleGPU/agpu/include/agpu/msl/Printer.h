@@ -44,6 +44,7 @@ private:
 
   void indent();
   void printExprAt(const Expr *e, int outerPrec);
+  void printPostfixBase(const Expr *e);
   void printLiteral(const Literal *l);
   void printParams(const Function *f);
 

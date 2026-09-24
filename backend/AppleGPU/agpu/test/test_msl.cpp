@@ -393,6 +393,22 @@ int main() {
     CHECK_EQ(renderExpr(c.mul(c.add(a, b), d)), std::string("(a + b) * d"));
   }
 
+  CASE("a prefix operator under a member or subscript is parenthesised");
+  {
+    Context c;
+    const Type f2 = Type::vector(Scalar::F32, 2);
+    Expr *pair = c.deref(c.cast(f2.pointerTo(AddrSpace::Threadgroup),
+                                c.add(c.var("p"), c.lit(8))));
+    CHECK_EQ(renderExpr(c.member(pair, "x")),
+             std::string("(*(threadgroup float2 *)(p + 8)).x"));
+    CHECK_EQ(renderExpr(c.subscript(
+                 c.cast(Type::scalar(Scalar::F32).pointerTo(AddrSpace::Device),
+                        c.var("q")),
+                 c.lit(0))),
+             std::string("((device float *)q)[0]"));
+    CHECK_EQ(renderExpr(c.member(c.var("v"), "x")), std::string("v.x"));
+  }
+
   CASE("left-associativity is preserved on the right operand");
   {
     Context c;

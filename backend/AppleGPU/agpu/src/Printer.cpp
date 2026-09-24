@@ -300,6 +300,30 @@ void Printer::printLiteral(const Literal *l) {
 
 void Printer::printExpr(const Expr *e) { printExprAt(e, 0); }
 
+// A prefix operator binds looser than the postfix `[]` and `.` applied to it.
+static bool isPrefixForm(const Expr *e) {
+  switch (e->kind) {
+  case ExprKind::Unary:
+  case ExprKind::Deref:
+  case ExprKind::AddrOf:
+    return true;
+  case ExprKind::Cast:
+    return static_cast<const Cast *>(e)->style == Cast::Style::Value;
+  default:
+    return false;
+  }
+}
+
+void Printer::printPostfixBase(const Expr *e) {
+  if (!e || !isPrefixForm(e)) {
+    printExprAt(e, 12);
+    return;
+  }
+  os_ << "(";
+  printExprAt(e, 0);
+  os_ << ")";
+}
+
 // `outerPrec` is the precedence of the surrounding context. Parens appear when
 // the tree would otherwise re-associate.
 void Printer::printExprAt(const Expr *e, int outerPrec) {
@@ -411,7 +435,7 @@ void Printer::printExprAt(const Expr *e, int outerPrec) {
   }
   case ExprKind::Subscript: {
     auto *s = static_cast<const Subscript *>(e);
-    printExprAt(s->base, 12);
+    printPostfixBase(s->base);
     os_ << "[";
     printExprAt(s->index, 0);
     os_ << "]";
@@ -419,7 +443,7 @@ void Printer::printExprAt(const Expr *e, int outerPrec) {
   }
   case ExprKind::Member: {
     auto *m = static_cast<const Member *>(e);
-    printExprAt(m->base, 12);
+    printPostfixBase(m->base);
     os_ << "." << m->field;
     return;
   }

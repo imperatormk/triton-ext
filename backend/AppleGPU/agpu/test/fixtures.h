@@ -119,6 +119,18 @@ inline agpu::LayoutBasis laneMajor(Bits reg = {32}) {
   return basis(std::move(reg), {1, 2, 4, 8, 16});
 }
 
+// A fragment read from threadgroup memory, as `loadFrag` spells its first
+// element: from `addr` plus the lane's offset in a row of `ld`.
+inline std::string laneLoad(const std::string &frag, const std::string &addr,
+                            std::int64_t ld, const std::string &elem = "half") {
+  return frag + ".thread_elements()[0] = (*(threadgroup " + elem + "2 *)(" +
+         addr + " + (fragRow * " + std::to_string(ld) + " + fragCol))).x;";
+}
+
+// Once per fragment read from threadgroup memory.
+inline constexpr const char *kLaneLoad =
+    ".thread_elements()[0] = (*(threadgroup";
+
 } // namespace agpu_test
 
 #endif // AGPU_TEST_FIXTURES_H

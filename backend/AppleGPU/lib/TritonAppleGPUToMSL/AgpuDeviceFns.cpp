@@ -187,7 +187,8 @@ LogicalResult AgpuEmitter::addDeviceFn(triton::FuncOp func) {
     return failure();
 
   am::Block body;
-  agpu::emitLaneWarpPrologue(agpu_.context(), body, agpu::KernelNames{});
+  agpu::emitLaneWarpPrologue(agpu_.context(), body, agpu::KernelNames{},
+                             walked);
   for (am::Stmt *s : poolDecls())
     body.push_back(s);
   for (am::Stmt *s : body_.hoist.decls)

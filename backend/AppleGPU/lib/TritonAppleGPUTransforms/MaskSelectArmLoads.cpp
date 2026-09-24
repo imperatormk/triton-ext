@@ -108,6 +108,11 @@ private:
     DominanceInfo dom(getOperation());
     Value cond = sel.getCondition();
     for (tt::LoadOp load : loads) {
+      // A masked-off lane needs a value, and a loaded pointer has no zero.
+      TypedAttr zero;
+      if (!load.getOther() &&
+          !(zero = Builder(load.getContext()).getZeroAttr(load.getType())))
+        continue;
       Type maskTy = tt::getI1SameShape(load.getType());
       bool splat = cond.getType() != maskTy;
       if (splat &&
@@ -128,11 +133,9 @@ private:
       if (Value mask = load.getMask())
         c = arith::AndIOp::create(b, loc, mask, c);
       load.getMaskMutable().assign(c);
-      if (!load.getOther()) {
-        Type ty = load.getType();
+      if (zero)
         load.getOtherMutable().assign(
-            arith::ConstantOp::create(b, loc, ty, b.getZeroAttr(ty)));
-      }
+            arith::ConstantOp::create(b, loc, load.getType(), zero));
     }
   }
 };

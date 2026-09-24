@@ -19,17 +19,35 @@ namespace mlir::triton::applegpu {
 
 namespace {
 
-// Ops in `sel`'s block whose every use ends in operand `arm` of `sel`.
+// Element i of the op's result reads only element i of its operands, so a
+// mask on element i of a load in the cone lines up with the select's.
+static bool isElementwise(Operation *op, Type selTy) {
+  if (op->getNumResults() != 1)
+    return false;
+  auto ty = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  auto sty = dyn_cast<RankedTensorType>(selTy);
+  if (bool(ty) != bool(sty) || (ty && ty.getShape() != sty.getShape()))
+    return false;
+  if (auto load = dyn_cast<tt::LoadOp>(op))
+    return !load.getIsVolatile();
+  const StringRef n = op->getName().getStringRef();
+  if (n.starts_with("arith.") || n.starts_with("math."))
+    return true;
+  return llvm::is_contained({"tt.extern_elementwise", "tt.precise_divf",
+                             "tt.precise_sqrt", "tt.mulhiui", "tt.fp_to_fp",
+                             "tt.bitcast", "tt.clampf", "tt.addptr"},
+                            n);
+}
+
+// Elementwise ops in `sel`'s block whose every use ends in operand `arm` of
+// `sel`.
 static SetVector<Operation *> exclusiveCone(arith::SelectOp sel, unsigned arm) {
   SetVector<Operation *> cone;
   SmallVector<Value> work{sel->getOperand(arm)};
   while (!work.empty()) {
     Operation *def = work.pop_back_val().getDefiningOp();
     if (!def || def->getBlock() != sel->getBlock() || def->getNumRegions() ||
-        cone.contains(def))
-      continue;
-    auto load = dyn_cast<tt::LoadOp>(def);
-    if (!(load && !load.getIsVolatile()) && !isMemoryEffectFree(def))
+        cone.contains(def) || !isElementwise(def, sel.getType()))
       continue;
     cone.insert(def);
     for (Value v : def->getOperands())

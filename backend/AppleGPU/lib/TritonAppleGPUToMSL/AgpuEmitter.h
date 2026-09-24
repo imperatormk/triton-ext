@@ -858,6 +858,8 @@ private:
   llvm::DenseMap<Operation *, bool> cDirectOf_;
 
   std::vector<ResidentOperand> residents_;
+  // Dots whose loop-invariant A residency planning turned away.
+  std::set<Operation *> directInvariantA_;
 
   std::map<agpu::ValueId, std::vector<ConstantValue>> constantFor_;
 

@@ -281,6 +281,7 @@ void AgpuEmitter::scanPool(triton::FuncOp func) {
 void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
   if (!func.isPublic())
     return;
+  directInvariantA_.clear();
   std::vector<ResidentOperand> found;
   int buffers = 0;
   func.walk([&](triton::DotOp dot) {
@@ -364,6 +365,7 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
   for (ResidentOperand &r : found)
     r.bytes = slots[r.buffer].bytes;
   buffers = (int)slots.size();
+  const std::vector<ResidentOperand> candidates = found;
 
   const auto peakWith = [&](const std::vector<ResidentOperand> &cands,
                             int keep) {
@@ -418,6 +420,30 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
     if (reserved.insert(r.buffer).second)
       agpu_.pool.live(agpu::Bytes(r.bytes));
     residents_.push_back(r);
+  }
+
+  // An A turned away here is restaged every trip. Read it in place instead,
+  // but only where the pool bytes that frees buy a resident threadgroup:
+  // otherwise staged fragments are the faster read.
+  const int64_t held = agpu_.pool.plan().live.count();
+  const auto peak = [&] {
+    int64_t p = 0;
+    func.walk([&](Operation *op) {
+      if (op != func.getOperation())
+        p = std::max(p, poolNeedOf(op).bytes());
+    });
+    return p + held;
+  };
+  for (const ResidentOperand &r : candidates) {
+    if (r.which != 0 || !dotShapeOf(cast<triton::DotOp>(r.dot)).aDevice.base ||
+        llvm::any_of(chosen, [&](const ResidentOperand &c) {
+          return c.dot == r.dot && c.which == 0;
+        }))
+      continue;
+    const int64_t staged = agpu::tgResidency(peak());
+    directInvariantA_.insert(r.dot);
+    if (agpu::tgResidency(peak()) <= staged)
+      directInvariantA_.erase(r.dot);
   }
 }
 

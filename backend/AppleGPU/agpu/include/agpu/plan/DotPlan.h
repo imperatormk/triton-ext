@@ -31,13 +31,14 @@ struct DotFacts {
   bool intAcc = false;   // integer accumulator: scalar path
   bool aInPlace = false; // A already resident in a threadgroup buffer
   bool bInPlace = false;
-  bool aDirect = false;      // A readable straight from device memory
-  bool carriedAcc = false;   // C is loop-carried: this dot runs per iteration
-  bool fusedAcc = false;     // C lives in registers across a K loop
-  bool cInitNonzero = false; // the fused loop's init is not zeros
-  bool cDirect = false;      // C stores straight to device
-  bool cFallback = false;    // ... but keeps a pool arm for ragged tiles
-  bool cRename = false;      // C's consumers read the fragment's own lanes
+  bool aDirect = false;    // A readable straight from device memory
+  bool carriedAcc = false; // C is loop-carried: this dot runs per iteration
+  bool aRestagedEachTrip = false; // loop-invariant A the loop keeps no copy of
+  bool fusedAcc = false;          // C lives in registers across a K loop
+  bool cInitNonzero = false;      // the fused loop's init is not zeros
+  bool cDirect = false;           // C stores straight to device
+  bool cFallback = false;         // ... but keeps a pool arm for ragged tiles
+  bool cRename = false;           // C's consumers read the fragment's own lanes
 
   std::vector<LayoutBasis> cDims;
   int64_t cRegs = 0;
@@ -758,9 +759,11 @@ inline Plan planDot(const DotFacts &facts, Bytes budget) {
   }
 
   // Staged fragments measured faster than device-resident ones, so A stages
-  // whenever the whole dot still fits. Not for a loop-carried dot, which would
-  // pay a scatter and a barrier every trip.
-  if (f.aDirect && !f.carriedAcc) {
+  // whenever the whole dot still fits. Not for a loop-carried dot, nor for a
+  // loop-invariant A the loop keeps no resident copy of: either would repeat
+  // the scatter and a barrier every trip (attention's Q at 64x32 tiles: 0.79 ->
+  // 0.58 ms direct).
+  if (f.aDirect && !f.carriedAcc && !f.aRestagedEachTrip) {
     DotFacts staged = f;
     staged.aDirect = false;
     const bool wholePadded =

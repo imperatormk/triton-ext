@@ -5,6 +5,7 @@
 namespace mlir::triton::applegpu::bridge {
 
 namespace am = agpu::msl;
+
 am::Str AgpuEmitter::derivedDevicePointer(const am::Str &base, am::Expr *offset,
                                           const agpu::ElemType &elem,
                                           am::Str name) {
@@ -51,6 +52,7 @@ DotOperands AgpuEmitter::dotOperandsOf(const agpu::OpView &o) {
   }
 
   d.shape.aDevice = deviceTileOf(mlirValueOf(o.operands[0]));
+  d.shape.aRestagedEachTrip = directInvariantA_.count(d.op) != 0;
 
   const agpu::ValueId ops[2] = {o.operands[0], o.operands[1]};
   agpu::ValueId *stage[2] = {&d.aStage, &d.bStage};
@@ -155,6 +157,7 @@ DotShape AgpuEmitter::dotShapeOf(triton::DotOp dot) const {
   d.bElem = *bE;
   d.cElem = *cE;
   d.aDevice = deviceTileOf(dot.getA());
+  d.aRestagedEachTrip = directInvariantA_.count(dot.getOperation()) != 0;
   fillAccumulatorCarry(d, dot.getC(), dot.getResult());
   return d;
 }
@@ -209,6 +212,7 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
   f.cInitNonzero = f.fusedAcc && !zeroSplat(fusedInitOf(shape.cCarried));
   f.aInPlace = f.bInPlace = false;
   f.aDirect = (bool)shape.aDevice.base;
+  f.aRestagedEachTrip = shape.aRestagedEachTrip;
   if (!f.fusedAcc) {
     const RankedTensorType renameTy = renameLandingTypeOf(shape);
     f.cDims = coordSourceOf(renameTy).dims;

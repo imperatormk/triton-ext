@@ -535,6 +535,12 @@ int main() {
     Plan looped = planDot(f, kBudget);
     CHECK(looped.facts.aDirect);
     CHECK_EQ(looped.stage.a.count(), 0);
+
+    f.carriedAcc = false;
+    f.aRestagedEachTrip = true;
+    Plan invariant = planDot(f, kBudget);
+    CHECK(invariant.facts.aDirect);
+    CHECK_EQ(invariant.stage.a.count(), 0);
   }
 
   CASE("a shape only the plain pitch admits goes direct-unpadded");

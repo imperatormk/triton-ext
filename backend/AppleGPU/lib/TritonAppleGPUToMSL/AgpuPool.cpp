@@ -440,39 +440,58 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
     chosen = fit(found);
   }
 
+  const auto readableInPlace = [&](const ResidentOperand &r) {
+    return r.which == 0 &&
+           (bool)dotShapeOf(cast<triton::DotOp>(r.dot)).aDevice.base;
+  };
+
   // A resident A that could be read in place gives its buffer up where that
-  // buys a resident threadgroup.
+  // buys a resident threadgroup. The buffer goes only with all its readers.
+  std::set<int> triedBuffers;
   for (const ResidentOperand &r : std::vector<ResidentOperand>(chosen)) {
-    if (r.which != 0 || !dotShapeOf(cast<triton::DotOp>(r.dot)).aDevice.base ||
-        llvm::count_if(chosen, [&](const ResidentOperand &c) {
-          return c.buffer == r.buffer;
-        }) > 1)
+    if (!triedBuffers.insert(r.buffer).second)
+      continue;
+    std::set<Operation *> readers;
+    bool movable = true;
+    for (const ResidentOperand &c : chosen)
+      if (c.buffer == r.buffer) {
+        movable = movable && readableInPlace(c);
+        readers.insert(c.dot);
+      }
+    if (!movable)
       continue;
     std::vector<ResidentOperand> without = chosen;
     llvm::erase_if(without, [&](const ResidentOperand &c) {
-      return c.dot == r.dot && c.which == 0;
+      return c.buffer == r.buffer;
     });
     if (agpu::cost::gainsResidency(peakWhere(chosen, {}) + live,
-                                   peakWhere(without, {r.dot}) + live,
+                                   peakWhere(without, readers) + live,
                                    threads)) {
       chosen = std::move(without);
-      directInvariantA_.insert(r.dot);
+      directInvariantA_.insert(readers.begin(), readers.end());
     }
   }
 
   // An A turned away here is restaged every trip. Read it in place instead,
   // but only where the pool bytes that frees buy a resident threadgroup:
-  // otherwise staged fragments are the faster read.
+  // otherwise staged fragments are the faster read. Every dot restaging the
+  // same A switches together; one left staging keeps the peak.
+  llvm::DenseSet<Value> triedSources;
   for (const ResidentOperand &r : candidates) {
-    if (r.which != 0 || directInvariantA_.count(r.dot) ||
-        !dotShapeOf(cast<triton::DotOp>(r.dot)).aDevice.base ||
-        llvm::any_of(chosen, [&](const ResidentOperand &c) {
-          return c.dot == r.dot && c.which == 0;
-        }))
+    if (r.which != 0 || !triedSources.insert(r.source).second)
       continue;
-    if (agpu::cost::gainsResidency(peakWhere(chosen, {}) + live,
-                                   peakWhere(chosen, {r.dot}) + live, threads))
-      directInvariantA_.insert(r.dot);
+    std::set<Operation *> readers;
+    for (const ResidentOperand &c : candidates)
+      if (c.source == r.source && readableInPlace(c) &&
+          !directInvariantA_.count(c.dot) &&
+          llvm::none_of(chosen, [&](const ResidentOperand &k) {
+            return k.dot == c.dot && k.which == 0;
+          }))
+        readers.insert(c.dot);
+    if (!readers.empty() &&
+        agpu::cost::gainsResidency(peakWhere(chosen, {}) + live,
+                                   peakWhere(chosen, readers) + live, threads))
+      directInvariantA_.insert(readers.begin(), readers.end());
   }
 
   std::set<int> reserved;

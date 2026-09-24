@@ -10,6 +10,7 @@ import struct as _struct
 from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
+from triton_apple_backend.device_assert import check_landed as _check_landed
 from triton_apple_backend.device_assert import check_pending as _check_pending
 from triton_apple_backend.device_assert import defer as _defer_asserts
 from triton_apple_backend.device_assert import parse_assert_layout
@@ -42,6 +43,14 @@ class _TorchRuntime:
 
     def as_u32(self, buf):
         return buf.cpu().numpy().view('uint32')
+
+    def assert_buffer(self, n):
+        return self.metal.alloc_shared(4 * n)
+
+    def peek_u32(self, buf):
+        """Host view of a shared buffer, without synchronizing."""
+        import numpy as np
+        return np.frombuffer(buf, dtype=np.uint32)
 
     def device_interface(self):
         return self.torch.mps
@@ -93,6 +102,12 @@ class _NativeRuntime:
     def as_u32(self, buf):
         import numpy as np
         return np.frombuffer(buf, dtype=np.uint32)
+
+    def assert_buffer(self, n):
+        return self.zeros_i32(n)
+
+    def peek_u32(self, buf):
+        return None
 
     def device_interface(self):
         return _NativeDeviceInterface(self.metal)
@@ -447,6 +462,7 @@ class MetalLauncher:
         # existing pointer binding. Must be zeroed: the head is a running
         # count the kernel bumps.
         rt = _runtime()
+        _check_landed(rt)
         print_buffer = None
         if self._print_layout is not None:
             print_buffer = rt.zeros_i32(self._print_layout.nbytes // 4)
@@ -454,11 +470,11 @@ class MetalLauncher:
 
         # Print first, then assert: the order planKernelAbi fixed.
         # One buffer per launcher, zeroed once: the head only moves when an
-        # assert fails, and check_pending re-zeroes it after reporting.
+        # assert fails, and the check that reports it re-zeroes it.
         assert_buffer = None
         if self._assert_layout is not None:
             if self._assert_buffer is None:
-                self._assert_buffer = rt.zeros_i32(
+                self._assert_buffer = rt.assert_buffer(
                     self._assert_layout.nbytes // 4)
             assert_buffer = self._assert_buffer
             reordered_args = reordered_args + (assert_buffer, )

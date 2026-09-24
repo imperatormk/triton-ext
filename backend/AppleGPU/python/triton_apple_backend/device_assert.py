@@ -3,9 +3,10 @@ layout comes from the ``AGPU-ASSERT-LAYOUT`` block the emitter
 (agpu/plan/AssertPlan.h) puts in the .metal module; the block's presence also
 says whether a kernel asserts.
 
-As on CUDA, a failure surfaces at the next device synchronize, not at the
-launch: reading the buffer right after the launch would stall the queue on
-every kernel that indexes indirectly.
+As on CUDA, a failure surfaces later, not at the launch: reading the buffer
+right after the launch would stall the queue on every kernel that indexes
+indirectly. It surfaces at the next synchronize, or at the next launch once the
+failing kernel has finished when the buffer is host-visible shared memory.
 """
 
 import re as _re
@@ -94,18 +95,41 @@ def defer(key, layout, buffer):
     _pending[key] = (layout, buffer)
 
 
+def _clear(rt, buffer):
+    words = rt.peek_u32(buffer)
+    if words is None:
+        rt.clear_cache(buffer)
+    else:
+        words[:] = 0
+
+
+def check_landed(rt):
+    """Before a launch: raise for an earlier launch whose failure the host can
+    already see, without waiting for the device."""
+    for key, (layout, buffer) in list(_pending.items()):
+        words = rt.peek_u32(buffer)
+        if words is None or layout.head(words) == 0:
+            continue
+        words = words.copy()
+        del _pending[key]
+        _clear(rt, buffer)
+        check(layout, words)
+
+
 def check_pending(rt):
     """After a synchronize: raise for the first launch whose assert failed."""
     pending = list(_pending.values())
     _pending.clear()
     failed = None
     for layout, buffer in pending:
-        words = rt.as_u32(buffer)
+        words = rt.peek_u32(buffer)
+        if words is None:
+            words = rt.as_u32(buffer)
         if layout.head(words) == 0:
             continue
         if failed is None:
             failed = (layout, words.copy())
-        rt.clear_cache(buffer)
+        _clear(rt, buffer)
     if failed is not None:
         check(*failed)
 

@@ -36,6 +36,16 @@ def test_a_reported_failure_does_not_repeat():
     torch.mps.synchronize()
 
 
+def test_the_next_launch_raises_once_the_failure_has_landed():
+    x = torch.arange(64, dtype=torch.int32, device="mps")
+    bounded_kernel[(1, )](x, LIMIT=10)
+    # Waits for the stream without going through torch.mps.synchronize.
+    torch.ones(1, device="mps").sum().item()
+    with pytest.raises(DeviceAssertError, match="value past the limit"):
+        bounded_kernel[(1, )](x, LIMIT=100)
+    torch.mps.synchronize()
+
+
 def test_a_passing_assert_never_raises():
     x = torch.arange(64, dtype=torch.int32, device="mps")
     for _ in range(3):

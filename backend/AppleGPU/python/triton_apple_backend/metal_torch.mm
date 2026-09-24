@@ -49,6 +49,70 @@ static id<MTLDevice> get_device(void) {
   return at::mps::getCurrentMPSStream()->device();
 }
 
+// ── SharedBuffer - host-visible memory a kernel writes ───────────────────
+// Its buffer view reads the memory as it is, without waiting for the GPU: for
+// state that only ever moves one way, like an assert count.
+
+typedef struct {
+  PyObject_HEAD id<MTLBuffer> buf;
+  Py_ssize_t nbytes;
+} SharedBufferObject;
+
+static void SharedBuffer_dealloc(SharedBufferObject *self) {
+  [self->buf release];
+  self->buf = nil;
+  Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static int SharedBuffer_getbuffer(SharedBufferObject *self, Py_buffer *view,
+                                  int flags) {
+  return PyBuffer_FillInfo(view, (PyObject *)self, [self->buf contents],
+                           self -> nbytes, 0, flags);
+}
+
+static PyBufferProcs SharedBuffer_as_buffer = {
+    (getbufferproc)SharedBuffer_getbuffer,
+    NULL,
+};
+
+static PyTypeObject SharedBufferType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "metal_torch.SharedBuffer",
+    .tp_basicsize = sizeof(SharedBufferObject),
+    .tp_dealloc = (destructor)SharedBuffer_dealloc,
+    .tp_as_buffer = &SharedBuffer_as_buffer,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+};
+
+static PyObject *py_alloc_shared(PyObject *, PyObject *args) {
+  Py_ssize_t nbytes;
+  if (!PyArg_ParseTuple(args, "n", &nbytes))
+    return NULL;
+  if (nbytes <= 0) {
+    PyErr_SetString(PyExc_ValueError, "nbytes must be positive");
+    return NULL;
+  }
+  return guarded([&]() -> PyObject * {
+    id<MTLBuffer> buf =
+        [get_device() newBufferWithLength:(NSUInteger)nbytes
+                                  options:MTLResourceStorageModeShared];
+    if (!buf) {
+      PyErr_Format(PyExc_MemoryError, "Metal could not allocate %zd bytes",
+                   nbytes);
+      return NULL;
+    }
+    memset([buf contents], 0, (size_t)nbytes);
+    auto *obj =
+        (SharedBufferObject *)SharedBufferType.tp_alloc(&SharedBufferType, 0);
+    if (!obj) {
+      [buf release];
+      return NULL;
+    }
+    obj->buf = buf;
+    obj->nbytes = nbytes;
+    return (PyObject *)obj;
+  });
+}
+
 // ── MetalKernel - callable PSO wrapper ───────────────────────────────────
 
 typedef struct {
@@ -175,6 +239,10 @@ static bool packArguments(PyObject *args, std::vector<ArgInfo> *out) {
       info.kind = ArgInfo::TENSOR;
       info.buf = getMTLBufferStorage(t);
       info.offset = t.storage_offset() * t.element_size();
+    } else if (PyObject_TypeCheck(arg, &SharedBufferType)) {
+      info.kind = ArgInfo::TENSOR;
+      info.buf = ((SharedBufferObject *)arg)->buf;
+      info.offset = 0;
     } else if (PyBytes_Check(arg)) {
       // Packed scalar blob, bound inline via setBytes. The args tuple keeps
       // the object alive across the dispatch_sync below.
@@ -183,7 +251,7 @@ static bool packArguments(PyObject *args, std::vector<ArgInfo> *out) {
       info.bytesLen = PyBytes_GET_SIZE(arg);
     } else {
       PyErr_Format(PyExc_TypeError,
-                   "Arg %zd: expected an MPS tensor or the "
+                   "Arg %zd: expected an MPS tensor, a SharedBuffer or the "
                    "packed scalar bytes",
                    i);
       return false;
@@ -424,6 +492,7 @@ static PyObject *py_gpu_address(PyObject *self, PyObject *args) {
 static PyMethodDef module_methods[] = {
     {"load_metallib", py_load_metallib, METH_VARARGS, NULL},
     {"is_available", py_is_available, METH_NOARGS, NULL},
+    {"alloc_shared", py_alloc_shared, METH_VARARGS, NULL},
     {"gpu_address", py_gpu_address, METH_VARARGS, NULL},
     {NULL}};
 
@@ -440,9 +509,13 @@ PyMODINIT_FUNC PyInit_metal_torch(void) {
     return NULL;
   if (PyType_Ready(&MetalLibraryType) < 0)
     return NULL;
+  if (PyType_Ready(&SharedBufferType) < 0)
+    return NULL;
   Py_INCREF(&MetalKernelType);
   Py_INCREF(&MetalLibraryType);
+  Py_INCREF(&SharedBufferType);
   PyModule_AddObject(m, "MetalKernel", (PyObject *)&MetalKernelType);
   PyModule_AddObject(m, "MetalLibrary", (PyObject *)&MetalLibraryType);
+  PyModule_AddObject(m, "SharedBuffer", (PyObject *)&SharedBufferType);
   return m;
 }

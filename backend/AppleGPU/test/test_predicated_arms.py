@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 torch = pytest.importorskip("torch", reason="the dispatch path is torch's")
@@ -43,6 +45,15 @@ def cheap_kernel(x_ptr, o_ptr, BLOCK: tl.constexpr):
     tl.store(o_ptr + i, tl.where(i % 64 < 32, x * 2.0 + 1.0, x - 3.0))
 
 
+@triton.jit
+def dot_arm_kernel(a_ptr, o_ptr, N: tl.constexpr):
+    r = tl.arange(0, N)
+    a = tl.load(a_ptr + r[:, None] * N + r[None, :])
+    d = tl.dot(a, a, input_precision="ieee")
+    out = tl.where(r[:, None] < N // 2, tl.exp(d), 0.0)
+    tl.store(o_ptr + r[:, None] * N + r[None, :], out)
+
+
 def _body(k):
     return k.asm["msl"].split("kernel void")[-1]
 
@@ -73,6 +84,16 @@ def test_a_2d_select_predicates_per_thread():
     halves_2d_kernel[(1, )](x, out, R=32, C=64)
     ref = torch.cat([x[:, :32].sin(), x[:, 32:].exp()], dim=1)
     torch.testing.assert_close(out, ref)
+
+
+def test_an_arm_beside_a_dot_stays_branch_free():
+    a = torch.randn(32, 32, device="mps") * 0.1
+    out = torch.empty_like(a)
+    k = dot_arm_kernel[(1, )](a, out, N=32)
+    ref = torch.where(
+        torch.arange(32, device="mps")[:, None] < 16, (a @ a).exp(), 0.0)
+    torch.testing.assert_close(out, ref)
+    assert not re.search(r"if \(!?c\d+_\d+( \|\||\) \{)", _body(k))
 
 
 def test_cheap_arms_stay_branch_free():

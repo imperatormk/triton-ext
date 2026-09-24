@@ -83,8 +83,12 @@ std::vector<Operation *> armCone(Operation *sel, unsigned arm,
 } // namespace
 
 // Latest select first, so a select inside an earlier-planned arm stays part of
-// that arm.
+// that arm. Not beside a dot: the branch splits the MMA schedule, and a
+// masked attention tile diverges per lane anyway (dkdv_mask nw4 +12%).
 void AgpuEmitter::planPredicatedArms(Block &block) {
+  if (llvm::any_of(block,
+                   [](Operation &op) { return nameOf(&op) == "tt.dot"; }))
+    return;
   llvm::DenseSet<Operation *> claimed;
   for (Operation &op : llvm::reverse(block)) {
     if (nameOf(&op) != "arith.select" || claimed.count(&op) ||

@@ -54,6 +54,14 @@ def dot_arm_kernel(a_ptr, o_ptr, N: tl.constexpr):
     tl.store(o_ptr + r[:, None] * N + r[None, :], out)
 
 
+@triton.jit
+def load_then_store_kernel(p_ptr, o_ptr, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    x = tl.load(p_ptr + i)
+    tl.store(p_ptr + i, tl.zeros([BLOCK], tl.float32))
+    tl.store(o_ptr + i, tl.where(i % 64 < 32, tl.sin(x), 1.0))
+
+
 def _body(k):
     return k.asm["msl"].split("kernel void")[-1]
 
@@ -84,6 +92,15 @@ def test_a_2d_select_predicates_per_thread():
     halves_2d_kernel[(1, )](x, out, R=32, C=64)
     ref = torch.cat([x[:, :32].sin(), x[:, 32:].exp()], dim=1)
     torch.testing.assert_close(out, ref)
+
+
+def test_an_arm_load_stays_ahead_of_a_later_store():
+    x = torch.randn(1024, device="mps")
+    x0 = x.clone()
+    out = torch.empty_like(x)
+    load_then_store_kernel[(1, )](x, out, BLOCK=1024)
+    j = torch.arange(1024, device="mps") % 64
+    torch.testing.assert_close(out, torch.where(j < 32, x0.sin(), 1.0))
 
 
 def test_an_arm_beside_a_dot_stays_branch_free():

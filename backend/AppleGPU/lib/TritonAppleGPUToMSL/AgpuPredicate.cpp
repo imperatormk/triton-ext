@@ -12,13 +12,12 @@ namespace {
 
 llvm::StringRef nameOf(Operation *op) { return op->getName().getStringRef(); }
 
-// Per-lane work only: anything that can reach a barrier or another lane would
-// diverge inside the branch.
+// Pure per-lane work only. The arm is re-emitted at the select, so a load could
+// move past a store, and a barrier or cross-lane op would diverge in the
+// branch.
 bool isArmOp(Operation *op) {
   if (op->getNumRegions() || op->getNumResults() != 1)
     return false;
-  if (auto load = dyn_cast<triton::LoadOp>(op))
-    return !load.getIsVolatile();
   const llvm::StringRef n = nameOf(op);
   if (n.starts_with("arith.") || n.starts_with("math."))
     return true;

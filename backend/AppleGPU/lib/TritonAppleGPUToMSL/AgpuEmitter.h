@@ -693,6 +693,9 @@ private:
   agpu::Decision emitSelectOp(const agpu::OpView &o);
   agpu::Decision emitNegateOp(const agpu::OpView &o);
   agpu::Decision emitMath1Op(const agpu::OpView &o);
+  Operation *sinCosPartner(const agpu::OpView &o);
+  agpu::Decision emitSinCos(const agpu::OpView &o, agpu::MathFn fn,
+                            Operation *partner, const Operand &a, int64_t regs);
   agpu::Decision emitMath2Op(const agpu::OpView &o);
   agpu::Decision emitMath3Op(const agpu::OpView &o);
   agpu::Decision emitLibdeviceFmaOp(const agpu::OpView &o);

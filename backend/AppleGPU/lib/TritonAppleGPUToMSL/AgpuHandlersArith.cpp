@@ -335,12 +335,71 @@ agpu::Decision AgpuEmitter::emitMath1Op(const agpu::OpView &o) {
 
   const Operand &a = ready[0];
 
+  if ((fn == agpu::MathFn::Sin || fn == agpu::MathFn::Cos) &&
+      *operandP == agpu::f32())
+    if (Operation *partner = sinCosPartner(o))
+      return emitSinCos(o, fn, partner, a, ready.regs);
+
   const agpu::ElemType result = agpu::mathResultType(fn, *operandP);
   return emitPerRegister(o, ready.regs, result, 'm', [&](int64_t r) {
     RegValue v;
     v.value = agpu::mathExpr(mc, fn, *operandP, mc.var(a.at(r)));
     return v;
   });
+}
+
+// The later sin or cos of the same value, when one sincos can emit both: same
+// block and emitted in the same scope, so neither result is declared inside a
+// predicated arm and read outside it.
+Operation *AgpuEmitter::sinCosPartner(const agpu::OpView &o) {
+  Operation *self = valueFor_[o.results[0]].getDefiningOp();
+  if (!self)
+    return nullptr;
+  const llvm::StringRef other =
+      self->getName().getStringRef() == "math.sin" ? "math.cos" : "math.sin";
+  const auto scopeOf = [&](Operation *op) -> const void * {
+    if (!deferred_.count(op))
+      return nullptr;
+    for (auto &entry : predicated_)
+      for (const std::vector<Operation *> &cone : entry.second.cones)
+        if (llvm::is_contained(cone, op))
+          return &cone;
+    return op;
+  };
+  for (Operation *u : self->getOperand(0).getUsers())
+    if (u->getName().getStringRef() == other &&
+        u->getBlock() == self->getBlock() && self->isBeforeInBlock(u) &&
+        u->getResult(0).getType() == self->getResult(0).getType() &&
+        !body_.absorbedOps.count(u) && scopeOf(u) == scopeOf(self))
+      return u;
+  return nullptr;
+}
+
+agpu::Decision AgpuEmitter::emitSinCos(const agpu::OpView &o, agpu::MathFn fn,
+                                       Operation *partner, const Operand &a,
+                                       int64_t regs) {
+  am::Context &mc = agpu_.context();
+  const Value other = partner->getResult(0);
+  const agpu::ValueId otherId = idOf(other);
+  valueFor_[otherId] = other;
+  elemFor_[otherId] = agpu::f32();
+  const agpu::ValueId sinId = fn == agpu::MathFn::Sin ? o.results[0] : otherId;
+  const agpu::ValueId cosId = fn == agpu::MathFn::Sin ? otherId : o.results[0];
+  const am::Type ty = agpu::mslTypeOf(agpu::f32());
+  agpu::ValueNames sins, coss;
+  for (int64_t r = 0; r < regs; ++r) {
+    sins.push_back(nameFor('m', sinId, r));
+    coss.push_back(nameFor('m', cosId, r));
+    cur_->push_back(mc.declStmt(ty, coss.back(), nullptr));
+    cur_->push_back(
+        mc.declStmt(ty, sins.back(),
+                    mc.call("metal::precise::sincos",
+                            {mc.var(a.at(r)), mc.var(coss.back())})));
+  }
+  body_.sym.bindRegs(sinId, std::move(sins));
+  body_.sym.bindRegs(cosId, std::move(coss));
+  body_.absorbedOps.insert(partner);
+  return agpu::Decision::emitted();
 }
 
 agpu::Decision AgpuEmitter::emitNegateOp(const agpu::OpView &o) {

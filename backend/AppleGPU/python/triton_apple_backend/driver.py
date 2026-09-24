@@ -10,7 +10,8 @@ import struct as _struct
 from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
-from triton_apple_backend.device_assert import check as _check_asserts
+from triton_apple_backend.device_assert import check_pending as _check_pending
+from triton_apple_backend.device_assert import defer as _defer_asserts
 from triton_apple_backend.device_assert import parse_assert_layout
 from triton_apple_backend.device_print import format_records, parse_print_layout
 from triton_apple_backend.hw_constants import TARGET as _TARGET
@@ -64,6 +65,7 @@ class _NativeDeviceInterface:
 
     def synchronize(self):
         self._metal.synchronize()
+        _check_pending(_runtime())
 
     def current_device(self):
         return 0
@@ -123,7 +125,21 @@ def _runtime():
     global _RUNTIME
     if _RUNTIME is None:
         _RUNTIME = (_TorchRuntime if _torch_installed() else _NativeRuntime)()
+        if isinstance(_RUNTIME, _TorchRuntime):
+            _check_asserts_on_torch_sync(_RUNTIME)
     return _RUNTIME
+
+
+def _check_asserts_on_torch_sync(rt):
+    mps = rt.torch.mps
+    sync = mps.synchronize
+
+    def synchronize(*args, **kwargs):
+        sync(*args, **kwargs)
+        _check_pending(rt)
+
+    synchronize.__wrapped__ = sync
+    mps.synchronize = synchronize
 
 
 def ty_to_cpp(ty):
@@ -340,6 +356,7 @@ class MetalLauncher:
             getattr(metadata, "print_layout", None))
         self._assert_layout = parse_assert_layout(
             getattr(metadata, "assert_layout", None))
+        self._assert_buffer = None
         self.lx = self._requested_threads
         self.ly = 1
         self.lz = 1
@@ -436,9 +453,14 @@ class MetalLauncher:
             reordered_args = reordered_args + (print_buffer, )
 
         # Print first, then assert: the order planKernelAbi fixed.
+        # One buffer per launcher, zeroed once: the head only moves when an
+        # assert fails, and check_pending re-zeroes it after reporting.
         assert_buffer = None
         if self._assert_layout is not None:
-            assert_buffer = rt.zeros_i32(self._assert_layout.nbytes // 4)
+            if self._assert_buffer is None:
+                self._assert_buffer = rt.zeros_i32(
+                    self._assert_layout.nbytes // 4)
+            assert_buffer = self._assert_buffer
             reordered_args = reordered_args + (assert_buffer, )
 
         if _os.environ.get('TRITON_MSL_DEBUG'):
@@ -469,14 +491,11 @@ class MetalLauncher:
             for line in format_records(self._print_layout, words):
                 print(line)
 
-        # Before the assert check, so a kernel that trips a device assert still
-        # closes the profiler's span.
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
 
-        # Asserts last, so any print is already on stdout when this throws.
         if assert_buffer is not None:
-            _check_asserts(self._assert_layout, rt.as_u32(assert_buffer))
+            _defer_asserts(id(self), self._assert_layout, assert_buffer)
 
 
 def _mps_do_bench(fn,

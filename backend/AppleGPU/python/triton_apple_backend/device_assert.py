@@ -2,6 +2,10 @@
 layout comes from the ``AGPU-ASSERT-LAYOUT`` block the emitter
 (agpu/plan/AssertPlan.h) puts in the .metal module; the block's presence also
 says whether a kernel asserts.
+
+As on CUDA, a failure surfaces at the next device synchronize, not at the
+launch: reading the buffer right after the launch would stall the queue on
+every kernel that indexes indirectly.
 """
 
 import re as _re
@@ -80,6 +84,30 @@ def parse_assert_layout(text):
             f"emitted assert layout is missing {missing}; the emitter and "
             "this decoder are out of sync (see agpu/plan/AssertPlan.h)")
     return AssertLayout(nums, messages, wheres)
+
+
+_pending = {}
+
+
+def defer(key, layout, buffer):
+    """Check `buffer` at the next synchronize."""
+    _pending[key] = (layout, buffer)
+
+
+def check_pending(rt):
+    """After a synchronize: raise for the first launch whose assert failed."""
+    pending = list(_pending.values())
+    _pending.clear()
+    failed = None
+    for layout, buffer in pending:
+        words = rt.as_u32(buffer)
+        if layout.head(words) == 0:
+            continue
+        if failed is None:
+            failed = (layout, words.copy())
+        rt.clear_cache(buffer)
+    if failed is not None:
+        check(*failed)
 
 
 def check(layout, words):

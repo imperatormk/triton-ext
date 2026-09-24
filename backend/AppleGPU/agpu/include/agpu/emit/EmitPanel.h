@@ -82,6 +82,14 @@ struct PanelMmaSize {
   int mma = 0;
 
   int load() const { return decls + mma; }
+
+  msl::FuncSize funcSize() const {
+    msl::FuncSize s;
+    s.decls = decls;
+    s.fragDecls = fragDecls;
+    s.mma = mma;
+    return s;
+  }
 };
 
 // A and B each need their own instance; the keyspace is not shared.

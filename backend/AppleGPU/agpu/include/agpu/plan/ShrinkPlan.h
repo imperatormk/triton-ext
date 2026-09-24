@@ -40,9 +40,7 @@ struct ShrinkPlan {
 inline ShrinkPlan planShrink(const FuncSize &s) {
   ShrinkPlan p;
   p.fuseGuards = s.branches > 0;
-  p.rollKSteps = (s.optimiserLoad() > cost::kDeclBudget &&
-                  s.fragDecls >= cost::kRollFragFloor) ||
-                 s.mma > cost::kRollMmaFloor;
+  p.rollKSteps = cost::rollsK(s);
   return p;
 }
 
@@ -61,7 +59,7 @@ inline FuncSize unrolledFrom(const FuncSize &rolled, const RollPrediction &p) {
 }
 
 inline bool withinBudget(const FuncSize &s) {
-  return s.optimiserLoad() <= cost::kDeclBudget;
+  return cost::withinDeclBudget(s);
 }
 
 enum class SizeVerdict {

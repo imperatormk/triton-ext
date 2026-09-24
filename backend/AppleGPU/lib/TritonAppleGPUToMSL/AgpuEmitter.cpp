@@ -333,8 +333,8 @@ agpu::RollPrediction AgpuEmitter::predictRollFor(triton::FuncOp func) {
   out.declDelta = u.decls - ro.decls;
   out.fragDelta = u.fragDecls - ro.fragDecls;
   out.mmaDelta = u.mma - ro.mma;
-  out.roll = u.load() > agpu::cost::kDeclBudget &&
-             u.fragDecls >= agpu::cost::kRollFragFloor && u.load() > ro.load();
+  out.roll =
+      agpu::cost::rollingFitsBudget(u.funcSize()) && u.load() > ro.load();
   return out;
 }
 

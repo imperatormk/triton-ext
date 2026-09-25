@@ -35,12 +35,14 @@ def row_masked_attn(q_ptr, k_ptr, v_ptr, o_ptr, M, N: tl.constexpr,
     tl.store(o_ptr + rm[:, None] * D + rd[None, :], acc)
 
 
-@pytest.mark.parametrize("M", [1, 31, 50, 64])
+@pytest.mark.parametrize("M", [0, 1, 31, 50, 64])
 @pytest.mark.parametrize("fill", [0.0, 2.0])
 def test_row_masked_q(M, fill):
+    # Two programs whatever M is: some tiles start past the bound, and with
+    # M = 0 no row of Q is in it at all.
     BM, BN, N, D = 32, 32, 128, 64
-    rows = triton.cdiv(M, BM) * BM
-    q = torch.randn(M, D, device="mps")
+    rows = 2 * BM
+    q = torch.randn(rows, D, device="mps")
     k = torch.randn(N, D, device="mps")
     v = torch.randn(N, D, device="mps")
     o = torch.empty(rows, D, device="mps")
@@ -57,5 +59,5 @@ def test_row_masked_q(M, fill):
                                                num_warps=4)
     assert "rowsA" in compiled.asm["msl"], "Q was restaged, not read in place"
     padded = torch.full((rows, D), fill, device="mps")
-    padded[:M] = q
+    padded[:M] = q[:M]
     torch.testing.assert_close(o, (padded @ k.T) @ v, rtol=1e-4, atol=1e-3)

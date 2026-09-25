@@ -28,6 +28,9 @@ struct OperandSource {
   // A masked load's row bound: rows from `rowsLeft` on, counted from the
   // window's first row, read `fill` instead. Empty for an unmasked operand.
   msl::Str rowsLeft;
+  // The row a lane past the bound reads instead, counted the same way: the
+  // last row in bounds, or the tensor's first row when none is.
+  msl::Str lastRow;
   double fill = 0;
   // Every row starts on an even element, so a lane's two adjacent elements
   // load as one pair.

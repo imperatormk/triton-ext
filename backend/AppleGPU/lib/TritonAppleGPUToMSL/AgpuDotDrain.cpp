@@ -94,22 +94,37 @@ agpu::Decision AgpuEmitter::readADirect(const DotOperands &ops,
   const AxisBound &bound = ops.shape.aDevice.rowBound;
   if (bound.present) {
     am::Context &mc = agpu_.context();
-    am::Expr *limit = mc.lit(bound.constant);
-    if (bound.limit) {
-      const am::Str *l = body_.sym.scalarName(idOf(bound.limit));
-      if (!l)
-        return declined("tt.dot", "A's row bound has no name");
-      limit = mc.var(*l);
-    }
-    if (ops.shape.aDevice.rowStart) {
-      const am::Str *rs =
-          body_.sym.scalarName(idOf(ops.shape.aDevice.rowStart));
-      if (!rs)
-        return declined("tt.dot", "A's window row offset has no name");
-      limit = mc.binary(am::BinOp::Sub, limit, mc.var(*rs));
-    }
+    const am::Str *l =
+        bound.limit ? body_.sym.scalarName(idOf(bound.limit)) : nullptr;
+    if (bound.limit && !l)
+      return declined("tt.dot", "A's row bound has no name");
+    const am::Str *rs =
+        ops.shape.aDevice.rowStart
+            ? body_.sym.scalarName(idOf(ops.shape.aDevice.rowStart))
+            : nullptr;
+    if (ops.shape.aDevice.rowStart && !rs)
+      return declined("tt.dot", "A's window row offset has no name");
+    const auto limit = [&]() -> am::Expr * {
+      if (l)
+        return mc.var(*l);
+      return mc.lit(bound.constant);
+    };
+    const auto fromWindow = [&](am::Expr *row) -> am::Expr * {
+      if (rs)
+        return mc.binary(am::BinOp::Sub, row, mc.var(*rs));
+      return row;
+    };
+    // A lane past the bound reads the last row in bounds, or the tensor's
+    // first when no row is: never outside the tensor.
     in.a.rowsLeft = "rowsA" + std::to_string(body_.dotSeq);
-    cur_->push_back(mc.declStmt(am::Context::i32(), in.a.rowsLeft, limit));
+    in.a.lastRow = "lastA" + std::to_string(body_.dotSeq);
+    cur_->push_back(
+        mc.declStmt(am::Context::i32(), in.a.rowsLeft, fromWindow(limit())));
+    cur_->push_back(mc.declStmt(
+        am::Context::i32(), in.a.lastRow,
+        fromWindow(mc.call(
+            am::builtin::math::Max,
+            {mc.binary(am::BinOp::Sub, limit(), mc.lit(1)), mc.lit(0)}))));
     in.a.fill = ops.shape.aDevice.fill;
 
     // The load's own pointer says whether each row starts on an even

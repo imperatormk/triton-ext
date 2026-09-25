@@ -183,9 +183,7 @@ inline msl::Str loadFrag(msl::Context &c, msl::Block &into, msl::Block &decls,
         c.binary(msl::BinOp::Lt, c.var(laneRow), c.var(src.rowsLeft))));
     const auto at = [&](int64_t i) {
       msl::Expr *clamped =
-          c.call(msl::builtin::math::Min,
-                 {c.var(laneRow),
-                  c.binary(msl::BinOp::Sub, c.var(src.rowsLeft), c.lit(1))});
+          c.call(msl::builtin::math::Min, {c.var(laneRow), c.var(src.lastRow)});
       msl::Expr *col = c.binary(msl::BinOp::Add, c.lit(src.colOrigin + i),
                                 c.var(nm.fragCol));
       if (kTerm)

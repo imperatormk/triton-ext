@@ -82,7 +82,7 @@ def _inert(default):
 @dataclass(frozen=True)
 class MetalOptions:
     num_warps: int = 4
-    num_stages: int = 2
+    num_stages: int = 1
     num_ctas: int = 1
     arch: str = "apple_m"
     backend_name: str = _TARGET
@@ -246,8 +246,11 @@ class MetalBackend(BaseBackend):
         passes.ttgpuir.add_fuse_nested_loops(pm)
         passes.common.add_canonicalizer(pm)
 
-        # No software pipelining: the ttgpuir pipeliner needs an async copy to
-        # overlap and staging here lowers to a synchronous threadgroup copy.
+        # Upstream's pipeliner needs an asynchronous copy, which Metal has not;
+        # this one runs loads ahead into registers instead.
+        _plugin.add_prefetch_loads(pm, [str(options.num_stages)])
+        passes.common.add_canonicalizer(pm)
+        passes.common.add_cse(pm)
         pm.run(mod, 'make_ttgir')
         metadata["shared"] = mod.get_int_attr("ttg.shared") or 0
         return mod

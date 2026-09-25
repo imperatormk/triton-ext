@@ -27,6 +27,11 @@ static void addReduceThroughLayoutChange(mlir::PassManager *pm,
                                          const std::vector<std::string> &) {
   pm->addPass(mlir::triton::applegpu::createReduceThroughLayoutChangePass());
 }
+static void addPrefetchLoads(mlir::PassManager *pm,
+                             const std::vector<std::string> &args) {
+  pm->addPass(mlir::triton::applegpu::createPrefetchLoadsPass(
+      args.empty() ? 1 : std::stoi(args[0])));
+}
 static void addEmitMSL(mlir::PassManager *pm,
                        const std::vector<std::string> &args) {
   pm->addPass(mlir::triton::applegpu::createEmitMSLPass(
@@ -58,6 +63,11 @@ static void registerReduceThroughLayoutChange() {
     return mlir::triton::applegpu::createReduceThroughLayoutChangePass();
   });
 }
+static void registerPrefetchLoads() {
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::triton::applegpu::createPrefetchLoadsPass(1);
+  });
+}
 static void registerEmitMSL() {
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return mlir::triton::applegpu::createEmitMSLPass();
@@ -82,6 +92,7 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
        registerAtomicLaneLayout},
       {"reduce_through_layout_change", "0.1.0", addReduceThroughLayoutChange,
        registerReduceThroughLayoutChange},
+      {"prefetch_loads", "0.1.0", addPrefetchLoads, registerPrefetchLoads},
       {"emit_msl", "0.1.0", addEmitMSL, registerEmitMSL},
   };
 

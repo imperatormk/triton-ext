@@ -11,6 +11,7 @@ std::unique_ptr<mlir::Pass> createStoreShuffleLayoutPass();
 std::unique_ptr<mlir::Pass> createMaskSelectArmLoadsPass();
 std::unique_ptr<mlir::Pass> createAtomicLaneLayoutPass();
 std::unique_ptr<mlir::Pass> createReduceThroughLayoutChangePass();
+std::unique_ptr<mlir::Pass> createPrefetchLoadsPass(int numStages);
 
 } // namespace mlir::triton::applegpu
 

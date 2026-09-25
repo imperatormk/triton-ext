@@ -86,6 +86,29 @@ def MaskSelectArmLoads : Pass<"triton-apple-mask-select-arm-loads", "mlir::Modul
   ];
 }
 
+def PrefetchLoads : Pass<"triton-apple-prefetch-loads", "mlir::ModuleOp"> {
+  let summary = "Load a loop's dot operands num_stages - 1 iterations ahead";
+
+  let description = [{
+    With no asynchronous copy to threadgroup memory, a K loop waits on its
+    operand loads before it can stage them for the MMA. Issuing each load
+    num_stages - 1 iterations ahead, into registers the loop carries, overlaps
+    it with the dots of the iterations in between.
+  }];
+
+  let options = [
+    Option<"numStages", "num-stages", "int32_t", /*default=*/"1",
+           "Pipeline depth; 1 leaves loops as they are">
+  ];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
 def EmitMSL : Pass<"triton-apple-emit-msl", "mlir::ModuleOp"> {
   let summary = "Emit Metal Shading Language from TTGIR";
 

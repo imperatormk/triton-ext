@@ -241,6 +241,20 @@ PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
   return need;
 }
 
+// Clamping a window's start moves the whole tile only when nothing else
+// carries the row it came from: `start` must be `x * c` with the multiply
+// the only use of `x`. Otherwise part of the tile keeps the unclamped row
+// and the overlap it stores twice differs.
+static bool clampShiftsWholeTile(Value start) {
+  auto mul = start ? start.getDefiningOp<arith::MulIOp>() : arith::MulIOp{};
+  if (!mul)
+    return false;
+  for (Value x : {mul.getLhs(), mul.getRhs()})
+    if (!matchPattern(x, m_Constant()) && !x.hasOneUse())
+      return false;
+  return true;
+}
+
 void AgpuEmitter::scanPool(triton::FuncOp func) {
   // The scan plans the unrolled build; a rolled rebuild replans its own dots.
   rollK_ = false;
@@ -253,6 +267,11 @@ void AgpuEmitter::scanPool(triton::FuncOp func) {
     for (const WindowBounds::Clamp &cl : shape.cClamps) {
       if (clampPoison_.count(cl.start))
         continue;
+      if (!clampShiftsWholeTile(cl.start)) {
+        clampOf_.erase(cl.start);
+        clampPoison_.insert(cl.start);
+        continue;
+      }
       const auto it = clampOf_.find(cl.start);
       if (it != clampOf_.end() && it->second != cl.to) {
         clampOf_.erase(it);

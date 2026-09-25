@@ -39,6 +39,13 @@ struct DeviceTile {
 // `simdgroup_load(f, p, stride)`'s addressing. Null `base` for anything else.
 DeviceTile deviceTileOf(Value operand);
 
+// The shared buffer behind a dot operand, when the operand is a
+// `ttg.local_load` of it in the dot's block with no shared-memory write in
+// between, and the buffer is laid out as a staged operand is: a row-major,
+// unswizzled, unpadded 2-D view of the operand's own shape and element, with
+// an even pitch and origin. Null for anything else.
+Value sharedTileOf(Operation *dot, Value operand);
+
 // The same proof on a tensor of pointers: what a `tt.store` writes through.
 DeviceTile deviceWindowOf(Value ptrTensor);
 

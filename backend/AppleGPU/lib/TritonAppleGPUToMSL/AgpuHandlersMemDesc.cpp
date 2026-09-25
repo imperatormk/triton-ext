@@ -1,8 +1,11 @@
 // Threadgroup buffer handlers: local_alloc, local_load, memdesc_subslice/index.
+#include "AgpuDeviceTile.h"
 #include "AgpuEmitter.h"
 
 #include "agpu/emit/EmitMemDesc.h"
 #include "agpu/emit/EmitPoison.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 namespace mlir::triton::applegpu::bridge {
 
@@ -205,6 +208,86 @@ static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
 
   base->setSwizzle(sw);
   return base;
+}
+
+// The view `md` addresses, from the IR alone: the same slices and windows
+// `emitMemDescViewOp` binds, without the buffer's name.
+static std::optional<agpu::TileView> staticViewOf(Value md) {
+  if (md.getDefiningOp<gpu::LocalAllocOp>())
+    return tileViewOfMemDesc(cast<gpu::MemDescType>(md.getType()));
+  if (auto ix = md.getDefiningOp<gpu::MemDescIndexOp>()) {
+    const std::optional<agpu::TileView> parent = staticViewOf(ix.getSrc());
+    if (!parent || parent->rank() < 2 || !parent->slicesAt(0))
+      return std::nullopt;
+    APInt k;
+    if (matchPattern(ix.getIndex(), m_ConstantInt(&k)))
+      return parent->slice(k.getSExtValue());
+    if (parent->padding().pads())
+      return std::nullopt;
+    return parent->slice(0);
+  }
+  if (auto sub = md.getDefiningOp<gpu::MemDescSubsliceOp>()) {
+    const std::optional<agpu::TileView> parent = staticViewOf(sub.getSrc());
+    const auto offs = sub.getOffsets();
+    if (!parent || (int)offs.size() != parent->rank())
+      return std::nullopt;
+    auto mt = cast<gpu::MemDescType>(md.getType());
+    return agpu::MemDesc{{}, *parent}
+        .subslice(
+            agpu::TileView::Coord(offs.begin(), offs.end()),
+            agpu::TileView::Coord(mt.getShape().begin(), mt.getShape().end()))
+        .view;
+  }
+  return std::nullopt;
+}
+
+// Whether `op`, or an op nested in it, may write shared memory.
+static bool mayWriteShared(Operation *op) {
+  return op
+      ->walk([](Operation *nested) {
+        auto effects = dyn_cast<MemoryEffectOpInterface>(nested);
+        if (!effects)
+          return nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>()
+                     ? WalkResult::advance()
+                     : WalkResult::interrupt();
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        for (const MemoryEffects::EffectInstance &e : instances)
+          if (isa<MemoryEffects::Write>(e.getEffect()) &&
+              (isa<gpu::SharedMemory>(e.getResource()) ||
+               isa<SideEffects::DefaultResource>(e.getResource())))
+            return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+Value sharedTileOf(Operation *dot, Value operand) {
+  auto load = throughLayoutChange(operand).getDefiningOp<gpu::LocalLoadOp>();
+  if (!load || load->getBlock() != dot->getBlock())
+    return {};
+  for (Operation *op = load->getNextNode(); op && op != dot;
+       op = op->getNextNode())
+    if (mayWriteShared(op))
+      return {};
+
+  auto ty = cast<RankedTensorType>(operand.getType());
+  auto mt = cast<gpu::MemDescType>(load.getSrc().getType());
+  if (mt.getElementType() != ty.getElementType() ||
+      !isa<FloatType>(ty.getElementType()))
+    return {};
+  const std::optional<agpu::TileView> v = staticViewOf(load.getSrc());
+  if (!v || v->rank() != 2 || v->swizzle().permutes() || v->padding().pads() ||
+      v->shifted())
+    return {};
+  // Fragments read element pairs, so every row must start on an even element.
+  const int64_t pitch = v->strideAt(0);
+  if (v->extent() !=
+          agpu::TileView::Coord(ty.getShape().begin(), ty.getShape().end()) ||
+      v->strideAt(1) != 1 || pitch < v->extentAt(1) || pitch % 2 != 0 ||
+      v->origin() % 2 != 0)
+    return {};
+  return load.getSrc();
 }
 
 agpu::Decision AgpuEmitter::emitLocalAlloc(const agpu::OpView &o) {

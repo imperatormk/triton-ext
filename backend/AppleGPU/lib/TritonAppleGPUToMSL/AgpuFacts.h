@@ -128,6 +128,10 @@ struct DotShape {
   // the MMA reads fragments in place and never stages them into the pool.
   DeviceTile aDevice;
 
+  // The shared buffers A and B already sit in, laid out as a staged operand
+  // would be, so the MMA reads their fragments there. Null otherwise.
+  Value aShared, bShared;
+
   // A's and B's types behind any layout change, which a layout-preserving
   // value shares.
   RankedTensorType aRegsTy, bRegsTy;

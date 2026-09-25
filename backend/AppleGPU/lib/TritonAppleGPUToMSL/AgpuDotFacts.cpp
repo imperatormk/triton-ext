@@ -52,6 +52,10 @@ DotOperands AgpuEmitter::dotOperandsOf(const agpu::OpView &o) {
   }
 
   d.shape.aDevice = deviceTileOf(mlirValueOf(o.operands[0]));
+  if (d.op) {
+    d.shape.aShared = sharedTileOf(d.op, mlirValueOf(o.operands[0]));
+    d.shape.bShared = sharedTileOf(d.op, mlirValueOf(o.operands[1]));
+  }
   d.shape.aRegsTy = dyn_cast<RankedTensorType>(
       throughLayoutChange(mlirValueOf(o.operands[0])).getType());
   d.shape.bRegsTy = dyn_cast<RankedTensorType>(
@@ -162,6 +166,8 @@ DotShape AgpuEmitter::dotShapeOf(triton::DotOp dot) const {
   d.bElem = *bE;
   d.cElem = *cE;
   d.aDevice = deviceTileOf(dot.getA());
+  d.aShared = sharedTileOf(dot, dot.getA());
+  d.bShared = sharedTileOf(dot, dot.getB());
   d.aRegsTy =
       dyn_cast<RankedTensorType>(throughLayoutChange(dot.getA()).getType());
   d.bRegsTy =
@@ -220,7 +226,8 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
 
   f.fusedAcc = shape.accumulatorOutlivesLoop();
   f.cInitNonzero = f.fusedAcc && !zeroSplat(fusedInitOf(shape.cCarried));
-  f.aInPlace = f.bInPlace = false;
+  f.aInPlace = (bool)shape.aShared;
+  f.bInPlace = (bool)shape.bShared;
   f.aDirect = (bool)shape.aDevice.base;
   f.aRestagedEachTrip = shape.aRestagedEachTrip;
   const auto stageDims = [&](RankedTensorType ty) {

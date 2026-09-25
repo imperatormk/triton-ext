@@ -88,7 +88,8 @@ def gemm_ring(a_ptr, b_ptr, c_ptr, M, N, K, BM: gl.constexpr, BN: gl.constexpr,
     gl.store(c_ptr + rmo[:, None] * N + rno[None, :], acc)
 
 
-@pytest.mark.parametrize("tile", [(32, 32, 16, 4), (64, 64, 16, 4)])
+@pytest.mark.parametrize("tile", [(32, 32, 16, 4), (64, 64, 16, 4),
+                                  (64, 64, 32, 8)])
 def test_gemm_ring(tile):
     BM, BN, BK, W = tile
     M, N, K = 128, 128, 256

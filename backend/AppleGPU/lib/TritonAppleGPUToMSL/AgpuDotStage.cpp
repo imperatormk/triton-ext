@@ -41,13 +41,15 @@ agpu::Decision AgpuEmitter::namePoolRegions(const agpu::Plan &plan,
   // B and C are regions of the threadgroup buffer carved by `walkOp`; this
   // handler only names them.
   const agpu::MmaNames mnm;
+  const bool bStaged =
+      !plan.facts.bInPlace || plan.kind == agpu::Plan::Kind::Panel;
   const auto resident = body_.residentBuf.find({dot, 1});
-  const am::Str bBuf = resident != body_.residentBuf.end()
-                           ? resident->second
-                           : body_.pool.use(mnm.poolB);
+  const am::Str bBuf = resident != body_.residentBuf.end() ? resident->second
+                       : bStaged ? body_.pool.use(mnm.poolB)
+                                 : am::Str();
   const bool cThroughPool = plan.cThroughPool();
   const am::Str cBuf = cThroughPool ? body_.pool.use(mnm.poolC) : am::Str();
-  if (bBuf.empty() || (cThroughPool && cBuf.empty()))
+  if ((bStaged && bBuf.empty()) || (cThroughPool && cBuf.empty()))
     return declined("tt.dot",
                     "a pool region this dot stages through was never carved");
   in.direct.poolB = in.panel.poolB = bBuf;
@@ -85,6 +87,27 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
   if (!stagesPerTile)
     cur_->push_back(agpu_.context().barrier());
 
+  // An operand already in a shared buffer is read where it lies. The origin
+  // splits at the pitch into the window's corner.
+  const auto inPlace = [&](Value md,
+                           agpu::OperandSource &src) -> agpu::Decision {
+    const auto it = body_.memDescOf.find(idOf(md));
+    if (it == body_.memDescOf.end())
+      return declined("tt.dot", "an in-place operand's buffer was never bound");
+    const agpu::TileView &v = it->second.view;
+    const int64_t pitch = v.rank() == 2 ? v.strideAt(0) : 0;
+    if (pitch <= 0 || pitch % 2 != 0 || v.origin() % 2 != 0 ||
+        v.swizzle().permutes())
+      return declined("tt.dot", "an in-place operand's buffer changed shape");
+    src.buffer = it->second.buffer;
+    src.leadingDim = agpu::Stride(pitch);
+    src.rowOrigin = v.origin() / pitch;
+    src.colOrigin = v.origin() % pitch;
+    return agpu::Decision::emitted();
+  };
+  const bool aInPlace = pf.aInPlace && !stagesPerTile;
+  const bool bInPlace = pf.bInPlace && !stagesPerTile;
+
   if (pf.aDirect) {
     const agpu::Decision d = readADirect(ops, in);
     if (!d.ok())
@@ -99,6 +122,10 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
                                       "A's registers were never bound");
       in.aRegs.push_back(*name);
     }
+  } else if (aInPlace) {
+    if (const agpu::Decision d = inPlace(ops.shape.aShared, in.a); !d.ok())
+      return d;
+    in.direct.poolA = in.panel.poolA = in.a.buffer;
   } else {
     const agpu::MmaNames mnm;
     const auto resident = body_.residentBuf.find({ops.op, 0});
@@ -125,7 +152,7 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
   }
 
   if (!stagesPerTile) {
-    if (!body_.residentBuf.count({ops.op, 1}))
+    if (!bInPlace && !body_.residentBuf.count({ops.op, 1}))
       if (const agpu::Decision d =
               stageWholeTensor(ops.bStage, ops.bStageTy, in.panel.poolB,
                                bStaged, stagedBElem, "tt.dot", "a B");
@@ -134,10 +161,15 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
     cur_->push_back(agpu_.context().barrier());
   }
 
-  in.b.buffer = in.panel.poolB;
-  in.b.leadingDim = agpu::Stride(bStaged.strideAt(bStaged.rank() - 2));
-  if (pf.batched())
-    in.b.sliceStride = bStaged.strideAt(0);
+  if (bInPlace) {
+    if (const agpu::Decision d = inPlace(ops.shape.bShared, in.b); !d.ok())
+      return d;
+  } else {
+    in.b.buffer = in.panel.poolB;
+    in.b.leadingDim = agpu::Stride(bStaged.strideAt(bStaged.rank() - 2));
+    if (pf.batched())
+      in.b.sliceStride = bStaged.strideAt(0);
+  }
   // B is indexed by N, its column axis, so fragment `ni` sits `ni*8`
   // elements across the row.
   in.b.fragAxis = agpu::OperandSource::FragAxis::Cols;

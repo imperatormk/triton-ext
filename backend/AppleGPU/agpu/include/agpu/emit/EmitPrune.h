@@ -12,11 +12,39 @@
 
 namespace agpu {
 
+// An `if` with nothing left in either arm runs nothing; it goes when its
+// condition has no effect of its own. Inner blocks first, so an `if` emptied
+// by the ones inside it goes too.
+inline bool dropEmptyIfs(msl::Block &body) {
+  bool dropped = false;
+  msl::PtrSet<msl::Stmt *> drop;
+  for (msl::Stmt *s : body) {
+    msl::forEachChildBlock(s, [&](msl::Block &child) {
+      dropped = dropEmptyIfs(child) || dropped;
+    });
+    if (s->kind != msl::StmtKind::If)
+      continue;
+    auto *arm = static_cast<msl::If *>(s);
+    if (arm->thenBody.empty() && arm->elseBody.empty() &&
+        !msl::hasSideEffect(arm->cond))
+      drop.insert(s);
+  }
+  if (drop.empty())
+    return dropped;
+  msl::eraseStmts(body, drop);
+  return true;
+}
+
+// A dropped `if` can leave its condition's names unread, and a dropped name
+// can empty an `if`, so the two alternate until neither finds anything.
 inline void pruneDead(msl::Block &body) {
-  const msl::SmallVec<msl::Stmt *, 8> dead = msl::findDeadDecls(body);
-  if (dead.empty())
-    return;
-  msl::eraseStmts(body, msl::PtrSet<msl::Stmt *>(dead.begin(), dead.end()));
+  for (;;) {
+    const msl::SmallVec<msl::Stmt *, 8> dead = msl::findDeadDecls(body);
+    if (!dead.empty())
+      msl::eraseStmts(body, msl::PtrSet<msl::Stmt *>(dead.begin(), dead.end()));
+    if (!dropEmptyIfs(body) && dead.empty())
+      return;
+  }
 }
 
 // A threadgroup barrier with no threadgroup memory touched since the last one

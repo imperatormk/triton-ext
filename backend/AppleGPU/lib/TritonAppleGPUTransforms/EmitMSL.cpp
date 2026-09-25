@@ -4,12 +4,14 @@
 #include "../TritonAppleGPUToMSL/AgpuEmitter.h"
 #include "TritonAppleGPUToMSL/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -61,6 +63,13 @@ public:
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    RewritePatternSet expand(mod.getContext());
+    arith::populateCeilFloorDivExpandOpsPatterns(expand);
+    if (failed(applyPatternsGreedily(mod, std::move(expand)))) {
+      signalPassFailure();
+      return;
+    }
+
     std::string msl;
     llvm::raw_string_ostream ss(msl);
 

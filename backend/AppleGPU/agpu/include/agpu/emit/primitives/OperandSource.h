@@ -29,6 +29,9 @@ struct OperandSource {
   // window's first row, read `fill` instead. Empty for an unmasked operand.
   msl::Str rowsLeft;
   double fill = 0;
+  // Every row starts on an even element, so a lane's two adjacent elements
+  // load as one pair.
+  bool pairAligned = false;
 
   // Offset along this operand's fragment axis alone: no origins, no K term.
   msl::Expr *axisOffsetOf(msl::Context &c, SlotCoord pos,

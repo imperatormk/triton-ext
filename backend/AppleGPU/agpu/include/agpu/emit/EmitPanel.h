@@ -169,7 +169,7 @@ inline msl::Str loadFrag(msl::Context &c, msl::Block &into, msl::Block &decls,
   if (!src.rowsLeft.empty()) {
     // Each lane reads its own pair at a row clamped into the tensor, so no
     // address leaves it, and takes the fill where the row is past the bound.
-    const msl::Str laneRow = name + "_row";
+    const msl::Str laneRow = name + "_row", inRows = name + "_in";
     into.push_back(c.declStmt(
         msl::Context::i32(), laneRow,
         c.binary(msl::BinOp::Add,
@@ -178,7 +178,10 @@ inline msl::Str loadFrag(msl::Context &c, msl::Block &into, msl::Block &decls,
                                    c.lit(kSgFragDim)),
                           c.lit(src.rowOrigin)),
                  c.var(nm.fragRow))));
-    for (int i = 0; i < 2; ++i) {
+    into.push_back(c.declStmt(
+        msl::Context::boolTy(), inRows,
+        c.binary(msl::BinOp::Lt, c.var(laneRow), c.var(src.rowsLeft))));
+    const auto at = [&](int64_t i) {
       msl::Expr *clamped =
           c.call(msl::builtin::math::Min,
                  {c.var(laneRow),
@@ -187,13 +190,25 @@ inline msl::Str loadFrag(msl::Context &c, msl::Block &into, msl::Block &decls,
                                 c.var(nm.fragCol));
       if (kTerm)
         col = c.binary(msl::BinOp::Add, col, kTerm);
-      msl::Expr *at = c.binary(
+      return c.binary(
           msl::BinOp::Add, c.var(src.buffer),
           c.binary(msl::BinOp::Add, src.leadingDim.scale(c, clamped), col));
+    };
+    const auto keep = [&](int64_t i, msl::Expr *v) {
       into.push_back(c.assign(fragElemExpr(c, name, i),
-                              c.ternary(c.binary(msl::BinOp::Lt, c.var(laneRow),
-                                                 c.var(src.rowsLeft)),
-                                        c.deref(at), c.litF(src.fill))));
+                              c.ternary(c.var(inRows), v, c.litF(src.fill))));
+    };
+    if (src.pairAligned) {
+      const msl::Str pair = name + "_v";
+      const msl::Type pairTy = msl::Type::vector(
+          nm.opElem == "half" ? msl::Scalar::F16 : msl::Scalar::F32, 2);
+      into.push_back(c.declStmt(
+          pairTy, pair, c.deref(c.cast(pairTy.pointerTo(src.space), at(0)))));
+      keep(0, c.member(c.var(pair), "x"));
+      keep(1, c.member(c.var(pair), "y"));
+    } else {
+      keep(0, c.deref(at(0)));
+      keep(1, c.deref(at(1)));
     }
   } else if (loadsByLane(src, nm.opElem)) {
     const msl::Type pair = msl::Type::vector(

@@ -111,6 +111,17 @@ agpu::Decision AgpuEmitter::readADirect(const DotOperands &ops,
     in.a.rowsLeft = "rowsA" + std::to_string(body_.dotSeq);
     cur_->push_back(mc.declStmt(am::Context::i32(), in.a.rowsLeft, limit));
     in.a.fill = ops.shape.aDevice.fill;
+
+    // The load's own pointer says whether each row starts on an even
+    // element; the fragment's column offsets are even.
+    auto load = throughLayoutChange(cast<triton::DotOp>(ops.op).getA())
+                    .getDefiningOp<triton::LoadOp>();
+    const agpu::PtrDims dims =
+        load ? ptrDimsOf(load.getPtr(), ops.shape.aElem) : agpu::PtrDims{};
+    in.a.pairAligned =
+        dims.size() == 2 && dims[1].alignment % 2 == 0 &&
+        dims[1].contiguity % 2 == 0 &&
+        (ops.shape.aElem == agpu::f32() || ops.shape.aElem == agpu::f16());
   }
   return agpu::Decision::emitted();
 }

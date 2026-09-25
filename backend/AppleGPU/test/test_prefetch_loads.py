@@ -1,5 +1,6 @@
 """K loops pipelined by num_stages: operand loads run ahead into registers
-the loop carries, the first ones before the loop and the last dot after it."""
+the loop carries, the first ones before the loop, and the last iterations,
+with nothing left to load, in a second loop."""
 
 from __future__ import annotations
 

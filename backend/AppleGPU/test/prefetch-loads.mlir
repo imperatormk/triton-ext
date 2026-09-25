@@ -7,19 +7,25 @@
 #opB = #ttg.dot_op<{opIdx = 1, parent = #acc}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "mps:apple_m", "ttg.threads-per-warp" = 32 : i32} {
   // The first iteration's loads move before the loop under the trip-count
-  // predicate, each iteration loads the next one's operands before its dot,
-  // and the last dot runs after the loop, kept only if the loop ran.
+  // predicate and each iteration loads the next one's operands, unmasked,
+  // before its dot. The last iteration has nothing left to load and runs in a
+  // loop of its own that continues the first's accumulator.
   // CHECK-LABEL: @dot_loop
   // CHECK: tt.load %{{.*}}, %{{.*}} : tensor<32x32x!tt.ptr<f32>, #blocked>
   // CHECK: tt.load %{{.*}}, %{{.*}} : tensor<32x32x!tt.ptr<f32>, #blocked>
-  // CHECK: %[[LOOP:.*]]:5 = scf.for
+  // CHECK: %[[LOOP:.*]]:5 = scf.for %{{.*}} = %{{.*}} to %[[SPLIT:[^ ]*]] step
   // CHECK-SAME: tensor<32x32xf32, #blocked>, tensor<32x32xf32, #blocked>
-  // CHECK: tt.load
-  // CHECK: tt.load
+  // CHECK: tt.load %{{[a-z0-9_]*}} : tensor<32x32x!tt.ptr<f32>, #blocked>
+  // CHECK: tt.load %{{[a-z0-9_]*}} : tensor<32x32x!tt.ptr<f32>, #blocked>
   // CHECK: tt.dot
   // CHECK: scf.yield
-  // CHECK: %[[LAST:.*]] = tt.dot
-  // CHECK: arith.select %{{.*}}, %[[LAST]], %[[LOOP]]#0
+  // CHECK: scf.for %{{.*}} = %[[SPLIT]] to %{{.*}} iter_args(%{{.*}} = %[[LOOP]]#0
+  // CHECK-NOT: tt.load
+  // CHECK-NOT: arith.select
+  // CHECK: tt.dot
+  // CHECK-NOT: tt.load
+  // CHECK-NOT: arith.select
+  // CHECK: tt.return
   // OFF-LABEL: @dot_loop
   // OFF-NOT: tt.load
   // OFF: scf.for

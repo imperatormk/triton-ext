@@ -2,11 +2,14 @@
 // so every iteration waits on its own loads. Loading them num_stages - 1
 // iterations ahead into loop-carried registers hides that wait behind the dots
 // of the iterations in between. The expansion itself is upstream's pipeliner;
-// this pass only decides which ops run ahead.
+// this pass decides which ops run ahead and splits off the last iterations,
+// which have nothing left to load.
 
 #include "TritonAppleGPUTransforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -206,6 +209,68 @@ llvm::SetVector<Operation *> aheadSet(scf::ForOp loop,
   return ahead;
 }
 
+// Splits `loop`, pipelined with its ahead ops masked by `ahead`, where
+// `ahead` turns false: the first loop runs them unmasked, and the second,
+// the last `last` iterations, has nothing left to load and drops them. A
+// peeled epilogue would instead take the accumulators out of the loop to
+// select between its last dot's result and the loop's.
+void splitWhereAheadEnds(RewriterBase &rewriter, scf::ForOp loop, Value ahead,
+                         unsigned last) {
+  const Location loc = loop.getLoc();
+  const Value lb = loop.getLowerBound(), step = loop.getStep();
+  const Type t = lb.getType();
+  rewriter.setInsertionPoint(loop);
+  const auto constant = [&](int64_t v) -> Value {
+    return arith::ConstantOp::create(rewriter, loc,
+                                     rewriter.getIntegerAttr(t, v));
+  };
+  // The first iteration at or past ub - last * step.
+  Value end = arith::SubIOp::create(
+      rewriter, loc, loop.getUpperBound(),
+      arith::MulIOp::create(rewriter, loc, step, constant(last)));
+  Value trips = arith::MaxSIOp::create(
+      rewriter, loc, constant(0),
+      arith::CeilDivSIOp::create(
+          rewriter, loc, arith::SubIOp::create(rewriter, loc, end, lb), step));
+  Value split = arith::AddIOp::create(
+      rewriter, loc, lb, arith::MulIOp::create(rewriter, loc, trips, step));
+  Value yes = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+  Value no = arith::ConstantIntOp::create(rewriter, loc, 0, 1);
+
+  rewriter.setInsertionPointAfter(loop);
+  IRMapping map;
+  auto tail = cast<scf::ForOp>(rewriter.clone(*loop, map));
+  for (auto [from, to] : llvm::zip(loop.getResults(), tail.getResults()))
+    rewriter.replaceAllUsesWith(from, to);
+  tail.getInitArgsMutable().assign(loop.getResults());
+  tail.getLowerBoundMutable().assign(split);
+  loop.getUpperBoundMutable().assign(split);
+
+  const auto masksOf = [](scf::ForOp l, Value pred) {
+    SmallVector<triton::gpu::MaskOp> masks;
+    for (auto mask : l.getBody()->getOps<triton::gpu::MaskOp>())
+      if (mask.getPred() == pred)
+        masks.push_back(mask);
+    return masks;
+  };
+  for (triton::gpu::MaskOp mask : masksOf(loop, ahead)) {
+    Operation *ret = mask.getBody()->getTerminator();
+    rewriter.inlineBlockBefore(mask.getBody(), mask);
+    rewriter.replaceOp(mask, ret->getOperands());
+    rewriter.eraseOp(ret);
+  }
+  const Value tailAhead = map.lookup(ahead);
+  for (triton::gpu::MaskOp mask : masksOf(tail, tailAhead)) {
+    rewriter.setInsertionPoint(mask);
+    SmallVector<Value> poison;
+    for (Type ty : mask->getResultTypes())
+      poison.push_back(ub::PoisonOp::create(rewriter, mask.getLoc(), ty));
+    rewriter.replaceOp(mask, poison);
+  }
+  rewriter.replaceAllUsesWith(ahead, yes);
+  rewriter.replaceAllUsesWith(tailAhead, no);
+}
+
 struct PrefetchLoadsPass : public impl::PrefetchLoadsBase<PrefetchLoadsPass> {
   using Base::Base;
 
@@ -234,16 +299,29 @@ struct PrefetchLoadsPass : public impl::PrefetchLoadsBase<PrefetchLoadsPass> {
         if (!ahead.contains(&op))
           schedule.emplace_back(&op, last);
 
+      Value aheadPred;
       tt::PipeliningOption options;
       options.supportDynamicLoops = true;
-      options.peelEpilogue = true;
+      options.peelEpilogue = false;
       options.predicateFn = tt::wrapInMaskOp;
+      options.emitPredicateStageFn = [&](RewriterBase &rewriter, Value iv,
+                                         Value ub, Value step,
+                                         uint64_t maxStage, uint64_t stage) {
+        Value pred =
+            tt::emitPredicateForStage(rewriter, iv, ub, step, maxStage, stage);
+        if (stage == 0)
+          aheadPred = pred;
+        return pred;
+      };
       options.getScheduleFn =
           [&](scf::ForOp, std::vector<std::pair<Operation *, unsigned>> &s) {
             s = schedule;
           };
       IRRewriter rewriter(loop);
-      (void)tt::pipelineForLoop(rewriter, loop, options);
+      FailureOr<scf::ForOp> pipelined =
+          tt::pipelineForLoop(rewriter, loop, options);
+      if (succeeded(pipelined) && aheadPred)
+        splitWhereAheadEnds(rewriter, *pipelined, aheadPred, last);
     }
     tt::resolveMaskOp(getOperation());
   }

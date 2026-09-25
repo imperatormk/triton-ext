@@ -116,6 +116,28 @@ int main() {
     CHECK_HAS(out, "acc = next;");
   }
 
+  CASE("a yield that swaps carried values reads both before writing either");
+  {
+    msl::Context c;
+    msl::Block body;
+    Carried carried, inits, yielded;
+    carried.push_back(val({"a"}));
+    carried.push_back(val({"b"}));
+    inits.push_back(val({"a0"}));
+    inits.push_back(val({"b0"}));
+    yielded.push_back(val({"b"}));
+    yielded.push_back(val({"a"}));
+    Decision d = emitFor(c, body, constBounds(c, "i", 0, 8), carried, inits,
+                         msl::Block{}, yielded);
+    CHECK(d.ok());
+    const std::string out = render(body);
+    CHECK_HAS(out, "int a_prev = a;");
+    CHECK_HAS(out, "a = b;");
+    CHECK_HAS(out, "b = a_prev;");
+    CHECK(out.find("int a_prev = a;") < out.find("a = b;"));
+    CHECK_LACKS(out, "b_prev");
+  }
+
   CASE("the loop spells its bounds and step");
   {
     msl::Context c;

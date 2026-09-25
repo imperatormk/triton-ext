@@ -9,6 +9,8 @@
 #include "agpu/msl/Context.h"
 #include "agpu/plan/Elementwise.h"
 
+#include <set>
+
 namespace agpu {
 
 // One value crossing a region boundary.
@@ -34,17 +36,32 @@ inline void assignReg(msl::Context &c, msl::Block &arm, const msl::Str &dst,
   arm.push_back(c.assign(c.var(dst), c.var(src)));
 }
 
-// False when the counts disagree: the IR is malformed.
+// False when the counts disagree: the IR is malformed. The copies happen at
+// once: a loop that yields one carried value into another's place reads it
+// before an earlier copy overwrites it.
 inline bool emitYield(msl::Context &c, msl::Block &arm, const Carried &results,
                       const Carried &yielded) {
   if (results.size() != yielded.size())
     return false;
+  std::set<msl::Str> written, stale;
   for (std::size_t i = 0; i < results.size(); ++i) {
     if (results[i].regs.size() != yielded[i].regs.size())
       return false;
-    for (std::size_t r = 0; r < results[i].regs.size(); ++r)
-      assignReg(c, arm, results[i].regs[r], yielded[i].regs[r]);
+    for (std::size_t r = 0; r < results[i].regs.size(); ++r) {
+      if (written.count(yielded[i].regs[r]) &&
+          stale.insert(yielded[i].regs[r]).second)
+        arm.push_back(c.declStmt(mslTypeOf(results[i].elem),
+                                 yielded[i].regs[r] + "_prev",
+                                 c.var(yielded[i].regs[r])));
+      written.insert(results[i].regs[r]);
+    }
   }
+  for (std::size_t i = 0; i < results.size(); ++i)
+    for (std::size_t r = 0; r < results[i].regs.size(); ++r) {
+      const msl::Str &src = yielded[i].regs[r];
+      assignReg(c, arm, results[i].regs[r],
+                stale.count(src) ? src + "_prev" : src);
+    }
   return true;
 }
 

@@ -9,6 +9,19 @@
 
 namespace mlir::triton::applegpu::bridge {
 
+// One axis of a proven mask: `coord < limit`, the limit a runtime scalar or
+// a compile-time number. `present` false means the axis was never masked,
+// distinct from a bound of zero, which is an empty window.
+struct AxisBound {
+  Value limit;
+  int64_t constant = 0;
+  bool present = false;
+
+  bool operator==(const AxisBound &o) const {
+    return present == o.present && limit == o.limit && constant == o.constant;
+  }
+};
+
 // A tile the MMA can read where it lies: a base pointer and a row stride.
 struct DeviceTile {
   Value base;      // the tensor's base pointer, a scalar !tt.ptr
@@ -33,10 +46,17 @@ struct DeviceTile {
   // colStart`.
   Value rowStart;
   Value colStart;
+
+  // A masked load's row bound on the window's rows, and what the rows past it
+  // read. A dot operand only; a window proof never sets it.
+  AxisBound rowBound;
+  double fill = 0;
 };
 
 // The device tile behind a dot operand: a row-major window matching
-// `simdgroup_load(f, p, stride)`'s addressing. Null `base` for anything else.
+// `simdgroup_load(f, p, stride)`'s addressing, or a load of one masked by a
+// bound on its rows alone with a constant fill (or none). Null `base` for
+// anything else.
 DeviceTile deviceTileOf(Value operand);
 
 // The shared buffer behind a dot operand, when the operand is a
@@ -48,19 +68,6 @@ Value sharedTileOf(Operation *dot, Value operand);
 
 // The same proof on a tensor of pointers: what a `tt.store` writes through.
 DeviceTile deviceWindowOf(Value ptrTensor);
-
-// One axis of a proven mask: `coord < limit`, the limit a runtime scalar or
-// a compile-time number. `present` false means the axis was never masked,
-// distinct from a bound of zero, which is an empty window.
-struct AxisBound {
-  Value limit;
-  int64_t constant = 0;
-  bool present = false;
-
-  bool operator==(const AxisBound &o) const {
-    return present == o.present && limit == o.limit && constant == o.constant;
-  }
-};
 
 // A mask reduced to per-axis bounds on the window's own coordinates. `ok`
 // requires every conjunct be a bound on one of the window's axes, with the

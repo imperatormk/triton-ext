@@ -97,7 +97,9 @@ inline void emitDirectMma(msl::Context &c, msl::Block &body,
         p = SlotCoord::fixed(p.constant);
     }
   };
-  if (!in.aSeed)
+  // A bounded operand's lanes compare their own row, which folding the warp
+  // term into the pointer would hide.
+  if (!in.aSeed && in.a.rowsLeft.empty())
     rebase(ind.a, true);
   rebase(ind.b, false);
   const DirectInputs &inr = ind;

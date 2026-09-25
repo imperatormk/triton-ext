@@ -166,7 +166,36 @@ inline msl::Str loadFrag(msl::Context &c, msl::Block &into, msl::Block &decls,
       off = c.binary(msl::BinOp::Add, off, kTerm);
     return c.binary(msl::BinOp::Add, c.var(src.buffer), off);
   };
-  if (loadsByLane(src, nm.opElem)) {
+  if (!src.rowsLeft.empty()) {
+    // Each lane reads its own pair at a row clamped into the tensor, so no
+    // address leaves it, and takes the fill where the row is past the bound.
+    const msl::Str laneRow = name + "_row";
+    into.push_back(c.declStmt(
+        msl::Context::i32(), laneRow,
+        c.binary(msl::BinOp::Add,
+                 c.binary(msl::BinOp::Add,
+                          c.binary(msl::BinOp::Mul, coordOf(c, row, nm.warpId),
+                                   c.lit(kSgFragDim)),
+                          c.lit(src.rowOrigin)),
+                 c.var(nm.fragRow))));
+    for (int i = 0; i < 2; ++i) {
+      msl::Expr *clamped =
+          c.call(msl::builtin::math::Min,
+                 {c.var(laneRow),
+                  c.binary(msl::BinOp::Sub, c.var(src.rowsLeft), c.lit(1))});
+      msl::Expr *col = c.binary(msl::BinOp::Add, c.lit(src.colOrigin + i),
+                                c.var(nm.fragCol));
+      if (kTerm)
+        col = c.binary(msl::BinOp::Add, col, kTerm);
+      msl::Expr *at = c.binary(
+          msl::BinOp::Add, c.var(src.buffer),
+          c.binary(msl::BinOp::Add, src.leadingDim.scale(c, clamped), col));
+      into.push_back(c.assign(fragElemExpr(c, name, i),
+                              c.ternary(c.binary(msl::BinOp::Lt, c.var(laneRow),
+                                                 c.var(src.rowsLeft)),
+                                        c.deref(at), c.litF(src.fill))));
+    }
+  } else if (loadsByLane(src, nm.opElem)) {
     const msl::Type pair = msl::Type::vector(
         nm.opElem == "half" ? msl::Scalar::F16 : msl::Scalar::F32, 2);
     // One read per element keeps the declaration count `predictPanelDotSize`

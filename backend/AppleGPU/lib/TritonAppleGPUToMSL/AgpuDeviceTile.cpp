@@ -420,11 +420,26 @@ DrainAddend drainAddendOf(Value v, const DeviceTile &at) {
 
 DeviceTile deviceTileOf(Value operand) {
   auto load = throughLayoutChange(operand).getDefiningOp<LoadOp>();
-  // `simdgroup_load` has no mask and a masked load reads something other
-  // than the tile.
-  if (!load || load.getMask() || load.getOther())
+  if (!load)
     return {};
-  return deviceWindowOf(load.getPtr());
+  DeviceTile t = deviceWindowOf(load.getPtr());
+  if (!t.base || !load.getMask())
+    return load.getOther() ? DeviceTile{} : t;
+
+  // Rows past a bound read the fill, per lane; any other mask reads
+  // something other than the tile.
+  auto ty = dyn_cast<RankedTensorType>(load.getType());
+  if (!ty || ty.getRank() != 2 || t.rowStartMod != 0)
+    return {};
+  const WindowBounds b =
+      windowBoundsOf(load.getMask(), t, ty.getShape()[0], ty.getShape()[1]);
+  if (!b.ok || !b.row.present || b.col.present || !b.clamps.empty() ||
+      b.uniform)
+    return {};
+  if (load.getOther() && !splatConstantOf(load.getOther(), t.fill))
+    return {};
+  t.rowBound = b.row;
+  return t;
 }
 
 } // namespace mlir::triton::applegpu::bridge

@@ -25,6 +25,11 @@ struct OperandSource {
 
   msl::AddrSpace space = msl::AddrSpace::Threadgroup;
 
+  // A masked load's row bound: rows from `rowsLeft` on, counted from the
+  // window's first row, read `fill` instead. Empty for an unmasked operand.
+  msl::Str rowsLeft;
+  double fill = 0;
+
   // Offset along this operand's fragment axis alone: no origins, no K term.
   msl::Expr *axisOffsetOf(msl::Context &c, SlotCoord pos,
                           const msl::Str &warpId) const {

@@ -89,6 +89,29 @@ agpu::Decision AgpuEmitter::readADirect(const DotOperands &ops,
                                        "pAdev" + std::to_string(body_.dotSeq));
     in.a.space = am::AddrSpace::Device;
   }
+
+  // Counted from the window's first row, which the pointer above starts at.
+  const AxisBound &bound = ops.shape.aDevice.rowBound;
+  if (bound.present) {
+    am::Context &mc = agpu_.context();
+    am::Expr *limit = mc.lit(bound.constant);
+    if (bound.limit) {
+      const am::Str *l = body_.sym.scalarName(idOf(bound.limit));
+      if (!l)
+        return declined("tt.dot", "A's row bound has no name");
+      limit = mc.var(*l);
+    }
+    if (ops.shape.aDevice.rowStart) {
+      const am::Str *rs =
+          body_.sym.scalarName(idOf(ops.shape.aDevice.rowStart));
+      if (!rs)
+        return declined("tt.dot", "A's window row offset has no name");
+      limit = mc.binary(am::BinOp::Sub, limit, mc.var(*rs));
+    }
+    in.a.rowsLeft = "rowsA" + std::to_string(body_.dotSeq);
+    cur_->push_back(mc.declStmt(am::Context::i32(), in.a.rowsLeft, limit));
+    in.a.fill = ops.shape.aDevice.fill;
+  }
   return agpu::Decision::emitted();
 }
 

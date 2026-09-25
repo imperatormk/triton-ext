@@ -228,7 +228,11 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
   f.cInitNonzero = f.fusedAcc && !zeroSplat(fusedInitOf(shape.cCarried));
   f.aInPlace = (bool)shape.aShared;
   f.bInPlace = (bool)shape.bShared;
-  f.aDirect = (bool)shape.aDevice.base;
+  // A row-bounded A is read per lane, which costs more than staging a tile
+  // loaded afresh each trip; it pays only where staging would repeat the same
+  // scatter every trip. The scalar integer dot reads by element, unbounded.
+  f.aDirect = shape.aDevice.base && (!shape.aDevice.rowBound.present ||
+                                     (shape.aRestagedEachTrip && !f.intAcc));
   f.aRestagedEachTrip = shape.aRestagedEachTrip;
   const auto stageDims = [&](RankedTensorType ty) {
     return ty && ty.getEncoding() ? coordSourceOf(ty).dims

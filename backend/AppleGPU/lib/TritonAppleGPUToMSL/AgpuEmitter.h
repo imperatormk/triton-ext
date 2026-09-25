@@ -769,7 +769,7 @@ private:
   // `actions` gets one entry per register that reaches the window. Declines
   // when the layout cannot be read.
   agpu::Decision
-  planTileActions(agpu::ValueId v, RankedTensorType ty,
+  planTileActions(RankedTensorType ty,
                   const std::vector<agpu::CoordWindow> &windows,
                   const agpu::TileView &dst, unsigned elemBits,
                   agpu::msl::SmallVec<agpu::StageAction, 8> &actions,

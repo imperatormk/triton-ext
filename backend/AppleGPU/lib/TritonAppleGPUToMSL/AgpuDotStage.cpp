@@ -223,9 +223,8 @@ agpu::Decision AgpuEmitter::setReadbackFor(const DotOperands &ops,
     agpu::CoordWindow &mw = window[cTy.getRank() - 2];
     mw.lo = rows.lo;
     mw.hi = std::min(rows.hi, mw.hi);
-    if (const agpu::Decision d =
-            planTileActions(cId, cTy, window, cView, (int)agpu::kAccBits,
-                            back.actions, "tt.dot");
+    if (const agpu::Decision d = planTileActions(
+            cTy, window, cView, (int)agpu::kAccBits, back.actions, "tt.dot");
         !d.ok())
       return R::no(declined(
           "tt.dot", "a C band's layout stopped resolving mid-emission"));
@@ -266,12 +265,10 @@ agpu::Decision AgpuEmitter::tileCoordsResolvable(RankedTensorType ty,
   return agpu::Decision::emitted();
 }
 
-agpu::Decision
-AgpuEmitter::planTileActions(agpu::ValueId v, RankedTensorType ty,
-                             const std::vector<agpu::CoordWindow> &windows,
-                             const agpu::TileView &dst, unsigned elemBits,
-                             am::SmallVec<agpu::StageAction, 8> &actions,
-                             std::string_view where) {
+agpu::Decision AgpuEmitter::planTileActions(
+    RankedTensorType ty, const std::vector<agpu::CoordWindow> &windows,
+    const agpu::TileView &dst, unsigned elemBits,
+    am::SmallVec<agpu::StageAction, 8> &actions, std::string_view where) {
   if (const agpu::Decision d = tileCoordsResolvable(ty, where); !d.ok())
     return d;
 
@@ -338,18 +335,17 @@ AgpuEmitter::panelInputsFor(const agpu::PanelTile &t, const DotOperands &ops,
     in.a.buffer = staged.poolA;
     in.a.leadingDim = agpu::Stride(t.aView().strideAt(0));
     in.aNames = staged.aNames;
-    plan1(planTileActions(ops.aStage, ops.aStageTy, t.aWindows(),
-                          t.aStagedView(), in.aElem.bits, in.aActions,
-                          "tt.dot"),
+    plan1(planTileActions(ops.aStageTy, t.aWindows(), t.aStagedView(),
+                          in.aElem.bits, in.aActions, "tt.dot"),
           "A");
   }
   in.bNames = staged.bNames;
-  plan1(planTileActions(ops.bStage, ops.bStageTy, t.bWindows(), t.bStagedView(),
+  plan1(planTileActions(ops.bStageTy, t.bWindows(), t.bStagedView(),
                         in.bElem.bits, in.bActions, "tt.dot"),
         "B");
 
   // C is the dot's result and has no bound names yet, so they are minted below.
-  plan1(planTileActions(ops.cOut, ops.cOutTy, t.cWindows(), t.cStagedView(),
+  plan1(planTileActions(ops.cOutTy, t.cWindows(), t.cStagedView(),
                         (int)agpu::kAccBits, in.cActions, "tt.dot"),
         "C");
   for (int64_t r = 0; r < registerCount(ops.cOutTy); ++r)
@@ -373,7 +369,7 @@ AgpuEmitter::stageWholeTensor(agpu::ValueId v, RankedTensorType ty,
   const int64_t regs = registerCount(ty);
   am::SmallVec<agpu::StageAction, 8> actions;
   const am::SmallVec<am::Str, 8> names = stagedNamesOf(v, regs);
-  if (const agpu::Decision d = planTileActions(v, ty, wholeWindowsOf(ty), dst,
+  if (const agpu::Decision d = planTileActions(ty, wholeWindowsOf(ty), dst,
                                                elem.bits, actions, where);
       !d.ok())
     return d;

@@ -230,10 +230,17 @@ public:
     return originAt(Coord(at));
   }
 
+  // Whether `slice` can drop `dim`: a swizzle survives it only when it
+  // permutes within the other dimensions.
+  bool slicesAt(int dim) const {
+    return !swizzle_.permutes() ||
+           (dim != swizzle_.groupDim && dim != swizzle_.phaseDim);
+  }
+
   // Drop a dimension by fixing its coordinate; the origin carries it.
   TileView slice(int64_t at, int dim = 0) const {
     assert(rank() > 1 && dim < rank());
-    assert(!swizzle_.permutes());
+    assert(slicesAt(dim));
     Coord at3(extent_.size(), 0);
     at3[dim] = at;
     const int64_t off = offsetOf(at3);
@@ -244,7 +251,12 @@ public:
       e.push_back(extent_[d]);
       s.push_back(stride_[d]);
     }
-    return TileView(std::move(e), std::move(s), off);
+    if (!swizzle_.permutes())
+      return TileView(std::move(e), std::move(s), off);
+    Swizzle sw = swizzle_;
+    sw.groupDim -= sw.groupDim > dim;
+    sw.phaseDim -= sw.phaseDim > dim;
+    return TileView(std::move(e), std::move(s), sw, off);
   }
 
   // Sizing query: a pool reservation must be at least this large. A swizzle

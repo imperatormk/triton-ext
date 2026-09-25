@@ -132,6 +132,35 @@ probedSwizzledView(gpu::MemDescType mt, ArrayRef<unsigned> ord) {
 }
 
 static std::optional<agpu::TileView> tileViewOfMemDesc(gpu::MemDescType mt) {
+  // A multi-buffered allocation: the encoding lays out one buffer, the
+  // trailing dimensions, and the leading ones index whole buffers placed one
+  // after another. Padding counted over the whole allocation would make the
+  // buffers differ, so a padded one is left out.
+  const int lead =
+      (int)mt.getRank() - (int)gpu::getCGALayout(mt.getEncoding()).getRank();
+  if (lead > 0) {
+    const auto one = gpu::MemDescType::get(
+        mt.getShape().drop_front(lead), mt.getElementType(), mt.getEncoding(),
+        mt.getMemorySpace(), mt.getMutableMemory());
+    const std::optional<agpu::TileView> slice = tileViewOfMemDesc(one);
+    if (!slice || slice->padding().pads() || slice->shifted() ||
+        slice->cosizeElems() != slice->sizeElems())
+      return std::nullopt;
+    agpu::TileView::Coord extent(mt.getShape().begin(), mt.getShape().end());
+    agpu::TileView::Coord stride(lead);
+    int64_t acc = slice->sizeElems();
+    for (int d = lead; d-- > 0;) {
+      stride[d] = acc;
+      acc *= extent[d];
+    }
+    stride.insert(stride.end(), slice->stride().begin(), slice->stride().end());
+    agpu::Swizzle sw = slice->swizzle();
+    sw.groupDim += lead;
+    sw.phaseDim += lead;
+    return agpu::TileView(std::move(extent), std::move(stride), sw,
+                          slice->origin());
+  }
+
   if (auto p = dyn_cast<gpu::PaddedSharedEncodingAttr>(mt.getEncoding()))
     return paddedView(p, mt);
   if (auto lin = dyn_cast<gpu::SharedLinearEncodingAttr>(mt.getEncoding()))
@@ -279,18 +308,39 @@ agpu::Decision AgpuEmitter::emitMemDescViewOp(const agpu::OpView &o) {
     body_.memDescOf[o.results[0]] = parent.subslice(at, ext);
   } else if (auto ix = res ? res.getDefiningOp<gpu::MemDescIndexOp>()
                            : gpu::MemDescIndexOp{}) {
-    // The index must be a compile-time constant.
     if (o.operands.size() < 2)
       return declined("ttg.memdesc_index", "expected a handle and an index");
+    if (!parent.view.slicesAt(0))
+      return declined("ttg.memdesc_index",
+                      "the index is a dimension the swizzle permutes");
     const auto k = constantFor_.find(o.operands[1]);
-    if (k == constantFor_.end() || k->second.empty() || !k->second[0].known ||
-        k->second[0].isFloat)
-      return declined("ttg.memdesc_index",
-                      "a runtime buffer index is not addressable");
-    if (parent.view.swizzle().permutes())
-      return declined("ttg.memdesc_index",
-                      "indexing a swizzled buffer is not addressable");
-    body_.memDescOf[o.results[0]] = parent.index(k->second[0].i);
+    if (k != constantFor_.end() && !k->second.empty() && k->second[0].known &&
+        !k->second[0].isFloat) {
+      body_.memDescOf[o.results[0]] = parent.index(k->second[0].i);
+    } else {
+      // A runtime index moves the base by whole slices, each the first one
+      // shifted; padding counted over the whole buffer breaks that.
+      if (parent.view.padding().pads())
+        return declined("ttg.memdesc_index",
+                        "a runtime index into a padded buffer");
+      const am::Str *i = body_.sym.scalarName(o.operands[1]);
+      if (!i)
+        return declined("ttg.memdesc_index", "the index has no emitted name");
+      const std::optional<agpu::ElemType> elem =
+          elemTypeOf(cast<gpu::MemDescType>(res.getType()).getElementType());
+      if (!elem)
+        return declined("ttg.memdesc_index",
+                        "the element has no representation");
+      const am::Str name = "md" + std::to_string(o.results[0]);
+      cur_->push_back(agpu_.context().declStmt(
+          agpu::mslTypeOf(*elem).pointerTo(am::AddrSpace::Threadgroup), name,
+          agpu_.context().binary(
+              am::BinOp::Add, agpu_.context().var(parent.buffer),
+              agpu_.context().binary(
+                  am::BinOp::Mul, agpu_.context().var(*i),
+                  agpu_.context().lit(parent.view.strideAt(0))))));
+      body_.memDescOf[o.results[0]] = agpu::MemDesc{name, parent.view.slice(0)};
+    }
   } else {
     return declined(o.name, "the op was never recorded");
   }

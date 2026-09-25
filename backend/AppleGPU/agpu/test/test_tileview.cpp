@@ -91,6 +91,29 @@ int main() {
     }
   }
 
+  CASE("slicing a dimension the swizzle leaves alone keeps the swizzle");
+  {
+    const int64_t Bd = 2, M = 8, N = 16;
+    agpu::Swizzle sw;
+    sw.vec = 2;
+    sw.perPhase = 1;
+    sw.maxPhase = 4;
+    sw.phaseDim = 1;
+    sw.groupDim = 2;
+    sw.groupExtent = N;
+    TileView c3 = TileView::rowMajor({Bd, M, N});
+    c3.setSwizzle(sw);
+    CHECK(c3.slicesAt(0));
+    CHECK(!c3.slicesAt(1));
+    for (int64_t bi = 0; bi < Bd; ++bi) {
+      const TileView c2 = c3.slice(bi);
+      CHECK(c2.swizzle().permutes());
+      for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n)
+          CHECK_EQ(c2.offsetOf({m, n}), c3.offsetOf({bi, m, n}));
+    }
+  }
+
   CASE("padded rows: stride grows, extent does not");
   {
     const int64_t rows = 16, cols = 32, pad = 4;

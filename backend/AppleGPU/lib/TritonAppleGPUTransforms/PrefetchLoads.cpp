@@ -6,8 +6,11 @@
 
 #include "TritonAppleGPUTransforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipelineExpander.h"
@@ -51,23 +54,122 @@ SmallVector<Operation *> dotOperandLoads(scf::ForOp loop) {
   return loads;
 }
 
-// Whether `loop` writes memory anywhere in its body. Loads moved ahead would
-// pass those writes, and nothing proves the two never alias.
-bool writesMemory(scf::ForOp loop) {
-  return loop.getBody()
-      ->walk([](Operation *op) {
-        auto effects = dyn_cast<MemoryEffectOpInterface>(op);
-        const bool writes =
-            effects ? effects.hasEffect<MemoryEffects::Write>()
-                    : !op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
-        return writes ? WalkResult::interrupt() : WalkResult::advance();
-      })
-      .wasInterrupted();
+// The kernel arguments `value` can point into, or nullopt when part of it
+// does not come from one.
+std::optional<DenseSet<Value>> argumentsBehind(Value value) {
+  DenseSet<Value> args, seen;
+  SmallVector<Value> work{value};
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    if (auto arg = dyn_cast<BlockArgument>(v)) {
+      Operation *owner = arg.getOwner()->getParentOp();
+      if (isa<tt::FuncOp>(owner)) {
+        args.insert(arg);
+        continue;
+      }
+      auto loop = dyn_cast<scf::ForOp>(owner);
+      if (!loop || arg == loop.getInductionVar())
+        return std::nullopt;
+      work.push_back(loop.getInitArgs()[arg.getArgNumber() - 1]);
+      work.push_back(loop.getYieldedValues()[arg.getArgNumber() - 1]);
+      continue;
+    }
+    Operation *def = v.getDefiningOp();
+    const unsigned i = cast<OpResult>(v).getResultNumber();
+    if (auto loop = dyn_cast<scf::ForOp>(def)) {
+      work.push_back(loop.getInitArgs()[i]);
+      work.push_back(loop.getYieldedValues()[i]);
+    } else if (auto branch = dyn_cast<scf::IfOp>(def)) {
+      work.push_back(branch.thenYield().getOperand(i));
+      work.push_back(branch.elseYield().getOperand(i));
+    } else if (!isa<ub::PoisonOp>(def)) {
+      const size_t before = work.size();
+      if (isPure(def))
+        for (Value operand : def->getOperands())
+          if (isa<tt::PointerType>(getElementTypeOrSelf(operand)))
+            work.push_back(operand);
+      if (work.size() == before)
+        return std::nullopt;
+    }
+  }
+  return args;
+}
+
+// One memory effect's resource and the kernel arguments its address can come
+// from (nullopt when not known).
+struct Access {
+  SideEffects::Resource *resource;
+  std::optional<DenseSet<Value>> args;
+};
+
+// Every access of `kind` in `op` and the ops nested in it; nullopt when some
+// op's effects are not known.
+template <typename Kind>
+std::optional<SmallVector<Access>> accessesOf(Operation *op) {
+  SmallVector<Access> accesses;
+  const bool unknown =
+      op->walk([&](Operation *nested) {
+          auto effects = dyn_cast<MemoryEffectOpInterface>(nested);
+          if (!effects)
+            return nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>()
+                       ? WalkResult::advance()
+                       : WalkResult::interrupt();
+          SmallVector<MemoryEffects::EffectInstance> instances;
+          effects.getEffects(instances);
+          for (const MemoryEffects::EffectInstance &e : instances) {
+            if (!isa<Kind>(e.getEffect()))
+              continue;
+            Value target = e.getValue();
+            accesses.push_back({e.getResource(), target
+                                                     ? argumentsBehind(target)
+                                                     : std::nullopt});
+          }
+          return WalkResult::advance();
+        }).wasInterrupted();
+  if (unknown)
+    return std::nullopt;
+  return accesses;
+}
+
+// Kernel arguments are taken not to alias one another.
+bool mayAlias(const Access &a, const Access &b) {
+  auto *any = SideEffects::DefaultResource::get();
+  if (a.resource != b.resource && a.resource != any && b.resource != any)
+    return false;
+  if (!a.args || !b.args)
+    return true;
+  return llvm::any_of(*a.args, [&](Value v) { return b.args->contains(v); });
+}
+
+// Whether a write anywhere in `loop` may touch what `ahead` reads: those
+// reads would pass it.
+bool aheadReadsMayBeWritten(scf::ForOp loop,
+                            const llvm::SetVector<Operation *> &ahead) {
+  SmallVector<Access> reads;
+  for (Operation *op : ahead) {
+    std::optional<SmallVector<Access>> r = accessesOf<MemoryEffects::Read>(op);
+    if (!r)
+      return true;
+    reads.append(*r);
+  }
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    std::optional<SmallVector<Access>> writes =
+        accessesOf<MemoryEffects::Write>(&op);
+    if (!writes)
+      return true;
+    for (const Access &w : *writes)
+      for (const Access &r : reads)
+        if (mayAlias(w, r))
+          return true;
+  }
+  return false;
 }
 
 // The ops that must run ahead with `loads`: everything in the body they
 // depend on, including what computes the loop-carried values they read.
-// Empty when that would carry a dot or any other side effect ahead.
+// Empty when that would carry a dot or a write ahead.
 llvm::SetVector<Operation *> aheadSet(scf::ForOp loop,
                                       ArrayRef<Operation *> loads) {
   Block *body = loop.getBody();
@@ -78,10 +180,16 @@ llvm::SetVector<Operation *> aheadSet(scf::ForOp loop,
     Operation *op = work.pop_back_val();
     if (!ahead.insert(op))
       continue;
-    if (op->getNumRegions() != 0 || isa<tt::DotOp>(op) ||
-        (!isa<tt::LoadOp>(op) && !isMemoryEffectFree(op)))
+    std::optional<SmallVector<Access>> writes =
+        accessesOf<MemoryEffects::Write>(op);
+    if (!writes || !writes->empty() || op->walk([](tt::DotOp) {
+                                           return WalkResult::interrupt();
+                                         }).wasInterrupted())
       return {};
-    for (Value v : op->getOperands()) {
+    llvm::SetVector<Value> used(op->getOperands().begin(),
+                                op->getOperands().end());
+    getUsedValuesDefinedAbove(op->getRegions(), used);
+    for (Value v : used) {
       if (Operation *def = v.getDefiningOp()) {
         if (def->getBlock() == body)
           work.push_back(def);
@@ -107,13 +215,13 @@ struct PrefetchLoadsPass : public impl::PrefetchLoadsBase<PrefetchLoadsPass> {
     for (scf::ForOp loop : loops) {
       // An outer loop would carry its tiles across the whole inner loop.
       const int stages = tt::getNumStagesOrDefault(loop, numStages);
-      if (stages < 2 || tt::isOuterLoop(loop) || writesMemory(loop))
+      if (stages < 2 || tt::isOuterLoop(loop))
         continue;
       const SmallVector<Operation *> loads = dotOperandLoads(loop);
       if (loads.empty())
         continue;
       const llvm::SetVector<Operation *> ahead = aheadSet(loop, loads);
-      if (ahead.empty())
+      if (ahead.empty() || aheadReadsMayBeWritten(loop, ahead))
         continue;
 
       // Ahead ops first, so the loads issue before this iteration's dots.

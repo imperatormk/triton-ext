@@ -138,8 +138,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %r#0 : tensor<32x32xf32, #acc>
   }
 
-  // A store in the body could alias what a moved load reads, so the loop
-  // stays as it is.
+  // A store through the argument a moved load reads could alias it, so the
+  // loop stays as it is.
   // CHECK-LABEL: @writes_memory
   // CHECK-NOT: tt.load
   // CHECK: scf.for
@@ -160,5 +160,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       scf.yield %d, %na, %nb : tensor<32x32xf32, #acc>, tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32x!tt.ptr<f32>, #blocked>
     }
     tt.return %r#0 : tensor<32x32xf32, #acc>
+  }
+
+  // A fused loop nest: one scf.if picks a new tile's addresses, another
+  // stores a finished tile through an argument no load reads. The first runs
+  // ahead with the loads, the second stays with the dot.
+  // CHECK-LABEL: @fused_nest
+  // CHECK: tt.load %{{.*}}, %{{.*}} : tensor<32x32x!tt.ptr<f32>, #blocked>
+  // CHECK: tt.load %{{.*}}, %{{.*}} : tensor<32x32x!tt.ptr<f32>, #blocked>
+  // CHECK: scf.for
+  // CHECK: scf.if
+  // CHECK: tt.load
+  // CHECK: tt.load
+  // CHECK: tt.dot
+  // CHECK: scf.if
+  // CHECK: tt.store
+  // CHECK: scf.yield
+  tt.func @fused_nest(%a: tensor<32x32x!tt.ptr<f32>, #blocked>, %b: tensor<32x32x!tt.ptr<f32>, #blocked>, %c: tensor<32x32x!tt.ptr<f32>, #blocked>, %step: tensor<32x32xi32, #blocked>, %tile: tensor<32x32xi32, #blocked>, %k: i32, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %zero = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #acc>
+    %r:4 = scf.for %i = %c0 to %n step %c1 iter_args(%j = %c0, %acc = %zero, %pa = %a, %pb = %b) -> (i32, tensor<32x32xf32, #acc>, tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32x!tt.ptr<f32>, #blocked>)  : i32 {
+      %first = arith.cmpi eq, %j, %c0 : i32
+      %p:2 = scf.if %first -> (tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32x!tt.ptr<f32>, #blocked>) {
+        %ta = tt.addptr %pa, %tile : tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32xi32, #blocked>
+        %tb = tt.addptr %pb, %tile : tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32xi32, #blocked>
+        scf.yield %ta, %tb : tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32x!tt.ptr<f32>, #blocked>
+      } else {
+        scf.yield %pa, %pb : tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32x!tt.ptr<f32>, #blocked>
+      }
+      %x = tt.load %p#0 : tensor<32x32x!tt.ptr<f32>, #blocked>
+      %y = tt.load %p#1 : tensor<32x32x!tt.ptr<f32>, #blocked>
+      %xa = ttg.convert_layout %x : tensor<32x32xf32, #blocked> -> tensor<32x32xf32, #opA>
+      %yb = ttg.convert_layout %y : tensor<32x32xf32, #blocked> -> tensor<32x32xf32, #opB>
+      %d = tt.dot %xa, %yb, %acc : tensor<32x32xf32, #opA> * tensor<32x32xf32, #opB> -> tensor<32x32xf32, #acc>
+      %last = arith.cmpi eq, %j, %k : i32
+      scf.if %last {
+        %out = ttg.convert_layout %d : tensor<32x32xf32, #acc> -> tensor<32x32xf32, #blocked>
+        tt.store %c, %out : tensor<32x32x!tt.ptr<f32>, #blocked>
+      }
+      %next = arith.addi %j, %c1 : i32
+      %jn = arith.select %last, %c0, %next : i32
+      %accn = arith.select %last, %zero, %d : tensor<32x32xf32, #acc>
+      %na = tt.addptr %p#0, %step : tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32xi32, #blocked>
+      %nb = tt.addptr %p#1, %step : tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32xi32, #blocked>
+      scf.yield %jn, %accn, %na, %nb : i32, tensor<32x32xf32, #acc>, tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32x!tt.ptr<f32>, #blocked>
+    }
+    tt.return
   }
 }

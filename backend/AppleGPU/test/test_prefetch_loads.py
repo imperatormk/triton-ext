@@ -103,3 +103,51 @@ def test_load_feeds_dot_and_reduction(num_stages, K):
                            num_stages=num_stages)
     torch.testing.assert_close(c.cpu(), a @ b, rtol=1e-4, atol=1e-3)
     torch.testing.assert_close(s.cpu(), a.sum(1), rtol=1e-4, atol=1e-3)
+
+
+@triton.jit
+def persistent_mm(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr,
+                  BN: tl.constexpr, BK: tl.constexpr, PROGS: tl.constexpr):
+    # Flattened into one loop whose scf.ifs start and finish each tile.
+    tiles_n = tl.cdiv(N, BN)
+    for tile in tl.range(tl.program_id(0),
+                         tl.cdiv(M, BM) * tiles_n,
+                         PROGS,
+                         flatten=True):
+        rm = (tile // tiles_n) * BM + tl.arange(0, BM)
+        rn = (tile % tiles_n) * BN + tl.arange(0, BN)
+        rk = tl.arange(0, BK)
+        a_ptrs = a_ptr + rm[:, None] * K + rk[None, :]
+        b_ptrs = b_ptr + rk[:, None] * N + rn[None, :]
+        acc = tl.zeros((BM, BN), tl.float32)
+        for k0 in range(0, K, BK):
+            in_k = k0 + rk < K
+            a = tl.load(a_ptrs, mask=in_k[None, :], other=0.0)
+            b = tl.load(b_ptrs, mask=in_k[:, None], other=0.0)
+            acc += tl.dot(a, b, input_precision="ieee")
+            a_ptrs += BK
+            b_ptrs += BK * N
+        tl.store(c_ptr + rm[:, None] * N + rn[None, :], acc)
+
+
+@pytest.mark.parametrize("num_stages", [1, 2, 3])
+@pytest.mark.parametrize("K", [16, 48, 200])
+@pytest.mark.parametrize("progs", [1, 4])
+def test_persistent_mm(num_stages, K, progs):
+    M, N, BM, BN, BK = 96, 64, 32, 32, 16
+    a = torch.randn(M, K)
+    b = torch.randn(K, N)
+    c = torch.empty(M, N, device="mps")
+    persistent_mm[(progs, )](a.to("mps"),
+                             b.to("mps"),
+                             c,
+                             M,
+                             N,
+                             K,
+                             BM=BM,
+                             BN=BN,
+                             BK=BK,
+                             PROGS=progs,
+                             num_warps=4,
+                             num_stages=num_stages)
+    torch.testing.assert_close(c.cpu(), a @ b, rtol=1e-4, atol=1e-3)

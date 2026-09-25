@@ -115,6 +115,42 @@ inline void emitMaskedScalar(msl::Context &c, msl::Block &body,
     body.push_back(s);
 }
 
+// The guard every register of a run shares, or null when one has none or
+// they differ.
+inline msl::Expr *sharedRunGuard(const MoveSite &site, int64_t base,
+                                 int64_t width) {
+  msl::Expr *g = site.guard ? site.guard(base) : nullptr;
+  for (int64_t i = 1; g && i < width; ++i) {
+    msl::Expr *o = site.guard(base + i);
+    if (!o || !msl::exprsEqual(g, o))
+      return nullptr;
+  }
+  return g;
+}
+
+// A run whose registers share one guard moves as one access under it; any
+// other run moves register by register.
+inline void emitGuardedRun(msl::Context &c, msl::Block &body,
+                           const MoveFacts &f, const MovePlan &p,
+                           const MoveSite &site, ElemType elem, int64_t base) {
+  bool anyDead = false;
+  for (int64_t i = 0; i < p.width(); ++i)
+    anyDead = anyDead || p.guards.deadAt(base + i);
+  if (p.vectorised() && !anyDead)
+    if (msl::Expr *g = sharedRunGuard(site, base, p.width())) {
+      msl::Block run;
+      if (f.isStore)
+        emitStoreRun(c, run, p, site, elem, base);
+      else
+        emitLoadRun(c, run, p, site, elem, base, /*declare=*/false);
+      c.guardedInto(body, g, std::move(run));
+      return;
+    }
+  for (int64_t i = 0; i < p.width(); ++i)
+    if (!p.guards.deadAt(base + i))
+      emitMaskedScalar(c, body, f, p, site, base + i, elem);
+}
+
 inline void emitMove(msl::Context &c, msl::Block &body, const MoveFacts &f,
                      const MovePlan &p, const MoveSite &site, ElemType elem) {
   // Every register must be defined before the mask is consulted: the mask is
@@ -132,9 +168,7 @@ inline void emitMove(msl::Context &c, msl::Block &body, const MoveFacts &f,
       if (runIsDead(p.guards, base, p.width()))
         continue;
       if (f.hasMask && !runIsUnguarded(p.guards, base, p.width())) {
-        for (int64_t i = 0; i < p.width(); ++i)
-          if (!p.guards.deadAt(base + i))
-            emitMaskedScalar(c, body, f, p, site, base + i, elem);
+        emitGuardedRun(c, body, f, p, site, elem, base);
         continue;
       }
       if (f.isStore)
@@ -186,8 +220,18 @@ inline void emitMove(msl::Context &c, msl::Block &body, const MoveFacts &f,
     return;
   }
 
-  for (int64_t r = 0; r < f.regCount; ++r)
-    emitMaskedScalar(c, cold, f, p, site, r, elem);
+  // Every register guarded by the one conjunct the peel tests: where it is
+  // false, no access runs, so there is no cold arm.
+  bool everyGuarded = true;
+  for (int64_t r = 0; r < f.regCount && everyGuarded; ++r)
+    everyGuarded = site.guard(r) != nullptr;
+  if (everyGuarded && seen.size() == 1) {
+    body.push_back(c.ifStmt(allTrue, std::move(hot)));
+    return;
+  }
+
+  for (int64_t base = 0; base < f.regCount; base += p.width())
+    emitGuardedRun(c, cold, f, p, site, elem, base);
 
   body.push_back(c.ifElse(allTrue, std::move(hot), std::move(cold)));
 }

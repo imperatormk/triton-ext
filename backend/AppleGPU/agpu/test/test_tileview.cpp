@@ -125,6 +125,25 @@ int main() {
     CHECK_EQ(p.cosizeElems(), (rows - 1) * (cols + pad) + cols);
   }
 
+  CASE("a slice or subview of a padded view pads where its parent does");
+  {
+    const int64_t Bd = 2, rows = 8, cols = 16;
+    TileView v = TileView::rowMajor({Bd, rows, cols});
+    agpu::Padding pad;
+    pad.rules.push_back({32, 4});
+    v.setPadding(pad);
+    for (int64_t b = 0; b < Bd; ++b) {
+      const TileView s = v.slice(b);
+      for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < cols; ++c)
+          CHECK_EQ(s.offsetOf({r, c}), v.offsetOf({b, r, c}));
+    }
+    const TileView sub = v.subview({1, 3, 0}, {1, 4, cols});
+    for (int64_t r = 0; r < 4; ++r)
+      for (int64_t c = 0; c < cols; ++c)
+        CHECK_EQ(sub.offsetOf({0, r, c}), v.offsetOf({1, 3 + r, c}));
+  }
+
   CASE("ragged final panel is a smaller subview, same strides");
   {
     const int64_t M = 100, N = 128, mp = 32;

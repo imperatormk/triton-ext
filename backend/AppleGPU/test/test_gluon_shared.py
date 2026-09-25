@@ -42,6 +42,33 @@ def test_ring_copy(NB):
 
 
 @gluon.jit
+def padded_half(x_ptr, y_ptr, R: gl.constexpr, C: gl.constexpr,
+                INTERVAL: gl.constexpr, PAD: gl.constexpr):
+    # The lower half of a padded buffer, read through a subslice: its rows
+    # cross padding intervals the subslice does not start on.
+    ld: gl.constexpr = gl.BlockedLayout([1, 4], [8, 4], [4, 1], [1, 0])
+    sl: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[INTERVAL, PAD]], [R, C], [1, 0])
+    buf = gl.allocate_shared_memory(gl.float32, [R, C], sl)
+    rows = gl.arange(0, R, layout=gl.SliceLayout(1, ld))
+    cols = gl.arange(0, C, layout=gl.SliceLayout(0, ld))
+    buf.store(gl.load(x_ptr + rows[:, None] * C + cols[None, :]))
+    gl.barrier()
+    half = buf.slice(R // 2, R // 2, dim=0)
+    hrows = gl.arange(0, R // 2, layout=gl.SliceLayout(1, ld))
+    gl.store(y_ptr + hrows[:, None] * C + cols[None, :], half.load(ld))
+
+
+@pytest.mark.parametrize("interval", [16, 32, 64])
+def test_padded_subslice(interval):
+    R, C = 16, 16
+    x = torch.randn(R, C, device="mps")
+    y = torch.empty(R // 2, C, device="mps")
+    padded_half[(1, )](x, y, R, C, interval, 4, num_warps=4)
+    torch.testing.assert_close(y, x[R // 2:])
+
+
+@gluon.jit
 def gemm_ring(a_ptr, b_ptr, c_ptr, M, N, K, BM: gl.constexpr, BN: gl.constexpr,
               BK: gl.constexpr, WARPS: gl.constexpr):
     # A and B stage through two-deep rings: step k reads slot k % 2 while the

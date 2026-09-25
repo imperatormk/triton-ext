@@ -135,6 +135,7 @@ public:
   TileView window(const Coord &at, const Coord &ext) const {
     assert(at.size() == extent_.size() && ext.size() == extent_.size());
     TileView v(ext, stride_, swizzle_, origin_);
+    v.padding_ = padding_;
     v.shift_ = at;
     for (std::size_t d = 0; d < shift_.size(); ++d)
       v.shift_[d] += shift_[d];
@@ -183,9 +184,19 @@ public:
   }
 
   int64_t offsetOf(const Coord &coord) const {
+    const int64_t off = linearOffsetOf(coord);
+    return off + padding_.extraBefore(off);
+  }
+  int64_t offsetOf(std::initializer_list<int64_t> coord) const {
+    return offsetOf(Coord(coord));
+  }
+
+  // The offset before padding: what the padding rules are counted over, so a
+  // view cut from this one keeps them by starting its origin here.
+  int64_t linearOffsetOf(const Coord &coord) const {
     assert(coord.size() == extent_.size());
     const Swizzle &sw = swizzle_;
-    const int64_t off = linearize<int64_t>(
+    return linearize<int64_t>(
         coord, [](int64_t v, int64_t s) { return v * s; },
         [](int64_t a, int64_t b) { return a + b; }, [](int64_t v) { return v; },
         [&sw, this](int64_t g, const Coord &all) {
@@ -199,18 +210,17 @@ public:
           const int64_t step = sw.tileStride > 0 ? sw.tileStride : width;
           return tile * step + swizzled;
         });
-    return off + padding_.extraBefore(off);
-  }
-  int64_t offsetOf(std::initializer_list<int64_t> coord) const {
-    return offsetOf(Coord(coord));
   }
 
-  // Keeps this view's strides; the origin absorbs the offset. An additive
-  // origin cannot carry a permutation, so a swizzled view takes `window`.
+  // Keeps this view's strides and padding; the origin absorbs the offset. An
+  // additive origin cannot carry a permutation, so a swizzled view takes
+  // `window`.
   TileView subview(const Coord &at, const Coord &ext) const {
     assert(at.size() == extent_.size() && ext.size() == extent_.size());
     assert(!swizzle_.permutes());
-    return TileView(ext, stride_, offsetOf(at));
+    TileView v(ext, stride_, linearOffsetOf(at));
+    v.padding_ = padding_;
+    return v;
   }
   TileView subview(std::initializer_list<int64_t> at,
                    std::initializer_list<int64_t> ext) const {
@@ -243,7 +253,7 @@ public:
     assert(slicesAt(dim));
     Coord at3(extent_.size(), 0);
     at3[dim] = at;
-    const int64_t off = offsetOf(at3);
+    const int64_t off = linearOffsetOf(at3);
     Coord e, s;
     for (int d = 0; d < rank(); ++d) {
       if (d == dim)
@@ -251,12 +261,15 @@ public:
       e.push_back(extent_[d]);
       s.push_back(stride_[d]);
     }
-    if (!swizzle_.permutes())
-      return TileView(std::move(e), std::move(s), off);
-    Swizzle sw = swizzle_;
-    sw.groupDim -= sw.groupDim > dim;
-    sw.phaseDim -= sw.phaseDim > dim;
-    return TileView(std::move(e), std::move(s), sw, off);
+    Swizzle sw;
+    if (swizzle_.permutes()) {
+      sw = swizzle_;
+      sw.groupDim -= sw.groupDim > dim;
+      sw.phaseDim -= sw.phaseDim > dim;
+    }
+    TileView v(std::move(e), std::move(s), sw, off);
+    v.padding_ = padding_;
+    return v;
   }
 
   // Sizing query: a pool reservation must be at least this large. A swizzle

@@ -273,6 +273,9 @@ private:
 
   agpu::Decision emitForOp(scf::ForOp forOp);
   bool continuesInto(scf::ForOp forOp, const FusedDot &fd);
+  // Whether the fragments a fused dot planned as `from` leaves can seed one
+  // planned as `to`.
+  static bool fragmentsCarryOver(const agpu::Plan &from, const agpu::Plan &to);
   bool keepsOperandsApart(Operation *dot);
 
   agpu::Decision emitIfOp(scf::IfOp ifOp);
@@ -581,6 +584,9 @@ private:
   DotOperands dotOperandsOf(const agpu::OpView &o);
 
   agpu::DotFacts dotFactsOf(const DotShape &shape);
+  // Whether a fused dot with facts `f` starts from the fragments of the loop
+  // that computes its init, which `continuesInto` then hands over.
+  bool initContinues(const DotShape &shape, const agpu::DotFacts &f);
   void planSeedGrants(triton::FuncOp func);
 
   // The single-use convert_layout a non-fused dot's readback lands in instead

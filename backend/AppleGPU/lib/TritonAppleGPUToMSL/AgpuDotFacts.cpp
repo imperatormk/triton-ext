@@ -312,7 +312,23 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
   }
   f.aSeedGranted = shape.aSeedGranted;
   f.rollK = rollK_;
+  f.cInitContinues = f.cInitNonzero && initContinues(shape, f);
   return f;
+}
+
+bool AgpuEmitter::initContinues(const DotShape &shape,
+                                const agpu::DotFacts &f) {
+  const Value init = fusedInitOf(shape.cCarried);
+  const triton::DotOp from = fusedDotBehind(init);
+  if (!from || !init.hasOneUse())
+    return false;
+  const DotShape fromShape = dotShapeOf(from);
+  if (!fromShape.aTy)
+    return false;
+  agpu::DotFacts seeded = f;
+  seeded.cInitContinues = true;
+  return fragmentsCarryOver(agpu_.planFor(dotFactsOf(fromShape)),
+                            agpu_.planFor(seeded));
 }
 
 } // namespace mlir::triton::applegpu::bridge

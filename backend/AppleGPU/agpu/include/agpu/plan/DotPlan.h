@@ -39,11 +39,12 @@ struct DotFacts {
   bool aRestagedEachTrip = false; // loop-invariant A the loop keeps no copy of
   bool fusedAcc = false;          // C lives in registers across a K loop
   bool cInitNonzero = false;      // the fused loop's init is not zeros
-  bool cDirect = false;           // C stores straight to device
-  bool cFallback = false;         // ... but keeps a pool arm for ragged tiles
-  bool cRename = false;           // C's consumers read the fragment's own lanes
-  bool aSeedGranted = false; // the kernel lets A's seed move the warp cover
-  bool rollK = false;        // this build rolls K loops
+  bool cInitContinues = false; // ... and arrives in an earlier loop's fragments
+  bool cDirect = false;        // C stores straight to device
+  bool cFallback = false;      // ... but keeps a pool arm for ragged tiles
+  bool cRename = false;        // C's consumers read the fragment's own lanes
+  bool aSeedGranted = false;   // the kernel lets A's seed move the warp cover
+  bool rollK = false;          // this build rolls K loops
   // The layouts A and B stage from, which place their pads.
   std::vector<LayoutBasis> aStageDims, bStageDims;
 
@@ -819,7 +820,8 @@ inline Plan planDotAs(const DotFacts &facts, Bytes budget) {
     f.aDirect = f.cDirect = false;
 
   // The direct drain stores fragments only, so an addend has nowhere to land.
-  if (f.cInitNonzero) {
+  // Continued fragments already hold it.
+  if (f.cInitNonzero && !f.cInitContinues) {
     f.cDirect = false;
     f.cFallback = false;
   }

@@ -40,6 +40,9 @@ agpu::Decision AgpuEmitter::emitDotOp(const agpu::OpView &o) {
 
   if (plan.kind == agpu::Plan::Kind::Unsupported)
     return declined("tt.dot", "no strategy for this shape");
+  if (f.cInitContinues && !body_.continuedFrom.count(idOf(ops.shape.cCarried)))
+    return declined("tt.dot", "planned to continue fragments the loop before "
+                              "did not hand over");
 
   agpu::DotInputs in;
   in.rollK = rollK_;

@@ -230,18 +230,23 @@ bool AgpuEmitter::continuesInto(scf::ForOp forOp, const FusedDot &fd) {
     const DotShape shape = dotShapeOf(dot);
     if (!shape.aTy)
       return false;
-    const agpu::Plan plan = agpu_.planFor(dotFactsOf(shape));
-    const agpu::WarpGrid a = agpu::gridOf(fd.plan), b = agpu::gridOf(plan);
-    const std::vector<am::Str> accs = agpu::fusedAccNames(fd.plan, fd.names);
-    if (!plan.accumulatorsOutlivePass() || a.mT != b.mT || a.nT != b.nT ||
-        a.numWarps != b.numWarps ||
-        !agpu::planWarpProgram(a).sameCover(agpu::planWarpProgram(b)) ||
-        agpu::fusedAccNames(plan, agpu::DirectNames{}).size() != accs.size())
+    if (!fragmentsCarryOver(fd.plan, agpu_.planFor(dotFactsOf(shape))))
       return false;
-    body_.continuedFrom[idOf(next.getResult(i))] = accs;
+    body_.continuedFrom[idOf(next.getResult(i))] =
+        agpu::fusedAccNames(fd.plan, fd.names);
     return true;
   }
   return false;
+}
+
+bool AgpuEmitter::fragmentsCarryOver(const agpu::Plan &from,
+                                     const agpu::Plan &to) {
+  const agpu::WarpGrid a = agpu::gridOf(from), b = agpu::gridOf(to);
+  return to.accumulatorsOutlivePass() && a.mT == b.mT && a.nT == b.nT &&
+         a.numWarps == b.numWarps &&
+         agpu::planWarpProgram(a).sameCover(agpu::planWarpProgram(b)) &&
+         agpu::fusedAccNames(to, agpu::DirectNames{}).size() ==
+             agpu::fusedAccNames(from, agpu::DirectNames{}).size();
 }
 
 agpu::Decision AgpuEmitter::emitIfOp(scf::IfOp ifOp) {

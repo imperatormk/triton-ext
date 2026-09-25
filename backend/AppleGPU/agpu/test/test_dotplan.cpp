@@ -176,7 +176,8 @@ int main() {
     CHECK(!fusedPadWorthCarrying(Bytes(9216), Bytes(8192), kBudget, 32));
   }
 
-  CASE("a fused C that fits only unpadded drops the pad but keeps the fusion");
+  CASE("a fused C that fits only unpadded drops its pad but keeps the fusion "
+       "and the operands' pad");
   {
     DotFacts f = gemm(64, 128, 64);
     f.fusedAcc = true;
@@ -187,11 +188,26 @@ int main() {
     CHECK_EQ(kindOf(p), kFused);
     CHECK(!p.fused().stagePad);
     CHECK(!p.padStagedC());
+    CHECK(p.padStagedOperands());
     CHECK_EQ(
         p.cPoolRegion().bytes,
         stagedTileBytes(64, fragAlignedExtent(128), kAccBytes, false).count());
-    CHECK_EQ(p.stage.ab().count(), planStageBytes(f, false).ab().count());
+    CHECK_EQ(p.stage.ab().count(), planStageBytes(f).ab().count());
     CHECK(p.pool.reserved() <= kBudget);
+  }
+
+  CASE("the operands drop their pad too when it alone costs residency");
+  {
+    DotFacts f = gemm(72, 80, 64);
+    f.fusedAcc = true;
+    f.cDirect = true;
+    const Bytes padded = planStageBytes(f).ab();
+    const Bytes plain = planStageBytes(f, false).ab();
+    CHECK(cost::tgResidency(padded.count()) < cost::tgResidency(plain.count()));
+    Plan p = planDot(f, kBudget);
+    CHECK_EQ(kindOf(p), kFused);
+    CHECK(!p.padStagedOperands());
+    CHECK_EQ(p.stage.ab().count(), plain.count());
   }
 
   CASE("a fused C too large to cross the pool at either pitch demotes");
@@ -477,7 +493,7 @@ int main() {
   {
     DotFacts f = gemm(64, 64, 24);
     Plan p = planDot(f, kBudget);
-    CHECK_EQ(padElemsFor(24, 2), 0);
+    CHECK_EQ(stagedPadFor(64, 24, 2), 0);
     CHECK_EQ(p.stage.a.count(), 64 * 24 * 2);
   }
 

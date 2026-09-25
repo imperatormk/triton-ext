@@ -355,9 +355,9 @@ int main() {
     Panel pan = panelCost(64, 64, 64, 2, kAccBytes);
     PanelSchedule s = planPanelSchedule(f, pan);
     const PanelTile &t = s.tiles[0];
-    CHECK_EQ(t.aView().strideAt(0), 64 + padElemsFor(64, 2));
+    CHECK_EQ(t.aView().strideAt(0), 64 + stagedPadFor(64, 64, 2));
     CHECK_EQ(t.aView().offsetOf({1, 0}), 72); // row 1 starts one pitch on
-    CHECK_EQ(t.cView().strideAt(0), 64 + padElemsFor(64, kAccBytes));
+    CHECK_EQ(t.cView().strideAt(0), 64 + stagedPadFor(64, 64, kAccBytes));
     CHECK_EQ(pan.aBytes.count(), t.aView().cosizeElems() * 2);
   }
 

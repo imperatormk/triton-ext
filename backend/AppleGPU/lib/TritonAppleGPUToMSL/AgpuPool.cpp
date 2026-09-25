@@ -303,7 +303,7 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
     const agpu::DotFacts &f = plan.facts;
     if (plan.kind == agpu::Plan::Kind::Panel)
       return;
-    const bool pad = plan.padStagedC();
+    const bool pad = plan.padStagedOperands();
     for (int which = 0; which < 2; ++which) {
       if (which == 0 && f.aDirect)
         continue;
@@ -320,10 +320,7 @@ void AgpuEmitter::planResidentOperands(triton::FuncOp func) {
       r.loop = loop;
       r.elem = stagedElemOf(plan, which == 0 ? shape.aElem : shape.bElem);
       r.view =
-          which == 0
-              ? agpu::stagedOperandView(f, f.M, f.K, f.aElemBytes, pad)
-              : agpu::stagedOperandView(f, f.K, agpu::fragAlignedExtent(f.N),
-                                        f.bElemBytes, pad);
+          which == 0 ? agpu::stagedAView(f, pad) : agpu::stagedBView(f, pad);
       r.bytes = stage.count();
       r.buffer = -1;
       for (const ResidentOperand &o : found)

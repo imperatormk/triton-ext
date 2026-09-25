@@ -3,17 +3,18 @@
 #define AGPU_DOT_PLAN_H
 
 #include "agpu/core/Decline.h"
-#include "agpu/core/Padding.h"
 #include "agpu/core/TileView.h"
 #include "agpu/core/Units.h"
 #include "agpu/cost/Occupancy.h"
 #include "agpu/plan/Elementwise.h"
 #include "agpu/plan/ReadbackPlan.h"
+#include "agpu/plan/StagePlan.h"
 #include "agpu/plan/WarpSlots.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <variant>
 
 namespace agpu {
@@ -43,6 +44,8 @@ struct DotFacts {
   bool cRename = false;           // C's consumers read the fragment's own lanes
   bool aSeedGranted = false; // the kernel lets A's seed move the warp cover
   bool rollK = false;        // this build rolls K loops
+  // The layouts A and B stage from, which place their pads.
+  std::vector<LayoutBasis> aStageDims, bStageDims;
 
   std::vector<LayoutBasis> cDims;
   int64_t cRegs = 0;
@@ -75,7 +78,40 @@ struct DotFacts {
   }
 };
 
+// Warps that actually own fragments.
+inline int64_t warpsFor(const DotFacts &f) {
+  return effectiveWarps(f.numWarps, f.nFrag());
+}
+
+inline WarpGrid warpGridFor(const DotFacts &f, bool bandedC) {
+  WarpGrid g;
+  g.mT = f.mT();
+  g.nT = f.nT();
+  g.numWarps = warpsFor(f);
+  g.hwWarps = f.numWarps;
+  g.aDirect = f.aDirect || f.aFromRegs;
+  g.bandedC = bandedC;
+  return g;
+}
+
 // ── operand staging cost ──────────────────────────────────────────────────
+
+// Fragment reads one staging of A (`a`) or B serves: every warp reads each
+// fragment of the row (A) or column (B) bands its slots cover, at every K
+// step.
+inline int64_t stagedFragmentReads(const DotFacts &f, bool a) {
+  const WarpGrid g = warpGridFor(f, false);
+  const WarpProgram prog = planWarpProgram(g);
+  int64_t bands = 0;
+  for (int64_t w = 0; w < g.numWarps; ++w) {
+    const int64_t block = prog.form == WarpForm::Parameterised ? 0 : w;
+    std::set<int64_t> seen;
+    for (const WarpSlot &s : prog.slots(block, g.mT, g.nT, g.numWarps))
+      seen.insert((a ? s.mi : s.ni).at(w));
+    bands += (int64_t)seen.size();
+  }
+  return bands * f.kT();
+}
 
 // Bytes A and B occupy in the pool. An unstaged operand costs nothing; a
 // staged one carries row padding so consecutive rows land in different banks.
@@ -85,19 +121,23 @@ struct StageBytes {
   Bytes ab() const { return a + b; }
 };
 
-// Rows rounded up to whole fragments, columns padded per core/Padding.h. The
+// Rows rounded up to whole fragments, columns padded per `stagedPadFor`. The
 // pool reservation, the staging scatter and simdgroup_load's leading dimension
 // all derive from this view. `cols` is the extent the caller means to address.
 inline TileView stagedTileView(int64_t rows, int64_t cols, int64_t elemBytes,
-                               bool pad = true) {
-  return TileView::rowMajorPadded({fragAlignedExtent(rows), cols},
-                                  pad ? padElemsFor(cols, elemBytes) : 0);
+                               bool pad = true,
+                               const StageTraffic &traffic = {}) {
+  const int64_t r = fragAlignedExtent(rows);
+  return TileView::rowMajorPadded(
+      {r, cols}, pad ? stagedPadFor(r, cols, elemBytes, traffic) : 0);
 }
 
 inline Bytes stagedTileBytes(int64_t rows, int64_t cols, int64_t elemBytes,
-                             bool pad = true) {
-  return Bytes(stagedTileView(rows, cols, elemBytes, pad).cosizeElems() *
-               elemBytes);
+                             bool pad = true,
+                             const StageTraffic &traffic = {}) {
+  return Bytes(
+      stagedTileView(rows, cols, elemBytes, pad, traffic).cosizeElems() *
+      elemBytes);
 }
 
 // The whole C tile as staged: whole fragments, fp32 accumulators. Every
@@ -119,8 +159,9 @@ inline Bytes cBandBytes(const DotFacts &f, bool pad = true) {
 // batch stride the slice cosize. Only the scalar dot stages a batched operand
 // whole; the MMA strategies go to the panel walk, one slice at a time.
 inline TileView stagedOperandView(const DotFacts &f, int64_t rows, int64_t cols,
-                                  int64_t elemBytes, bool pad = true) {
-  const TileView slice = stagedTileView(rows, cols, elemBytes, pad);
+                                  int64_t elemBytes, bool pad = true,
+                                  const StageTraffic &traffic = {}) {
+  const TileView slice = stagedTileView(rows, cols, elemBytes, pad, traffic);
   if (!f.batched())
     return slice;
   return TileView({f.Bd, slice.extentAt(0), slice.extentAt(1)},
@@ -128,17 +169,31 @@ inline TileView stagedOperandView(const DotFacts &f, int64_t rows, int64_t cols,
 }
 
 inline Bytes stagedOperandBytes(const DotFacts &f, int64_t rows, int64_t cols,
-                                int64_t elemBytes, bool pad = true) {
-  return Bytes(stagedOperandView(f, rows, cols, elemBytes, pad).cosizeElems() *
-               elemBytes);
+                                int64_t elemBytes, bool pad = true,
+                                const StageTraffic &traffic = {}) {
+  return Bytes(
+      stagedOperandView(f, rows, cols, elemBytes, pad, traffic).cosizeElems() *
+      elemBytes);
+}
+
+inline TileView stagedAView(const DotFacts &f, bool pad = true) {
+  return stagedOperandView(
+      f, f.M, f.K, f.aElemBytes, pad,
+      {f.aStageDims, f.numWarps, stagedFragmentReads(f, true)});
+}
+
+inline TileView stagedBView(const DotFacts &f, bool pad = true) {
+  return stagedOperandView(
+      f, f.K, fragAlignedExtent(f.N), f.bElemBytes, pad,
+      {f.bStageDims, f.numWarps, stagedFragmentReads(f, false)});
 }
 
 inline StageBytes planStageBytes(const DotFacts &f, bool pad = true) {
   StageBytes s;
   if (!f.aInPlace && !f.aDirect && !f.aFromRegs)
-    s.a = stagedOperandBytes(f, f.M, f.K, f.aElemBytes, pad);
+    s.a = Bytes(stagedAView(f, pad).cosizeElems() * f.aElemBytes);
   if (!f.bInPlace)
-    s.b = stagedOperandBytes(f, f.K, fragAlignedExtent(f.N), f.bElemBytes, pad);
+    s.b = Bytes(stagedBView(f, pad).cosizeElems() * f.bElemBytes);
   return s;
 }
 
@@ -320,8 +375,11 @@ struct FusedParams {
   int64_t fragsPerWarp = 0;
   bool cDirect = false;
 
-  // See `fusedPadWorthCarrying`.
+  // See `fusedPadWorthCarrying`: C's pitch, and the operands'. The operands
+  // are read every K step and C once at the drain, so they keep their pad
+  // when only C's does not pay.
   bool stagePad = true;
+  bool operandPad = true;
 };
 
 // Zero where every fragment lands whole, since the scratch exists to hold a
@@ -414,6 +472,13 @@ struct Plan {
     if (const ScalarParams *sp = std::get_if<ScalarParams>(&params))
       return sp->stagePad;
     return true;
+  }
+
+  // The pitch A and B are staged at.
+  bool padStagedOperands() const {
+    if (const FusedParams *fp = std::get_if<FusedParams>(&params))
+      return fp->operandPad;
+    return padStagedC();
   }
 
   // The C tile as staged: fragment-aligned, at this plan's pitch.
@@ -565,25 +630,10 @@ struct PoolDependent {
   }
 };
 
-// Warps that actually own fragments and how many each owns.
-inline int64_t warpsFor(const DotFacts &f) {
-  return effectiveWarps(f.numWarps, f.nFrag());
-}
 inline int64_t fragsPerWarpFor(const DotFacts &f) {
   // effectiveWarps floors at 1, so the divide is always safe.
   const int64_t nw = warpsFor(f);
   return (f.nFrag() + nw - 1) / nw;
-}
-
-inline WarpGrid warpGridFor(const DotFacts &f, bool bandedC) {
-  WarpGrid g;
-  g.mT = f.mT();
-  g.nT = f.nT();
-  g.numWarps = warpsFor(f);
-  g.hwWarps = f.numWarps;
-  g.aDirect = f.aDirect || f.aFromRegs;
-  g.bandedC = bandedC;
-  return g;
 }
 
 // Read off the plan.
@@ -814,15 +864,17 @@ inline Plan planDotAs(const DotFacts &facts, Bytes budget) {
       planStageBytes(f, false).ab() + bandBytes(false) <= budget;
   DotFit fit;
   fit.operandsAndBand = fitsPadded || fitsPlain;
-  // The whole tile is the bar because the fused drain has no banded arm and
-  // the overlay's max at one pitch, because C shares the pool's bytes with
-  // operands staged at that same pitch. Asked at both pitches.
-  const auto wholeCBytes = [&](bool pad) {
+  // The whole tile is the bar because the fused drain has no banded arm, and
+  // the overlay's max because C shares the pool's bytes with the operands.
+  // Asked at both pitches.
+  const auto wholeCBytes = [&](bool operandPad, bool cPad) {
     const Bytes cWhole =
-        f.cCostsPoolNothing() || mayRename ? Bytes(0) : cTileBytes(f, pad);
-    return maxBytes(planStageBytes(f, pad).ab(), cWhole);
+        f.cCostsPoolNothing() || mayRename ? Bytes(0) : cTileBytes(f, cPad);
+    return maxBytes(planStageBytes(f, operandPad).ab(), cWhole);
   };
-  const auto wholeCFits = [&](bool pad) { return wholeCBytes(pad) <= budget; };
+  const auto wholeCFits = [&](bool pad) {
+    return wholeCBytes(pad, pad) <= budget;
+  };
   fit.wholeC = wholeCFits(true) || wholeCFits(false);
   p.fit = fit;
   p.kind = selectKind(f, fit);
@@ -871,10 +923,16 @@ inline Plan planDotAs(const DotFacts &facts, Bytes budget) {
     FusedParams fp;
     fp.fragsPerWarp = fragsPerWarpFor(f);
     fp.cDirect = f.cDirect;
-    if (!fusedPadWorthCarrying(wholeCBytes(true), wholeCBytes(false), budget,
-                               threadsFor(f.numWarps))) {
+    const Bytes plain = wholeCBytes(false, false);
+    const int64_t threads = threadsFor(f.numWarps);
+    if (!fusedPadWorthCarrying(wholeCBytes(true, true), plain, budget,
+                               threads)) {
       fp.stagePad = false;
-      p.stage = planStageBytes(f, false);
+      if (!fusedPadWorthCarrying(wholeCBytes(true, false), plain, budget,
+                                 threads)) {
+        fp.operandPad = false;
+        p.stage = planStageBytes(f, false);
+      }
     }
     p.params = fp;
     break;

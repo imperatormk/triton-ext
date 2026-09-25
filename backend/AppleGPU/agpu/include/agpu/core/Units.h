@@ -40,7 +40,7 @@ inline Bytes maxBytes(Bytes a, Bytes b) { return std::max(a, b); }
 inline constexpr int64_t kTGResidentBudgetBytes = 32768;
 
 // Alignment of a threadgroup pool's base address (Metal's widest vector
-// access). `kPadBytes` is a whole multiple of it.
+// access).
 inline constexpr int64_t kTGPoolAlignBytes = 16;
 
 inline constexpr int64_t kWarpSize = 32;

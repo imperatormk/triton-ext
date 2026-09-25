@@ -54,6 +54,8 @@ DotOperands AgpuEmitter::dotOperandsOf(const agpu::OpView &o) {
   d.shape.aDevice = deviceTileOf(mlirValueOf(o.operands[0]));
   d.shape.aRegsTy = dyn_cast<RankedTensorType>(
       throughLayoutChange(mlirValueOf(o.operands[0])).getType());
+  d.shape.bRegsTy = dyn_cast<RankedTensorType>(
+      throughLayoutChange(mlirValueOf(o.operands[1])).getType());
   d.shape.aRestagedEachTrip = directInvariantA_.count(d.op) != 0;
   d.shape.aSeedGranted = aSeedGranted_.count(d.op) != 0;
 
@@ -162,6 +164,8 @@ DotShape AgpuEmitter::dotShapeOf(triton::DotOp dot) const {
   d.aDevice = deviceTileOf(dot.getA());
   d.aRegsTy =
       dyn_cast<RankedTensorType>(throughLayoutChange(dot.getA()).getType());
+  d.bRegsTy =
+      dyn_cast<RankedTensorType>(throughLayoutChange(dot.getB()).getType());
   d.aRestagedEachTrip = directInvariantA_.count(dot.getOperation()) != 0;
   d.aSeedGranted = aSeedGranted_.count(dot.getOperation()) != 0;
   fillAccumulatorCarry(d, dot.getC(), dot.getResult());
@@ -219,6 +223,12 @@ agpu::DotFacts AgpuEmitter::dotFactsOf(const DotShape &shape) {
   f.aInPlace = f.bInPlace = false;
   f.aDirect = (bool)shape.aDevice.base;
   f.aRestagedEachTrip = shape.aRestagedEachTrip;
+  const auto stageDims = [&](RankedTensorType ty) {
+    return ty && ty.getEncoding() ? coordSourceOf(ty).dims
+                                  : std::vector<agpu::LayoutBasis>{};
+  };
+  f.aStageDims = stageDims(shape.aRegsTy);
+  f.bStageDims = stageDims(shape.bRegsTy);
   if (!f.fusedAcc) {
     const RankedTensorType renameTy = renameLandingTypeOf(shape);
     f.cDims = coordSourceOf(renameTy).dims;

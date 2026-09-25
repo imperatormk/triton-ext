@@ -75,12 +75,10 @@ agpu::Decision AgpuEmitter::stageAB(const DotOperands &ops,
   // here when tiles stage per tile: the pool regions hold one tile, so a
   // whole-operand scatter would write past `pB`'s end.
   const bool stagesPerTile = plan.kind == agpu::Plan::Kind::Panel;
-  const bool stagePad = plan.padStagedC();
+  const bool stagePad = plan.padStagedOperands();
   const agpu::DotFacts &pf = plan.facts;
-  const agpu::TileView aStaged =
-      agpu::stagedOperandView(pf, pf.M, pf.K, pf.aElemBytes, stagePad);
-  const agpu::TileView bStaged = agpu::stagedOperandView(
-      pf, pf.K, agpu::fragAlignedExtent(pf.N), pf.bElemBytes, stagePad);
+  const agpu::TileView aStaged = agpu::stagedAView(pf, stagePad);
+  const agpu::TileView bStaged = agpu::stagedBView(pf, stagePad);
 
   // Every pool user opens its epoch with a barrier: the previous one (a fused
   // pass's MMAs, a drained dot's readback) leaves its reads unfenced.

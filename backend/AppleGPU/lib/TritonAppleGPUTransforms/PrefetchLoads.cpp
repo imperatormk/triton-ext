@@ -51,6 +51,20 @@ SmallVector<Operation *> dotOperandLoads(scf::ForOp loop) {
   return loads;
 }
 
+// Whether `loop` writes memory anywhere in its body. Loads moved ahead would
+// pass those writes, and nothing proves the two never alias.
+bool writesMemory(scf::ForOp loop) {
+  return loop.getBody()
+      ->walk([](Operation *op) {
+        auto effects = dyn_cast<MemoryEffectOpInterface>(op);
+        const bool writes =
+            effects ? effects.hasEffect<MemoryEffects::Write>()
+                    : !op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+        return writes ? WalkResult::interrupt() : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 // The ops that must run ahead with `loads`: everything in the body they
 // depend on, including what computes the loop-carried values they read.
 // Empty when that would carry a dot or any other side effect ahead.
@@ -88,11 +102,13 @@ struct PrefetchLoadsPass : public impl::PrefetchLoadsBase<PrefetchLoadsPass> {
   using Base::Base;
 
   void runOnOperation() override {
-    if (numStages < 2)
-      return;
     SmallVector<scf::ForOp> loops;
     getOperation()->walk([&](scf::ForOp loop) { loops.push_back(loop); });
     for (scf::ForOp loop : loops) {
+      // An outer loop would carry its tiles across the whole inner loop.
+      const int stages = tt::getNumStagesOrDefault(loop, numStages);
+      if (stages < 2 || tt::isOuterLoop(loop) || writesMemory(loop))
+        continue;
       const SmallVector<Operation *> loads = dotOperandLoads(loop);
       if (loads.empty())
         continue;
@@ -102,7 +118,7 @@ struct PrefetchLoadsPass : public impl::PrefetchLoadsBase<PrefetchLoadsPass> {
 
       // Ahead ops first, so the loads issue before this iteration's dots.
       std::vector<std::pair<Operation *, unsigned>> schedule;
-      const unsigned last = numStages - 1;
+      const unsigned last = stages - 1;
       for (Operation &op : loop.getBody()->without_terminator())
         if (ahead.contains(&op))
           schedule.emplace_back(&op, 0);

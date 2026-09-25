@@ -93,12 +93,14 @@ def PrefetchLoads : Pass<"triton-apple-prefetch-loads", "mlir::ModuleOp"> {
     With no asynchronous copy to threadgroup memory, a K loop waits on its
     operand loads before it can stage them for the MMA. Issuing each load
     num_stages - 1 iterations ahead, into registers the loop carries, overlaps
-    it with the dots of the iterations in between.
+    it with the dots of the iterations in between. A loop's own
+    `tt.num_stages` overrides the option; outer loops and loops that write
+    memory are left as they are.
   }];
 
   let options = [
     Option<"numStages", "num-stages", "int32_t", /*default=*/"1",
-           "Pipeline depth; 1 leaves loops as they are">
+           "Pipeline depth for loops without their own; 1 leaves them as they are">
   ];
 
   let dependentDialects = [

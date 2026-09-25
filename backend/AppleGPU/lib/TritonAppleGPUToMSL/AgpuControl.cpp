@@ -242,8 +242,8 @@ bool AgpuEmitter::continuesInto(scf::ForOp forOp, const FusedDot &fd) {
 bool AgpuEmitter::fragmentsCarryOver(const agpu::Plan &from,
                                      const agpu::Plan &to) {
   const agpu::WarpGrid a = agpu::gridOf(from), b = agpu::gridOf(to);
-  return to.accumulatorsOutlivePass() && a.mT == b.mT && a.nT == b.nT &&
-         a.numWarps == b.numWarps &&
+  return from.accumulatorsOutlivePass() && to.accumulatorsOutlivePass() &&
+         a.mT == b.mT && a.nT == b.nT && a.numWarps == b.numWarps &&
          agpu::planWarpProgram(a).sameCover(agpu::planWarpProgram(b)) &&
          agpu::fusedAccNames(to, agpu::DirectNames{}).size() ==
              agpu::fusedAccNames(from, agpu::DirectNames{}).size();

@@ -61,6 +61,31 @@ def test_mm(num_stages, K, dtype):
                                atol=tol * max(K, 1)**0.5)
 
 
+@pytest.mark.parametrize("num_warps", [4, 8])
+def test_mm_tile_too_big_to_keep_c(num_warps):
+    # The first loop's C does not fit beside A and B, so its dot walks panels
+    # and keeps no fragments; the split-off last iteration must not expect them.
+    M, N, K, BM, BN, BK = 128, 128, 256, 128, 128, 64
+    a = torch.randn(M, K, dtype=torch.float16)
+    b = torch.randn(K, N, dtype=torch.float16)
+    c = torch.empty(M, N, device="mps", dtype=torch.float32)
+    mm[(1, 1)](a.to("mps"),
+               b.to("mps"),
+               c,
+               M,
+               N,
+               K,
+               BM=BM,
+               BN=BN,
+               BK=BK,
+               num_warps=num_warps,
+               num_stages=3)
+    torch.testing.assert_close(c.cpu(),
+                               a.float() @ b.float(),
+                               rtol=1e-2,
+                               atol=1e-1)
+
+
 @triton.jit
 def mm_rowsum(a_ptr, b_ptr, c_ptr, s_ptr, M, N, K, BM: tl.constexpr,
               BN: tl.constexpr, BK: tl.constexpr):

@@ -365,6 +365,10 @@ class MetalLauncher:
         self._smem_bytes = int(getattr(metadata, "shared", 0) or 0)
         self._cross_tg_barrier = bool(
             getattr(metadata, "cross_tg_barrier", False))
+        self._exposes_addresses = bool(
+            getattr(metadata, "exposes_addresses", False))
+        self._reads_addresses = bool(
+            getattr(metadata, "reads_addresses", False))
         # None when the kernel does not print/assert, which also says not to
         # bind a buffer.
         self._print_layout = parse_print_layout(
@@ -498,6 +502,8 @@ class MetalLauncher:
             threads=[gridX * self.lx, gridY * self.ly, gridZ * self.lz],
             group_size=[self.lx, self.ly, self.lz],
             threadgroup_mem=self._smem_bytes,
+            exposes_addresses=self._exposes_addresses,
+            reads_addresses=self._reads_addresses,
         )
 
         # The copy to CPU synchronises; the records do not exist until the

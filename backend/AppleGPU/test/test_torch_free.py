@@ -141,3 +141,50 @@ def test_address_table_without_torch():
         print('ok')
     """)
     assert out.strip() == "ok"
+
+
+# Buffers reached only through tables, bound to no argument, read and written
+# from a later command buffer; the launch keeps them alive until it completes,
+# so dropping them right after it is safe.
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs Metal")
+@pytest.mark.skipif(
+    importlib.util.find_spec("triton_apple_backend.metal_native") is None,
+    reason="metal_native is not built")
+def test_buffers_behind_addresses_without_torch():
+    out = _run_without_torch("""
+        import numpy as np
+        import triton
+        import triton.language as tl
+        from triton_apple_backend import metal_native
+        from triton_apple_backend.address import address_table
+
+        @triton.jit
+        def copy_through_tables(src_tab, dst_tab, n, BLOCK: tl.constexpr):
+            e = tl.program_id(0)
+            src = tl.load(src_tab + e).to(tl.pointer_type(tl.float32))
+            dst = tl.load(dst_tab + e).to(tl.pointer_type(tl.float32))
+            for i in range(0, n, BLOCK):
+                offs = i + tl.arange(0, BLOCK)
+                tl.store(dst + offs, tl.load(src + offs))
+
+        count, n = 4, 2 << 20
+        for rep in range(3):
+            src, dst = [], []
+            for i in range(count):
+                s = metal_native.alloc(n * 4, np.dtype('float32'))
+                np.frombuffer(s, dtype=np.float32)[:] = i + 1 + 10 * rep
+                src.append(s)
+                dst.append(metal_native.alloc(n * 4, np.dtype('float32')))
+            tables = address_table(src), address_table(dst)
+            metal_native.synchronize()
+            copy_through_tables[(count,)](*tables, n, BLOCK=1024)
+            del src
+            metal_native.synchronize()
+            for i, d in enumerate(dst):
+                assert np.all(np.frombuffer(d, dtype=np.float32)
+                              == i + 1 + 10 * rep), (rep, i)
+
+        assert 'torch' not in sys.modules
+        print('ok')
+    """)
+    assert out.strip() == "ok"

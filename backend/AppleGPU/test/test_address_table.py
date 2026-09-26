@@ -120,6 +120,53 @@ def test_data_ptr_is_not_a_gpu_address():
     assert gpu_address(src) != src.data_ptr()
 
 
+@triton.jit
+def copy_through_tables(src_tab, dst_tab, n, BLOCK: tl.constexpr):
+    e = tl.program_id(0)
+    src = tl.load(src_tab + e).to(tl.pointer_type(tl.float16))
+    dst = tl.load(dst_tab + e).to(tl.pointer_type(tl.float16))
+    for i in range(0, n, BLOCK):
+        off = i + tl.arange(0, BLOCK)
+        tl.store(dst + off, tl.load(src + off))
+
+
+# Buffers reached only through a table are bound to no argument, so they are
+# resident only because the launch names them. Large, separate allocations sit
+# in heaps no argument shares; small ones next to the arguments pass by luck.
+@pytest.mark.parametrize("build", [host_table, device_table])
+def test_separate_buffers_reached_through_tables(build):
+    count, n = 4, 8 << 19
+    for rep in range(3):
+        src = [
+            torch.full((n, ),
+                       float(i + 1 + 10 * rep),
+                       dtype=torch.float16,
+                       device=DEVICE) for i in range(count)
+        ]
+        dst = [
+            torch.zeros(n, dtype=torch.float16, device=DEVICE)
+            for _ in range(count)
+        ]
+        tables = build(src), build(dst)
+        # A capture kernel binds its buffers; the copy must not ride on that.
+        torch.mps.synchronize()
+        copy_through_tables[(count, )](*tables, n, BLOCK=1024)
+        for s, d in zip(src, dst):
+            assert torch.equal(d.cpu(), s.cpu())
+
+
+def test_launch_flags_name_address_use():
+    src = torch.ones(256, device=DEVICE)
+    tab = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    out = torch.zeros(256, device=DEVICE)
+    capture = capture_address[(1, )](src, tab, 0)
+    read = read_through_table[(1, )](tab, out, 256, BLOCK=256)
+    assert capture.metadata.exposes_addresses
+    assert not capture.metadata.reads_addresses
+    assert read.metadata.reads_addresses
+    assert not read.metadata.exposes_addresses
+
+
 def test_host_table_of_views():
     n, count = 256, 8
     stacked = torch.arange(count * n, dtype=torch.float32,

@@ -80,13 +80,17 @@ public:
     }
     ss.flush();
 
-    // Tells the host launcher whether the whole grid must be resident at once.
-    const agpu::GridResidency residency =
-        agpu::residencyFor(bridge::launchFactsOf(mod));
-    mod->setAttr(
-        agpu::kGridResidencyAttr,
-        IntegerAttr::get(IntegerType::get(mod.getContext(), 1),
-                         residency == agpu::GridResidency::CoResident));
+    // Tells the host launcher whether the whole grid must be resident at once,
+    // and which buffers it must make resident.
+    const agpu::LaunchFacts facts = bridge::launchFactsOf(mod);
+    const auto flag = [&](const char *name, bool value) {
+      mod->setAttr(
+          name, IntegerAttr::get(IntegerType::get(mod.getContext(), 1), value));
+    };
+    flag(agpu::kGridResidencyAttr,
+         agpu::residencyFor(facts) == agpu::GridResidency::CoResident);
+    flag(agpu::kExposesAddressesAttr, facts.exposesAddresses);
+    flag(agpu::kReadsAddressesAttr, facts.readsAddresses);
 
     if (mslDumpEnabled())
       llvm::errs() << "// -----// MSL Dump After EmitMSL "

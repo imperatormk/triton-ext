@@ -10,6 +10,9 @@ namespace am = agpu::msl;
 
 agpu::LaunchFacts launchFactsOf(Operation *scope) {
   agpu::LaunchFacts f;
+  const auto isPointer = [](Value v) {
+    return isa<triton::PointerType>(getElementTypeOrSelf(v.getType()));
+  };
   scope->walk([&](Operation *op) {
     if (auto p = dyn_cast<triton::AtomicPollOp>(op)) {
       if (!p.getTimeout())
@@ -20,6 +23,14 @@ agpu::LaunchFacts launchFactsOf(Operation *scope) {
       if (op->getParentOfType<scf::WhileOp>() ||
           op->getParentOfType<scf::ForOp>())
         f.atomicInLoop = true;
+    } else if (isa<triton::PtrToIntOp>(op)) {
+      f.exposesAddresses = true;
+    } else if (isa<triton::IntToPtrOp>(op)) {
+      f.readsAddresses = true;
+    } else if (auto load = dyn_cast<triton::LoadOp>(op)) {
+      f.readsAddresses |= isPointer(load.getResult());
+    } else if (auto store = dyn_cast<triton::StoreOp>(op)) {
+      f.exposesAddresses |= isPointer(store.getValue());
     }
   });
   return f;

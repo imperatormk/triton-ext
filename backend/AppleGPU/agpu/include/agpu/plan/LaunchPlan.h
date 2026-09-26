@@ -24,6 +24,14 @@ struct LaunchFacts {
   // on a device atomic in a loop but is safe at any grid size.
   bool atomicInLoop = false;
   bool readsGridExtent = false;
+
+  // A pointer turned into an integer or stored: its buffer can be reached
+  // later with no argument binding it.
+  bool exposesAddresses = false;
+  // An integer turned into a pointer or a pointer loaded: the kernel reads
+  // through buffers no argument binds, which Metal keeps resident only when
+  // the launch names them.
+  bool readsAddresses = false;
 };
 
 inline GridResidency residencyFor(const LaunchFacts &f) {
@@ -35,6 +43,9 @@ inline GridResidency residencyFor(const LaunchFacts &f) {
 // Module attribute the launcher reads the verdict off, via
 // `module.get_int_attr`.
 inline constexpr const char *kGridResidencyAttr = "applegpu.grid_coresident";
+inline constexpr const char *kExposesAddressesAttr =
+    "applegpu.exposes_addresses";
+inline constexpr const char *kReadsAddressesAttr = "applegpu.reads_addresses";
 
 } // namespace agpu
 

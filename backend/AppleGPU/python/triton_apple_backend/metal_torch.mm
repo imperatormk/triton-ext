@@ -49,6 +49,20 @@ static id<MTLDevice> get_device(void) {
   return at::mps::getCurrentMPSStream()->device();
 }
 
+// A kernel that reads through an address reaches buffers no argument binds,
+// and Metal keeps those resident only when the encoder names them. Every
+// buffer whose address was handed out is recorded here, weakly: the table
+// keeps nothing alive and a freed buffer drops out. GIL held.
+static NSHashTable *exposedBuffers(void) {
+  static NSHashTable *table = [[NSHashTable weakObjectsHashTable] retain];
+  return table;
+}
+
+static bool kwargFlag(PyObject *kwargs, const char *name) {
+  PyObject *v = kwargs ? PyDict_GetItemString(kwargs, name) : NULL;
+  return v && PyObject_IsTrue(v) == 1;
+}
+
 // ── SharedBuffer - host-visible memory a kernel writes ───────────────────
 // Its buffer view reads the memory as it is, without waiting for the GPU: for
 // state that only ever moves one way, like an assert count.
@@ -276,7 +290,8 @@ static void bindArguments(id<MTLComputeCommandEncoder> enc,
 }
 
 static void encodeDispatch(MetalKernelObject *self, const LaunchGeometry &geom,
-                           const std::vector<ArgInfo> &argInfos) {
+                           const std::vector<ArgInfo> &argInfos,
+                           NSArray *resident) {
   // Dispatch on stream->queue() (serial) to serialize with other MPS ops.
   // Don't call endKernelCoalescing(): reusing torch's cached encoder
   // coalesces back-to-back dispatches and RAW deps are still honored.
@@ -293,6 +308,15 @@ static void encodeDispatch(MetalKernelObject *self, const LaunchGeometry &geom,
           [enc setThreadgroupMemoryLength:geom.tgmem atIndex:0];
 
         bindArguments(enc, argInfos);
+
+        if (resident.count) {
+          std::vector<id<MTLResource>> rs;
+          for (id<MTLBuffer> b in resident)
+            rs.push_back(b);
+          [enc useResources:rs.data()
+                      count:rs.size()
+                      usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        }
 
         MTLSize threadgroups = MTLSizeMake(geom.tx / geom.gx, geom.ty / geom.gy,
                                            geom.tz / geom.gz);
@@ -315,13 +339,22 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
     if (!packArguments(args, &argInfos))
       return NULL;
 
+    if (kwargFlag(kwargs, "exposes_addresses"))
+      for (const ArgInfo &info : argInfos)
+        if (info.kind == ArgInfo::TENSOR)
+          [exposedBuffers() addObject:info.buf];
+    NSArray *resident = kwargFlag(kwargs, "reads_addresses")
+                            ? [[exposedBuffers() allObjects] retain]
+                            : nil;
+
     // Nothing below touches Python, and the args tuple keeps the borrowed
     // pointers in argInfos alive. Holding the GIL here would deadlock anything
     // on the MPS queue that wants it.
     {
       ReleasedGil unlocked;
-      encodeDispatch(self, geom, argInfos);
+      encodeDispatch(self, geom, argInfos, resident);
     }
+    [resident release];
     Py_RETURN_NONE;
   });
 }
@@ -485,6 +518,7 @@ static PyObject *py_gpu_address(PyObject *self, PyObject *args) {
     }
     const uint64_t addr =
         [buf gpuAddress] + (uint64_t)(t.storage_offset() * t.element_size());
+    [exposedBuffers() addObject:buf];
     return PyLong_FromUnsignedLongLong(addr);
   });
 }

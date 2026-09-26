@@ -23,12 +23,28 @@ static id<MTLCommandBuffer> g_last = nil;
 
 // A committed command buffer keeps Python references to its MetalBuffer
 // arguments until it is seen complete, so wrapped caller memory cannot be
-// released under the GPU. Entries complete in commit order.
+// released under the GPU, and the buffers it reaches through addresses.
+// Entries complete in commit order.
 struct Inflight {
   id<MTLCommandBuffer> cb;
   std::vector<PyObject *> held;
+  NSArray *resident;
 };
 static std::deque<Inflight> g_inflight;
+
+// A kernel that reads through an address reaches buffers no argument binds,
+// and Metal keeps those resident only when the encoder names them. Every
+// buffer whose address was handed out is recorded here, weakly: the table
+// keeps nothing alive and a freed buffer drops out. GIL held.
+static NSHashTable *exposedBuffers(void) {
+  static NSHashTable *table = [NSHashTable weakObjectsHashTable];
+  return table;
+}
+
+static bool kwargFlag(PyObject *kwargs, const char *name) {
+  PyObject *v = kwargs ? PyDict_GetItemString(kwargs, name) : NULL;
+  return v && PyObject_IsTrue(v) == 1;
+}
 
 static id<MTLDevice> get_device(void) {
   if (!g_device) {
@@ -123,6 +139,7 @@ static PyObject *MetalBuffer_gpu_address(MetalBufferObject *self,
                     "through; allocate with metal_native.alloc instead");
     return NULL;
   }
+  [exposedBuffers() addObject:self->buf];
   return PyLong_FromUnsignedLongLong([self->buf gpuAddress]);
 }
 
@@ -344,7 +361,8 @@ static bool packArguments(PyObject *args, std::vector<ArgInfo> *out) {
 }
 
 static void encodeDispatch(MetalKernelObject *self, const LaunchGeometry &geom,
-                           const std::vector<ArgInfo> &argInfos) {
+                           const std::vector<ArgInfo> &argInfos,
+                           NSArray *resident) {
   @autoreleasepool {
     get_device();
     reapInflight();
@@ -370,13 +388,21 @@ static void encodeDispatch(MetalKernelObject *self, const LaunchGeometry &geom,
         break;
       }
     }
+    if (resident.count) {
+      std::vector<id<MTLResource>> rs;
+      for (id<MTLBuffer> b in resident)
+        rs.push_back(b);
+      [enc useResources:rs.data()
+                  count:rs.size()
+                  usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    }
     MTLSize threadgroups =
         MTLSizeMake(geom.tx / geom.gx, geom.ty / geom.gy, geom.tz / geom.gz);
     MTLSize threadsPerGroup = MTLSizeMake(geom.gx, geom.gy, geom.gz);
     [enc dispatchThreadgroups:threadgroups
         threadsPerThreadgroup:threadsPerGroup];
     [enc endEncoding];
-    Inflight held{cb, {}};
+    Inflight held{cb, {}, resident};
     for (const ArgInfo &info : argInfos)
       if (info.kind == ArgInfo::BUFFER)
         held.held.push_back(Py_NewRef(info.obj));
@@ -394,7 +420,14 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
   std::vector<ArgInfo> argInfos;
   if (!packArguments(args, &argInfos))
     return NULL;
-  encodeDispatch(self, geom, argInfos);
+  if (kwargFlag(kwargs, "exposes_addresses"))
+    for (const ArgInfo &info : argInfos)
+      if (info.kind == ArgInfo::BUFFER)
+        [exposedBuffers() addObject:info.buf];
+  NSArray *resident = kwargFlag(kwargs, "reads_addresses")
+                          ? [exposedBuffers() allObjects]
+                          : nil;
+  encodeDispatch(self, geom, argInfos, resident);
   Py_RETURN_NONE;
 }
 

@@ -24,6 +24,8 @@ _plugin = passes.plugin
 
 # Set by the emit-msl pass; also spelled in agpu/plan/LaunchPlan.h.
 _GRID_RESIDENCY_ATTR = 'applegpu.grid_coresident'
+_EXPOSES_ADDRESSES_ATTR = 'applegpu.exposes_addresses'
+_READS_ADDRESSES_ATTR = 'applegpu.reads_addresses'
 
 # Also spelled in agpu/plan/PoolPlan.h.
 _POOL_NEEDED_ATTR = 'applegpu.pool_needed_bytes'
@@ -314,6 +316,12 @@ class MetalBackend(BaseBackend):
         # completes. The launcher rejects such a grid using this.
         metadata["cross_tg_barrier"] = bool(
             mod.get_int_attr(_GRID_RESIDENCY_ATTR))
+        # A buffer reached through an address is bound to no argument, so the
+        # launcher records the ones handed out and names them to Metal.
+        metadata["exposes_addresses"] = bool(
+            mod.get_int_attr(_EXPOSES_ADDRESSES_ATTR))
+        metadata["reads_addresses"] = bool(
+            mod.get_int_attr(_READS_ADDRESSES_ATTR))
         # Text: metadata round-trips through JSON into the compile cache.
         # None when the kernel does not print/assert, which
         # also tells the launcher not to bind a buffer.

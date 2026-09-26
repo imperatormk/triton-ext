@@ -4,6 +4,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
@@ -13,6 +14,7 @@
 // getMTLBufferStorage mirrors PyTorch's ATen/native/mps/OperationUtils.h.
 #include <ATen/Tensor.h>
 #include <ATen/mps/MPSStream.h>
+#include <c10/metal/error.h>
 #include <torch/csrc/autograd/python_variable.h>
 
 static inline id<MTLBuffer> getMTLBufferStorage(const at::TensorBase &t) {
@@ -56,6 +58,32 @@ static id<MTLDevice> get_device(void) {
 static NSHashTable *exposedBuffers(void) {
   static NSHashTable *table = [[NSHashTable weakObjectsHashTable] retain];
   return table;
+}
+
+// Torch counts a failed command buffer as finished and raises only what
+// kernels write to its error buffer, so a failure is written there.
+static void reportFailure(at::mps::MPSStream *stream) {
+  static char watched;
+  id<MTLCommandBuffer> segment = stream->commandBuffer().rootCommandBuffer;
+  if (objc_getAssociatedObject(segment, &watched))
+    return;
+  objc_setAssociatedObject(segment, &watched, @YES,
+                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  id<MTLBuffer> errors = stream->getErrorBuffer();
+  [segment addCompletedHandler:^(id<MTLCommandBuffer> done) {
+    if (done.status != MTLCommandBufferStatusError)
+      return;
+    auto *msgs = static_cast<c10::metal::ErrorMessages *>([errors contents]);
+    if (__atomic_load_n(&msgs->count, __ATOMIC_ACQUIRE) == 0) {
+      c10::metal::ErrorMessage &m = msgs->msg[0];
+      snprintf(m.message, sizeof m.message, "Metal command buffer failed: %s",
+               done.error.localizedDescription.UTF8String);
+      snprintf(m.file, sizeof m.file, "%s", __FILE_NAME__);
+      snprintf(m.func, sizeof m.func, "%s", "reportFailure");
+      m.line = __LINE__;
+    }
+    __atomic_fetch_add(&msgs->count, 1, __ATOMIC_RELEASE);
+  }];
 }
 
 static bool kwargFlag(PyObject *kwargs, const char *name) {
@@ -323,6 +351,7 @@ static void encodeDispatch(MetalKernelObject *self, const LaunchGeometry &geom,
         MTLSize threadsPerGroup = MTLSizeMake(geom.gx, geom.gy, geom.gz);
         [enc dispatchThreadgroups:threadgroups
             threadsPerThreadgroup:threadsPerGroup];
+        reportFailure(stream);
       }
     });
   }

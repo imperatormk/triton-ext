@@ -192,7 +192,7 @@ int main() {
     CHECK_EQ(render(emitMath(c, MathFn::Isnan, f32(), "d", c.var("v"))),
              std::string("bool d = metal::isnan(v);\n"));
     CHECK_EQ(render(emitMath(c, MathFn::Exp, f32(), "d", c.var("v"))),
-             std::string("float d = metal::precise::exp(v);\n"));
+             std::string("float d = metal::exp(v);\n"));
   }
 
   CASE("the binary and ternary math families have spellings");

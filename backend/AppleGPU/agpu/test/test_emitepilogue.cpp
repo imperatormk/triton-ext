@@ -75,7 +75,7 @@ int main() {
     CHECK_EQ(render(epilogueExpr(c, {"math.absf"}, c.var("a"))),
              std::string("metal::fabs(a)"));
     CHECK_EQ(render(epilogueExpr(c, {"math.exp"}, c.var("a"))),
-             std::string("metal::precise::exp(a)"));
+             std::string("metal::exp(a)"));
   }
 
   CASE("fusable is decided by policy");

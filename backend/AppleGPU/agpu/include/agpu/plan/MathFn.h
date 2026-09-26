@@ -62,6 +62,8 @@ enum class MathFn2 {
   Copysign,
   // Integer high-half multiply: the top word of a widening product.
   Mulhi,
+  // Float `/`. The correctly rounded one is `tt.precise_divf`, a DivF.
+  Divide,
   Count,
 };
 
@@ -89,8 +91,10 @@ struct MathSpelling {
   bool returnsBool = false;
 };
 
+// Triton's exp and `/` are approximate: upstream lowers them to ex2.approx and
+// div.full.
 inline constexpr MathSpelling kMathSpellings[] = {
-    {MathFn::Exp, spell(msl::builtin::accuracy::Exp, Accuracy::Exact), true},
+    {MathFn::Exp, spell(msl::builtin::accuracy::Exp, Accuracy::Tolerant), true},
     {MathFn::Exp2, spell(msl::builtin::accuracy::Exp2, Accuracy::Tolerant),
      true},
     {MathFn::Exp10, spell(msl::builtin::accuracy::Exp10, Accuracy::Exact),
@@ -150,6 +154,8 @@ inline constexpr MathSpelling2 kMathSpellings2[] = {
      true},
     {MathFn2::Copysign, msl::builtin::math::Copysign, true},
     {MathFn2::Mulhi, msl::builtin::math::Mulhi, false},
+    {MathFn2::Divide, spell(msl::builtin::accuracy::Divide, Accuracy::Tolerant),
+     true},
 };
 
 // ── one operand ───────────────────────────────────────────────────────────

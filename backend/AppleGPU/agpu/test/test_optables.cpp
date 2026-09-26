@@ -105,11 +105,11 @@ int main() {
     CHECK(checkMath(MathFn::Exp, i32()).isDecline());
   }
 
-  CASE("exp and sqrt both take the precise spelling");
+  CASE("exp takes the tolerant spelling, sqrt the precise one");
   {
     const MathFn e = mathFnOf("math.exp");
     const MathFn s = mathFnOf("math.sqrt");
-    CHECK_EQ(std::string(mathNameOf(e)), std::string("metal::precise::exp"));
+    CHECK_EQ(std::string(mathNameOf(e)), std::string("metal::exp"));
     // metal::sqrt(12.25) answers 3.5000002, one ulp above the exact root.
     CHECK_EQ(std::string(mathNameOf(s)), std::string("metal::precise::sqrt"));
   }

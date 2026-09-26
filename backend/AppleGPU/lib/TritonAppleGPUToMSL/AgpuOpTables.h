@@ -54,18 +54,17 @@ struct EwName {
 };
 
 inline constexpr EwName kEwNames[] = {
-    {"arith.addf", agpu::EwOp::Add},       {"arith.subf", agpu::EwOp::Sub},
-    {"arith.mulf", agpu::EwOp::Mul},       {"arith.divf", agpu::EwOp::DivF},
-    {"tt.precise_divf", agpu::EwOp::DivF},
+    {"arith.addf", agpu::EwOp::Add},   {"arith.subf", agpu::EwOp::Sub},
+    {"arith.mulf", agpu::EwOp::Mul},   {"tt.precise_divf", agpu::EwOp::DivF},
 
-    {"arith.addi", agpu::EwOp::Add},       {"arith.subi", agpu::EwOp::Sub},
-    {"arith.muli", agpu::EwOp::Mul},       {"arith.divsi", agpu::EwOp::DivS},
-    {"arith.divui", agpu::EwOp::DivU},     {"arith.remsi", agpu::EwOp::RemS},
+    {"arith.addi", agpu::EwOp::Add},   {"arith.subi", agpu::EwOp::Sub},
+    {"arith.muli", agpu::EwOp::Mul},   {"arith.divsi", agpu::EwOp::DivS},
+    {"arith.divui", agpu::EwOp::DivU}, {"arith.remsi", agpu::EwOp::RemS},
     {"arith.remui", agpu::EwOp::RemU},
 
-    {"arith.andi", agpu::EwOp::And},       {"arith.ori", agpu::EwOp::Or},
-    {"arith.xori", agpu::EwOp::Xor},       {"arith.shli", agpu::EwOp::Shl},
-    {"arith.shrsi", agpu::EwOp::ShrS},     {"arith.shrui", agpu::EwOp::ShrU},
+    {"arith.andi", agpu::EwOp::And},   {"arith.ori", agpu::EwOp::Or},
+    {"arith.xori", agpu::EwOp::Xor},   {"arith.shli", agpu::EwOp::Shl},
+    {"arith.shrsi", agpu::EwOp::ShrS}, {"arith.shrui", agpu::EwOp::ShrU},
     // `arith.remf` is absent: it lowers to `fmod` in the two-operand math
     // table below.
 };
@@ -157,6 +156,7 @@ inline constexpr Math2Name kMath2Names[] = {
     {"math.copysign", agpu::MathFn2::Copysign, false},
     {"arith.remf", agpu::MathFn2::Fmod, false},
     {"tt.mulhiui", agpu::MathFn2::Mulhi, false, true},
+    {"arith.divf", agpu::MathFn2::Divide, false},
 };
 
 inline const Math2Name *math2For(std::string_view name) {

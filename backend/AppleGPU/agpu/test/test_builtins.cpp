@@ -157,7 +157,8 @@ int main() {
     for (MathFn3 fn : {MathFn3::Fma, MathFn3::Clamp})
       CHECK(owned(mathNameOf(fn)));
 
-    CHECK(mathNameOf(MathFn::Exp) == bi::accuracy::Exp.precise);
+    CHECK(mathNameOf(MathFn::Exp) == bi::accuracy::Exp.fast);
+    CHECK(mathNameOf(MathFn2::Divide) == bi::accuracy::Divide.fast);
     CHECK(mathNameOf(MathFn2::Fmod) == bi::accuracy::Fmod.precise);
     CHECK(mathNameOf(MathFn::Erf) == bi::helper::Erf);
     CHECK(mathNameOf(MathFn2::Min) == bi::math::Min);
@@ -166,16 +167,17 @@ int main() {
   CASE("the transcendentals are precise and the default set is measured");
   {
     for (const MathFn fn :
-         {MathFn::Sin, MathFn::Cos, MathFn::Tanh, MathFn::Exp, MathFn::Exp10,
-          MathFn::Log, MathFn::Log2, MathFn::Log10, MathFn::Sqrt})
+         {MathFn::Sin, MathFn::Cos, MathFn::Tanh, MathFn::Exp10, MathFn::Log,
+          MathFn::Log2, MathFn::Log10, MathFn::Sqrt})
       CHECK(has(mathNameOf(fn), "precise::"));
 
     for (const MathFn2 fn : {MathFn2::Fmod, MathFn2::Pow, MathFn2::Atan2})
       CHECK(has(mathNameOf(fn), "precise::"));
 
-    for (const MathFn fn : {MathFn::Exp2, MathFn::Rsqrt, MathFn::Abs,
-                            MathFn::Floor, MathFn::Ceil})
+    for (const MathFn fn : {MathFn::Exp, MathFn::Exp2, MathFn::Rsqrt,
+                            MathFn::Abs, MathFn::Floor, MathFn::Ceil})
       CHECK(!has(mathNameOf(fn), "precise::"));
+    CHECK(!has(mathNameOf(MathFn2::Divide), "precise::"));
   }
 
   CASE("the fragment type name is built from the table's affixes");

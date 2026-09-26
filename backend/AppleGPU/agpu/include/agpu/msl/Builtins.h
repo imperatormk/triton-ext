@@ -50,6 +50,7 @@ inline constexpr AccuracyPair Log10{"metal::log10", "metal::precise::log10"};
 inline constexpr AccuracyPair Pow{"metal::pow", "metal::precise::pow"};
 inline constexpr AccuracyPair Atan2{"metal::atan2", "metal::precise::atan2"};
 inline constexpr AccuracyPair Fmod{"metal::fmod", "metal::precise::fmod"};
+inline constexpr AccuracyPair Divide{"metal::divide", "metal::precise::divide"};
 // metal::sqrt(12.25) answers 3.5000002, so an exact square does not round trip.
 inline constexpr AccuracyPair Sqrt{"metal::sqrt", "metal::precise::sqrt"};
 inline constexpr AccuracyPair Rsqrt{"metal::rsqrt", "metal::precise::rsqrt"};

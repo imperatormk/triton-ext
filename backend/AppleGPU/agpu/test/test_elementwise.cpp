@@ -172,8 +172,7 @@ int main() {
     CHECK_EQ(std::string(mathNameOf(MathFn::Tanh)),
              std::string("metal::precise::tanh"));
 
-    CHECK_EQ(std::string(mathNameOf(MathFn::Exp)),
-             std::string("metal::precise::exp"));
+    CHECK_EQ(std::string(mathNameOf(MathFn::Exp)), std::string("metal::exp"));
   }
 
   CASE("every MathFn has a spelling");
@@ -265,16 +264,16 @@ int main() {
   CASE("every transcendental is precise and only the measured ones are not");
   {
     for (MathFn fn :
-         {MathFn::Exp, MathFn::Exp10, MathFn::Log, MathFn::Log2, MathFn::Log10,
-          MathFn::Sin, MathFn::Cos, MathFn::Tanh, MathFn::Tan, MathFn::Asin,
-          MathFn::Acos, MathFn::Atan, MathFn::Sinh, MathFn::Cosh, MathFn::Sqrt})
+         {MathFn::Exp10, MathFn::Log, MathFn::Log2, MathFn::Log10, MathFn::Sin,
+          MathFn::Cos, MathFn::Tanh, MathFn::Tan, MathFn::Asin, MathFn::Acos,
+          MathFn::Atan, MathFn::Sinh, MathFn::Cosh, MathFn::Sqrt})
       CHECK(std::string(mathNameOf(fn)).find("precise::") != std::string::npos);
 
     for (MathFn fn : {MathFn::Round, MathFn::RoundEven, MathFn::Trunc})
       CHECK(std::string(mathNameOf(fn)).find("precise::") == std::string::npos);
 
-    for (MathFn fn : {MathFn::Exp2, MathFn::Rsqrt, MathFn::Abs, MathFn::Floor,
-                      MathFn::Ceil})
+    for (MathFn fn : {MathFn::Exp, MathFn::Exp2, MathFn::Rsqrt, MathFn::Abs,
+                      MathFn::Floor, MathFn::Ceil})
       CHECK(std::string(mathNameOf(fn)).find("precise::") == std::string::npos);
 
     CHECK(std::string(mathNameOf(MathFn2::Pow)).find("precise::") !=

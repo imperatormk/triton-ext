@@ -7,6 +7,7 @@ import importlib.util as _importlib_util
 import os as _os
 import re as _re
 import struct as _struct
+import time as _time
 from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -556,12 +557,16 @@ def _mps_do_bench(fn,
     fn()
     torch.mps.synchronize()
 
-    estimate_ms = max(timed_once(), 1e-3)
-    for _ in range(max(1, int(warmup / estimate_ms))):
+    # A repetition costs the flush and two synchronizations, so the budgets
+    # count by that: by the kernel's time a microsecond kernel runs 20000 times.
+    t0 = _time.perf_counter()
+    timed_once()
+    per_rep_ms = (_time.perf_counter() - t0) * 1e3
+    for _ in range(max(1, int(warmup / per_rep_ms))):
         fn()
     torch.mps.synchronize()
 
-    times = [timed_once() for _ in range(max(1, int(rep / estimate_ms)))]
+    times = [timed_once() for _ in range(max(1, int(rep / per_rep_ms)))]
     return _summarize_statistics(times, quantiles, return_mode)
 
 

@@ -12,6 +12,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -223,6 +224,28 @@ int64_t registersPerStage(const llvm::SetVector<Operation *> &ahead) {
   return registersHeld(loaded);
 }
 
+// Whether a dot in `loop` accumulates onto a value an enclosing loop makes on
+// every trip. The split cannot hand over fragments that did not start from
+// that value, so each outer trip would pay the prologue and a second drain to
+// run this loop's few trips ahead.
+bool accumulatesOntoOuterTrip(scf::ForOp loop) {
+  auto outer = loop->getParentOfType<scf::ForOp>();
+  if (!outer)
+    return false;
+  for (tt::DotOp dot : loop.getBody()->getOps<tt::DotOp>()) {
+    auto acc = dyn_cast<BlockArgument>(dot.getC());
+    if (!acc || acc.getOwner() != loop.getBody() ||
+        acc == loop.getInductionVar())
+      continue;
+    Value init = loop.getInitArgs()[acc.getArgNumber() - 1];
+    if (matchPattern(init, m_AnyZeroFloat()) || matchPattern(init, m_Zero()))
+      continue;
+    if (outer->isAncestor(init.getParentRegion()->getParentOp()))
+      return true;
+  }
+  return false;
+}
+
 // Splits `loop`, pipelined with its ahead ops masked by `ahead`, where
 // `ahead` turns false: the first loop runs them unmasked, and the second,
 // the last `last` iterations, has nothing left to load and drops them. A
@@ -294,7 +317,7 @@ struct PrefetchLoadsPass : public impl::PrefetchLoadsBase<PrefetchLoadsPass> {
     for (scf::ForOp loop : loops) {
       // An outer loop would carry its tiles across the whole inner loop.
       const int stages = tt::getNumStagesOrDefault(loop, numStages);
-      if (stages < 2 || tt::isOuterLoop(loop))
+      if (stages < 2 || tt::isOuterLoop(loop) || accumulatesOntoOuterTrip(loop))
         continue;
       const SmallVector<Operation *> loads = dotOperandLoads(loop);
       if (loads.empty())

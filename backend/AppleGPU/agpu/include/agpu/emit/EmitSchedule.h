@@ -63,36 +63,51 @@ inline void sinkIn(msl::Block &body, const msl::PtrSet<msl::Str> &shared) {
     msl::forEachChildBlock(s,
                            [&](msl::Block &child) { sinkIn(child, shared); });
 
-  struct Entry {
-    msl::Stmt *stmt;
-    msl::PtrSet<msl::Str> reads, writes;
-  };
-  std::vector<Entry> es;
-  es.reserve(body.size());
-  for (msl::Stmt *s : body)
-    es.push_back({s, msl::collectReads(msl::Block{s}), namesWritten(s)});
-
-  for (std::size_t i = es.size(); i-- > 0;) {
-    if (!sinkable(es[i].stmt, shared))
-      continue;
-    const msl::Str &name = static_cast<msl::Decl *>(es[i].stmt)->name;
-    std::size_t j = i + 1;
-    bool blocked = false;
-    for (;
-         j < es.size() && !es[j].reads.count(name) && !es[j].writes.count(name);
-         ++j)
-      for (const msl::Str &op : es[i].reads)
-        blocked = blocked || es[j].writes.count(op);
-    if (j == es.size() || j == i + 1 || blocked)
-      continue;
-    Entry e = std::move(es[i]);
-    es.erase(es.begin() + (std::ptrdiff_t)i);
-    es.insert(es.begin() + (std::ptrdiff_t)(j - 1), std::move(e));
+  const std::size_t n = body.size();
+  std::vector<msl::PtrSet<msl::Str>> reads, writes;
+  reads.reserve(n);
+  writes.reserve(n);
+  for (msl::Stmt *s : body) {
+    reads.push_back(msl::collectReads(msl::Block{s}));
+    writes.push_back(namesWritten(s));
   }
 
+  // The order as a circular list over the original positions, `n` its
+  // sentinel, so a move relinks instead of shifting the rest.
+  std::vector<std::size_t> next(n + 1), prev(n + 1);
+  for (std::size_t k = 0; k <= n; ++k) {
+    next[k] = (k + 1) % (n + 1);
+    prev[k] = (k + n) % (n + 1);
+  }
+
+  for (std::size_t i = n; i-- > 0;) {
+    if (!sinkable(body[i], shared))
+      continue;
+    const msl::Str &name = static_cast<msl::Decl *>(body[i])->name;
+    std::size_t j = next[i];
+    bool blocked = false;
+    for (;
+         j != n && !blocked && !reads[j].count(name) && !writes[j].count(name);
+         j = next[j])
+      for (const msl::Str &op : reads[i])
+        blocked = blocked || writes[j].count(op);
+    if (j == n || j == next[i] || blocked)
+      continue;
+    next[prev[i]] = next[i];
+    prev[next[i]] = prev[i];
+    prev[i] = prev[j];
+    next[i] = j;
+    next[prev[j]] = i;
+    prev[j] = i;
+  }
+
+  std::vector<msl::Stmt *> order;
+  order.reserve(n);
+  for (std::size_t k = next[n]; k != n; k = next[k])
+    order.push_back(body[k]);
   body.clear();
-  for (Entry &e : es)
-    body.push_back(e.stmt);
+  for (msl::Stmt *s : order)
+    body.push_back(s);
 }
 
 } // namespace detail

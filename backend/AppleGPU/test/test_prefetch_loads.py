@@ -177,3 +177,47 @@ def test_persistent_mm(num_stages, K, progs):
                              num_warps=4,
                              num_stages=num_stages)
     torch.testing.assert_close(c.cpu(), a @ b, rtol=1e-4, atol=1e-3)
+
+
+# A static first loop's last dot is peeled to straight-line code, so the
+# second loop starts from that dot's result rather than a loop's fragments.
+@triton.jit
+def two_loops(a_ptr, b_ptr, c_ptr, n2, K, N1: tl.constexpr, BM: tl.constexpr,
+              BN: tl.constexpr, BK: tl.constexpr):
+    rm = tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for i in range(N1):
+        a = tl.load(a_ptr + rm[:, None] * K + (i * BK + rk)[None, :])
+        b = tl.load(b_ptr + (i * BK + rk)[:, None] * BN + rn[None, :])
+        acc += tl.dot(a, b, input_precision="ieee")
+    for j in range(n2):
+        k0 = (N1 + j) * BK
+        a = tl.load(a_ptr + rm[:, None] * K + (k0 + rk)[None, :])
+        b = tl.load(b_ptr + (k0 + rk)[:, None] * BN + rn[None, :])
+        acc += tl.dot(a, b, input_precision="ieee")
+    tl.store(c_ptr + rm[:, None] * BN + rn[None, :], acc)
+
+
+@pytest.mark.parametrize("num_stages", [1, 2, 3])
+@pytest.mark.parametrize("n1", [1, 8])
+@pytest.mark.parametrize("n2", [0, 2, 5])
+def test_second_loop_continues_a_peeled_dot(num_stages, n1, n2):
+    BM, BN, BK = 32, 32, 16
+    K = (n1 + n2) * BK
+    a = torch.randn(BM, K)
+    b = torch.randn(K, BN)
+    c = torch.empty(BM, BN, device="mps")
+    two_loops[(1, )](a.to("mps"),
+                     b.to("mps"),
+                     c,
+                     n2,
+                     K,
+                     N1=n1,
+                     BM=BM,
+                     BN=BN,
+                     BK=BK,
+                     num_warps=4,
+                     num_stages=num_stages)
+    torch.testing.assert_close(c.cpu(), a @ b, rtol=1e-4, atol=1e-3)

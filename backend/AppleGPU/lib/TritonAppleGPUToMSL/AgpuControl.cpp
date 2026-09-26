@@ -241,9 +241,13 @@ bool AgpuEmitter::continuesInto(scf::ForOp forOp, const FusedDot &fd) {
 
 bool AgpuEmitter::fragmentsCarryOver(const agpu::Plan &from,
                                      const agpu::Plan &to) {
+  // A nonzero init the fragments did not start from is only added at the
+  // drain, which a handover skips.
+  const bool holdsInit = !from.facts.cInitNonzero || from.facts.cInitContinues;
   const agpu::WarpGrid a = agpu::gridOf(from), b = agpu::gridOf(to);
-  return from.accumulatorsOutlivePass() && to.accumulatorsOutlivePass() &&
-         a.mT == b.mT && a.nT == b.nT && a.numWarps == b.numWarps &&
+  return holdsInit && from.accumulatorsOutlivePass() &&
+         to.accumulatorsOutlivePass() && a.mT == b.mT && a.nT == b.nT &&
+         a.numWarps == b.numWarps &&
          agpu::planWarpProgram(a).sameCover(agpu::planWarpProgram(b)) &&
          agpu::fusedAccNames(to, agpu::DirectNames{}).size() ==
              agpu::fusedAccNames(from, agpu::DirectNames{}).size();

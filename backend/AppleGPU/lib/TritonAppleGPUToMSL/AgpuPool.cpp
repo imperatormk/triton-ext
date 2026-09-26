@@ -222,6 +222,8 @@ PoolNeed AgpuEmitter::poolNeedOf(Operation *op) {
     // threadgroup memory must decline on an unbound source too.
     if (isa<gpu::ConvertLayoutOp>(op) && usedOnlyByDot(op->getResult(0)))
       return need;
+    if (reshapeKeepsRegisters(op))
+      return need;
 
     // The same query emitRedistribute asks, so reservation and addressing
     // agree.

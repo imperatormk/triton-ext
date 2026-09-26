@@ -810,6 +810,8 @@ private:
   const std::vector<std::vector<int64_t>> &elemsPerLaneOf(RankedTensorType rt);
   std::map<const void *, std::vector<std::vector<int64_t>>> elemsPerLane_;
 
+  bool reshapeKeepsRegisters(Operation *op);
+
   // `order[d]` names which source axis becomes result axis d (transpose);
   // empty for a pure layout change.
   agpu::ShufflePlan shuffleFor(RankedTensorType srcTy, RankedTensorType resTy,

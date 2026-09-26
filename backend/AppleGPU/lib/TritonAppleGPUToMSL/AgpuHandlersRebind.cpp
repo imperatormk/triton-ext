@@ -26,6 +26,23 @@ std::optional<int64_t> elemThroughShapeOp(Value res, RankedTensorType srcTy,
 
 } // namespace
 
+// A reshape that may reorder elements, between layouts that each hold every
+// element once in the same number of registers: every thread keeps its own
+// values, a permutation the reorder allows. The reservation pass and the
+// emission pass must agree on this.
+bool AgpuEmitter::reshapeKeepsRegisters(Operation *op) {
+  auto rs = dyn_cast<triton::ReshapeOp>(op);
+  if (!rs || !rs.getAllowReorder())
+    return false;
+  const auto srcTy = cast<RankedTensorType>(rs.getSrc().getType());
+  const auto resTy = cast<RankedTensorType>(rs.getType());
+  const int64_t regs = registerCount(srcTy);
+  const int64_t threads = agpu::threadsFor(numWarps());
+  return regs == registerCount(resTy) &&
+         regs * threads == srcTy.getNumElements() &&
+         regs * threads == resTy.getNumElements();
+}
+
 // Whether a layout change can stay inside the warp (no pool, no barrier). The
 // reservation pass and the emission pass must agree on this.
 agpu::ShufflePlan AgpuEmitter::shuffleFor(RankedTensorType srcTy,
@@ -316,6 +333,21 @@ agpu::Decision AgpuEmitter::emitRebindOp(const agpu::OpView &o) {
       body_.sym.bindRegs(o.results[0], std::move(alias));
       return agpu::Decision::emitted();
     }
+  }
+
+  if (reshapeKeepsRegisters(res.getDefiningOp())) {
+    const int64_t regs = registerCount(srcTy);
+    const Ready ready =
+        readyForCounted(o, 0, 1, regs, "a source register was never bound");
+    if (!ready.ok())
+      return ready.why;
+    agpu::ValueNames names;
+    for (int64_t r = 0; r < regs; ++r) {
+      names.push_back(ready.ops[0].at(r));
+      inheritOffset(o.operands[0], r, o.results[0], r);
+    }
+    body_.sym.bindRegs(o.results[0], std::move(names));
+    return agpu::Decision::emitted();
   }
 
   // A rename needs the layouts to agree for every thread.

@@ -130,12 +130,55 @@ def test_address_table_without_torch():
 
         assert gpu_address(bufs[0]) != bufs[0].data_ptr()
 
-        try:
-            gpu_address(metal_native.wrap(data[0]))
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("a wrapped buffer should have no gpu address")
+        assert 'torch' not in sys.modules
+        print('ok')
+    """)
+    assert out.strip() == "ok"
+
+
+# A host that brings its own memory reaches it through wraps: their addresses
+# are read and written through tables like alloc()'d ones, bound or not.
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs Metal")
+@pytest.mark.skipif(
+    importlib.util.find_spec("triton_apple_backend.metal_native") is None,
+    reason="metal_native is not built")
+def test_wrapped_buffers_behind_addresses_without_torch():
+    out = _run_without_torch("""
+        import mmap
+        import numpy as np
+        import triton
+        import triton.language as tl
+        from triton_apple_backend import metal_native
+        from triton_apple_backend.address import address_table
+
+        @triton.jit
+        def copy_through_tables(src_tab, dst_tab, bound, n, BLOCK: tl.constexpr):
+            e = tl.program_id(0)
+            src = tl.load(src_tab + e).to(tl.pointer_type(tl.float32))
+            dst = tl.load(dst_tab + e).to(tl.pointer_type(tl.float32))
+            for i in range(0, n, BLOCK):
+                offs = i + tl.arange(0, BLOCK)
+                tl.store(dst + offs, tl.load(src + offs))
+
+        count, n = 2, 2 << 20
+
+        def host(fill):
+            m = mmap.mmap(-1, n * 4)
+            a = np.frombuffer(m, dtype=np.float32)
+            a[:] = fill
+            return m, a
+
+        for bind in (False, True):
+            src_host = [host(i + 1) for i in range(count)]
+            dst_host = [host(0) for _ in range(count)]
+            src = [metal_native.wrap(a) for _, a in src_host]
+            dst = [metal_native.wrap(a) for _, a in dst_host]
+            dummy = metal_native.alloc(4, np.dtype('float32'))
+            copy_through_tables[(count,)](address_table(src), address_table(dst),
+                                          src[0] if bind else dummy, n, BLOCK=1024)
+            metal_native.synchronize()
+            for i, (_, a) in enumerate(dst_host):
+                assert np.all(a == i + 1), (bind, i)
 
         assert 'torch' not in sys.modules
         print('ok')

@@ -131,14 +131,6 @@ static PyObject *MetalBuffer_data_ptr(MetalBufferObject *self,
 // The address a shader dereferences: `contents` is the CPU mapping.
 static PyObject *MetalBuffer_gpu_address(MetalBufferObject *self,
                                          PyObject *Py_UNUSED(args)) {
-  // A no-copy view over host memory reads as zeros through a raw address,
-  // whether or not it is also bound.
-  if (self->hasView) {
-    PyErr_SetString(PyExc_RuntimeError,
-                    "a wrapped buffer has no address a kernel can read "
-                    "through; allocate with metal_native.alloc instead");
-    return NULL;
-  }
   [exposedBuffers() addObject:self->buf];
   return PyLong_FromUnsignedLongLong([self->buf gpuAddress]);
 }

@@ -23,9 +23,10 @@ def gpu_address(buffer):
 def address_table(buffers, device=None):
     """An int64 table of addresses, in whichever buffer type `buffers` are.
 
-    The table is built in the type it was given, which is wider than what
-    `gpu_address` answers for: a host holding buffers it wrapped itself has to
-    build the table from addresses a kernel captured.
+    metal_native buffers, alloc()'d or wrapped, give a metal_native table;
+    MPS tensors give a tensor on their device. The table does not keep the
+    buffers alive: every buffer it names must outlive the kernels that read
+    through it.
     """
     if not buffers:
         raise ValueError("address_table needs at least one buffer")

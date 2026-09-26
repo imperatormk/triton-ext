@@ -85,7 +85,7 @@ std::vector<Operation *> armCone(Operation *sel, unsigned arm,
 bool isSimdgroupUniform(ModuleAxisInfoAnalysis &axis, Value cond) {
   auto ty = dyn_cast<RankedTensorType>(cond.getType());
   if (!ty)
-    return true;
+    return false;
   auto blk =
       dyn_cast_or_null<triton::gpu::BlockedEncodingAttr>(ty.getEncoding());
   AxisInfo *ai = axis.getAxisInfo(cond);

@@ -55,6 +55,15 @@ def dot_arm_kernel(a_ptr, o_ptr, N: tl.constexpr):
 
 
 @triton.jit
+def scalar_cond_kernel(x_ptr, s_ptr, o_ptr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + i)
+    a = tl.load(s_ptr + tl.program_id(0))
+    scalar = tl.where(a > 1.0, tl.exp(a), tl.sin(a))
+    tl.store(o_ptr + i, x + scalar)
+
+
+@triton.jit
 def load_then_store_kernel(p_ptr, o_ptr, BLOCK: tl.constexpr):
     i = tl.arange(0, BLOCK)
     x = tl.load(p_ptr + i)
@@ -89,6 +98,16 @@ def test_a_lane_varying_condition_stays_branch_free(num_warps):
     k = alternate_kernel[(4, )](x, out, BLOCK=1024, num_warps=num_warps)
     even = torch.arange(4096, device="mps") % 2 == 0
     torch.testing.assert_close(out, torch.where(even, x.sin(), x.cos()))
+    assert not _predicated(k)
+
+
+def test_a_scalar_condition_stays_branch_free():
+    x = torch.randn(2048, device="mps")
+    s = torch.tensor([2.0, 0.5, 3.0, 0.25], device="mps")
+    out = torch.empty_like(x)
+    k = scalar_cond_kernel[(4, )](x, s, out, BLOCK=512, num_warps=16)
+    scalar = torch.where(s > 1.0, s.exp(), s.sin()).repeat_interleave(512)
+    torch.testing.assert_close(out, x + scalar)
     assert not _predicated(k)
 
 

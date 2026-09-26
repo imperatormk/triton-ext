@@ -111,28 +111,18 @@ struct Access {
 // op's effects are not known.
 template <typename Kind>
 std::optional<SmallVector<Access>> accessesOf(Operation *op) {
-  SmallVector<Access> accesses;
-  const bool unknown =
-      op->walk([&](Operation *nested) {
-          auto effects = dyn_cast<MemoryEffectOpInterface>(nested);
-          if (!effects)
-            return nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>()
-                       ? WalkResult::advance()
-                       : WalkResult::interrupt();
-          SmallVector<MemoryEffects::EffectInstance> instances;
-          effects.getEffects(instances);
-          for (const MemoryEffects::EffectInstance &e : instances) {
-            if (!isa<Kind>(e.getEffect()))
-              continue;
-            Value target = e.getValue();
-            accesses.push_back({e.getResource(), target
-                                                     ? argumentsBehind(target)
-                                                     : std::nullopt});
-          }
-          return WalkResult::advance();
-        }).wasInterrupted();
-  if (unknown)
+  std::optional<SmallVector<MemoryEffects::EffectInstance>> effects =
+      getEffectsRecursively(op);
+  if (!effects)
     return std::nullopt;
+  SmallVector<Access> accesses;
+  for (const MemoryEffects::EffectInstance &e : *effects) {
+    if (!isa<Kind>(e.getEffect()))
+      continue;
+    Value target = e.getValue();
+    accesses.push_back(
+        {e.getResource(), target ? argumentsBehind(target) : std::nullopt});
+  }
   return accesses;
 }
 

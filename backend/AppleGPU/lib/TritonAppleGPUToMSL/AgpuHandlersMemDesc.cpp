@@ -243,23 +243,13 @@ static std::optional<agpu::TileView> staticViewOf(Value md) {
 
 // Whether `op`, or an op nested in it, may write shared memory.
 static bool mayWriteShared(Operation *op) {
-  return op
-      ->walk([](Operation *nested) {
-        auto effects = dyn_cast<MemoryEffectOpInterface>(nested);
-        if (!effects)
-          return nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>()
-                     ? WalkResult::advance()
-                     : WalkResult::interrupt();
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (const MemoryEffects::EffectInstance &e : instances)
-          if (isa<MemoryEffects::Write>(e.getEffect()) &&
-              (isa<gpu::SharedMemory>(e.getResource()) ||
-               isa<SideEffects::DefaultResource>(e.getResource())))
-            return WalkResult::interrupt();
-        return WalkResult::advance();
-      })
-      .wasInterrupted();
+  std::optional<SmallVector<MemoryEffects::EffectInstance>> effects =
+      getEffectsRecursively(op);
+  return !effects || llvm::any_of(*effects, [](const auto &e) {
+    return isa<MemoryEffects::Write>(e.getEffect()) &&
+           (isa<gpu::SharedMemory>(e.getResource()) ||
+            isa<SideEffects::DefaultResource>(e.getResource()));
+  });
 }
 
 Value sharedTileOf(Operation *dot, Value operand) {

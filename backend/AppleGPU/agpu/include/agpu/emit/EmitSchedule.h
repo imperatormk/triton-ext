@@ -17,10 +17,8 @@ namespace agpu {
 
 namespace detail {
 
-// A value whose initialiser reads no memory, calls nothing another lane sees
-// and writes no argument: `sincos`, `modf` and `frexp` return a second value
-// through a reference.
-inline bool sinkable(const msl::Stmt *s) {
+// `sincos`, `modf` and `frexp` return a second value through a reference.
+inline bool sinkable(const msl::Stmt *s, const msl::PtrSet<msl::Str> &shared) {
   if (s->kind != msl::StmtKind::Decl)
     return false;
   const auto *d = static_cast<const msl::Decl *>(s);
@@ -33,6 +31,9 @@ inline bool sinkable(const msl::Stmt *s) {
   bool pure = true;
   msl::visitExprs(init, [&](msl::Expr *e) {
     if (e->kind == msl::ExprKind::Subscript || e->kind == msl::ExprKind::Deref)
+      pure = false;
+    if (e->kind == msl::ExprKind::VarRef &&
+        shared.count(static_cast<msl::VarRef *>(e)->name))
       pure = false;
     if (e->kind == msl::ExprKind::Call) {
       const msl::Str &f = static_cast<msl::Call *>(e)->callee;
@@ -57,16 +58,10 @@ inline msl::PtrSet<msl::Str> namesWritten(msl::Stmt *s) {
   return out;
 }
 
-} // namespace detail
-
-// Walking up from the end, each declaration moves to right before the first
-// statement that now reads or assigns it, unless a statement between writes
-// one of its operands. A chain's heavy links, sunk first, end up below the
-// cheap ones still waiting above them, so those overlap the long latencies.
-inline void sinkToFirstReader(msl::Block &body) {
+inline void sinkIn(msl::Block &body, const msl::PtrSet<msl::Str> &shared) {
   for (msl::Stmt *s : body)
     msl::forEachChildBlock(s,
-                           [](msl::Block &child) { sinkToFirstReader(child); });
+                           [&](msl::Block &child) { sinkIn(child, shared); });
 
   struct Entry {
     msl::Stmt *stmt;
@@ -75,11 +70,10 @@ inline void sinkToFirstReader(msl::Block &body) {
   std::vector<Entry> es;
   es.reserve(body.size());
   for (msl::Stmt *s : body)
-    es.push_back(
-        {s, msl::collectReads(msl::Block{s}), detail::namesWritten(s)});
+    es.push_back({s, msl::collectReads(msl::Block{s}), namesWritten(s)});
 
   for (std::size_t i = es.size(); i-- > 0;) {
-    if (!detail::sinkable(es[i].stmt))
+    if (!sinkable(es[i].stmt, shared))
       continue;
     const msl::Str &name = static_cast<msl::Decl *>(es[i].stmt)->name;
     std::size_t j = i + 1;
@@ -99,6 +93,14 @@ inline void sinkToFirstReader(msl::Block &body) {
   body.clear();
   for (Entry &e : es)
     body.push_back(e.stmt);
+}
+
+} // namespace detail
+
+// Each pure declaration moves to right before its first reader, unless a
+// statement between writes one of its operands.
+inline void sinkToFirstReader(msl::Block &body) {
+  detail::sinkIn(body, msl::threadgroupNames(body));
 }
 
 } // namespace agpu

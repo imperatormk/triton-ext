@@ -53,21 +53,7 @@ inline void pruneDead(msl::Block &body) {
 // declared outside the body). A hard barrier is never dropped but still fences
 // what follows it; one ordering device memory neither goes nor fences.
 inline void pruneRedundantBarriers(msl::Block &body) {
-  msl::PtrSet<msl::Str> shared;
-  msl::visitBlock(
-      body,
-      [&](msl::Stmt *s) {
-        if (s->kind == msl::StmtKind::Decl) {
-          auto *d = static_cast<msl::Decl *>(s);
-          if (d->type.addrSpace() == msl::AddrSpace::Threadgroup)
-            shared.insert(d->name);
-        } else if (s->kind == msl::StmtKind::ArrayDecl) {
-          auto *d = static_cast<msl::ArrayDecl *>(s);
-          if (d->elem.addrSpace() == msl::AddrSpace::Threadgroup)
-            shared.insert(d->name);
-        }
-      },
-      [](msl::Expr *) {});
+  const msl::PtrSet<msl::Str> shared = msl::threadgroupNames(body);
 
   bool hit = false;
   const auto onExpr = [&](msl::Expr *e) {

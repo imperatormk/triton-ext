@@ -82,6 +82,25 @@ inline FuncSize measure(const Block &body) {
   return s;
 }
 
+inline PtrSet<Str> threadgroupNames(const Block &body) {
+  PtrSet<Str> out;
+  visitBlock(
+      body,
+      [&](Stmt *s) {
+        if (s->kind == StmtKind::Decl) {
+          auto *d = static_cast<Decl *>(s);
+          if (d->type.addrSpace() == AddrSpace::Threadgroup)
+            out.insert(d->name);
+        } else if (s->kind == StmtKind::ArrayDecl) {
+          auto *d = static_cast<ArrayDecl *>(s);
+          if (d->elem.addrSpace() == AddrSpace::Threadgroup)
+            out.insert(d->name);
+        }
+      },
+      [](Expr *) {});
+  return out;
+}
+
 // Names read anywhere in the block, at any depth.
 //
 // A plain `v = rhs` does not read v, but `v[i] = rhs`, `*v = rhs` and

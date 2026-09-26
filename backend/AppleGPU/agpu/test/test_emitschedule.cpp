@@ -116,5 +116,18 @@ int main() {
     CHECK(before(render(body), "float l", "buf[i] = 3"));
   }
 
+  CASE("a read of a threadgroup scalar stays ahead of the barrier after it");
+  {
+    msl::Context c;
+    msl::Block body{
+        c.declStmt(f32.inAddrSpace(msl::AddrSpace::Threadgroup), "s"),
+        c.declStmt(f32, "b", c.var("s")),
+        c.hardBarrier(),
+        c.assign(c.var("o"), c.var("b")),
+    };
+    sinkToFirstReader(body);
+    CHECK(before(render(body), "float b", "threadgroup_barrier"));
+  }
+
   return ::agpu_test::report("EmitSchedule");
 }

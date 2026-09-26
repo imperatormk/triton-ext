@@ -80,12 +80,13 @@ std::vector<Operation *> armCone(Operation *sel, unsigned arm,
 }
 
 // A simdgroup covers sizePerThread * threadsPerWarp elements of each dim, so a
-// condition constant over aligned runs that long is the same in every lane.
-// Only then does a branch skip work; a lane-varying one runs both arms.
+// condition constant over aligned runs that long is the same in every lane, as
+// a scalar is. Only then does a branch skip work; a lane-varying one runs both
+// arms.
 bool isSimdgroupUniform(ModuleAxisInfoAnalysis &axis, Value cond) {
   auto ty = dyn_cast<RankedTensorType>(cond.getType());
   if (!ty)
-    return false;
+    return true;
   auto blk =
       dyn_cast_or_null<triton::gpu::BlockedEncodingAttr>(ty.getEncoding());
   AxisInfo *ai = axis.getAxisInfo(cond);
@@ -104,12 +105,17 @@ bool isSimdgroupUniform(ModuleAxisInfoAnalysis &axis, Value cond) {
 } // namespace
 
 // Latest select first, so a select inside an earlier-planned arm stays part of
-// that arm.
+// that arm. A scalar select stays branch-free although its condition is
+// uniform: branching its arms measured no faster and was miscompiled on one
+// GPU generation.
 void AgpuEmitter::planPredicatedArms(Block &block) {
   llvm::DenseSet<Operation *> claimed;
   for (Operation &op : llvm::reverse(block)) {
-    if (nameOf(&op) != "arith.select" || claimed.count(&op) ||
-        !isSimdgroupUniform(axisInfo(), op.getOperand(0)))
+    if (nameOf(&op) != "arith.select" || claimed.count(&op))
+      continue;
+    const Value cond = op.getOperand(0);
+    if (!isa<RankedTensorType>(cond.getType()) ||
+        !isSimdgroupUniform(axisInfo(), cond))
       continue;
     PredicatedArms p;
     for (unsigned arm : {1u, 2u})

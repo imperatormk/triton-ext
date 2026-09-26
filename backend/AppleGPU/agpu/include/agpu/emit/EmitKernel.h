@@ -2,6 +2,7 @@
 #ifndef AGPU_EMIT_KERNEL_H
 #define AGPU_EMIT_KERNEL_H
 
+#include "agpu/emit/EmitSchedule.h"
 #include "agpu/emit/KernelAbi.h"
 #include "agpu/emit/primitives/FragLane.h"
 #include "agpu/msl/Analysis.h"
@@ -170,6 +171,7 @@ inline KernelResult emitKernel(msl::Context &c, const KernelFacts &f,
     emitLaneWarpPrologue(c, body, nm, built.stmts);
     for (msl::Stmt *s : built.stmts)
       body.push_back(s);
+    sinkToFirstReader(body);
     built.stmts = std::move(body);
     return built;
   };

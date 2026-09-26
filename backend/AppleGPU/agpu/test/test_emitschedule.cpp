@@ -71,6 +71,25 @@ int main() {
     CHECK(before(t, "if (p)", "float u"));
   }
 
+  CASE("a masked load's register sinks to the branch that fills it");
+  {
+    msl::Context c;
+    msl::Block fill{
+        c.assign(c.var("l0"), c.subscript(c.var("buf"), c.var("f")))};
+    msl::Block body{
+        c.declStmt(f32, "l0", c.var("k")),
+        c.declStmt(msl::Context::i32(), "e", c.var("i")),
+        c.declStmt(msl::Context::i32(), "f", c.var("e")),
+        c.ifStmt(c.var("p"), std::move(fill)),
+        c.assign(c.var("o"),
+                 c.binary(msl::BinOp::Add, c.var("l0"), c.var("f"))),
+    };
+    sinkToFirstReader(body);
+    const std::string t = render(body);
+    CHECK(before(t, "int e", "float l0"));
+    CHECK(before(t, "float l0", "if (p)"));
+  }
+
   CASE("a call returning a second value through a reference stays put");
   {
     msl::Context c;

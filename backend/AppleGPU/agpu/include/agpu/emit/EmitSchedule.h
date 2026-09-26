@@ -11,9 +11,6 @@
 #include "agpu/msl/Analysis.h"
 #include "agpu/msl/AstWalk.h"
 
-#include <algorithm>
-#include <functional>
-#include <unordered_map>
 #include <vector>
 
 namespace agpu {
@@ -62,63 +59,46 @@ inline msl::PtrSet<msl::Str> namesWritten(msl::Stmt *s) {
 
 } // namespace detail
 
-// The other statements keep their order. Each is preceded by the not yet
-// placed declarations it reads or assigns, each of those by its own, so a
-// declaration lands right before its first reader. A statement that writes a
-// name is also preceded by every earlier declaration reading that name, which
-// must see the value from before the write.
+// Walking up from the end, each declaration moves to right before the first
+// statement that now reads or assigns it, unless a statement between writes
+// one of its operands. A chain's heavy links, sunk first, end up below the
+// cheap ones still waiting above them, so those overlap the long latencies.
 inline void sinkToFirstReader(msl::Block &body) {
   for (msl::Stmt *s : body)
     msl::forEachChildBlock(s,
                            [](msl::Block &child) { sinkToFirstReader(child); });
 
-  const std::size_t n = body.size();
-  std::vector<msl::PtrSet<msl::Str>> reads(n), writes(n);
-  std::vector<bool> moves(n);
-  std::unordered_map<msl::Str, std::size_t> declOf;
-  std::unordered_map<msl::Str, std::vector<std::size_t>> readersOf;
-  for (std::size_t i = 0; i < n; ++i) {
-    reads[i] = msl::collectReads(msl::Block{body[i]});
-    writes[i] = detail::namesWritten(body[i]);
-    moves[i] = detail::sinkable(body[i]);
-    if (!moves[i])
+  struct Entry {
+    msl::Stmt *stmt;
+    msl::PtrSet<msl::Str> reads, writes;
+  };
+  std::vector<Entry> es;
+  es.reserve(body.size());
+  for (msl::Stmt *s : body)
+    es.push_back(
+        {s, msl::collectReads(msl::Block{s}), detail::namesWritten(s)});
+
+  for (std::size_t i = es.size(); i-- > 0;) {
+    if (!detail::sinkable(es[i].stmt))
       continue;
-    declOf[static_cast<msl::Decl *>(body[i])->name] = i;
-    for (const msl::Str &op : reads[i])
-      readersOf[op].push_back(i);
+    const msl::Str &name = static_cast<msl::Decl *>(es[i].stmt)->name;
+    std::size_t j = i + 1;
+    bool blocked = false;
+    for (;
+         j < es.size() && !es[j].reads.count(name) && !es[j].writes.count(name);
+         ++j)
+      for (const msl::Str &op : es[i].reads)
+        blocked = blocked || es[j].writes.count(op);
+    if (j == es.size() || j == i + 1 || blocked)
+      continue;
+    Entry e = std::move(es[i]);
+    es.erase(es.begin() + (std::ptrdiff_t)i);
+    es.insert(es.begin() + (std::ptrdiff_t)(j - 1), std::move(e));
   }
 
-  msl::Block out;
-  out.reserve(n);
-  std::vector<bool> placed(n, false);
-  const std::function<void(std::size_t)> place = [&](std::size_t x) {
-    placed[x] = true;
-    std::vector<std::size_t> first;
-    const auto need = [&](std::size_t d) {
-      if (d < x && moves[d] && !placed[d])
-        first.push_back(d);
-    };
-    for (const msl::PtrSet<msl::Str> *names : {&reads[x], &writes[x]})
-      for (const msl::Str &v : *names)
-        if (const auto it = declOf.find(v); it != declOf.end())
-          need(it->second);
-    for (const msl::Str &v : writes[x])
-      if (const auto it = readersOf.find(v); it != readersOf.end())
-        for (std::size_t d : it->second)
-          need(d);
-    std::sort(first.begin(), first.end());
-    for (std::size_t d : first)
-      if (!placed[d])
-        place(d);
-    out.push_back(body[x]);
-  };
-  for (std::size_t i = 0; i < n; ++i)
-    if (!moves[i])
-      place(i);
-  for (std::size_t i = 0; i < n; ++i)
-    if (!placed[i])
-      place(i);
-  body = std::move(out);
+  body.clear();
+  for (Entry &e : es)
+    body.push_back(e.stmt);
 }
 
 } // namespace agpu

@@ -4,6 +4,7 @@
 #include "agpu/core/Names.h"
 #include "agpu/emit/EmitPrune.h"
 #include "agpu/msl/Printer.h"
+#include "agpu/msl/ValueNumber.h"
 #include "agpu/plan/Vestigial.h"
 
 #include "llvm/ADT/ScopeExit.h"
@@ -356,6 +357,7 @@ agpu::BuiltBody AgpuEmitter::buildKernelBody(Region &region) {
   for (am::Stmt *s : body)
     out.push_back(s);
 
+  am::reuseEqualValues(out);
   // A convert_layout absorbed by a later dot leaves its scatter-barrier-gather
   // emitted but unread. Metal drops the dead registers but not the barriers.
   agpu::pruneDead(out);

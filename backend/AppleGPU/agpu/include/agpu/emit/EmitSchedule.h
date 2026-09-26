@@ -17,7 +17,6 @@ namespace agpu {
 
 namespace detail {
 
-// `sincos`, `modf` and `frexp` return a second value through a reference.
 inline bool sinkable(const msl::Stmt *s, const msl::PtrSet<msl::Str> &shared) {
   if (s->kind != msl::StmtKind::Decl)
     return false;
@@ -35,13 +34,10 @@ inline bool sinkable(const msl::Stmt *s, const msl::PtrSet<msl::Str> &shared) {
     if (e->kind == msl::ExprKind::VarRef &&
         shared.count(static_cast<msl::VarRef *>(e)->name))
       pure = false;
-    if (e->kind == msl::ExprKind::Call) {
-      const msl::Str &f = static_cast<msl::Call *>(e)->callee;
-      for (const char *impure :
-           {"simd_", "quad_", "atomic", "barrier", "sincos", "modf", "frexp"})
-        if (f.find(impure) != msl::Str::npos)
-          pure = false;
-    }
+    if (e->kind == msl::ExprKind::Call &&
+        msl::callEffect(static_cast<msl::Call *>(e)->callee) !=
+            msl::CallEffect::None)
+      pure = false;
   });
   return pure;
 }

@@ -158,6 +158,19 @@ inline bool hasSideEffect(const Expr *e) {
   return impure;
 }
 
+// Besides computing from its arguments: reads other lanes, or changes state
+// (atomic, barrier, result written through a reference argument).
+enum class CallEffect { None, Lanes, State };
+inline CallEffect callEffect(const Str &callee) {
+  for (const char *s : {"atomic", "barrier", "sincos", "modf", "frexp"})
+    if (callee.find(s) != Str::npos)
+      return CallEffect::State;
+  for (const char *s : {"simd_", "simdgroup_", "quad_"})
+    if (callee.find(s) != Str::npos)
+      return CallEffect::Lanes;
+  return CallEffect::None;
+}
+
 // The initialiser of a declaration, or null for one without.
 inline const Expr *initOf(const Stmt *s) {
   if (s->kind == StmtKind::Decl)

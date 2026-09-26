@@ -738,6 +738,7 @@ private:
   agpu::BuiltBody buildKernelBody(Region &region);
 
   agpu::PtrDims ptrDimsOf(Value ptr, const agpu::ElemType &elem);
+  std::vector<int64_t> constancyOf(Value v);
 
   std::vector<agpu::LayoutBasis> layoutDimsOf(Value v);
 

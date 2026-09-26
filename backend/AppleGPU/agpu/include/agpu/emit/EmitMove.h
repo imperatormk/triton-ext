@@ -136,8 +136,12 @@ inline void emitGuardedRun(msl::Context &c, msl::Block &body,
   bool anyDead = false;
   for (int64_t i = 0; i < p.width(); ++i)
     anyDead = anyDead || p.guards.deadAt(base + i);
+  if (p.runGuarded && anyDead)
+    return;
   if (p.vectorised() && !anyDead)
-    if (msl::Expr *g = sharedRunGuard(site, base, p.width())) {
+    if (msl::Expr *g = p.runGuarded && site.guard
+                           ? site.guard(base)
+                           : sharedRunGuard(site, base, p.width())) {
       msl::Block run;
       if (f.isStore)
         emitStoreRun(c, run, p, site, elem, base);
@@ -184,7 +188,7 @@ inline void emitMove(msl::Context &c, msl::Block &body, const MoveFacts &f,
   msl::Expr *allTrue = nullptr;
   msl::SmallVec<msl::Expr *, 8> seen;
   msl::SmallVec<msl::Expr *, 8> pending;
-  for (int64_t r = 0; r < f.regCount; ++r) {
+  for (int64_t r = 0; r < f.regCount; r += p.runGuarded ? p.width() : 1) {
     if (msl::Expr *g = site.guard ? site.guard(r) : nullptr)
       pending.push_back(g);
     while (!pending.empty()) {

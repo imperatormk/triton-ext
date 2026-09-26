@@ -28,6 +28,18 @@ agpu::PtrDims AgpuEmitter::ptrDimsOf(Value ptr, const agpu::ElemType &elem) {
   return out;
 }
 
+std::vector<int64_t> AgpuEmitter::constancyOf(Value v) {
+  std::vector<int64_t> out;
+  const auto rt =
+      v ? dyn_cast<RankedTensorType>(v.getType()) : RankedTensorType();
+  AxisInfo *ai = rt ? axisInfo().getAxisInfo(v) : nullptr;
+  if (!ai)
+    return out;
+  for (int d = 0; d < rt.getRank(); ++d)
+    out.push_back(ai->getConstancy(d));
+  return out;
+}
+
 // Sets `bases` and `runtime`; leaves them empty for a value with no layout.
 std::vector<agpu::LayoutBasis> AgpuEmitter::layoutDimsOf(Value v) {
   const auto rt =
@@ -177,9 +189,11 @@ agpu::Decision AgpuEmitter::emitLoad(const agpu::OpView &o,
                   &ready.elem, ready.regs, /*isStore=*/false);
   f.hasMask = o.operands.size() > maskIndex;
   f.hasOther = hasOther;
-  if (f.hasMask)
+  if (f.hasMask) {
     f.bound = maskBoundOf(mlirValueOf(o.operands[maskIndex]),
                           mlirValueOf(o.results[0]));
+    f.maskConstancy = constancyOf(mlirValueOf(o.operands[maskIndex]));
+  }
 
   agpu::MoveSite site;
   // When the pointer's registers are one affine family, materialise one base
@@ -268,8 +282,10 @@ agpu::Decision AgpuEmitter::emitStore(const agpu::OpView &o,
   agpu::MoveFacts f = moveFactsOf(ptrV, ptrV, ve, regs, /*isStore=*/true);
   f.hasMask = o.operands.size() > maskIndex || elected != nullptr;
   f.guardHasRuntimeTerm = elected != nullptr;
-  if (o.operands.size() > maskIndex)
+  if (o.operands.size() > maskIndex) {
     f.bound = maskBoundOf(mlirValueOf(o.operands[maskIndex]), ptrV);
+    f.maskConstancy = constancyOf(mlirValueOf(o.operands[maskIndex]));
+  }
 
   agpu::MoveSite site;
   site.elem = [this, ptr](int64_t r) { return addressAt(ptr, r); };

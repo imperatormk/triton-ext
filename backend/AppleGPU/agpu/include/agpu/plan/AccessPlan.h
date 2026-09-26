@@ -42,6 +42,9 @@ struct MoveFacts {
 
   MaskBound bound;
 
+  // Per dimension, the size of the aligned groups the mask is constant over.
+  std::vector<int64_t> maskConstancy;
+
   const char *where() const { return isStore ? "emitStore" : "emitLoad"; }
 };
 
@@ -138,6 +141,9 @@ inline MaskedInit initFor(const MoveFacts &f) {
 struct MovePlan {
   RunPlan runs;
   bool peel = false;
+  // Every run lies in one group the mask is constant over, so the guard of
+  // its first register stands for the run.
+  bool runGuarded = false;
   MaskedInit init = MaskedInit::None;
   VecElem elem = VecElem::Unsupported;
 
@@ -159,6 +165,11 @@ inline MovePlan planMove(const MoveFacts &f) {
   p.runs = planRuns(f, p.access);
   p.guards = planMaskGuards(f);
   p.peel = peelsFastPath(f, p.guards);
+  // Condition (c) of the run plan starts every run on a multiple of its width.
+  const int d = p.access.dim;
+  p.runGuarded = f.hasMask && p.vectorised() && d >= 0 &&
+                 d < (int)f.maskConstancy.size() &&
+                 f.maskConstancy[(std::size_t)d] % p.width() == 0;
   p.init = initFor(f);
   p.coherent = f.coherent;
   return p;

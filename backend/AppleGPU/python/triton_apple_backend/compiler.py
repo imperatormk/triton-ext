@@ -19,6 +19,7 @@ from triton_apple_backend.hw_constants import TARGET as _TARGET
 from triton_apple_backend.hw_constants import target_arch as _target_arch
 from triton_apple_backend import PLUGIN_LIBRARY
 from triton_apple_backend.hw_constants import WARP_SIZE as _WARP_SIZE
+from triton_apple_backend.hw_constants import MAX_PIPELINE_STAGES as _MAX_PIPELINE_STAGES
 
 _plugin = passes.plugin
 
@@ -148,6 +149,10 @@ class MetalBackend(BaseBackend):
             k: opts[k]
             for k in MetalOptions.__dataclass_fields__ if k in opts
         }
+        # A deeper request compiles to the capped kernel, so it shares that
+        # kernel's cache entry instead of compiling it again.
+        if "num_stages" in args:
+            args["num_stages"] = min(args["num_stages"], _MAX_PIPELINE_STAGES)
         return MetalOptions(**args)
 
     def pack_metadata(self, metadata):

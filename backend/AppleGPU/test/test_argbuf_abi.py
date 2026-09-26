@@ -99,18 +99,19 @@ def test_fp64_occupies_eight_bytes():
     assert total == 9
 
 
-def _header_constant(name: str) -> int:
+def _header_constant(header: str, name: str) -> int:
     hdr = (Path(__file__).resolve().parents[1] / "agpu" / "include" / "agpu" /
-           "core" / "Units.h").read_text()
+           header).read_text()
     m = re.search(rf"{name}\s*=\s*(\d+)", hdr)
-    assert m, f"{name} not found in Units.h"
+    assert m, f"{name} not found in {header}"
     return int(m.group(1))
 
 
-@pytest.mark.parametrize("py_name,cxx_name", [
-    ("WARP_SIZE", "kWarpSize"),
-    ("SG_FRAG_DIM", "kSgFragDim"),
-    ("TG_BUDGET_BYTES", "kTGResidentBudgetBytes"),
+@pytest.mark.parametrize("py_name,header,cxx_name", [
+    ("WARP_SIZE", "core/Units.h", "kWarpSize"),
+    ("SG_FRAG_DIM", "core/Units.h", "kSgFragDim"),
+    ("TG_BUDGET_BYTES", "core/Units.h", "kTGResidentBudgetBytes"),
+    ("MAX_PIPELINE_STAGES", "cost/Pipeline.h", "kMaxPipelineStages"),
 ])
-def test_hardware_constants_match_the_cxx_owner(py_name, cxx_name):
-    assert getattr(hw_constants, py_name) == _header_constant(cxx_name)
+def test_hardware_constants_match_the_cxx_owner(py_name, header, cxx_name):
+    assert getattr(hw_constants, py_name) == _header_constant(header, cxx_name)

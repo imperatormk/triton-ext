@@ -61,6 +61,20 @@ def test_mm(num_stages, K, dtype):
                                atol=tol * max(K, 1)**0.5)
 
 
+def test_stages_past_the_cap_share_one_compile():
+    M = N = K = 64
+    a = torch.randn(M, K, device="mps")
+    b = torch.randn(K, N, device="mps")
+    c = torch.empty(M, N, device="mps")
+    hashes = {
+        ns: mm[(2, 2)](a, b, c, M, N, K, BM=32, BN=32, BK=16,
+                       num_stages=ns).hash
+        for ns in (1, 2, 3, 5)
+    }
+    assert hashes[2] == hashes[3] == hashes[5]
+    assert hashes[1] != hashes[2]
+
+
 @pytest.mark.parametrize("num_warps", [4, 8])
 def test_mm_tile_too_big_to_keep_c(num_warps):
     # The first loop's C does not fit beside A and B, so its dot walks panels

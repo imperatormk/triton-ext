@@ -1,4 +1,5 @@
 // RUN: apple_opt.py %s prefetch_loads=2 | %filecheck %s
+// RUN: apple_opt.py %s prefetch_loads=5 | %filecheck %s
 // RUN: apple_opt.py %s prefetch_loads | %filecheck %s --check-prefix=OFF
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>

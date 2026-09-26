@@ -1,11 +1,13 @@
 // A K loop's dot operands are loaded, staged and multiplied in one iteration,
-// so every iteration waits on its own loads. Loading them num_stages - 1
-// iterations ahead into loop-carried registers hides that wait behind the dots
-// of the iterations in between. The expansion itself is upstream's pipeliner;
-// this pass decides which ops run ahead and splits off the last iterations,
-// which have nothing left to load.
+// so every iteration waits on its own loads. Loading them ahead into
+// loop-carried registers hides that wait behind the dots of the iterations in
+// between. num_stages - 1 iterations ahead is a ceiling;
+// `agpu::cost::pipelineStages` decides how far to go. The expansion itself is
+// upstream's pipeliner; this pass decides which ops run ahead and splits off
+// the last iterations, which have nothing left to load.
 
 #include "TritonAppleGPUTransforms/Passes.h"
+#include "agpu/cost/Pipeline.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -199,6 +201,28 @@ llvm::SetVector<Operation *> aheadSet(scf::ForOp loop,
   return ahead;
 }
 
+// The registers a thread holds for `values`; pointers take 64 bits.
+int64_t registersHeld(ValueRange values) {
+  int64_t bits = 0;
+  for (Value v : values)
+    if (auto ty = dyn_cast<RankedTensorType>(v.getType())) {
+      const Type elem = ty.getElementType();
+      bits += int64_t(triton::gpu::getTotalElemsPerThread(ty)) *
+              (elem.isIntOrFloat() ? elem.getIntOrFloatBitWidth() : 64);
+    }
+  return (bits + 31) / 32;
+}
+
+// One iteration's worth of the loads in `ahead`: what each stage past the
+// first keeps in flight.
+int64_t registersPerStage(const llvm::SetVector<Operation *> &ahead) {
+  SmallVector<Value> loaded;
+  for (Operation *op : ahead)
+    if (isa<tt::LoadOp>(op))
+      loaded.push_back(op->getResult(0));
+  return registersHeld(loaded);
+}
+
 // Splits `loop`, pipelined with its ahead ops masked by `ahead`, where
 // `ahead` turns false: the first loop runs them unmasked, and the second,
 // the last `last` iterations, has nothing left to load and drops them. A
@@ -278,10 +302,17 @@ struct PrefetchLoadsPass : public impl::PrefetchLoadsBase<PrefetchLoadsPass> {
       const llvm::SetVector<Operation *> ahead = aheadSet(loop, loads);
       if (ahead.empty() || aheadReadsMayBeWritten(loop, ahead))
         continue;
+      // Every tensor the loop carries is live across a trip, next to the
+      // slice it loads.
+      const int64_t perStage = registersPerStage(ahead);
+      const int64_t depth = agpu::cost::pipelineStages(
+          stages, perStage, registersHeld(loop.getRegionIterArgs()) + perStage);
+      if (depth < 2)
+        continue;
 
       // Ahead ops first, so the loads issue before this iteration's dots.
       std::vector<std::pair<Operation *, unsigned>> schedule;
-      const unsigned last = stages - 1;
+      const unsigned last = depth - 1;
       for (Operation &op : loop.getBody()->without_terminator())
         if (ahead.contains(&op))
           schedule.emplace_back(&op, 0);

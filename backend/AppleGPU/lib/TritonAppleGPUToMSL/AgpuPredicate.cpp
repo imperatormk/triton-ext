@@ -173,8 +173,10 @@ agpu::Decision AgpuEmitter::emitPredicatedSelect(Operation *sel) {
       yielded = y.value;
     }
 
+    // Assigned only when the arm runs, so defined for when it does not.
     const agpu::CarriedValue result = carriedFresh(root);
-    agpu::declareResults(c, *cur_, agpu::Carried{result});
+    for (const am::Str &r : result.regs)
+      cur_->push_back(agpu::poisonDecl(c, r, result.elem));
     agpu::emitYield(c, arm, agpu::Carried{result}, agpu::Carried{yielded});
     am::Expr *pred = nullptr;
     for (const am::Str &s : conds) {

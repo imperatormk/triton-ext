@@ -176,6 +176,17 @@ int main() {
     CHECK(!fusedPadWorthCarrying(Bytes(9216), Bytes(8192), kBudget, 32));
   }
 
+  CASE("a fused pad is kept where the register file may cap the gain");
+  {
+    CHECK(cost::tgResidency(9200) < cost::tgResidency(8192));
+    CHECK_EQ(cost::certainResidency(9200, 64),
+             cost::certainResidency(8192, 64));
+    CHECK(fusedPadWorthCarrying(Bytes(9200), Bytes(8192), kBudget, 64));
+    CHECK(fusedPadWorthCarrying(Bytes(11248), Bytes(10240), kBudget, 128));
+    CHECK(fusedPadWorthCarrying(Bytes(21488), Bytes(20480), kBudget, 256));
+    CHECK(!fusedPadWorthCarrying(Bytes(20736), Bytes(20480), kBudget, 128));
+  }
+
   CASE("a fused C that fits only unpadded drops its pad but keeps the fusion "
        "and the operands' pad");
   {

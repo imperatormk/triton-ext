@@ -289,15 +289,18 @@ inline int64_t panelTiles(int64_t M, int64_t N, int64_t K, const Panel &p) {
 
 // Whether a fused dot's staged operands carry the bank pad. Dropped when only
 // the plain pitch fits the overlay, or when the pad costs resident
-// threadgroups. Where neither pitch fits, answers padded, which is what the
-// strategy was sized against.
+// threadgroups at every register count the kernel may compile to: the pad's
+// conflict-free reads are certain, a residency gain the register file may cap
+// is not. Where neither pitch fits, answers padded, which is what the strategy
+// was sized against.
 inline bool fusedPadWorthCarrying(Bytes padded, Bytes plain, Bytes budget,
                                   int64_t threadsPerTG) {
   if (padded > budget)
     return !(plain <= budget);
   if (plain > budget)
     return true;
-  return !cost::losesResidency(plain.count(), padded.count(), threadsPerTG);
+  return !cost::certainlyGainsResidency(padded.count(), plain.count(),
+                                        threadsPerTG);
 }
 
 // The pad, unless it costs whole tiles: an extra tile is a full restage plus

@@ -96,7 +96,7 @@ inline constexpr bool losesResidency(int64_t from, int64_t to,
   return gainsResidency(to, from, threadsPerTG, band);
 }
 
-// For a choice whose downside is a spill rather than a slower read.
+// For a choice whose downside is certain: a spill, or a bank pad given up.
 inline constexpr bool certainlyGainsResidency(int64_t from, int64_t to,
                                               int64_t threadsPerTG,
                                               RegisterBand band = {}) {

@@ -58,28 +58,30 @@ int main() {
     CHECK(planPoll(pollOf(32)).load == PollLoad::AtomicWord);
   }
 
-  CASE("a 64-bit flag reads through a volatile deref");
+  CASE("a 64-bit flag reads its two words");
   {
     PollPlan p = planPoll(pollOf(64));
     CHECK(p.usable);
-    CHECK(p.load == PollLoad::VolatileWide);
+    CHECK(p.load == PollLoad::WideHalves);
     CHECK(p.word == msl::Scalar::U64);
 
     msl::Context c;
     msl::Block body;
     CHECK(!emitOne(c, body, p, nm).empty());
     const std::string out = render(body);
-    CHECK_LACKS(out, "atomic_load_explicit");
-    CHECK_HAS(out, "*flagp");
-    CHECK(out.find("while (") < out.find("*flagp"));
+    CHECK_EQ(countOf(out, "atomic_compare_exchange_weak_explicit"), 2);
+    CHECK_HAS(out, "uint2(");
+    CHECK(out.find("while (") < out.find("atomic_compare_exchange"));
   }
 
-  CASE("the 64-bit flag pointer is volatile, in device space");
+  CASE("every flag pointer is a 32-bit atomic word");
   {
-    std::ostringstream os;
-    msl::Printer pr(os);
-    pr.printType(pollPtrType(planPoll(pollOf(64))));
-    CHECK_EQ(os.str(), "volatile device ulong *");
+    for (unsigned bits : {32u, 64u}) {
+      std::ostringstream os;
+      msl::Printer pr(os);
+      pr.printType(pollPtrType(planPoll(pollOf(bits))));
+      CHECK_EQ(os.str(), "device atomic_uint *");
+    }
   }
 
   CASE("a width with no atomic load declines");
@@ -103,7 +105,7 @@ int main() {
     CHECK(out.find("if (tid.x == 0)") < out.find("while ("));
   }
 
-  CASE("the load is re-issued on every iteration");
+  CASE("the read is re-issued on every iteration");
   {
     msl::Context c;
     msl::Block body;
@@ -111,19 +113,21 @@ int main() {
     const std::string out = render(body);
     const std::size_t loop = out.find("while (");
     CHECK(loop != std::string::npos);
-    const std::size_t load = out.find("atomic_load_explicit");
-    CHECK(load > loop);
-    CHECK(out.find("while (") != std::string::npos);
+    const std::size_t read = out.find("atomic_compare_exchange_weak_explicit");
+    CHECK(read != std::string::npos);
+    CHECK(read > loop);
   }
 
-  CASE("the load is relaxed, because the barrier carries the ordering");
+  CASE("the read is a relaxed compare-exchange, with no fence in the election");
   {
     msl::Context c;
     msl::Block body;
     emitOne(c, body, planPoll(pollOf(32)), nm);
     const std::string out = render(body);
+    CHECK_LACKS(out, "atomic_load_explicit");
     CHECK_HAS(out, "memory_order_relaxed");
     CHECK_LACKS(out, "memory_order_seq_cst");
+    CHECK_LACKS(out, "atomic_thread_fence");
   }
 
   CASE("the barrier after the poll is hard");
@@ -135,13 +139,16 @@ int main() {
     CHECK_EQ(countOf(render(body), "threadgroup_barrier"), 2);
   }
 
-  CASE("an acquire poll barriers at device scope");
+  CASE("an acquire poll barriers at device scope, then every thread fences");
   {
     msl::Context c;
     msl::Block body;
     emitOne(c, body, planPoll(pollOf(32, /*timeout=*/false, /*acquire=*/true)),
             nm);
-    CHECK_HAS(render(body), "mem_device");
+    const std::string out = render(body);
+    CHECK_HAS(out, "mem_device");
+    CHECK_EQ(countOf(out, "atomic_thread_fence"), 1);
+    CHECK(out.rfind("threadgroup_barrier") < out.find("atomic_thread_fence"));
   }
 
   CASE("a timeout poll is planned whatever the budget, since one load is the "
@@ -233,7 +240,7 @@ int main() {
     const std::string out = render(body);
     CHECK_HAS(out, "p0");
     CHECK_HAS(out, "p1");
-    CHECK_EQ(countOf(out, "atomic_load_explicit"), 2);
+    CHECK_EQ(countOf(out, "atomic_compare_exchange_weak_explicit"), 2);
   }
 
   CASE("a tensor poll barriers once, not once per element");
@@ -260,7 +267,7 @@ int main() {
                        {"p0", "p1"}, {"w0", "w1"}, replicas, ThreadElection{});
     CHECK_EQ(outs.size(), 2u);
     CHECK_EQ(outs[0], outs[1]);
-    CHECK_EQ(countOf(render(body), "atomic_load_explicit"), 1);
+    CHECK_EQ(countOf(render(body), "atomic_compare_exchange_weak_explicit"), 1);
   }
 
   return ::agpu_test::report("Poll");

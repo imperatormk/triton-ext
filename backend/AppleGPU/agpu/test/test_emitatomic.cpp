@@ -86,14 +86,15 @@ int main() {
     CHECK(out.find("threadgroup_barrier", op) != std::string::npos);
   }
 
-  CASE("the barrier carries device scope and no thread fence is emitted");
+  CASE("an acquire barriers at device scope, then every thread fences");
   {
     msl::Context c;
     msl::Block body;
     emitAtomic(c, body, planAtomic(intAdd(), MemOrder::Acquire), "p", "v", nm);
     const std::string out = render(body);
     CHECK_HAS(out, "mem_device");
-    CHECK_LACKS(out, "atomic_thread_fence");
+    CHECK_EQ(countOf(out, "atomic_thread_fence"), 1);
+    CHECK(out.find("atomic_fetch_add") < out.find("atomic_thread_fence"));
   }
 
   CASE("both barriers sit outside the election guard");
@@ -278,7 +279,7 @@ int main() {
       CHECK(!n.empty());
   }
 
-  CASE("a float max goes through the CAS helper, unfenced");
+  CASE("a float max goes through the CAS helper, fenced around it");
   {
     msl::Context c;
     msl::Block body;
@@ -290,7 +291,9 @@ int main() {
     const std::string out = render(body);
     CHECK_HAS(out, "__agpu_atomic_rmw_f32");
     CHECK_LACKS(out, "atomic_fetch");
-    CHECK_EQ(countOf(out, "atomic_thread_fence"), 0);
+    CHECK_EQ(countOf(out, "atomic_thread_fence"), 2);
+    CHECK(out.find("atomic_thread_fence") < out.find("__agpu_atomic_rmw_f32"));
+    CHECK(out.rfind("atomic_thread_fence") > out.find("__agpu_atomic_rmw_f32"));
   }
 
   CASE("a 16-bit float goes through the packed helper");

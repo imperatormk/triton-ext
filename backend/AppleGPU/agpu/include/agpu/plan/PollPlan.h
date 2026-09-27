@@ -3,9 +3,7 @@
 // A cross-threadgroup handoff is a store, a device barrier and a load. The
 // load side is a poll: spin on a flag until the producer's value appears.
 //
-// One thread spins. The load must be atomic and
-// the pointer volatile or the compiler hoists it. The rest of the
-// threadgroup waits on a hard barrier.
+// One thread spins. The rest of the threadgroup waits on a hard barrier.
 #ifndef AGPU_POLL_PLAN_H
 #define AGPU_POLL_PLAN_H
 
@@ -27,11 +25,10 @@ struct PollFacts {
   bool hasTimeout = false;
 };
 
-// Metal's atomic loads are 32-bit only. AtomicWord is
-// `atomic_load_explicit` on the flag's own word; PackedHalf reads a 16-bit
-// flag out of its containing 32-bit word; VolatileWide derefs a volatile
-// device pointer, an aligned 64-bit load being single-copy on Apple GPUs.
-enum class PollLoad { AtomicWord, PackedHalf, VolatileWide };
+// Metal's atomics are 32-bit only. AtomicWord reads the flag's own word;
+// PackedHalf reads a 16-bit flag out of its containing 32-bit word;
+// WideHalves reads a 64-bit flag as its two 32-bit words.
+enum class PollLoad { AtomicWord, PackedHalf, WideHalves };
 
 // How the poll is performed.
 struct PollPlan {
@@ -65,7 +62,7 @@ inline PollPlan planPoll(const PollFacts &f) {
     break;
   case WordAccess::Wide64:
     p.word = msl::Scalar::U64;
-    p.load = PollLoad::VolatileWide;
+    p.load = PollLoad::WideHalves;
     break;
   case WordAccess::Unsupported:
     return p;

@@ -1,11 +1,11 @@
 // EmitPoll.h - the spin-wait, emitted.
 //
-// One thread polls each element; others wait at a hard barrier. The load must
-// be volatile or atomic or the compiler hoists it out of the loop.
+// One thread polls each element; others wait at a hard barrier.
 #ifndef AGPU_EMIT_POLL_H
 #define AGPU_EMIT_POLL_H
 
 #include "agpu/core/Names.h"
+#include "agpu/emit/EmitAtomic.h"
 #include "agpu/emit/EmitElection.h"
 #include "agpu/msl/Builtins.h"
 #include "agpu/msl/Context.h"
@@ -23,42 +23,47 @@ struct PollNames : ThreadNames {
   msl::Str flag = "seen";     // the shared answer, for the timeout form
 };
 
-// The flag's current value, as an expression that re-reads on evaluation.
-// Relaxed; ordering comes from the barrier that follows.
-// `isHigh` selects a packed-16 flag's half; empty means the whole word.
-inline msl::Expr *pollLoad(msl::Context &c, const PollPlan &p,
-                           const msl::Str &ptr, const msl::Str &isHigh) {
-  auto word = [&] {
-    return c.call(msl::builtin::atomic::Load,
-                  {c.var(ptr), c.var(msl::builtin::order::Relaxed)});
+// Reads the flag into `body` and returns its current value. A relaxed load
+// can be served from a cache another threadgroup's store never reached; a
+// compare-exchange expecting and writing 0 changes nothing and reads the
+// location itself. `isHigh` selects a packed-16 flag's half; empty means the
+// whole word.
+inline msl::Expr *emitPollRead(msl::Context &c, msl::Block &body,
+                               const PollPlan &p, const PollNames &nm,
+                               const msl::Str &isHigh) {
+  const msl::Type u32 = msl::Type::scalar(msl::Scalar::U32);
+  msl::Expr *const relaxed = c.var(msl::builtin::order::Relaxed);
+  auto word = [&](int64_t half) {
+    const msl::Str seen = nm.expected + "_r" + std::to_string(half);
+    body.push_back(c.declStmt(u32, seen, c.cast(u32, c.lit(0))));
+    msl::Expr *ptr = half
+                         ? c.binary(msl::BinOp::Add, c.var(nm.ptr), c.lit(half))
+                         : c.var(nm.ptr);
+    body.push_back(
+        c.exprStmt(c.call(msl::builtin::atomic::CompareExchangeWeak,
+                          {ptr, c.addrOf(c.var(seen)), c.cast(u32, c.lit(0)),
+                           relaxed, relaxed})));
+    return c.var(seen);
   };
   switch (p.load) {
   case PollLoad::AtomicWord:
-    return word();
-  case PollLoad::VolatileWide:
-    return c.deref(c.var(ptr));
+    return word(0);
+  case PollLoad::WideHalves:
+    return c.bitcast(msl::Type::scalar(msl::Scalar::U64),
+                     c.call(msl::Str(msl::spell(msl::Scalar::U32)) + "2",
+                            {word(0), word(1)}));
   case PollLoad::PackedHalf:
     break;
   }
-  msl::Expr *low = c.binary(msl::BinOp::And, word(), c.lit(0xffff));
+  msl::Expr *w = word(0);
+  msl::Expr *low = c.binary(msl::BinOp::And, w, c.lit(0xffff));
   if (isHigh.empty())
     return low;
-  return c.ternary(c.var(isHigh), c.binary(msl::BinOp::Shr, word(), c.lit(16)),
-                   low);
+  return c.ternary(c.var(isHigh), c.binary(msl::BinOp::Shr, w, c.lit(16)), low);
 }
 
-// Metal has no 64-bit atomic load; the wide form uses a volatile plain
-// pointer and relies on single-copy atomicity of an aligned load.
-inline msl::Type pollPtrType(const PollPlan &p) {
-  switch (p.load) {
-  case PollLoad::VolatileWide:
-    return msl::Type::scalar(p.word).pointerTo(msl::AddrSpace::Device,
-                                               msl::Type::Volatile);
-  case PollLoad::AtomicWord:
-  case PollLoad::PackedHalf:
-    break;
-  }
-  return msl::deviceAtomicPtr(p.word);
+inline msl::Type pollPtrType(const PollPlan &) {
+  return msl::deviceAtomicPtr(msl::Scalar::U32);
 }
 
 // Declares one element's answer slot and seeds it. Seeding is separate from
@@ -88,16 +93,18 @@ inline void emitPollElement(msl::Context &c, msl::Block &body,
   inner.push_back(c.declStmt(wordTy, nm.expected + "_w",
                              c.cast(wordTy, c.var(nm.expected))));
 
-  msl::Expr *loaded = pollLoad(c, p, nm.ptr, isHigh);
-
   if (p.spins) {
-    inner.push_back(
-        c.whileStmt(c.binary(msl::BinOp::Ne, loaded, c.var(nm.expected + "_w")),
-                    msl::Block{}));
+    msl::Block loop;
+    msl::Expr *seen = emitPollRead(c, loop, p, nm, isHigh);
+    loop.push_back(
+        c.ifStmt(c.binary(msl::BinOp::Eq, seen, c.var(nm.expected + "_w")),
+                 {c.breakStmt()}));
+    inner.push_back(c.whileStmt(c.litBool(true), std::move(loop)));
   } else {
+    msl::Expr *seen = emitPollRead(c, inner, p, nm, isHigh);
     inner.push_back(
         c.assign(c.var(nm.flag),
-                 c.binary(msl::BinOp::Eq, loaded, c.var(nm.expected + "_w"))));
+                 c.binary(msl::BinOp::Eq, seen, c.var(nm.expected + "_w"))));
   }
 
   if (!owner) {
@@ -112,6 +119,8 @@ inline void emitPollBarrier(msl::Context &c, msl::Block &body,
                             const PollPlan &p) {
   body.push_back(c.hardBarrier(p.acquire ? msl::Barrier::Scope::Device
                                          : msl::Barrier::Scope::Threadgroup));
+  if (p.acquire)
+    body.push_back(deviceFence(c));
 }
 
 inline void bindPollResult(msl::Context &c, msl::Block &body, const PollPlan &p,

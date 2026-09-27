@@ -109,3 +109,87 @@ def test_masked_block_poll():
                          LIMIT=LIMIT)
     assert torch.equal(seen.cpu(), torch.arange(1, N + 1, dtype=torch.int32))
     assert 1 < polls.item() < LIMIT
+
+
+@triton.jit
+def handoff_atomic_poll(flag, seen, polls, scratch, DELAY: tl.constexpr,
+                        LIMIT: tl.constexpr):
+    if tl.program_id(0) == 0:
+        for _ in range(DELAY):
+            tl.atomic_add(scratch, 1)
+        tl.store(flag, 5)
+    else:
+        ok = tl.atomic_poll(flag, 5, timeout_ns=0).to(tl.int32)
+        n = 1
+        while (ok == 0) & (n < LIMIT):
+            ok = tl.atomic_poll(flag, 5, timeout_ns=0).to(tl.int32)
+            n += 1
+        tl.store(seen, ok)
+        tl.store(polls, n)
+
+
+def test_atomic_poll():
+    flag = torch.zeros(1, dtype=torch.int32, device="mps")
+    seen = torch.zeros(1, dtype=torch.int32, device="mps")
+    polls = torch.zeros(1, dtype=torch.int32, device="mps")
+    scratch = torch.zeros(1, dtype=torch.int32, device="mps")
+    handoff_atomic_poll[(2, )](flag,
+                               seen,
+                               polls,
+                               scratch,
+                               DELAY=DELAY,
+                               LIMIT=LIMIT)
+    assert seen.item() == 1
+    assert 1 < polls.item() < LIMIT
+
+
+@triton.jit
+def publish(data, flag, before, after, polls, scratch, BLOCK: tl.constexpr,
+            DELAY: tl.constexpr, LIMIT: tl.constexpr, ACQUIRE: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    if tl.program_id(0) == 0:
+        for _ in range(DELAY):
+            tl.atomic_add(scratch, 1)
+        tl.store(data + offs, offs + 1)
+        tl.atomic_xchg(flag, 1, sem="release")
+    else:
+        tl.store(before + offs, tl.load(data + offs))
+        n = 1
+        if ACQUIRE:
+            ok = tl.atomic_poll(flag, 1, sem="acquire",
+                                timeout_ns=0).to(tl.int32)
+            while (ok == 0) & (n < LIMIT):
+                ok = tl.atomic_poll(flag, 1, sem="acquire",
+                                    timeout_ns=0).to(tl.int32)
+                n += 1
+        else:
+            v = tl.load(flag, volatile=True)
+            while (v == 0) & (n < LIMIT):
+                v = tl.load(flag, volatile=True)
+                n += 1
+        tl.store(after + offs, tl.load(data + offs))
+        tl.store(polls, n)
+
+
+@pytest.mark.parametrize("acquire", [False, True])
+def test_release_publishes_data(acquire):
+    BLOCK = 128
+    data = torch.zeros(BLOCK, dtype=torch.int32, device="mps")
+    flag = torch.zeros(1, dtype=torch.int32, device="mps")
+    before = torch.zeros(BLOCK, dtype=torch.int32, device="mps")
+    after = torch.zeros(BLOCK, dtype=torch.int32, device="mps")
+    polls = torch.zeros(1, dtype=torch.int32, device="mps")
+    scratch = torch.zeros(1, dtype=torch.int32, device="mps")
+    publish[(2, )](data,
+                   flag,
+                   before,
+                   after,
+                   polls,
+                   scratch,
+                   BLOCK=BLOCK,
+                   DELAY=DELAY,
+                   LIMIT=LIMIT,
+                   ACQUIRE=acquire)
+    assert 1 < polls.item() < LIMIT
+    assert torch.equal(after.cpu(),
+                       torch.arange(1, BLOCK + 1, dtype=torch.int32))

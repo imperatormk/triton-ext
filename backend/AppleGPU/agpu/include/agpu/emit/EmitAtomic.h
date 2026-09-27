@@ -114,10 +114,10 @@ inline void emitAtomic(msl::Context &c, msl::Block &body, const AtomicPlan &p,
     return;
   // A device seq_cst fence inside the election crashes the AGX3 compiler, and
   // a barrier there would be divergent: both sit outside it.
+  if (p.fences.before || p.fresh)
+    body.push_back(deviceFence(c));
   if (p.fences.before)
     body.push_back(c.barrier(msl::Barrier::Scope::Device));
-  if (p.fresh)
-    body.push_back(deviceFence(c));
   msl::Block inner;
   emitAtomicBody(c, inner, p, ptr, value, nm);
   c.guardedInto(body, c.allOf(cond, electionExpr(c, p.election, nm)),
@@ -125,6 +125,8 @@ inline void emitAtomic(msl::Context &c, msl::Block &body, const AtomicPlan &p,
   if (p.fences.after)
     body.push_back(c.barrier(msl::Barrier::Scope::Device));
   emitElectedBroadcast(c, body, p, nm);
+  if (p.fences.after)
+    body.push_back(deviceFence(c));
 }
 
 // A replica issues nothing; it binds to its canonical register's result.

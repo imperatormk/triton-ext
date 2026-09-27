@@ -69,6 +69,10 @@ _sys.meta_path.insert(0, _LibdevicePatchFinder())
 if PLUGIN_LIBRARY is not None:
     import triton._C.libtriton as _libtriton
     _libtriton.passes.plugin.extend_with(str(PLUGIN_LIBRARY))
+    # Passes load the dialect they depend on; parsing IR that already carries
+    # it (a dumped TTGIR, an override) needs it registered up front.
+    if hasattr(_libtriton.ir, "extend_dialects_with"):
+        _libtriton.ir.extend_dialects_with(str(PLUGIN_LIBRARY))
 else:
     # Otherwise the first symptom is an AttributeError on add_emit_msl, raised
     # from inside the compiler.

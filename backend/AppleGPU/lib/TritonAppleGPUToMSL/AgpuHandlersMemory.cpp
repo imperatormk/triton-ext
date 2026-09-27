@@ -167,6 +167,9 @@ agpu::MoveFacts AgpuEmitter::moveFactsOf(Value ptr, Value laidOut,
 
 agpu::Decision AgpuEmitter::emitLoad(const agpu::OpView &o,
                                      std::size_t maskIndex) {
+  if (o.intAt(0))
+    return emitAtomicAccess(o, agpu::AtomicAccess::Load,
+                            agpu::MemOrder::Relaxed, "tt.load");
   const Ready ready = readyFor(o, 1);
   if (!ready.ok())
     return ready.why;
@@ -262,6 +265,9 @@ agpu::Decision AgpuEmitter::emitStore(const agpu::OpView &o,
   // Count registers from the pointer's layout: registers can share a base
   // name via broadcast and counting names would under-store.
   const Value ptrV = mlirValueOf(ptr);
+  if (atomicBuffer(ptrV))
+    return emitAtomicAccess(o, agpu::AtomicAccess::Store,
+                            agpu::MemOrder::Relaxed, "tt.store");
   const int64_t regs = registersHeldBy(ptr);
   const Ready ready =
       readyForCounted(o, 1, 2, regs, "stored value has no register names");

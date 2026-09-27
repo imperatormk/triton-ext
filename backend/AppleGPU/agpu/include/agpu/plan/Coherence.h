@@ -8,6 +8,7 @@
 
 #include "agpu/msl/Containers.h"
 
+#include <algorithm>
 #include <vector>
 
 namespace agpu {
@@ -21,6 +22,7 @@ struct BufferAccess {
 
   // A per-lane address into a tile.
   bool isTensor = false;
+  bool isVolatile = false;
 };
 
 // What the IR says about a function's scalar device traffic.
@@ -43,6 +45,9 @@ public:
   }
   const std::vector<int> &buffers() const { return coherent_; }
   bool any() const { return !coherent_.empty(); }
+  bool needsAtomic(int buffer) const {
+    return std::find(atomic_.begin(), atomic_.end(), buffer) != atomic_.end();
+  }
 
   friend CoherencePlan planCoherence(const CoherenceFacts &);
 
@@ -67,6 +72,7 @@ private:
   }
 
   std::vector<int> coherent_;
+  std::vector<int> atomic_;
 };
 
 inline CoherencePlan planCoherence(const CoherenceFacts &f) {
@@ -87,6 +93,10 @@ inline CoherencePlan planCoherence(const CoherenceFacts &f) {
   if (f.hasDeviceBarrier)
     p.addPublished(
         f, [](const BufferAccess &, const BufferAccess &) { return true; });
+
+  for (const BufferAccess &a : f.accesses)
+    if (a.isVolatile && !p.needsAtomic(a.buffer))
+      p.atomic_.push_back(a.buffer);
 
   return p;
 }

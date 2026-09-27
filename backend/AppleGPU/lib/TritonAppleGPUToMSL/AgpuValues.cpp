@@ -99,7 +99,8 @@ agpu::CoherenceFacts AgpuEmitter::coherenceFactsOf(triton::FuncOp func) {
   Block &entry = func.getBody().front();
   llvm::DenseMap<Operation *, int> loopIds;
 
-  auto record = [&](Operation *op, Value ptr, agpu::AccessKind kind) {
+  auto record = [&](Operation *op, Value ptr, agpu::AccessKind kind,
+                    bool isVolatile) {
     const BlockArgument base = traceToKernelArg(ptr);
     if (!base || base.getOwner() != &entry)
       return;
@@ -109,14 +110,15 @@ agpu::CoherenceFacts AgpuEmitter::coherenceFactsOf(triton::FuncOp func) {
     if (Operation *loop = outermostLoopOf(op))
       a.loop = loopIds.try_emplace(loop, (int)loopIds.size()).first->second;
     a.isTensor = isa<RankedTensorType>(ptr.getType());
+    a.isVolatile = isVolatile;
     f.accesses.push_back(a);
   };
 
   func.walk([&](Operation *op) {
     if (auto st = dyn_cast<triton::StoreOp>(op))
-      record(st, st.getPtr(), agpu::AccessKind::Store);
+      record(st, st.getPtr(), agpu::AccessKind::Store, false);
     else if (auto ld = dyn_cast<triton::LoadOp>(op))
-      record(ld, ld.getPtr(), agpu::AccessKind::Load);
+      record(ld, ld.getPtr(), agpu::AccessKind::Load, ld.getIsVolatile());
     if (ordersDeviceMemory(op))
       f.hasDeviceBarrier = true;
   });
@@ -127,6 +129,11 @@ agpu::CoherenceFacts AgpuEmitter::coherenceFactsOf(triton::FuncOp func) {
 bool AgpuEmitter::coherentBuffer(Value ptr) const {
   const BlockArgument arg = traceToKernelArg(ptr);
   return arg && coherentArgs_.count((int)arg.getArgNumber()) > 0;
+}
+
+bool AgpuEmitter::atomicBuffer(Value ptr) const {
+  const BlockArgument arg = traceToKernelArg(ptr);
+  return arg && atomicArgs_.count((int)arg.getArgNumber()) > 0;
 }
 
 std::optional<agpu::ElemType> AgpuEmitter::heldTypeFor(Value v) const {

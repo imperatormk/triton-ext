@@ -1,0 +1,84 @@
+"""A program polling with volatile loads sees what an earlier program of the
+same launch stored. Only earlier: Apple GPUs promise no forward progress to a
+program waiting on a later one."""
+
+from __future__ import annotations
+
+import pytest
+
+torch = pytest.importorskip("torch", reason="the dispatch path is torch's")
+
+if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+    pytest.skip("needs an Apple GPU", allow_module_level=True)
+
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
+
+LIMIT = 100_000
+DELAY = 1_000
+
+
+@triton.jit
+def handoff(flag, seen, polls, scratch, DELAY: tl.constexpr,
+            LIMIT: tl.constexpr):
+    if tl.program_id(0) == 0:
+        for _ in range(DELAY):
+            tl.atomic_add(scratch, 1)
+        tl.store(flag, 5)
+    else:
+        v = tl.load(flag, volatile=True)
+        n = 1
+        while (v == 0) & (n < LIMIT):
+            v = tl.load(flag, volatile=True)
+            n += 1
+        tl.store(seen, v)
+        tl.store(polls, n)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float16])
+def test_scalar_poll(dtype):
+    flag = torch.zeros(1, dtype=dtype, device="mps")
+    seen = torch.zeros(1, dtype=dtype, device="mps")
+    polls = torch.zeros(1, dtype=torch.int32, device="mps")
+    scratch = torch.zeros(1, dtype=torch.int32, device="mps")
+    handoff[(2, )](flag, seen, polls, scratch, DELAY=DELAY, LIMIT=LIMIT)
+    assert seen.item() == 5
+    assert 1 < polls.item() < LIMIT
+
+
+@triton.jit
+def handoff_block(flags, seen, polls, scratch, N: tl.constexpr,
+                  BLOCK: tl.constexpr, DELAY: tl.constexpr,
+                  LIMIT: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    if tl.program_id(0) == 0:
+        for _ in range(DELAY):
+            tl.atomic_add(scratch, 1)
+        tl.store(flags + offs, offs + 1, mask=mask)
+    else:
+        v = tl.load(flags + offs, mask=mask, other=1, volatile=True)
+        n = 1
+        while (tl.min(v, axis=0) == 0) & (n < LIMIT):
+            v = tl.load(flags + offs, mask=mask, other=1, volatile=True)
+            n += 1
+        tl.store(seen + offs, v, mask=mask)
+        tl.store(polls, n)
+
+
+def test_masked_block_poll():
+    N, BLOCK = 100, 128
+    flags = torch.zeros(N, dtype=torch.int32, device="mps")
+    seen = torch.zeros(N, dtype=torch.int32, device="mps")
+    polls = torch.zeros(1, dtype=torch.int32, device="mps")
+    scratch = torch.zeros(1, dtype=torch.int32, device="mps")
+    handoff_block[(2, )](flags,
+                         seen,
+                         polls,
+                         scratch,
+                         N=N,
+                         BLOCK=BLOCK,
+                         DELAY=DELAY,
+                         LIMIT=LIMIT)
+    assert torch.equal(seen.cpu(), torch.arange(1, N + 1, dtype=torch.int32))
+    assert 1 < polls.item() < LIMIT

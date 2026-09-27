@@ -101,24 +101,40 @@ int main() {
     CHECK_LACKS(out, "memory_order_seq_cst");
   }
 
-  CASE("acquire fences after, release before");
+  CASE("a load fences before, acquire also after");
   {
     msl::Context c;
     msl::Block body;
-    emitAtomicAccessFenceBefore(
-        c, body, planAtomicAccess(accessOf(intOf(32)), MemOrder::Acquire));
-    CHECK(body.empty());
-    emitAtomicAccessFenceAfter(
-        c, body, planAtomicAccess(accessOf(intOf(32)), MemOrder::Acquire));
-    CHECK_EQ(countOf(render(body), "threadgroup_barrier"), 1);
+    const AtomicAccessPlan relaxed =
+        planAtomicAccess(accessOf(intOf(32)), MemOrder::Relaxed);
+    emitAtomicAccessFenceBefore(c, body, relaxed);
+    emitAtomicAccessFenceAfter(c, body, relaxed);
+    CHECK_EQ(countOf(render(body), "atomic_thread_fence"), 1);
 
-    msl::Block rel;
-    emitAtomicAccessFenceBefore(
-        c, rel, planAtomicAccess(accessOf(intOf(32)), MemOrder::Release));
-    CHECK_EQ(countOf(render(rel), "threadgroup_barrier"), 1);
-    emitAtomicAccessFenceAfter(
-        c, rel, planAtomicAccess(accessOf(intOf(32)), MemOrder::Release));
-    CHECK_EQ(countOf(render(rel), "threadgroup_barrier"), 1);
+    msl::Block acq;
+    const AtomicAccessPlan acquire =
+        planAtomicAccess(accessOf(intOf(32)), MemOrder::Acquire);
+    emitAtomicAccessFenceBefore(c, acq, acquire);
+    emitAtomicAccessFenceAfter(c, acq, acquire);
+    CHECK_EQ(countOf(render(acq), "atomic_thread_fence"), 2);
+    CHECK_LACKS(render(acq), "threadgroup_barrier");
+  }
+
+  CASE("a store fences only before, and only on release");
+  {
+    msl::Context c;
+    msl::Block body;
+    const AtomicAccessPlan relaxed = planAtomicAccess(
+        accessOf(intOf(32), AtomicAccess::Store), MemOrder::Relaxed);
+    emitAtomicAccessFenceBefore(c, body, relaxed);
+    emitAtomicAccessFenceAfter(c, body, relaxed);
+    CHECK(body.empty());
+
+    const AtomicAccessPlan release = planAtomicAccess(
+        accessOf(intOf(32), AtomicAccess::Store), MemOrder::Release);
+    emitAtomicAccessFenceBefore(c, body, release);
+    emitAtomicAccessFenceAfter(c, body, release);
+    CHECK_EQ(countOf(render(body), "atomic_thread_fence"), 1);
   }
 
   CASE("a sub-word load shifts and masks its part out");

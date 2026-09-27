@@ -3,6 +3,7 @@
 #define AGPU_EMIT_ATOMIC_ACCESS_H
 
 #include "agpu/core/Names.h"
+#include "agpu/emit/EmitAtomic.h"
 #include "agpu/emit/Prelude.h"
 #include "agpu/msl/Builtins.h"
 #include "agpu/msl/Context.h"
@@ -34,6 +35,18 @@ inline msl::Expr *atomicWordLoad(msl::Context &c, const AtomicAccessPlan &p,
                                  const msl::Str &ptr) {
   if (p.wide)
     return c.deref(c.var(ptr));
+  if (p.halves) {
+    const auto half = [&](int64_t h) {
+      return c.call(msl::builtin::atomic::Load,
+                    {h ? c.binary(msl::BinOp::Add, c.var(ptr), c.lit(h))
+                       : (msl::Expr *)c.var(ptr),
+                     c.var(msl::builtin::order::Relaxed)});
+    };
+    // Shifting the halves together crashes the G13 compiler.
+    return c.bitcast(msl::Type::scalar(msl::Scalar::U64),
+                     c.call(msl::Str(msl::spell(msl::Scalar::U32)) + "2",
+                            {half(0), half(1)}));
+  }
   return c.call(msl::builtin::atomic::Load,
                 {c.var(ptr), c.var(msl::builtin::order::Relaxed)});
 }
@@ -80,13 +93,13 @@ inline msl::Expr *atomicStoreBits(msl::Context &c, const AtomicAccessPlan &p,
 inline void emitAtomicAccessFenceBefore(msl::Context &c, msl::Block &body,
                                         const AtomicAccessPlan &p) {
   if (p.fences.before)
-    body.push_back(c.barrier(msl::Barrier::Scope::Device));
+    body.push_back(deviceFence(c));
 }
 
 inline void emitAtomicAccessFenceAfter(msl::Context &c, msl::Block &body,
                                        const AtomicAccessPlan &p) {
   if (p.fences.after)
-    body.push_back(c.barrier(msl::Barrier::Scope::Device));
+    body.push_back(deviceFence(c));
 }
 
 // A store of a value narrower than the word has to leave its neighbours
@@ -141,6 +154,22 @@ inline void emitAtomicStoreValue(msl::Context &c, msl::Block &body,
   }
   if (p.wide) {
     body.push_back(c.assign(c.deref(c.var(ptr)), c.var(value)));
+    return;
+  }
+  if (p.halves) {
+    const msl::Type u64 = msl::Type::scalar(msl::Scalar::U64);
+    const msl::Str bits = nm.result + "_bits";
+    body.push_back(c.declStmt(u64, bits,
+                              p.elem.kind == ElemType::Kind::Float
+                                  ? c.bitcast(u64, c.var(value))
+                                  : c.cast(u64, c.var(value))));
+    for (int64_t h : {0, 1})
+      body.push_back(c.exprStmt(
+          c.call(msl::builtin::atomic::Store,
+                 {c.binary(msl::BinOp::Add, c.var(ptr), c.lit(h)),
+                  c.cast(msl::Type::scalar(msl::Scalar::U32),
+                         c.binary(msl::BinOp::Shr, c.var(bits), c.lit(32 * h))),
+                  c.var(msl::builtin::order::Relaxed)})));
     return;
   }
   body.push_back(c.exprStmt(c.call(msl::builtin::atomic::Store,

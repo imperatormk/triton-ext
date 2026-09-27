@@ -227,6 +227,8 @@ agpu::OpView AgpuEmitter::opViewOf(Operation *op) {
     view.ints.push_back((int64_t)rmw.getAtomicRmwOp());
     view.ints.push_back((int64_t)rmw.getSem());
   }
+  if (auto ld = dyn_cast<triton::LoadOp>(op))
+    view.ints.push_back(ld.getIsVolatile());
   if (auto ld = dyn_cast<triton::AtomicLoadOp>(op))
     view.ints.push_back((int64_t)ld.getSem());
   if (auto st = dyn_cast<triton::AtomicStoreOp>(op))
@@ -408,10 +410,13 @@ LogicalResult AgpuEmitter::emit() {
     const agpu::CoherencePlan coherence =
         agpu::planCoherence(coherenceFactsOf(func));
     coherentArgs_.clear();
+    atomicArgs_.clear();
     for (std::size_t i = 0; i < facts.args.size(); ++i) {
       facts.args[i].coherent = coherence.needsCoherent((int)i);
       if (facts.args[i].coherent)
         coherentArgs_.insert((int)i);
+      if (coherence.needsAtomic((int)i))
+        atomicArgs_.insert((int)i);
     }
 
     facts.predictedRoll = predictRollFor(func);
@@ -424,11 +429,13 @@ LogicalResult AgpuEmitter::emit() {
 
     agpu_.addKernel(facts,
                     [this, afterArgs, argPtrs, &entry, coherent = coherentArgs_,
+                     atomic = atomicArgs_,
                      declineMark = std::optional<std::size_t>(),
                      printMark = std::optional<std::size_t>(),
                      assertMark = std::optional<std::size_t>()](
                         am::Context &, bool rollK) mutable -> agpu::BuiltBody {
                       coherentArgs_ = coherent;
+                      atomicArgs_ = atomic;
                       rollK_ = rollK;
                       body_ = BodyState{afterArgs, argPtrs};
                       // Marking keeps earlier kernels' entries through this

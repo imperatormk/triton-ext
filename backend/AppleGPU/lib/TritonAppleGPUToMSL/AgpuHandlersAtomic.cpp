@@ -337,9 +337,17 @@ agpu::Decision AgpuEmitter::emitAtomicRmwOp(const agpu::OpView &o) {
 
 agpu::Decision AgpuEmitter::emitAtomicAccessOp(const agpu::OpView &o,
                                                agpu::AtomicAccess kind) {
+  const bool isLoad = kind == agpu::AtomicAccess::Load;
+  return emitAtomicAccess(o, kind, memOrderOf((triton::MemSemantic)o.intAt(0)),
+                          isLoad ? "tt.atomic_load" : "tt.atomic_store");
+}
+
+agpu::Decision AgpuEmitter::emitAtomicAccess(const agpu::OpView &o,
+                                             agpu::AtomicAccess kind,
+                                             agpu::MemOrder order,
+                                             const char *what) {
   am::Context &mc = agpu_.context();
   const bool isLoad = kind == agpu::AtomicAccess::Load;
-  const char *what = isLoad ? "tt.atomic_load" : "tt.atomic_store";
 
   const agpu::ValueId elemOwner = isLoad ? o.results[0] : o.operands[1];
   const agpu::ElemType *elemP = elemOf(elemOwner);
@@ -349,9 +357,9 @@ agpu::Decision AgpuEmitter::emitAtomicAccessOp(const agpu::OpView &o,
   agpu::AtomicAccessFacts f;
   f.kind = kind;
   f.elem = *elemP;
+  f.tearable = o.name == "tt.load" || o.name == "tt.store";
 
-  const agpu::AtomicAccessPlan plan =
-      agpu::planAtomicAccess(f, memOrderOf((triton::MemSemantic)o.intAt(0)));
+  const agpu::AtomicAccessPlan plan = agpu::planAtomicAccess(f, order);
   if (!plan.usable)
     return agpu::atomicAccessDecision(plan);
 
@@ -361,20 +369,29 @@ agpu::Decision AgpuEmitter::emitAtomicAccessOp(const agpu::OpView &o,
   const int64_t regs = ptrTy ? registerCount(ptrTy) : 1;
 
   const std::size_t maskIndex = isLoad ? 1 : 2;
+  const bool hasOther = isLoad && o.operands.size() > 2;
   Ready ready;
-  if (!isLoad) {
-    ready = readyForCounted(o, 1, 2, regs, "the value has no register names");
+  if (!isLoad || hasOther) {
+    ready = isLoad ? readyForCounted(o, 2, 3, regs,
+                                     "the other value has no register names")
+                   : readyForCounted(o, 1, 2, regs,
+                                     "the value has no register names");
     if (!ready.ok())
       return ready.why;
   }
 
   agpu::AtomicAccessNames nm;
-  const std::string tag =
-      std::to_string(isLoad ? o.results[0] : o.operands[0]) + body_.scope;
+  const std::string tag = isLoad ? std::to_string(o.results[0]) + body_.scope
+                                 : std::to_string(o.operands[0]) + body_.scope +
+                                       "s" + std::to_string(body_.tempSeq++);
   nm.result = (isLoad ? "atl" : "ats") + tag;
 
   const am::Type ptrTypeOfPlan = agpu::atomicAccessPtrType(plan);
   agpu::ValueNames names;
+  am::Expr *const elected =
+      isLoad ? nullptr
+             : agpu::electionExpr(mc, agpu::electFor(spreadOf(ptrV)),
+                                  agpu::ThreadNames{});
 
   agpu::emitAtomicAccessFenceBefore(mc, *cur_, plan);
 
@@ -398,8 +415,10 @@ agpu::Decision AgpuEmitter::emitAtomicAccessOp(const agpu::OpView &o,
 
     am::Expr *guard = maskAt(o, maskIndex, r);
     if (isLoad) {
-      cur_->push_back(
-          mc.declStmt(agpu::mslTypeOf(*elemP), rn.result, mc.lit(0)));
+      cur_->push_back(mc.declStmt(agpu::mslTypeOf(*elemP), rn.result,
+                                  hasOther
+                                      ? (am::Expr *)mc.var(ready.ops[2].at(r))
+                                      : (am::Expr *)mc.lit(0)));
       am::Block body;
       body.push_back(mc.assign(mc.var(rn.result),
                                agpu::atomicLoadValue(mc, plan, pn, rn)));
@@ -410,7 +429,7 @@ agpu::Decision AgpuEmitter::emitAtomicAccessOp(const agpu::OpView &o,
 
     am::Block body;
     agpu::emitAtomicStoreValue(mc, body, plan, pn, ready.ops[1].at(r), rn);
-    mc.guardedInto(*cur_, guard, std::move(body));
+    mc.guardedInto(*cur_, mc.allOf(elected, guard), std::move(body));
   }
 
   agpu::emitAtomicAccessFenceAfter(mc, *cur_, plan);

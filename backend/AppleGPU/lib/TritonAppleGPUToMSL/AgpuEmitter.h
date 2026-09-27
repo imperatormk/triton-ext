@@ -687,6 +687,9 @@ private:
   agpu::Decision emitAtomicRmwOp(const agpu::OpView &o);
   agpu::Decision emitAtomicCasOp(const agpu::OpView &o);
   agpu::Decision emitAtomicPollOp(const agpu::OpView &o);
+  agpu::Decision emitAtomicAccess(const agpu::OpView &o,
+                                  agpu::AtomicAccess kind, agpu::MemOrder order,
+                                  const char *what);
   agpu::Decision emitAtomicAccessOp(const agpu::OpView &o,
                                     agpu::AtomicAccess kind);
 
@@ -751,6 +754,7 @@ private:
   // A wide access casts to an unqualified vector pointer, stripping the
   // coherent qualifier, so the fact travels on the access instead.
   bool coherentBuffer(Value ptr) const;
+  bool atomicBuffer(Value ptr) const;
 
   // `heldTypeOf` with the coherent qualifier a pointer into such a buffer
   // must declare.
@@ -842,6 +846,7 @@ private:
   std::unique_ptr<ModuleAxisInfoAnalysis> axisInfo_;
 
   std::set<int> coherentArgs_;
+  std::set<int> atomicArgs_;
 
   agpu::Emitter agpu_;
   agpu::DispatchTable table_;

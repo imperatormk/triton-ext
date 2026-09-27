@@ -23,6 +23,7 @@ enum class SubWord { None, Byte, Half };
 struct AtomicAccessFacts {
   AtomicAccess kind = AtomicAccess::Load;
   ElemType elem;
+  bool tearable = false;
 };
 
 struct AtomicAccessPlan {
@@ -33,6 +34,7 @@ struct AtomicAccessPlan {
   // Metal has no 64-bit atomic load or store. An aligned 64-bit access is
   // single-copy on Apple GPUs, so it goes through a volatile pointer.
   bool wide = false;
+  bool halves = false;
   FencePlan fences;
   bool usable = false;
 };
@@ -54,6 +56,7 @@ inline AtomicAccessPlan planAtomicAccess(const AtomicAccessFacts &f,
   p.kind = f.kind;
   p.elem = f.elem;
   p.fences = fencesFor(order);
+  p.fences.before |= f.kind == AtomicAccess::Load;
   p.sub = subWordFor(f.elem.bits);
 
   switch (f.elem.bits) {
@@ -64,8 +67,9 @@ inline AtomicAccessPlan planAtomicAccess(const AtomicAccessFacts &f,
     p.word = msl::Scalar::U32;
     break;
   case 64:
-    p.word = msl::Scalar::U64;
-    p.wide = true;
+    p.halves = f.tearable;
+    p.wide = !f.tearable;
+    p.word = f.tearable ? msl::Scalar::U32 : msl::Scalar::U64;
     break;
   default:
     return p;

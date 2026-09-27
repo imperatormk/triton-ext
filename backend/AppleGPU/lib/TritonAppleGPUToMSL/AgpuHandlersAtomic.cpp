@@ -259,6 +259,8 @@ agpu::Decision AgpuEmitter::emitAtomicRmwOp(const agpu::OpView &o) {
   f.laneFree = spread.laneFree;
   f.warpFree = spread.warpFree;
   f.uniformPtr = spread.uniformPtr;
+  if (const Value result = mlirValueOf(o.results[0]))
+    f.resultRead = !result.use_empty();
 
   auto ptrTy =
       ptrV ? dyn_cast<RankedTensorType>(ptrV.getType()) : RankedTensorType();

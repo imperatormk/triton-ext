@@ -1,6 +1,6 @@
-"""A program polling with volatile loads sees what an earlier program of the
-same launch stored. Only earlier: Apple GPUs promise no forward progress to a
-program waiting on a later one."""
+"""A program polling with volatile loads or value-preserving atomics sees what
+an earlier program of the same launch stored. Only earlier: Apple GPUs promise
+no forward progress to a program waiting on a later one."""
 
 from __future__ import annotations
 
@@ -42,6 +42,33 @@ def test_scalar_poll(dtype):
     polls = torch.zeros(1, dtype=torch.int32, device="mps")
     scratch = torch.zeros(1, dtype=torch.int32, device="mps")
     handoff[(2, )](flag, seen, polls, scratch, DELAY=DELAY, LIMIT=LIMIT)
+    assert seen.item() == 5
+    assert 1 < polls.item() < LIMIT
+
+
+@triton.jit
+def handoff_rmw(flag, seen, polls, scratch, DELAY: tl.constexpr,
+                LIMIT: tl.constexpr):
+    if tl.program_id(0) == 0:
+        for _ in range(DELAY):
+            tl.atomic_add(scratch, 1)
+        tl.store(flag, 5)
+    else:
+        v = tl.atomic_add(flag, 0)
+        n = 1
+        while (v == 0) & (n < LIMIT):
+            v = tl.atomic_add(flag, 0)
+            n += 1
+        tl.store(seen, v)
+        tl.store(polls, n)
+
+
+def test_scalar_rmw_poll():
+    flag = torch.zeros(1, dtype=torch.int32, device="mps")
+    seen = torch.zeros(1, dtype=torch.int32, device="mps")
+    polls = torch.zeros(1, dtype=torch.int32, device="mps")
+    scratch = torch.zeros(1, dtype=torch.int32, device="mps")
+    handoff_rmw[(2, )](flag, seen, polls, scratch, DELAY=DELAY, LIMIT=LIMIT)
     assert seen.item() == 5
     assert 1 < polls.item() < LIMIT
 

@@ -100,7 +100,7 @@ agpu::CoherenceFacts AgpuEmitter::coherenceFactsOf(triton::FuncOp func) {
   llvm::DenseMap<Operation *, int> loopIds;
 
   auto record = [&](Operation *op, Value ptr, agpu::AccessKind kind,
-                    bool isVolatile) {
+                    bool polls) {
     const BlockArgument base = traceToKernelArg(ptr);
     if (!base || base.getOwner() != &entry)
       return;
@@ -110,7 +110,7 @@ agpu::CoherenceFacts AgpuEmitter::coherenceFactsOf(triton::FuncOp func) {
     if (Operation *loop = outermostLoopOf(op))
       a.loop = loopIds.try_emplace(loop, (int)loopIds.size()).first->second;
     a.isTensor = isa<RankedTensorType>(ptr.getType());
-    a.isVolatile = isVolatile;
+    a.polls = polls;
     f.accesses.push_back(a);
   };
 
@@ -119,6 +119,16 @@ agpu::CoherenceFacts AgpuEmitter::coherenceFactsOf(triton::FuncOp func) {
       record(st, st.getPtr(), agpu::AccessKind::Store, false);
     else if (auto ld = dyn_cast<triton::LoadOp>(op))
       record(ld, ld.getPtr(), agpu::AccessKind::Load, ld.getIsVolatile());
+    else if (auto rmw = dyn_cast<triton::AtomicRMWOp>(op))
+      record(rmw, rmw.getPtr(), agpu::AccessKind::Atomic,
+             !rmw.getResult().use_empty());
+    else if (auto cas = dyn_cast<triton::AtomicCASOp>(op))
+      record(cas, cas.getPtr(), agpu::AccessKind::Atomic,
+             !cas.getResult().use_empty());
+    else if (auto ald = dyn_cast<triton::AtomicLoadOp>(op))
+      record(ald, ald.getPtr(), agpu::AccessKind::Atomic, true);
+    else if (auto poll = dyn_cast<triton::AtomicPollOp>(op))
+      record(poll, poll.getPtr(), agpu::AccessKind::Atomic, true);
     if (ordersDeviceMemory(op))
       f.hasDeviceBarrier = true;
   });

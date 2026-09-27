@@ -55,6 +55,7 @@ struct AtomicFacts {
   unsigned regFree = 0;
 
   bool uniformPtr = false; // a scalar pointer: one thread does the work
+  bool resultRead = false;
 };
 
 // `strategyFor` and the decline reason read the same row.
@@ -266,6 +267,7 @@ struct AtomicPlan {
   AtomicWord word = AtomicWord::I32;
   const char *builtin = nullptr;
   FencePlan fences;
+  bool fresh = false;
   ReplicaMap replicas;
   ThreadElection election;
 
@@ -304,6 +306,7 @@ inline AtomicPlan planAtomic(const AtomicFacts &f, MemOrder order) {
 
   p.packedElem = f.packedElem;
   p.fences = fencesFor(order);
+  p.fresh = f.resultRead;
 
   p.replicas = ReplicaMap{f.regFree};
   p.election = electFor(f);

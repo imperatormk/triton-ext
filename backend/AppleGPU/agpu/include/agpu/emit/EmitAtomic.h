@@ -112,10 +112,12 @@ inline void emitAtomic(msl::Context &c, msl::Block &body, const AtomicPlan &p,
                        const AtomicNames &nm, msl::Expr *cond = nullptr) {
   if (!p.usable())
     return;
-  // A device seq_cst fence before a uniform-address atomic crashes the AGX3
-  // compiler. Outside the election: a barrier there would be divergent.
+  // A device seq_cst fence inside the election crashes the AGX3 compiler, and
+  // a barrier there would be divergent: both sit outside it.
   if (p.fences.before)
     body.push_back(c.barrier(msl::Barrier::Scope::Device));
+  if (p.fresh)
+    body.push_back(deviceFence(c));
   msl::Block inner;
   emitAtomicBody(c, inner, p, ptr, value, nm);
   c.guardedInto(body, c.allOf(cond, electionExpr(c, p.election, nm)),

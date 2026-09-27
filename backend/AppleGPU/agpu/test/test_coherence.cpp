@@ -147,6 +147,19 @@ int main() {
     CHECK(planCoherence(f).needsCoherent(0));
   }
 
+  CASE("a polled buffer takes atomic stores, not coherence");
+  {
+    CoherenceFacts f;
+    BufferAccess polled = scalar(0, AccessKind::Atomic, 1);
+    polled.polls = true;
+    BufferAccess counted = scalar(1, AccessKind::Atomic, 1);
+    f.accesses = {store(0, 1), polled, store(1, 1), counted};
+    CoherencePlan p = planCoherence(f);
+    CHECK(p.needsAtomic(0));
+    CHECK(!p.needsAtomic(1));
+    CHECK(!p.any());
+  }
+
   CASE("a buffer qualifying twice is listed once");
   {
     CoherenceFacts f;

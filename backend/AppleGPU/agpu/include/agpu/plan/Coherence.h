@@ -13,7 +13,7 @@
 
 namespace agpu {
 
-enum class AccessKind { Load, Store };
+enum class AccessKind { Load, Store, Atomic };
 
 struct BufferAccess {
   int buffer = 0; // index of the kernel argument it traces back to
@@ -22,7 +22,7 @@ struct BufferAccess {
 
   // A per-lane address into a tile.
   bool isTensor = false;
-  bool isVolatile = false;
+  bool polls = false;
 };
 
 // What the IR says about a function's scalar device traffic.
@@ -95,7 +95,7 @@ inline CoherencePlan planCoherence(const CoherenceFacts &f) {
         f, [](const BufferAccess &, const BufferAccess &) { return true; });
 
   for (const BufferAccess &a : f.accesses)
-    if (a.isVolatile && !p.needsAtomic(a.buffer))
+    if (a.polls && !p.needsAtomic(a.buffer))
       p.atomic_.push_back(a.buffer);
 
   return p;

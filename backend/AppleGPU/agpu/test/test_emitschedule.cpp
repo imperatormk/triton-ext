@@ -116,6 +116,43 @@ int main() {
     CHECK(before(render(body), "float l", "buf[i] = 3"));
   }
 
+  CASE("a declaration does not pass a cross-lane call");
+  {
+    msl::Context c;
+    msl::Block body{
+        c.declStmt(f32, "a", c.binary(msl::BinOp::Add, c.var("x"), c.litF(1))),
+        c.declStmt(f32, "w", c.call("simd_shuffle", {c.var("v"), c.var("l")})),
+        c.assign(c.var("o"), c.binary(msl::BinOp::Add, c.var("a"), c.var("w"))),
+    };
+    sinkToFirstReader(body);
+    CHECK(before(render(body), "float a", "float w"));
+  }
+
+  CASE("a declaration passes a cross-lane value already read");
+  {
+    msl::Context c;
+    msl::Block body{
+        c.declStmt(f32, "a", c.binary(msl::BinOp::Add, c.var("x"), c.litF(1))),
+        c.declStmt(f32, "w", c.call("simd_shuffle", {c.var("v"), c.var("l")})),
+        c.assign(c.var("r"), c.binary(msl::BinOp::Add, c.var("r"), c.var("w"))),
+        c.assign(c.var("o"), c.var("a")),
+    };
+    sinkToFirstReader(body);
+    CHECK(before(render(body), "r = r + w", "float a"));
+  }
+
+  CASE("a declaration passes a load");
+  {
+    msl::Context c;
+    msl::Block body{
+        c.declStmt(f32, "a", c.binary(msl::BinOp::Add, c.var("x"), c.litF(1))),
+        c.declStmt(f32, "l", c.subscript(c.var("buf"), c.var("i"))),
+        c.assign(c.var("o"), c.binary(msl::BinOp::Add, c.var("a"), c.var("l"))),
+    };
+    sinkToFirstReader(body);
+    CHECK(before(render(body), "float l", "float a"));
+  }
+
   CASE("a read of a threadgroup scalar stays ahead of the barrier after it");
   {
     msl::Context c;

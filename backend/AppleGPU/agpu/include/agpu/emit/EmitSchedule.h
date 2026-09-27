@@ -11,6 +11,8 @@
 #include "agpu/msl/Analysis.h"
 #include "agpu/msl/AstWalk.h"
 
+#include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 namespace agpu {
@@ -40,6 +42,18 @@ inline bool sinkable(const msl::Stmt *s, const msl::PtrSet<msl::Str> &shared) {
       pure = false;
   });
   return pure;
+}
+
+inline bool readsOtherLanes(const msl::Stmt *s) {
+  if (s->kind != msl::StmtKind::Decl)
+    return false;
+  bool lanes = false;
+  msl::visitExprs(static_cast<const msl::Decl *>(s)->init, [&](msl::Expr *e) {
+    lanes = lanes || (e->kind == msl::ExprKind::Call &&
+                      msl::callEffect(static_cast<msl::Call *>(e)->callee) ==
+                          msl::CallEffect::Lanes);
+  });
+  return lanes;
 }
 
 // The names a statement assigns, at any depth.
@@ -76,19 +90,47 @@ inline void sinkIn(msl::Block &body, const msl::PtrSet<msl::Str> &shared) {
     prev[k] = (k + n) % (n + 1);
   }
 
+  const auto nameOf = [&](std::size_t k) -> const msl::Str & {
+    return static_cast<msl::Decl *>(body[k])->name;
+  };
+  std::vector<int> laneReaders(n, 0);
+  std::unordered_map<msl::Str, std::size_t> laneDecl;
+  for (std::size_t k = 0; k < n; ++k)
+    if (readsOtherLanes(body[k]))
+      laneDecl.emplace(nameOf(k), k);
+  for (std::size_t k = 0; k < n; ++k)
+    for (const msl::Str &r : reads[k])
+      if (const auto it = laneDecl.find(r); it != laneDecl.end())
+        ++laneReaders[it->second];
+
   for (std::size_t i = n; i-- > 0;) {
     if (!sinkable(body[i], shared))
       continue;
-    const msl::Str &name = static_cast<msl::Decl *>(body[i])->name;
-    std::size_t j = next[i];
-    bool blocked = false;
-    for (;
-         j != n && !blocked && !reads[j].count(name) && !writes[j].count(name);
-         j = next[j])
+    const msl::Str &name = nameOf(i);
+    // Cross-lane values passed but still to be read.
+    std::vector<std::pair<std::size_t, int>> open;
+    std::size_t dest = next[i];
+    bool found = false, blocked = false;
+    for (std::size_t j = next[i]; j != n && !blocked; j = next[j]) {
+      if (open.empty())
+        dest = j;
+      if (reads[j].count(name) || writes[j].count(name)) {
+        found = true;
+        break;
+      }
       for (const msl::Str &op : reads[i])
         blocked = blocked || writes[j].count(op);
-    if (j == n || j == next[i] || blocked)
+      for (auto &[k, left] : open)
+        left -= (int)reads[j].count(nameOf(k));
+      open.erase(std::remove_if(open.begin(), open.end(),
+                                [](const auto &o) { return o.second == 0; }),
+                 open.end());
+      if (laneReaders[j] > 0)
+        open.emplace_back(j, laneReaders[j]);
+    }
+    if (!found || blocked || dest == next[i])
       continue;
+    const std::size_t j = dest;
     next[prev[i]] = next[i];
     prev[next[i]] = prev[i];
     prev[i] = prev[j];
@@ -108,8 +150,8 @@ inline void sinkIn(msl::Block &body, const msl::PtrSet<msl::Str> &shared) {
 
 } // namespace detail
 
-// Each pure declaration moves to right before its first reader, unless a
-// statement between writes one of its operands.
+// Pure declarations move toward their first reader, never leaving a cross-lane
+// value live across them.
 inline void sinkToFirstReader(msl::Block &body) {
   detail::sinkIn(body, msl::threadgroupNames(body));
 }

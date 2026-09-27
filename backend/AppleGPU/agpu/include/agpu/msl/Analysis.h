@@ -165,7 +165,7 @@ inline CallEffect callEffect(const Str &callee) {
   for (const char *s : {"atomic", "barrier", "sincos", "modf", "frexp"})
     if (callee.find(s) != Str::npos)
       return CallEffect::State;
-  for (const char *s : {"simd_", "simdgroup_", "quad_"})
+  for (const char *s : {"simd_", "quad_"})
     if (callee.find(s) != Str::npos)
       return CallEffect::Lanes;
   return CallEffect::None;

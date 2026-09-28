@@ -105,6 +105,16 @@ else()
     message(STATUS "uTLX: AMDGPU dialect header not found — AMD support disabled")
 endif()
 
+# ---------------------------------------------------------------------------
+# Triton release/3.8 compatibility: PointerType::get takes a plain int address
+# space there, rather than the PtrAddrSpace enum (defined in TritonTypeEnums.td)
+# on Triton main. Both report TRITON_VERSION "3.8.0", so probe the header.
+# ---------------------------------------------------------------------------
+if(NOT EXISTS "${TRITON_WHEEL_INCLUDE_DIR}/triton/Dialect/Triton/IR/TritonTypeEnums.td")
+    message(STATUS "uTLX: PtrAddrSpace not found — enabling UTLX_TRITON_INT_ADDR_SPACE")
+    target_compile_definitions(${TRITON_EXT_NAME} PRIVATE UTLX_TRITON_INT_ADDR_SPACE)
+endif()
+
 # Shared compile flags + link-only-against-libtriton (single source of truth).
 target_link_libraries(${TRITON_EXT_NAME} PRIVATE triton_ext::plugin)
 # uTLX additionally disables C++ exceptions.
@@ -115,3 +125,11 @@ set_target_properties(${TRITON_EXT_NAME} PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 install(TARGETS ${TRITON_EXT_NAME} LIBRARY DESTINATION utlx_plugin)
+
+# These land at the site-packages root rather than inside the package: site.py
+# runs the .pth at interpreter startup, the only point early enough for a Triton
+# that reads TRITON_PLUGIN_PATHS while importing (see _utlx_autoregister.py).
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/utlx_plugin.pth"
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/_utlx_autoregister.py"
+    DESTINATION .)

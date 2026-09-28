@@ -48,6 +48,7 @@ _PACKAGE_MAP: dict[str, str] = {
     "example": "triton_example",
     "triton-example": "triton_example",
     "utlx": "utlx_plugin",
+    "apple-backend": "triton_apple_backend",
 }
 
 

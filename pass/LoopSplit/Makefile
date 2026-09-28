@@ -1,3 +1,4 @@
+WHEEL_NAME := triton-loop-split
 WHEEL_DIR ?= dist
 
 .PHONY: build
@@ -6,7 +7,7 @@ build:
 
 .PHONY: install
 install:
-	pip install $(WHEEL_DIR)/*.whl --force-reinstall
+	uv pip install $(WHEEL_DIR)/*.whl --reinstall-package $(WHEEL_NAME)
 
 .PHONY: test
 test:

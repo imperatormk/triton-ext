@@ -173,12 +173,10 @@ AgpuEmitter::storageOf(agpu::ValueId v) const {
   const agpu::ElemType *elem = elemOf(v);
   const am::Type ty = elem ? agpu::mslTypeOf(*elem) : am::Context::i32();
 
-  if (elem && elem->isPointer())
-    for (int64_t r = 0, n = (int64_t)body_.sym.regCount(v); r < n; ++r) {
-      const auto off = body_.offsetOf.find({v, r});
-      if (off != body_.offsetOf.end() && off->second.owned)
-        add(off->second.name, off->second.type);
-    }
+  for (auto off = body_.offsetOf.lower_bound({v, 0});
+       off != body_.offsetOf.end() && off->first.first == v; ++off)
+    if (off->second.owned)
+      add(off->second.name, off->second.type);
 
   for (const am::Str &n : body_.sym.ownedNamesOf(v))
     add(n, ty);

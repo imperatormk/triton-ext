@@ -121,26 +121,12 @@ make test
 
 ### Serving a dependency from another index
 
-An extension that needs a package from somewhere other than PyPI names the index
-in its own `pyproject.toml`. `explicit` keeps that index out of the search for
-every other package:
+An extension whose dependency should come from an index other than PyPI names it
+in the `install` target:
 
-```toml
-[project]
-dependencies = ["torch"]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }
+```bash
+uv pip install --index <name>=<url> dist/*.whl --reinstall-package <name>
 ```
-
-Here that avoids the CUDA runtime, over a gigabyte of it, that the Linux torch
-on PyPI depends on, along with a released `triton` that would sit on top of the
-pinned nightly.
 
 ## Use
 

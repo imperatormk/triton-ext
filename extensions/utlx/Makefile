@@ -1,5 +1,3 @@
-# The name in pyproject.toml, so a rebuild replaces this wheel
-# and leaves everything it depends on alone.
 WHEEL_NAME := utlx
 WHEEL_DIR ?= dist
 

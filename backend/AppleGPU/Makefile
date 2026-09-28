@@ -10,7 +10,7 @@ build:
 
 .PHONY: install
 install:
-	uv pip install $(WHEEL_DIR)/*.whl --reinstall-package $(WHEEL_NAME)
+	uv pip install . --no-build-isolation --reinstall-package $(WHEEL_NAME)
 
 .PHONY: test
 test:

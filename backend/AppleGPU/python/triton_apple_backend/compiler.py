@@ -65,13 +65,15 @@ def _metallib_from_source(msl):
         lib = os.path.join(d, 'k.metallib')
         with open(src, 'w') as f:
             f.write(msl)
-        for argv in ([
-                'xcrun', 'metal', '-c', '-fmetal-math-mode=safe',
+        for tool, args in (('metal', [
+                '-c', '-fmetal-math-mode=safe',
                 '-fmetal-math-fp32-functions=fast', src, '-o', air
-        ], ['xcrun', 'metallib', air, '-o', lib]):
-            got = subprocess.run(argv, capture_output=True, text=True)
+        ]), ('metallib', [air, '-o', lib])):
+            got = subprocess.run(['xcrun', '-sdk', 'macosx', tool, *args],
+                                 capture_output=True,
+                                 text=True)
             if got.returncode != 0:
-                raise RuntimeError(f"{argv[1]} failed: {got.stderr.strip()}")
+                raise RuntimeError(f"{tool} failed: {got.stderr.strip()}")
         with open(lib, 'rb') as f:
             return f.read()
 

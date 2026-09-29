@@ -33,10 +33,11 @@ that is what produces the `.metallib`. On Xcode 16 and later it is a separate
 download: `xcodebuild -downloadComponent MetalToolchain`. Building the library
 in-process instead fails to load on macOS 26.
 
-On Xcode 27, `xcrun metal` reports
+On Xcode 27, a bare `xcrun metal` reports
 `cannot execute tool 'metal' due to missing Metal Toolchain` even once the
 component is installed, because the default toolchain does not delegate to the
-mounted one. Set `TOOLCHAINS=Metal` to pick it up.
+mounted one. The backend calls `xcrun -sdk macosx`, which resolves the mounted
+toolchain; no `TOOLCHAINS` override is needed.
 
 ### Metal version and hardware
 

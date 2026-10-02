@@ -97,6 +97,16 @@ __all__ = [
     # warp_ops
     "vote_ballot_sync",
     "warp_redux",
+    # layout_ops
+    "amd_mfma_layout",
+    "dot_operand_layout",
+    "slice_layout",
+    "swizzled_layout",
+    "require_layout",
+    "release_layout",
+    "zeros",
+    "buffer_load",
+    "buffer_store",
 ]
 
 # Imported first, ahead of anything that pulls in triton: importing it is the
@@ -150,6 +160,9 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
+from .layout_ops import (amd_mfma_layout, buffer_load, buffer_store,
+                         dot_operand_layout, release_layout, require_layout,
+                         slice_layout, swizzled_layout, zeros)
 from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, tcgen05_commit
 from .types import (
     async_token,
@@ -193,6 +206,7 @@ from .utility import (
 # Register this module as triton.language.extra.tlx so that
 # `import triton.language.extra.tlx` works without a filesystem symlink.
 # This must happen before importing mxfp8_utils which does that import.
+import os as _os
 import sys as _sys
 import triton.language.extra as _extra
 
@@ -321,6 +335,13 @@ from .mxfp8_utils import _to_mxfp8_block  # noqa: E402
 from .warp_ops import vote_ballot_sync, warp_redux  # noqa: E402
 
 from . import custom_stages  # noqa: E402
+from .compiler.semantic import install_semantic  # noqa: E402
+
+# Layout propagation, entirely inside a TritonSemantic subclass -- the ops as
+# overrides and the result type via make_tensor. No monkeypatching. No-ops for
+# values without an explicit layout. UTLX_NO_LAYOUT_PROPAGATION=1 opts out.
+if _os.environ.get("UTLX_NO_LAYOUT_PROPAGATION") != "1":
+    install_semantic()
 
 from triton import knobs  # noqa: E402
 
@@ -384,6 +405,52 @@ def _patch_visit_with():
 # Meta's fork owns visit_With, so only patch a Triton that has no registry.
 if not _register_compiler_dispatch():
     _patch_visit_with()
+
+
+def _patch_verify_loop_carried_variable():
+    """Reject loop-carried TLX values whose type changes inside the loop.
+
+    Upstream's ``CodeGenerator._verify_loop_carried_variable`` only compares
+    types for ``tl.tensor``, so a TLX value -- e.g. a 2-buffer ``local_alloc``
+    reassigned to one ``local_view`` of it -- slips through and the mismatch
+    surfaces later as a raw MLIR verifier error on ``scf.for``/``scf.while``.
+    Meta's fork extends the check to TLX values; do the same here.
+
+    Compare the Python-side ``.type``, as upstream does, not the IR handles:
+    the check runs after the loop's dry-run block is erased, so ``loop_val``'s
+    handle is already dangling.
+    """
+    import triton.compiler.code_generator as _cg
+
+    from .types import tlx_value
+
+    if getattr(_cg.CodeGenerator, "_utlx_verify_loop_carried", False):
+        return
+
+    _orig_verify = _cg.CodeGenerator._verify_loop_carried_variable
+
+    def _verify_loop_carried_variable(self, name, loop_val, live_val):
+        _orig_verify(self, name, loop_val, live_val)
+        if not isinstance(loop_val, tlx_value):
+            return
+        try:
+            same = loop_val.type == live_val.type
+        except NotImplementedError:
+            # tl.base_type's default __eq__; nothing structural to compare.
+            return
+        if not same:
+            # Same wording as upstream's tl.tensor check.
+            raise AssertionError(
+                f'Loop-carried variable {name} has initial type '
+                f'{live_val.type} but is re-assigned to {loop_val.type} in '
+                f'loop! Please make sure that the type stays consistent.')
+
+    _cg.CodeGenerator._verify_loop_carried_variable = (
+        _verify_loop_carried_variable)
+    _cg.CodeGenerator._utlx_verify_loop_carried = True
+
+
+_patch_verify_loop_carried_variable()
 
 
 def _make_tlx_op_builder():

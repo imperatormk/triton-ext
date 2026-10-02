@@ -14,7 +14,6 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Version.h"
-
 #include <iterator>
 
 #ifndef TRITON_EXT_VERSION
@@ -205,6 +204,13 @@ static void createTMEMSubSlice(TritonOpBuilder &self,
   if (!offset || !size)
     return;
 
+#ifdef UTLX_TRITON_TMEM_SUBSLICE_NO_DIM
+  // release/3.8's derived builder has no `dim` and always slices the last
+  // dimension, which is what TLX's local_slice wants
+  // (UTLX_TRITON_TMEM_SUBSLICE_NO_DIM is set by CMake in that case).
+  operands[0] = self.create<ttng::TMEMSubSliceOp>(
+      operands[1], static_cast<int>(*offset), static_cast<int>(*size));
+#else
   // Upstream's derived builder gained a `dim`: the op can now slice either
   // physical-layout dimension, or the leading pipeline dimension of a
   // multi-buffered descriptor. TLX's local_slice always takes columns, so
@@ -216,6 +222,7 @@ static void createTMEMSubSlice(TritonOpBuilder &self,
 
   operands[0] = self.create<ttng::TMEMSubSliceOp>(
       operands[1], static_cast<int>(*offset), static_cast<int>(*size), dim);
+#endif
 }
 
 // --- utlx_memdesc_subslice: Rectangular subslice of a memdesc ---
@@ -913,6 +920,9 @@ TRITON_PLUGIN_API plugin::PluginInfo *tritonGetPluginInfo() {
       {"utlx_async_load", utlx::createAsyncLoad},
       {"utlx_global_scratch_alloc", utlx::createGlobalScratchAlloc},
       {"utlx_make_dummy_register_layout", utlx::createMakeDummyRegisterLayout},
+      {"utlx_make_amd_mfma_layout", utlx::createMakeAmdMfmaLayout},
+      {"utlx_make_slice_layout", utlx::createMakeSliceLayout},
+      {"utlx_local_slice_typed", utlx::createLocalSlice},
       {"utlx_require_with_layout_carrier",
        utlx::createRequireWithLayoutCarrier},
       {"utlx_alloc_clc_responses", utlx::createAllocClcResponses},

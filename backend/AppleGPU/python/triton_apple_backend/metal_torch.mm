@@ -118,7 +118,8 @@ static PyBufferProcs SharedBuffer_as_buffer = {
 };
 
 static PyTypeObject SharedBufferType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "metal_torch.SharedBuffer",
+    .ob_base = PyVarObject_HEAD_INIT(NULL, 0).tp_name =
+        "metal_torch.SharedBuffer",
     .tp_basicsize = sizeof(SharedBufferObject),
     .tp_dealloc = (destructor)SharedBuffer_dealloc,
     .tp_as_buffer = &SharedBuffer_as_buffer,
@@ -399,7 +400,8 @@ static PyGetSetDef MetalKernel_getset[] = {{"max_total_threads_per_threadgroup",
                                            {NULL}};
 
 static PyTypeObject MetalKernelType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "metal_torch.MetalKernel",
+    .ob_base = PyVarObject_HEAD_INIT(NULL, 0).tp_name =
+        "metal_torch.MetalKernel",
     .tp_basicsize = sizeof(MetalKernelObject),
     .tp_dealloc = (destructor)MetalKernel_dealloc,
     .tp_call = (ternaryfunc)MetalKernel_call,
@@ -472,7 +474,8 @@ static PyMethodDef MetalLibrary_methods[] = {
     {NULL}};
 
 static PyTypeObject MetalLibraryType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "metal_torch.MetalLibrary",
+    .ob_base = PyVarObject_HEAD_INIT(NULL, 0).tp_name =
+        "metal_torch.MetalLibrary",
     .tp_basicsize = sizeof(MetalLibraryObject),
     .tp_dealloc = (destructor)MetalLibrary_dealloc,
     .tp_flags = Py_TPFLAGS_DEFAULT,

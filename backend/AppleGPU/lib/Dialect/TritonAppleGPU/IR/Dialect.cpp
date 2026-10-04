@@ -63,6 +63,21 @@ struct AppleGPUInferLayoutInterface
     return success();
   }
 
+  LogicalResult
+  verifyBroadcastOpEncoding(RankedTensorType srcType,
+                            RankedTensorType dstType) const override {
+    if (!isa<ttg::DistributedEncodingTrait>(dstType.getEncoding()))
+      return failure();
+    auto src = ttg::toLinearLayout(srcType);
+    auto dst = ttg::toLinearLayout(dstType);
+    for (auto [dim, size] : src.getOutDims())
+      dst = dst.resizeOutDim(dim, size);
+    auto kReg =
+        StringAttr::get(srcType.getContext(), applegpu::lldim::Register);
+    return success(src.removeZeroBasesAlongDim(kReg) ==
+                   dst.removeZeroBasesAlongDim(kReg));
+  }
+
   LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                                    Attribute retEncoding,
                                    std::optional<Location> loc) const override {

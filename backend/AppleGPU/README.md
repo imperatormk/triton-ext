@@ -24,7 +24,7 @@ triton-ext/backend/AppleGPU/
 
 ## Prerequisites
 
-macOS 14+ with Xcode, for the Metal framework and clang. Everything else (LLVM,
+macOS 15+ with Xcode, for the Metal framework and clang. Everything else (LLVM,
 Triton, cmake, ninja) is the repo-wide setup in the
 [top-level README](../../README.md).
 

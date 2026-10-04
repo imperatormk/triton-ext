@@ -10,6 +10,7 @@ import re
 import subprocess
 import tempfile
 
+from triton import knobs
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes
 from triton_apple_backend.device_assert import extract_assert_layout_text
@@ -36,19 +37,19 @@ _REFLECT_FTZ_ATTR = 'applegpu.reflect_ftz'
 _MSL_PREAMBLE_END = 'using namespace metal;\n'
 
 
-def _disable_fp_contraction(msl):
-    """Insert the fp-contract pragma for enable_fp_fusion=False. Metal
-    contracts `a*b+c` into an FMA by default and MTLCompileOptions has no knob
-    for it.
+def _set_fp_contraction(msl, fuse):
+    """Insert the fp-contract pragma for enable_fp_fusion. MTLCompileOptions
+    has no knob for it, and Metal's default fuses `a*b+c` only within one
+    expression, while the emitter gives each op its own statement.
     """
-    pragma = '#pragma METAL fp contract(off)\n'
+    pragma = f"#pragma METAL fp contract({'fast' if fuse else 'off'})\n"
     if pragma in msl:
         return msl
     at = msl.find(_MSL_PREAMBLE_END)
     if at < 0:
         raise RuntimeError(
-            "cannot honour enable_fp_fusion=False: no MSL preamble to anchor "
-            "the fp-contract pragma to")
+            "cannot honour enable_fp_fusion: no MSL preamble to anchor the "
+            "fp-contract pragma to")
     at += len(_MSL_PREAMBLE_END)
     return msl[:at] + pragma + msl[at:]
 
@@ -100,7 +101,7 @@ class MetalOptions:
     simdgroup_k: int = _inert(_SG_FRAG_DIM)
 
     debug: bool = False
-    enable_fp_fusion: bool = True
+    enable_fp_fusion: bool = False
     enable_reflect_ftz: bool = True
     launch_cooperative_grid: bool = _inert(False)
     instrumentation_mode: str = "none"
@@ -155,6 +156,8 @@ class MetalBackend(BaseBackend):
         # kernel's cache entry instead of compiling it again.
         if "num_stages" in args:
             args["num_stages"] = min(args["num_stages"], _MAX_PIPELINE_STAGES)
+        args["enable_fp_fusion"] = knobs.language.fp_fusion_enabled(
+            args.get("enable_fp_fusion"))
         return MetalOptions(**args)
 
     def pack_metadata(self, metadata):
@@ -295,8 +298,7 @@ class MetalBackend(BaseBackend):
         with open(msl_path, 'r') as f:
             msl = f.read()
         os.unlink(msl_path)
-        if not options.enable_fp_fusion:
-            msl = _disable_fp_contraction(msl)
+        msl = _set_fp_contraction(msl, options.enable_fp_fusion)
         if os.environ.get('TRITON_MSL_DEBUG'):
             print("=== emitted MSL ===")
             print(msl)

@@ -210,6 +210,27 @@ int main() {
              std::string("metal::clamp(v, lo, hi)"));
   }
 
+  CASE("bfloat multi-operand math is widened to float and narrowed back");
+  {
+    msl::Context c;
+    CHECK_EQ(render(minMaxExprOf(c, MathFn2::Max, bf16(), c.var("a"),
+                                 c.var("b"), false)),
+             std::string("(bfloat)metal::max((float)a, (float)b)"));
+    CHECK_EQ(
+        render(mathExpr(c, MathFn3::Clamp, bf16(), c.var("v"), c.var("lo"),
+                        c.var("hi"))),
+        std::string("(bfloat)metal::clamp((float)v, (float)lo, (float)hi)"));
+    CHECK_EQ(render(mathExpr(c, MathFn3::Fma, bf16(), c.var("a"), c.var("b"),
+                             c.var("d"))),
+             std::string("(bfloat)metal::fma((float)a, (float)b, (float)d)"));
+    CHECK_EQ(render(minMaxExprOf(c, MathFn2::Max, f16(), c.var("a"), c.var("b"),
+                                 false)),
+             std::string("metal::max(a, b)"));
+    CHECK_EQ(render(mathExpr(c, MathFn2::DivideApprox, f32(), c.var("a"),
+                             c.var("b"))),
+             std::string("metal::divide(a, b)"));
+  }
+
   CASE("a float-only function declines on an integer and mulhi the reverse");
   {
     CHECK(checkMath2(MathFn2::Pow, i32()).isDecline());

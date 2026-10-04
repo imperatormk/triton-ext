@@ -21,11 +21,11 @@ bool isArmOp(Operation *op) {
   const llvm::StringRef n = nameOf(op);
   if (n.starts_with("arith.") || n.starts_with("math."))
     return true;
-  return llvm::is_contained({"tt.splat", "tt.broadcast", "tt.expand_dims",
-                             "tt.addptr", "tt.extern_elementwise",
-                             "tt.precise_divf", "tt.precise_sqrt", "tt.mulhiui",
-                             "tt.fp_to_fp", "tt.bitcast"},
-                            n);
+  return llvm::is_contained(
+      {"tt.splat", "tt.broadcast", "tt.expand_dims", "tt.addptr",
+       "tt.extern_elementwise", "tt.precise_divf", "tt.approx_divf",
+       "tt.precise_sqrt", "tt.mulhiui", "tt.fp_to_fp", "tt.bitcast"},
+      n);
 }
 
 bool isCostly(Operation *op) {
@@ -37,7 +37,7 @@ bool isCostly(Operation *op) {
                                 "math.ctlz", "math.cttz", "math.ctpop"},
                                n);
   return llvm::is_contained({"tt.extern_elementwise", "tt.precise_divf",
-                             "tt.precise_sqrt", "arith.divf"},
+                             "tt.approx_divf", "tt.precise_sqrt", "arith.divf"},
                             n);
 }
 

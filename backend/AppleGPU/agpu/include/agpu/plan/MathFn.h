@@ -64,6 +64,7 @@ enum class MathFn2 {
   Mulhi,
   // Float `/`. The correctly rounded one is `tt.precise_divf`, a DivF.
   Divide,
+  DivideApprox,
   Count,
 };
 
@@ -160,6 +161,8 @@ inline constexpr MathSpelling2 kMathSpellings2[] = {
     {MathFn2::Mulhi, msl::builtin::math::Mulhi, false},
     {MathFn2::Divide, spell(msl::builtin::accuracy::Divide, Accuracy::Tolerant),
      true},
+    {MathFn2::DivideApprox,
+     spell(msl::builtin::accuracy::Divide, Accuracy::Tolerant), true},
 };
 
 // ── one operand ───────────────────────────────────────────────────────────
@@ -213,6 +216,13 @@ inline ElemType mathResultType(MathFn fn, ElemType operand) {
 inline bool mathResultNarrows(MathFn fn, ElemType operand) {
   return operand.kind == ElemType::Kind::Float && operand.bits < 32 &&
          mathResultType(fn, operand) == operand;
+}
+
+// Metal's multi-operand math has no `bfloat` overload, and a `bfloat`
+// converts to both its float and integer overloads, so the call is ambiguous.
+inline bool mathWidensToFloat(ElemType elem) {
+  return elem.kind == ElemType::Kind::Float &&
+         elem.floatKind == FloatKind::Brain;
 }
 
 inline Decision checkMath(MathFn fn, ElemType elem) {

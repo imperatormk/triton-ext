@@ -91,13 +91,22 @@ inline msl::Stmt *emitFCmp(msl::Context &c, FCmp pred, const msl::Str &dst,
   return c.declStmt(mslTypeOf(i1()), dst, fcmpExpr(c, pred, a, b));
 }
 
+inline msl::Expr *mathCall(msl::Context &c, const char *name, ElemType elem,
+                           msl::SmallVec<msl::Expr *, 4> args) {
+  if (!mathWidensToFloat(elem))
+    return c.call(name, std::move(args));
+  for (msl::Expr *&arg : args)
+    arg = c.cast(mslTypeOf(f32()), arg);
+  return c.cast(mslTypeOf(elem), c.call(name, std::move(args)));
+}
+
 // ── min and max ───────────────────────────────────────────────────────────
 
 // The NaN arm is `a + b`: it yields a NaN of the right type without naming
 // one per float width.
 inline msl::Expr *minMaxExprOf(msl::Context &c, MathFn2 fn, ElemType elem,
                                msl::Expr *a, msl::Expr *b, bool propagateNan) {
-  msl::Expr *call = c.call(mathNameOf(fn), {a, b});
+  msl::Expr *call = mathCall(c, mathNameOf(fn), elem, {a, b});
   if (!minMaxPropagatesNan(fn, elem, propagateNan))
     return call;
   return c.ternary(eitherIsNan(c, a, b), c.binary(msl::BinOp::Add, a, b), call);
@@ -146,7 +155,7 @@ inline msl::Expr *mathExpr(msl::Context &c, MathFn2 fn, ElemType elem,
                            msl::Expr *a, msl::Expr *b) {
   if (fn == MathFn2::Divide && divideNeedsHelper(elem))
     return c.call(msl::builtin::helper::DivF, {a, b});
-  return mathExpr(c, fn, a, b);
+  return mathCall(c, mathNameOf(fn), elem, {a, b});
 }
 
 inline msl::Expr *mathExpr(msl::Context &c, MathFn3 fn, msl::Expr *a,
@@ -157,11 +166,12 @@ inline msl::Expr *mathExpr(msl::Context &c, MathFn3 fn, msl::Expr *a,
 // `metal::fma` flushes a subnormal operand or result to zero, so f32 goes
 // through the helper that falls back to integer arithmetic there.
 inline msl::Expr *mathExpr(msl::Context &c, MathFn3 fn, ElemType elem,
-                           msl::Expr *a, msl::Expr *b, msl::Expr *d) {
-  if (fn == MathFn3::Fma && elem.kind == ElemType::Kind::Float &&
-      elem.bits == 32)
+                           msl::Expr *a, msl::Expr *b, msl::Expr *d,
+                           bool keepSubnormals = true) {
+  if (keepSubnormals && fn == MathFn3::Fma &&
+      elem.kind == ElemType::Kind::Float && elem.bits == 32)
     return c.call(msl::builtin::helper::Fma, {a, b, d});
-  return mathExpr(c, fn, a, b, d);
+  return mathCall(c, mathNameOf(fn), elem, {a, b, d});
 }
 
 // `metal::clamp` drops NaN like min/max do. Under `propagateNan` the tested

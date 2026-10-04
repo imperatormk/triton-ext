@@ -157,6 +157,7 @@ inline constexpr Math2Name kMath2Names[] = {
     {"arith.remf", agpu::MathFn2::Fmod, false},
     {"tt.mulhiui", agpu::MathFn2::Mulhi, false, true},
     {"arith.divf", agpu::MathFn2::Divide, false},
+    {"tt.approx_divf", agpu::MathFn2::DivideApprox, false},
 };
 
 inline const Math2Name *math2For(std::string_view name) {

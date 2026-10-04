@@ -264,11 +264,9 @@ agpu::Decision AgpuEmitter::emitLibdeviceFmaOp(const agpu::OpView &o) {
   const Operand &v2 = ready[2];
   return emitPerRegister(o, ready.regs, ready.elem, 'm', [&](int64_t r) {
     RegValue v;
-    v.value = ftz ? agpu::mathExpr(mc, agpu::MathFn3::Fma, mc.var(v0.at(r)),
-                                   mc.var(v1.at(r)), mc.var(v2.at(r)))
-                  : agpu::mathExpr(mc, agpu::MathFn3::Fma, ready.elem,
-                                   mc.var(v0.at(r)), mc.var(v1.at(r)),
-                                   mc.var(v2.at(r)));
+    v.value =
+        agpu::mathExpr(mc, agpu::MathFn3::Fma, ready.elem, mc.var(v0.at(r)),
+                       mc.var(v1.at(r)), mc.var(v2.at(r)), !ftz);
     return v;
   });
 }

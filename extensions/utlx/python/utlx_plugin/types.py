@@ -13,6 +13,21 @@ from triton._C.libtriton import ir
 from triton.language.core import _aggregate as aggregate
 
 
+class tlx_value(tl.base_value):
+    """Base for TLX values that wrap a single IR handle.
+
+    `tl.base_value._set_name` is abstract. Upstream's code generator calls it
+    on every value bound to a named variable, so without an implementation any
+    `x = tlx.local_alloc(...)` raises a bare `NotImplementedError`. Meta's fork
+    never hits this because its code generator does not name TLX values.
+    Mirrors `tl.tensor._set_name`.
+    """
+
+    def _set_name(self, builder, name: str) -> None:
+        self.handle.set_loc(
+            builder.create_name_loc(name, self.handle.get_loc()))
+
+
 class layout_encoding:
 
     def __init__(self):
@@ -232,6 +247,115 @@ class tensor_memory_scales_layout_encoding:
             self.CTASplitM, self.CTASplitN)
 
 
+def _modes_to_flat_strides(shape, stride):
+    """Expand a shape:stride list of modes into per-bit flat strides.
+
+    ``shape`` is a tuple of power-of-two mode extents and ``stride`` the
+    matching tuple of scalar flat offsets. A mode ``(2^k, s)`` contributes the
+    ``k`` bit-strides ``s, 2s, 4s, ..., 2^(k-1) s`` -- the GF(2) decomposition a
+    linear layout is written in.
+    """
+    assert len(shape) == len(stride), \
+        "layout: shape and stride must have the same number of modes"
+    flat = []
+    for extent, s in zip(shape, stride):
+        extent = int(extent)
+        s = int(s)
+        assert extent & (extent - 1) == 0, \
+            f"layout mode extent {extent} must be a power of two"
+        b = 1
+        while b < extent:
+            flat.append(s * b)
+            b <<= 1
+    return flat
+
+
+def _flat_to_coord(flat, tensor_shape):
+    """Decode a flat row-major offset into a per-dimension coordinate vector."""
+    coord = []
+    for d in range(len(tensor_shape)):
+        dim_stride = 1
+        for later in tensor_shape[d + 1:]:
+            dim_stride *= int(later)
+        coord.append((flat // dim_stride) % int(tensor_shape[d]))
+    return coord
+
+
+class layout(layout_encoding):
+    """A user-specified distributed (register) layout, as CuTe shape/stride.
+
+    The layout has two top-level modes, ``(thread, value)``::
+
+        shape  = (thread_shape, value_shape)
+        stride = (thread_stride, value_stride)
+
+    Each ``*_shape`` is a tuple of power-of-two extents and each ``*_stride``
+    the matching tuple of flat, row-major offsets into the tile. Each mode
+    ``(2^k, s)`` decomposes into bits ``s, 2s, ..., 2^(k-1) s``; the thread bits
+    split into lane (the low ``log2(threads_per_warp)``) and warp (the rest),
+    and the value bits map to registers.
+
+    Example (separable QK layout, tile ``[N=128, M=128]``, so flat offset is
+    ``n * 128 + m``)::
+
+        tlx.layout(
+            shape =((32, 4, 2), (32, 2)),   # (thread, value)
+            stride=((128, 4096, 32), (1, 64)),
+        )
+
+    Unlike TLX this takes no ``spec`` argument: passing a swizzled shared-memory
+    layout is not supported here, so use the shared-memory encodings directly.
+    """
+
+    def __init__(self, shape=None, stride=None):
+        super().__init__()
+        assert shape is not None and stride is not None, \
+            "tlx.layout requires shape= and stride= for a register layout"
+        assert len(shape) == 2 and len(stride) == 2, \
+            "layout: shape and stride must each be (thread, value)"
+        self.thread_shape, self.value_shape = shape
+        self.thread_stride, self.value_stride = stride
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None):
+        assert shape is not None, \
+            "layout.to_ir requires the consuming tensor shape"
+        tensor_shape = [int(s) for s in shape]
+        warp_size = int(builder.options.warp_size)
+        lane_bits = warp_size.bit_length() - 1  # log2(threads_per_warp)
+
+        value_flat = _modes_to_flat_strides(self.value_shape,
+                                            self.value_stride)
+        thread_flat = _modes_to_flat_strides(self.thread_shape,
+                                             self.thread_stride)
+        lane_flat = thread_flat[:lane_bits]
+        warp_flat = thread_flat[lane_bits:]
+
+        reg_bases = [_flat_to_coord(f, tensor_shape) for f in value_flat]
+        lane_bases = [_flat_to_coord(f, tensor_shape) for f in lane_flat]
+        warp_bases = [_flat_to_coord(f, tensor_shape) for f in warp_flat]
+        # Call the fork's spelling: layout_compat installs
+        # make_linear_encoding_attr onto TLXOpBuilder and maps it to upstream's
+        # get_distributed_linear_layout, the same way it does for the shared
+        # and tensor-memory encodings.
+        return builder.make_linear_encoding_attr(reg_bases, lane_bases,
+                                                 warp_bases, tensor_shape)
+
+    def __repr__(self):
+        return (f"layout<shape=({self.thread_shape}, {self.value_shape}), "
+                f"stride=({self.thread_stride}, {self.value_stride})>")
+
+    def __eq__(self, other):
+        return (isinstance(other, layout)
+                and self.thread_shape == other.thread_shape
+                and self.value_shape == other.value_shape
+                and self.thread_stride == other.thread_stride
+                and self.value_stride == other.value_stride)
+
+    def __hash__(self):
+        return hash((tuple(self.thread_shape), tuple(self.value_shape),
+                     tuple(self.thread_stride), tuple(self.value_stride)))
+
+
 class DummyRegisterLayoutEncoding(layout_encoding):
 
     def __init__(self,
@@ -355,7 +479,7 @@ class reuse_group:
         return builder.utlx_reuse_group(args)
 
 
-class buffered_tensor(tl.base_value):
+class buffered_tensor(tlx_value):
     """A tensor allocated in a manually managed buffer (SMEM or TMEM)."""
 
     def __init__(
@@ -372,7 +496,24 @@ class buffered_tensor(tl.base_value):
         self.shape = shape
         self.type = buffered_tensor_type(element_ty, shape, num, storage,
                                          layout)
+        # Upstream Triton's builder has no memdesc type constructor
+        # (get_shared_mem_desc_ty / make_*_shared_encoding_attr are TLX-fork
+        # only), so buffered_tensor_type.to_ir() cannot build the type there.
+        # It does not need to: this handle already carries exactly that type.
+        if handle is not None:
+            try:
+                self.type._ir_type = handle.get_type()
+            except AttributeError:
+                pass
         self.dtype = element_ty
+
+    def _set_name(self, builder, name: str) -> None:
+        # Mirrors tl.tensor._set_name. base_value's default raises, and newer
+        # Triton calls this for every @triton.jit argument, so a buffered_tensor
+        # could not be passed across a jit boundary without it.
+        if self.handle is not None:
+            self.handle.set_loc(
+                builder.create_name_loc(name, self.handle.get_loc()))
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
@@ -427,6 +568,11 @@ class buffered_tensor_type(tl.block_type):
                 and self.layout == other.layout)
 
     def to_ir(self, builder):
+        # Prefer the concrete type recorded from the defining value; only fall
+        # back to constructing one (TLX-fork builders only) if unavailable.
+        cached = getattr(self, "_ir_type", None)
+        if cached is not None:
+            return cached
         shape = self.shape
         if self.num >= 1:
             shape = [self.num] + list(shape)
@@ -455,7 +601,7 @@ class buffered_tensor_type(tl.block_type):
         return value, cursor + 1
 
 
-class mbarrier(tl.base_value):
+class mbarrier(tlx_value):
     """An mbarrier allocated in shared memory."""
 
     def __init__(
@@ -489,7 +635,13 @@ class mbarrier_type(buffered_tensor_type):
 
     def to_ir(self, builder):
         if self.num >= 1:
-            shape = [self.num]
+            # Must match createAllocBarriers, which allocates {num, numCTAs}
+            # with numCTAs == 1. Declaring the array rank 1 here made every
+            # memdesc_index that crossed a function boundary go rank 1 -> rank
+            # 1, which upstream rejects with "result rank must be input rank
+            # - 1". A single barrier (num == 0, from local_view) keeps
+            # self.shape and stays rank 1.
+            shape = [self.num, 1]
         else:
             shape = self.shape
         assert self.layout is not None
@@ -506,7 +658,7 @@ class mbarrier_type(buffered_tensor_type):
         return value, cursor + 1
 
 
-class clc_response(tl.base_value):
+class clc_response(tlx_value):
     """A CLC response object."""
 
     def __init__(self, handle, num: int,
@@ -522,11 +674,14 @@ class clc_response(tl.base_value):
 class clc_response_type(buffered_tensor_type):
 
     def __init__(self, num: int, layout: Optional[shared_layout_encoding]):
-        super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
+        # A CLC response is {2} x i64; see createAllocClcResponses.
+        super().__init__(tl.int64, [2], num, storage_kind.smem, layout)
 
     def to_ir(self, builder):
         if self.num >= 1:
-            shape = [self.num]
+            # Match createAllocClcResponses' {num, 2}; see mbarrier_type.to_ir
+            # for why the array must not be declared rank 1.
+            shape = [self.num, 2]
         else:
             shape = self.shape
         assert self.layout is not None
@@ -573,7 +728,7 @@ class reuse_group_ir_type(tl.base_type):
         return f"reuse_group_{self._group_kind.value}"
 
 
-class storage_alias_spec(tl.base_value):
+class storage_alias_spec(tlx_value):
     """A storage alias specification for buffer sharing."""
 
     def __init__(
@@ -672,7 +827,7 @@ class storage_alias_spec_type(tl.base_type):
         return value, cursor + 1
 
 
-class async_token(tl.base_value):
+class async_token(tlx_value):
     """Tracks and synchronizes asynchronous operations."""
 
     def __init__(self, handle):
@@ -704,7 +859,7 @@ class async_token_type(tl.base_type):
         return async_token(handles[cursor]), cursor + 1
 
 
-class tensor_descriptor_ptr(tl.base_value):
+class tensor_descriptor_ptr(tlx_value):
 
     def __init__(self, handle, num: int, descriptor_size: int):
         super().__init__()

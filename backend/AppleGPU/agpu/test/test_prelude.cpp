@@ -378,5 +378,38 @@ int main() {
     CHECK_LACKS(body, "ulong");
   }
 
+  CASE("f32 division, exact or tolerant, pulls in the soft path it guards");
+  {
+    HelperSet hs;
+    hs.require(EwOp::DivF, f32());
+    CHECK(hs.has(Helper::DivF));
+    CHECK(hs.has(Helper::SoftDivF));
+    CHECK((unsigned)Helper::SoftDivF < (unsigned)Helper::DivF);
+
+    HelperSet tolerant;
+    tolerant.require(MathFn2::Divide, f32());
+    CHECK(tolerant.has(Helper::DivF));
+
+    HelperSet other;
+    other.require(EwOp::DivF, f16());
+    other.require(MathFn2::Fmod, f32());
+    CHECK(!other.any());
+  }
+
+  CASE("a subnormal operand or quotient leaves the hardware divide");
+  {
+    const std::string body = helperSource(Helper::DivF);
+    CHECK_HAS(body, "a / b");
+    CHECK_HAS(body, helperName(Helper::SoftDivF));
+    CHECK_HAS(body, "metal::min3");
+    CHECK_HAS(body, "__builtin_expect(near, 0)");
+
+    const std::string soft = helperSource(Helper::SoftDivF);
+    CHECK_HAS(soft, "fa / fb");
+    CHECK_HAS(soft, "metal::fma(-q, fb, fa)");
+    CHECK_HAS(soft, "0x3f800000u");
+    CHECK_LACKS(soft, "ulong");
+  }
+
   return ::agpu_test::report("Prelude");
 }

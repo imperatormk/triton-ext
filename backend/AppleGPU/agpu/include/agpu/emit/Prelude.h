@@ -137,6 +137,16 @@ public:
     add(Helper::SoftFma);
   }
 
+  void require(MathFn2 fn, ElemType elem) {
+    if (fn == MathFn2::Divide && divideNeedsHelper(elem))
+      requireDivide();
+  }
+
+  void require(EwOp op, ElemType elem) {
+    if (op == EwOp::DivF && divideNeedsHelper(elem))
+      requireDivide();
+  }
+
   void require(const ConvertPlan &p) {
     Helper h;
     if (!convertHelper(p, h))
@@ -149,6 +159,11 @@ public:
   }
 
 private:
+  void requireDivide() {
+    add(Helper::DivF);
+    add(Helper::SoftDivF);
+  }
+
   EnumBitset<Helper, std::uint64_t> bits_;
 };
 
@@ -762,6 +777,147 @@ inline msl::Function *guardedFma(msl::Context &c) {
   return fn;
 }
 
+// Divides significands rebuilt from the bits; the exact fma residual breaks a
+// subnormal result's rounding tie.
+inline msl::Function *softDiv(msl::Context &c) {
+  using B = msl::BinOp;
+  const msl::Type f32 = msl::Type::scalar(msl::Scalar::F32);
+  const msl::Type u32 = msl::Type::scalar(msl::Scalar::U32);
+  const msl::Type i32 = msl::Type::scalar(msl::Scalar::I32);
+  const msl::Type b = msl::Type::scalar(msl::Scalar::Bool);
+
+  msl::Function *fn = helperFn(c, hn::SoftDivF, f32);
+  fn->params.push_back({f32, "a", {}});
+  fn->params.push_back({f32, "b", {}});
+
+  const auto v = [&](const std::string &n) { return c.var(n); };
+  const auto bin = [&](B op, msl::Expr *x, msl::Expr *y) {
+    return c.binary(op, x, y);
+  };
+  const auto hex = [&](int64_t x) { return c.litHex(x); };
+  const auto asF = [&](msl::Expr *e) { return c.bitcast(f32, e); };
+  const auto zero = [&] { return c.lit(0, u32); };
+  const auto nan = [&] { return c.returnStmt(asF(hex(0x7fc00000))); };
+  const auto inf = [&] {
+    return c.returnStmt(asF(bin(B::Or, v("sg"), hex(0x7f800000))));
+  };
+  const auto signedZero = [&] { return c.returnStmt(asF(v("sg"))); };
+  msl::Block &body = fn->body;
+
+  for (const char *x : {"a", "b"}) {
+    const std::string s(x);
+    body.push_back(c.declStmt(u32, "u" + s, c.bitcast(u32, v(s))));
+    body.push_back(
+        c.declStmt(u32, "m" + s, bin(B::And, v("u" + s), hex(0x7fffffff))));
+  }
+  body.push_back(c.declStmt(
+      u32, "sg", bin(B::And, bin(B::Xor, v("ua"), v("ub")), hex(0x80000000))));
+
+  body.push_back(c.ifStmt(bin(B::LOr, bin(B::Gt, v("ma"), hex(0x7f800000)),
+                              bin(B::Gt, v("mb"), hex(0x7f800000))),
+                          {nan()}));
+  body.push_back(c.ifStmt(
+      bin(B::Eq, v("ma"), hex(0x7f800000)),
+      {c.ifStmt(bin(B::Eq, v("mb"), hex(0x7f800000)), {nan()}), inf()}));
+  body.push_back(
+      c.ifStmt(bin(B::Eq, v("mb"), hex(0x7f800000)), {signedZero()}));
+  body.push_back(
+      c.ifStmt(bin(B::Eq, v("mb"), zero()),
+               {c.ifStmt(bin(B::Eq, v("ma"), zero()), {nan()}), inf()}));
+  body.push_back(c.ifStmt(bin(B::Eq, v("ma"), zero()), {signedZero()}));
+
+  for (const char *x : {"a", "b"}) {
+    const std::string s(x);
+    const std::string m = "m" + s, k = "k" + s, z = "z" + s;
+    body.push_back(
+        c.declStmt(b, z, bin(B::Eq, bin(B::Shr, v(m), c.lit(23)), zero())));
+    body.push_back(c.declStmt(
+        u32, k, c.ternary(v(z), c.bitcast(u32, c.cast(f32, v(m))), v(m))));
+    body.push_back(
+        c.declStmt(i32, "e" + s,
+                   bin(B::Sub, c.cast(i32, bin(B::Shr, v(k), c.lit(23))),
+                       c.ternary(v(z), c.lit(276), c.lit(127)))));
+    body.push_back(c.declStmt(
+        f32, "f" + s,
+        asF(bin(B::Or, bin(B::And, v(k), hex(0x7fffff)), hex(0x3f800000)))));
+  }
+
+  body.push_back(c.declStmt(f32, "q", bin(B::Div, v("fa"), v("fb"))));
+  body.push_back(c.declStmt(u32, "uq", c.bitcast(u32, v("q"))));
+  body.push_back(c.declStmt(
+      i32, "E",
+      bin(B::Add,
+          bin(B::Sub, c.cast(i32, bin(B::Shr, v("uq"), c.lit(23))), c.lit(127)),
+          bin(B::Sub, v("ea"), v("eb")))));
+  body.push_back(c.ifStmt(bin(B::Gt, v("E"), c.lit(127)), {inf()}));
+  body.push_back(c.ifStmt(
+      bin(B::Ge, v("E"), c.lit(-126)),
+      {c.returnStmt(
+          asF(bin(B::Or,
+                  bin(B::Or, v("sg"),
+                      bin(B::Shl, c.cast(u32, bin(B::Add, v("E"), c.lit(127))),
+                          c.lit(23))),
+                  bin(B::And, v("uq"), hex(0x7fffff)))))}));
+
+  body.push_back(c.declStmt(i32, "sh", bin(B::Sub, c.lit(-126), v("E"))));
+  body.push_back(c.ifStmt(bin(B::Gt, v("sh"), c.lit(24)), {signedZero()}));
+  body.push_back(c.declStmt(
+      u32, "M",
+      bin(B::Or, bin(B::And, v("uq"), hex(0x7fffff)), hex(0x800000))));
+  body.push_back(c.declStmt(
+      u32, "rem",
+      bin(B::And, v("M"),
+          bin(B::Sub, bin(B::Shl, c.lit(1, u32), v("sh")), c.lit(1, u32)))));
+  body.push_back(c.declStmt(
+      u32, "hb", bin(B::Shl, c.lit(1, u32), bin(B::Sub, v("sh"), c.lit(1)))));
+  body.push_back(c.declStmt(u32, "qq", bin(B::Shr, v("M"), v("sh"))));
+
+  msl::Block tie;
+  tie.push_back(
+      c.declStmt(f32, "r",
+                 c.call(msl::builtin::math::Fma,
+                        {c.unary(msl::UnOp::Neg, v("q")), v("fb"), v("fa")})));
+  tie.push_back(c.ifElse(
+      bin(B::Gt, v("r"), c.litF(0.0)),
+      {c.assign(v("qq"), bin(B::Add, v("qq"), c.lit(1, u32)))},
+      {c.ifStmt(
+          bin(B::Eq, v("r"), c.litF(0.0)),
+          {c.assign(v("qq"), bin(B::Add, v("qq"),
+                                 bin(B::And, v("qq"), c.lit(1, u32))))})}));
+  body.push_back(
+      c.ifElse(bin(B::Gt, v("rem"), v("hb")),
+               {c.assign(v("qq"), bin(B::Add, v("qq"), c.lit(1, u32)))},
+               {c.ifStmt(bin(B::Eq, v("rem"), v("hb")), std::move(tie))}));
+  body.push_back(c.returnStmt(asF(bin(B::Or, v("sg"), v("qq")))));
+  return fn;
+}
+
+// The ALU reads a subnormal operand as zero and flushes a subnormal quotient.
+inline msl::Function *guardedDiv(msl::Context &c) {
+  const msl::Type f32 = msl::Type::scalar(msl::Scalar::F32);
+  const msl::Type b = msl::Type::scalar(msl::Scalar::Bool);
+
+  msl::Function *fn = helperFn(c, hn::DivF, f32);
+  fn->params.push_back({f32, "a", {}});
+  fn->params.push_back({f32, "b", {}});
+
+  fn->body.push_back(
+      c.declStmt(f32, "r", c.binary(msl::BinOp::Div, c.var("a"), c.var("b"))));
+  fn->body.push_back(c.declStmt(
+      b, "near",
+      c.binary(msl::BinOp::Lt,
+               c.call(msl::builtin::math::Min3,
+                      {c.call(msl::builtin::math::Fabs, {c.var("a")}),
+                       c.call(msl::builtin::math::Fabs, {c.var("b")}),
+                       c.call(msl::builtin::math::Fabs, {c.var("r")})}),
+               c.bitcast(f32, c.litHex(0x800000)))));
+  fn->body.push_back(
+      c.ifStmt(c.call(msl::builtin::math::Expect, {c.var("near"), c.lit(0)}),
+               {c.returnStmt(c.call(hn::SoftDivF, {c.var("a"), c.var("b")}))}));
+  fn->body.push_back(c.returnStmt(c.var("r")));
+  return fn;
+}
+
 inline std::string helperSource(Helper h) {
   switch (h) {
   case Helper::AtomicRmwF32: {
@@ -1325,6 +1481,14 @@ inline std::string helperSource(Helper h) {
   case Helper::Fma: {
     msl::Context c;
     return renderHelper(guardedFma(c));
+  }
+  case Helper::SoftDivF: {
+    msl::Context c;
+    return renderHelper(softDiv(c));
+  }
+  case Helper::DivF: {
+    msl::Context c;
+    return renderHelper(guardedDiv(c));
   }
   case Helper::Count:
     break;

@@ -73,6 +73,10 @@ enum class MathFn3 {
   Count,
 };
 
+inline bool divideNeedsHelper(ElemType elem) {
+  return elem.kind == ElemType::Kind::Float && elem.bits == 32;
+}
+
 // ── the tables ────────────────────────────────────────────────────────────
 
 enum class Accuracy {

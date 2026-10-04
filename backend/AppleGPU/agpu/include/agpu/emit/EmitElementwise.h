@@ -21,6 +21,8 @@ inline msl::Expr *ewExpr(msl::Context &c, EwOp op, ElemType elem, msl::Expr *a,
   msl::BinOp bo;
   if (!spellingOf(op, elem, bo))
     return nullptr;
+  if (op == EwOp::DivF && divideNeedsHelper(elem))
+    return c.call(msl::builtin::helper::DivF, {a, b});
 
   const EwTypes t = typesFor(op, elem);
   const ElemType want = evalWidthFor(t.operand);
@@ -138,6 +140,13 @@ inline msl::Stmt *emitMath(msl::Context &c, MathFn fn, ElemType elem,
 inline msl::Expr *mathExpr(msl::Context &c, MathFn2 fn, msl::Expr *a,
                            msl::Expr *b) {
   return c.call(mathNameOf(fn), {a, b});
+}
+
+inline msl::Expr *mathExpr(msl::Context &c, MathFn2 fn, ElemType elem,
+                           msl::Expr *a, msl::Expr *b) {
+  if (fn == MathFn2::Divide && divideNeedsHelper(elem))
+    return c.call(msl::builtin::helper::DivF, {a, b});
+  return mathExpr(c, fn, a, b);
 }
 
 inline msl::Expr *mathExpr(msl::Context &c, MathFn3 fn, msl::Expr *a,

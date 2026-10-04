@@ -298,6 +298,7 @@ agpu::Decision AgpuEmitter::emitMath2Op(const agpu::OpView &o) {
 
   const Operand &a = ready[0];
   const Operand &b = ready[1];
+  agpu_.helpers.require(m->fn, operand);
 
   const bool promote = !(operand == *operandP);
   return emitPerRegister(o, ready.regs, operand, 'm', [&](int64_t r) {
@@ -310,7 +311,7 @@ agpu::Decision AgpuEmitter::emitMath2Op(const agpu::OpView &o) {
       v.value = agpu::minMaxExpr(mc, m->fn, operand, an, bn, m->propagateNan);
       return v;
     }
-    v.value = agpu::mathExpr(mc, m->fn, mc.var(an), mc.var(bn));
+    v.value = agpu::mathExpr(mc, m->fn, operand, mc.var(an), mc.var(bn));
     return v;
   });
 }
@@ -497,6 +498,7 @@ agpu::Decision AgpuEmitter::emitElementwiseOp(const agpu::OpView &o) {
 
   const agpu::ElemType operand =
       elemOf(o.operands[0]) ? *elemOf(o.operands[0]) : ready.elem;
+  agpu_.helpers.require(ew, operand);
   agpu::EwTypes t = agpu::typesFor(ew, operand);
   t.result = agpu::evalWidthFor(t.result);
 

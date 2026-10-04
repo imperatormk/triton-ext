@@ -65,7 +65,7 @@ int main() {
   {
     msl::Context c;
     CHECK_EQ(render(emitEw(c, EwOp::DivF, f32(), "d", c.var("a"), c.var("b"))),
-             std::string("float d = a / b;\n"));
+             std::string("float d = __agpu_div(a, b);\n"));
     CHECK(checkEw(EwOp::DivS, f32()).isDecline());
     CHECK(checkEw(EwOp::DivF, i32()).isDecline());
   }

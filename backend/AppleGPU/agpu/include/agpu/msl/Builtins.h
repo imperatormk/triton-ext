@@ -168,6 +168,8 @@ inline constexpr const char *AssertRecord = "__agpu_assert_record";
 inline constexpr const char *NarrowF64 = "__agpu_f64_to_f32";
 inline constexpr const char *SoftFma = "__agpu_soft_fma";
 inline constexpr const char *Fma = "__agpu_fma";
+inline constexpr const char *SoftDivF = "__agpu_soft_div";
+inline constexpr const char *DivF = "__agpu_div";
 } // namespace helper
 
 namespace comp {

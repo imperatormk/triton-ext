@@ -29,5 +29,7 @@ HELPER(AssertRecord)
 HELPER(NarrowF64)
 HELPER(SoftFma)
 HELPER(Fma)
+HELPER(SoftDivF)
+HELPER(DivF)
 
 #undef HELPER

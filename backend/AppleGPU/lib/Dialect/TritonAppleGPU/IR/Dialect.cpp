@@ -63,6 +63,7 @@ struct AppleGPUInferLayoutInterface
     return success();
   }
 
+#ifdef AGPU_TRITON_VERIFIES_BROADCAST
   LogicalResult
   verifyBroadcastOpEncoding(RankedTensorType srcType,
                             RankedTensorType dstType) const override {
@@ -77,6 +78,7 @@ struct AppleGPUInferLayoutInterface
     return success(src.removeZeroBasesAlongDim(kReg) ==
                    dst.removeZeroBasesAlongDim(kReg));
   }
+#endif
 
   LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                                    Attribute retEncoding,

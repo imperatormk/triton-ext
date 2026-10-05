@@ -114,6 +114,17 @@ target_link_libraries(TritonAppleGPUBackend PUBLIC MLIRMathTransforms)
 target_compile_options(TritonAppleGPUBackend PRIVATE
     -Wall -Wextra -Wno-missing-field-initializers)
 
+# Builds against each supported Triton from one source: probe the headers for
+# what differs rather than the version, which a development build may not bump.
+file(READ "${TRITON_WHEEL_INCLUDE_DIR}/triton/Dialect/Triton/IR/Dialect.h"
+     _AGPU_TT_DIALECT_H)
+string(FIND "${_AGPU_TT_DIALECT_H}" "verifyBroadcastOpEncoding"
+       _AGPU_BROADCAST_VERIFY_AT)
+if(NOT _AGPU_BROADCAST_VERIFY_AT EQUAL -1)
+    target_compile_definitions(TritonAppleGPUBackend PRIVATE
+        AGPU_TRITON_VERIFIES_BROADCAST)
+endif()
+
 set_source_files_properties(lib/Dialect/TritonAppleGPU/IR/Dialect.cpp
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter")
 

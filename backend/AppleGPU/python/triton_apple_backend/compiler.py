@@ -59,6 +59,15 @@ def _pmaybe_enable_debug(pm):
         pm.enable_debug()
 
 
+def _fp_fusion_enabled(requested):
+    """Triton's resolution of enable_fp_fusion. A Triton without the
+    force-disable knob has only the default to fall back on."""
+    language = knobs.language
+    if hasattr(language, "fp_fusion_enabled"):
+        return language.fp_fusion_enabled(requested)
+    return language.default_fp_fusion if requested is None else requested
+
+
 def _metallib_from_source(msl):
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, 'k.metal')
@@ -156,7 +165,7 @@ class MetalBackend(BaseBackend):
         # kernel's cache entry instead of compiling it again.
         if "num_stages" in args:
             args["num_stages"] = min(args["num_stages"], _MAX_PIPELINE_STAGES)
-        args["enable_fp_fusion"] = knobs.language.fp_fusion_enabled(
+        args["enable_fp_fusion"] = _fp_fusion_enabled(
             args.get("enable_fp_fusion"))
         return MetalOptions(**args)
 

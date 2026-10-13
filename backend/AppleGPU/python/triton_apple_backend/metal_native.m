@@ -83,13 +83,15 @@ static bool sync_gpu(void) {
   Py_BEGIN_ALLOW_THREADS;
   [cb waitUntilCompleted];
   Py_END_ALLOW_THREADS;
-  reapInflight();
-  NSError *failed = cb.error ? cb.error : g_reapError;
-  if (failed) {
-    PyErr_Format(PyExc_RuntimeError, "Metal command buffer failed: %s",
-                 failed.localizedDescription.UTF8String);
-    g_reapError = nil;
-    return false;
+  @autoreleasepool {
+    reapInflight();
+    NSError *failed = cb.error ? cb.error : g_reapError;
+    if (failed) {
+      PyErr_Format(PyExc_RuntimeError, "Metal command buffer failed: %s",
+                   failed.localizedDescription.UTF8String);
+      g_reapError = nil;
+      return false;
+    }
   }
   return true;
 }
@@ -131,7 +133,9 @@ static PyObject *MetalBuffer_data_ptr(MetalBufferObject *self,
 // The address a shader dereferences: `contents` is the CPU mapping.
 static PyObject *MetalBuffer_gpu_address(MetalBufferObject *self,
                                          PyObject *Py_UNUSED(args)) {
-  [exposedBuffers() addObject:self->buf];
+  @autoreleasepool {
+    [exposedBuffers() addObject:self->buf];
+  }
   return PyLong_FromUnsignedLongLong([self->buf gpuAddress]);
 }
 
@@ -249,12 +253,14 @@ static PyObject *py_wrap(PyObject *self, PyObject *args) {
                                    deallocator:nil];
   }
   if (!out->buf) {
+    void *ptr = out->view.buf;
+    Py_ssize_t len = out->view.len;
     Py_DECREF(out);
     PyErr_Format(PyExc_ValueError,
                  "Metal declined a zero-copy view of this memory (%p, %zd "
                  "bytes); the documented requirement is page alignment. Copy "
                  "into alloc() instead.",
-                 out->view.buf, out->view.len);
+                 ptr, len);
     return NULL;
   }
   if (dtype != Py_None) {
@@ -412,14 +418,16 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
   std::vector<ArgInfo> argInfos;
   if (!packArguments(args, &argInfos))
     return NULL;
-  if (kwargFlag(kwargs, "exposes_addresses"))
-    for (const ArgInfo &info : argInfos)
-      if (info.kind == ArgInfo::BUFFER)
-        [exposedBuffers() addObject:info.buf];
-  NSArray *resident = kwargFlag(kwargs, "reads_addresses")
-                          ? [exposedBuffers() allObjects]
-                          : nil;
-  encodeDispatch(self, geom, argInfos, resident);
+  @autoreleasepool {
+    if (kwargFlag(kwargs, "exposes_addresses"))
+      for (const ArgInfo &info : argInfos)
+        if (info.kind == ArgInfo::BUFFER)
+          [exposedBuffers() addObject:info.buf];
+    NSArray *resident = kwargFlag(kwargs, "reads_addresses")
+                            ? [exposedBuffers() allObjects]
+                            : nil;
+    encodeDispatch(self, geom, argInfos, resident);
+  }
   Py_RETURN_NONE;
 }
 
@@ -489,11 +497,15 @@ static PyObject *MetalLibrary_get_function(MetalLibraryObject *self,
 
 static PyObject *MetalLibrary_get_function_names(MetalLibraryObject *self,
                                                  void *closure) {
-  NSArray<NSString *> *names = [self->library functionNames];
-  PyObject *list = PyList_New([names count]);
-  for (NSUInteger i = 0; i < [names count]; i++)
-    PyList_SetItem(list, i, PyUnicode_FromString([names[i] UTF8String]));
-  return list;
+  @autoreleasepool {
+    NSArray<NSString *> *names = [self->library functionNames];
+    PyObject *list = PyList_New([names count]);
+    if (!list)
+      return NULL;
+    for (NSUInteger i = 0; i < [names count]; i++)
+      PyList_SetItem(list, i, PyUnicode_FromString([names[i] UTF8String]));
+    return list;
+  }
 }
 
 static PyMethodDef MetalLibrary_methods[] = {
@@ -584,7 +596,9 @@ static PyObject *py_compile_source(PyObject *self, PyObject *args) {
 }
 
 static PyObject *py_get_device_name(PyObject *self, PyObject *Py_UNUSED(args)) {
-  return PyUnicode_FromString([[get_device() name] UTF8String]);
+  @autoreleasepool {
+    return PyUnicode_FromString([[get_device() name] UTF8String]);
+  }
 }
 
 static PyObject *py_is_available(PyObject *self, PyObject *Py_UNUSED(args)) {

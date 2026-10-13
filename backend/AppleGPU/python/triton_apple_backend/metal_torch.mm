@@ -71,18 +71,20 @@ static void reportFailure(at::mps::MPSStream *stream) {
                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
   id<MTLBuffer> errors = stream->getErrorBuffer();
   [segment addCompletedHandler:^(id<MTLCommandBuffer> done) {
-    if (done.status != MTLCommandBufferStatusError)
-      return;
-    auto *msgs = static_cast<c10::metal::ErrorMessages *>([errors contents]);
-    if (__atomic_load_n(&msgs->count, __ATOMIC_ACQUIRE) == 0) {
-      c10::metal::ErrorMessage &m = msgs->msg[0];
-      snprintf(m.message, sizeof m.message, "Metal command buffer failed: %s",
-               done.error.localizedDescription.UTF8String);
-      snprintf(m.file, sizeof m.file, "%s", __FILE_NAME__);
-      snprintf(m.func, sizeof m.func, "%s", "reportFailure");
-      m.line = __LINE__;
+    @autoreleasepool {
+      if (done.status != MTLCommandBufferStatusError)
+        return;
+      auto *msgs = static_cast<c10::metal::ErrorMessages *>([errors contents]);
+      if (__atomic_load_n(&msgs->count, __ATOMIC_ACQUIRE) == 0) {
+        c10::metal::ErrorMessage &m = msgs->msg[0];
+        snprintf(m.message, sizeof m.message, "Metal command buffer failed: %s",
+                 done.error.localizedDescription.UTF8String);
+        snprintf(m.file, sizeof m.file, "%s", __FILE_NAME__);
+        snprintf(m.func, sizeof m.func, "%s", "reportFailure");
+        m.line = __LINE__;
+      }
+      __atomic_fetch_add(&msgs->count, 1, __ATOMIC_RELEASE);
     }
-    __atomic_fetch_add(&msgs->count, 1, __ATOMIC_RELEASE);
   }];
 }
 
@@ -135,24 +137,26 @@ static PyObject *py_alloc_shared(PyObject *, PyObject *args) {
     return NULL;
   }
   return guarded([&]() -> PyObject * {
-    id<MTLBuffer> buf =
-        [get_device() newBufferWithLength:(NSUInteger)nbytes
-                                  options:MTLResourceStorageModeShared];
-    if (!buf) {
-      PyErr_Format(PyExc_MemoryError, "Metal could not allocate %zd bytes",
-                   nbytes);
-      return NULL;
+    @autoreleasepool {
+      id<MTLBuffer> buf =
+          [get_device() newBufferWithLength:(NSUInteger)nbytes
+                                    options:MTLResourceStorageModeShared];
+      if (!buf) {
+        PyErr_Format(PyExc_MemoryError, "Metal could not allocate %zd bytes",
+                     nbytes);
+        return NULL;
+      }
+      memset([buf contents], 0, (size_t)nbytes);
+      auto *obj =
+          (SharedBufferObject *)SharedBufferType.tp_alloc(&SharedBufferType, 0);
+      if (!obj) {
+        [buf release];
+        return NULL;
+      }
+      obj->buf = buf;
+      obj->nbytes = nbytes;
+      return (PyObject *)obj;
     }
-    memset([buf contents], 0, (size_t)nbytes);
-    auto *obj =
-        (SharedBufferObject *)SharedBufferType.tp_alloc(&SharedBufferType, 0);
-    if (!obj) {
-      [buf release];
-      return NULL;
-    }
-    obj->buf = buf;
-    obj->nbytes = nbytes;
-    return (PyObject *)obj;
   });
 }
 
@@ -369,22 +373,24 @@ static PyObject *MetalKernel_call(MetalKernelObject *self, PyObject *args,
     if (!packArguments(args, &argInfos))
       return NULL;
 
-    if (kwargFlag(kwargs, "exposes_addresses"))
-      for (const ArgInfo &info : argInfos)
-        if (info.kind == ArgInfo::TENSOR)
-          [exposedBuffers() addObject:info.buf];
-    NSArray *resident = kwargFlag(kwargs, "reads_addresses")
-                            ? [[exposedBuffers() allObjects] retain]
-                            : nil;
+    @autoreleasepool {
+      if (kwargFlag(kwargs, "exposes_addresses"))
+        for (const ArgInfo &info : argInfos)
+          if (info.kind == ArgInfo::TENSOR)
+            [exposedBuffers() addObject:info.buf];
+      NSArray *resident = kwargFlag(kwargs, "reads_addresses")
+                              ? [[exposedBuffers() allObjects] retain]
+                              : nil;
 
-    // Nothing below touches Python, and the args tuple keeps the borrowed
-    // pointers in argInfos alive. Holding the GIL here would deadlock anything
-    // on the MPS queue that wants it.
-    {
-      ReleasedGil unlocked;
-      encodeDispatch(self, geom, argInfos, resident);
+      // Nothing below touches Python, and the args tuple keeps the borrowed
+      // pointers in argInfos alive. Holding the GIL here would deadlock
+      // anything on the MPS queue that wants it.
+      {
+        ReleasedGil unlocked;
+        encodeDispatch(self, geom, argInfos, resident);
+      }
+      [resident release];
     }
-    [resident release];
     Py_RETURN_NONE;
   });
 }
@@ -428,43 +434,45 @@ static PyObject *MetalLibrary_get_function(MetalLibraryObject *self,
     if (!PyArg_ParseTuple(args, "s", &name))
       return NULL;
 
-    NSString *fnName = [NSString stringWithUTF8String:name];
-    id<MTLFunction> fn = [self->library newFunctionWithName:fnName];
-    if (!fn) {
-      PyErr_Format(PyExc_KeyError, "Function '%s' not found", name);
-      return NULL;
-    }
+    @autoreleasepool {
+      NSString *fnName = [NSString stringWithUTF8String:name];
+      id<MTLFunction> fn = [self->library newFunctionWithName:fnName];
+      if (!fn) {
+        PyErr_Format(PyExc_KeyError, "Function '%s' not found", name);
+        return NULL;
+      }
 
-    NSError *error = nil;
-    id<MTLComputePipelineState> pso =
-        [get_device() newComputePipelineStateWithFunction:fn error:&error];
-    [fn release];
-    if (!pso) {
-      // The PSO compiler often leaves localizedDescription useless and puts the
-      // real diagnostic in userInfo or the underlying error.
-      NSMutableString *full = [NSMutableString string];
-      [full appendFormat:@"%@", [error localizedDescription]];
-      NSDictionary *info = [error userInfo];
-      if (info && [info count])
-        [full appendFormat:@" | userInfo=%@", info];
-      NSError *under = [[error userInfo] objectForKey:NSUnderlyingErrorKey];
-      if (under)
-        [full appendFormat:@" | underlying=%@ (%@)",
-                           [under localizedDescription], [under userInfo]];
-      PyErr_Format(PyExc_RuntimeError, "PSO creation failed: %s",
-                   [full UTF8String]);
-      return NULL;
-    }
+      NSError *error = nil;
+      id<MTLComputePipelineState> pso =
+          [get_device() newComputePipelineStateWithFunction:fn error:&error];
+      [fn release];
+      if (!pso) {
+        // The PSO compiler often leaves localizedDescription useless and puts
+        // the real diagnostic in userInfo or the underlying error.
+        NSMutableString *full = [NSMutableString string];
+        [full appendFormat:@"%@", [error localizedDescription]];
+        NSDictionary *info = [error userInfo];
+        if (info && [info count])
+          [full appendFormat:@" | userInfo=%@", info];
+        NSError *under = [[error userInfo] objectForKey:NSUnderlyingErrorKey];
+        if (under)
+          [full appendFormat:@" | underlying=%@ (%@)",
+                             [under localizedDescription], [under userInfo]];
+        PyErr_Format(PyExc_RuntimeError, "PSO creation failed: %s",
+                     [full UTF8String]);
+        return NULL;
+      }
 
-    MetalKernelObject *kernel =
-        PyObject_New(MetalKernelObject, &MetalKernelType);
-    if (!kernel) {
-      [pso release];
-      return NULL;
+      MetalKernelObject *kernel =
+          PyObject_New(MetalKernelObject, &MetalKernelType);
+      if (!kernel) {
+        [pso release];
+        return NULL;
+      }
+      kernel->pso = pso;
+      kernel->maxThreads = [pso maxTotalThreadsPerThreadgroup];
+      return (PyObject *)kernel;
     }
-    kernel->pso = pso;
-    kernel->maxThreads = [pso maxTotalThreadsPerThreadgroup];
-    return (PyObject *)kernel;
   });
 }
 
@@ -517,7 +525,10 @@ static PyObject *py_load_metallib(PyObject *self, PyObject *args) {
 }
 
 static PyObject *py_is_available(PyObject *self, PyObject *Py_UNUSED(args)) {
-  return PyBool_FromLong(MTLCreateSystemDefaultDevice() != nil);
+  id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+  bool ok = dev != nil;
+  [dev release];
+  return PyBool_FromLong(ok);
 }
 
 // The address a shader dereferences: data_ptr() is the MTLBuffer object.
@@ -550,7 +561,9 @@ static PyObject *py_gpu_address(PyObject *self, PyObject *args) {
     }
     const uint64_t addr =
         [buf gpuAddress] + (uint64_t)(t.storage_offset() * t.element_size());
-    [exposedBuffers() addObject:buf];
+    @autoreleasepool {
+      [exposedBuffers() addObject:buf];
+    }
     return PyLong_FromUnsignedLongLong(addr);
   });
 }

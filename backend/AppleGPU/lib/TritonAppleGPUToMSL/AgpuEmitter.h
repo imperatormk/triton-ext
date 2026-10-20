@@ -638,9 +638,10 @@ private:
   agpu::Decision stageDotOperands(const DotOperands &ops,
                                   const agpu::Plan &plan, agpu::DotInputs &in);
 
-  // Sums every step of a chained addptr (row + col, etc).
+  // Sums every step of a chained addptr (row + col, etc). `addedWide`: the
+  // offset operand is i64, so the sum is held in a `long`, never narrowed.
   PtrOffset offsetSum(agpu::ValueId basePtr, int64_t reg,
-                      const agpu::msl::Str &added);
+                      const agpu::msl::Str &added, bool addedWide = false);
 
   void inheritOffset(agpu::ValueId from, int64_t fromReg, agpu::ValueId to,
                      int64_t toReg);
